@@ -39,17 +39,32 @@ class ReductionBase:
         vecsize = copy_bits // self.dtype.width
         assert self.N % vecsize == 0, f"Input N {self.N} is not divisible by vector size {vecsize}"
         num_threads = self._get_num_threads()
-        num_warps = num_threads // cute.arch.WARP_SIZE
         assert num_threads % cute.arch.WARP_SIZE == 0
 
         threads_per_row = self._calculate_threads_per_row()
         num_blocks_N = cute.ceil_div(self.N // vecsize, threads_per_row * self.cluster_n)
         cols_per_block = num_threads // threads_per_row
+
+        # Example with `N = 512` and FP16, then each tile has `[4, 512]` elements.
+        # - `vector_size = 8` (i.e., 16-bit x 8 = 128-bit)
+        # - `num_threads = 128`
+        # - `threads_per_row = 32`
+        # - `cols_per_block = 4`
+        # - `cluster_n = 1`
+        # - `num_blocks_N = 2`
+        # TV Layout:
+        # - Shape  (4, 32), (8, 2)
+        # - Stride (1, 32), (4, 1024)
+        # Here's the memory layout:
+        # - Row 0: [B0, T0 x8] [B0, T4 x8] ... [B0, T124 x8] [B1, T0 x8] [B1, T4 x8] ... [B1, T124 x8]
+        # - Row 1: [B0, T1 x8] [B0, T5 x8] ... [B0, T125 x8] [B1, T1 x8] [B1, T5 x8] ... [B1, T125 x8]
+        # - Row 2: [B0, T2 x8] [B0, T6 x8] ... [B0, T126 x8] [B1, T2 x8] [B1, T6 x8] ... [B1, T126 x8]
+        # - Row 3: [B0, T3 x8] [B0, T7 x8] ... [B0, T127 x8] [B1, T3 x8] [B1, T7 x8] ... [B1, T127 x8]
         tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)
         tv_layout = cute.make_layout(
-            ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
+            ((cols_per_block, threads_per_row), (vecsize, num_blocks_N)),
             stride=(
-                (vecsize * cols_per_block, 1),
+                (1, vecsize * cols_per_block),
                 (cols_per_block, cols_per_block * vecsize * threads_per_row),
             ),
         )
