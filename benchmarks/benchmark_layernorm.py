@@ -8,7 +8,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from quack.layernorm import layernorm, layernorm_ref, rstd_ref, mean_ref
+from quack.layernorm import _layernorm_fwd, layernorm_ref, rstd_ref, mean_ref
 import cutlass.cute as cute
 
 try:
@@ -43,11 +43,11 @@ def run_layernorm(
     eps = 1e-6
 
     print("Executing kernel...")
-    out, rstd, mean = layernorm(x, w, eps=eps, return_rstd=True, return_mean=True)
+    out, rstd, mean = _layernorm_fwd(x, w, eps=eps, return_rstd=True, return_mean=True)
 
     compiled_func_ref = torch.compile(layernorm_ref)
 
-    fn = lambda: layernorm(x, w, eps=eps)
+    fn = lambda: _layernorm_fwd(x, w, eps=eps)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9

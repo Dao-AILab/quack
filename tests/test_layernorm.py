@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.layernorm import layernorm, layernorm_ref, rstd_ref, mean_ref
+from quack.layernorm import _layernorm_fwd, layernorm_ref, rstd_ref, mean_ref
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
@@ -35,7 +35,7 @@ def test_layernorm_forward(M, N, input_dtype, eps):
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
 
-    out, rstd, mean = layernorm(x, weight, eps=eps, return_rstd=True, return_mean=True)
+    out, rstd, mean = _layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=True)
     out_ref = layernorm_ref(x_ref, weight_ref, eps=eps)
     rstd_ref_val = rstd_ref(x_ref, eps=eps)
     mean_ref_val = mean_ref(x_ref)
@@ -64,24 +64,24 @@ def test_layernormnorm_return_rstd_option(return_rstd, return_mean):
     weight = torch.randn(N, device=device, dtype=torch.float32)
 
     if return_rstd and return_mean:
-        out, rstd, mean = layernorm(x, weight, eps=eps, return_rstd=True, return_mean=True)
+        out, rstd, mean = _layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=True)
         assert out.shape == (M, N)
         assert rstd.shape == (M,)
         assert rstd.dtype == torch.float32
         assert mean.shape == (M,)
         assert mean.dtype == torch.float32
     elif return_rstd and not return_mean:
-        out, rstd = layernorm(x, weight, eps=eps, return_rstd=True, return_mean=False)
+        out, rstd = _layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=False)
         assert out.shape == (M, N)
         assert rstd.shape == (M,)
         assert rstd.dtype == torch.float32
     elif not return_rstd and return_mean:
-        out, mean = layernorm(x, weight, eps=eps, return_rstd=False, return_mean=True)
+        out, mean = _layernorm_fwd(x, weight, eps=eps, return_rstd=False, return_mean=True)
         assert out.shape == (M, N)
         assert mean.shape == (M,)
         assert mean.dtype == torch.float32
     else:
-        out = layernorm(x, weight, eps=eps, return_rstd=False, return_mean=False)
+        out = _layernorm_fwd(x, weight, eps=eps, return_rstd=False, return_mean=False)
         assert out.shape == (M, N)
         assert isinstance(out, torch.Tensor)
 
@@ -95,35 +95,35 @@ def test_layernorm_input_validation():
     weight = torch.randn(1024, device=device, dtype=torch.float32)
 
     with pytest.raises(AssertionError, match="Input must be 2D"):
-        layernorm(x_3d, weight)
+        _layernorm_fwd(x_3d, weight)
 
     # Test weight dimension mismatch
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
     weight_wrong = torch.randn(512, device=device, dtype=torch.float32)
 
     with pytest.raises(AssertionError, match="Last dimension of input must match weight dimension"):
-        layernorm(x, weight_wrong)
+        _layernorm_fwd(x, weight_wrong)
 
     # Test CPU tensors (should fail)
     x_cpu = torch.randn(32, 1024, dtype=torch.float16)
     weight_cpu = torch.randn(1024, dtype=torch.float32)
 
     with pytest.raises(AssertionError, match="Tensors must be on CUDA device"):
-        layernorm(x_cpu, weight_cpu)
+        _layernorm_fwd(x_cpu, weight_cpu)
 
     # Test unsupported dtype
     x = torch.randn(32, 1024, device=device, dtype=torch.float64)
     weight = torch.randn(1024, device=device, dtype=torch.float32)
 
     with pytest.raises(AssertionError, match="Unsupported dtype"):
-        layernorm(x, weight)
+        _layernorm_fwd(x, weight)
 
     # Test wrong weight dtype
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
     weight_wrong_dtype = torch.randn(1024, device=device, dtype=torch.float16)
 
     with pytest.raises(AssertionError, match="Weight must be float32"):
-        layernorm(x, weight_wrong_dtype)
+        _layernorm_fwd(x, weight_wrong_dtype)
 
 
 def test_layernorm_compile_cache():
@@ -133,30 +133,30 @@ def test_layernorm_compile_cache():
     eps = 1e-6
 
     # Clear cache
-    layernorm.compile_cache.clear()
-    assert len(layernorm.compile_cache) == 0
+    _layernorm_fwd.compile_cache.clear()
+    assert len(_layernorm_fwd.compile_cache) == 0
 
     x1 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight1 = torch.randn(N, device=device, dtype=torch.float32)
 
     # First call should compile
-    out1 = layernorm(x1, weight1, eps=eps)
-    assert len(layernorm.compile_cache) == 1
+    out1 = _layernorm_fwd(x1, weight1, eps=eps)
+    assert len(_layernorm_fwd.compile_cache) == 1
 
     # Same shape should reuse cache
     x2 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
-    out2 = layernorm(x2, weight2, eps=eps)
-    assert len(layernorm.compile_cache) == 1
+    out2 = _layernorm_fwd(x2, weight2, eps=eps)
+    assert len(_layernorm_fwd.compile_cache) == 1
 
     # Different shape should create new cache entry
     x3 = torch.randn(M, N * 2, device=device, dtype=torch.float16)
     weight3 = torch.randn(N * 2, device=device, dtype=torch.float32)
-    out3 = layernorm(x3, weight3, eps=eps)
-    assert len(layernorm.compile_cache) == 2
+    out3 = _layernorm_fwd(x3, weight3, eps=eps)
+    assert len(_layernorm_fwd.compile_cache) == 2
 
     # Different dtype should create new cache entry
     x4 = torch.randn(M, N, device=device, dtype=torch.float32)
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
-    out4 = layernorm(x4, weight4, eps=eps)
-    assert len(layernorm.compile_cache) == 3
+    out4 = _layernorm_fwd(x4, weight4, eps=eps)
+    assert len(_layernorm_fwd.compile_cache) == 3
