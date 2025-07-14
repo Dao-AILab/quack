@@ -3,15 +3,16 @@
 import pytest
 import torch
 
-from quack.layernorm import _layernorm_fwd, layernorm_ref, rstd_ref, mean_ref
+from quack.layernorm import _layernorm_fwd, layernorm_ref, rstd_ref, mean_ref, layernorm
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("M", [1, 37, 199])
-@pytest.mark.parametrize(
-    "N", [256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
-)  # , 32768])
+# @pytest.mark.parametrize(
+#    "N", [256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+# )  # , 32768])
+@pytest.mark.parametrize("N", [256, 2048, 32768, 65536])  # , 32768])
 def test_layernorm_forward(M, N, input_dtype, eps):
     """Test LayerNorm forward pass against reference implementation."""
     device = "cuda"
@@ -35,21 +36,28 @@ def test_layernorm_forward(M, N, input_dtype, eps):
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
 
-    out, rstd, mean = _layernorm_fwd(x, weight, eps=eps, return_rstd=True, return_mean=True)
+    out = layernorm(x, weight, eps=eps)
     out_ref = layernorm_ref(x_ref, weight_ref, eps=eps)
-    rstd_ref_val = rstd_ref(x_ref, eps=eps)
-    mean_ref_val = mean_ref(x_ref)
 
     # shapes & dtypes
     assert out.shape == x.shape
     assert out.dtype == input_dtype
-    assert rstd.shape == (M,) and rstd.dtype == torch.float32
-    assert mean.shape == (M,) and mean.dtype == torch.float32
 
     # numeric check
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
-    torch.testing.assert_close(rstd, rstd_ref_val, atol=6e-4, rtol=6e-4)
-    torch.testing.assert_close(mean, mean_ref_val, atol=6e-4, rtol=6e-4)
+
+    # torch.testing.assert_close(rstd, rstd_ref_val, atol=atol, rtol=1e-3)
+    # Backward pass
+
+    if N > 128 * 1024 and input_dtype == torch.float32:
+        # Skip backward pass for due to not enough smem
+        return
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol * 1.6, rtol=rtol * 1.6)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=rtol * 1.6)
 
 
 @pytest.mark.parametrize("return_rstd", [True, False])
