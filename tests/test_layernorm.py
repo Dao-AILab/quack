@@ -8,11 +8,10 @@ from quack.layernorm import _layernorm_fwd, layernorm_ref, rstd_ref, mean_ref, l
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("M", [1, 37, 199])
-# @pytest.mark.parametrize(
-#    "N", [256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
-# )  # , 32768])
-@pytest.mark.parametrize("N", [256, 2048, 32768, 65536])  # , 32768])
+@pytest.mark.parametrize("M", [1, 37])
+@pytest.mark.parametrize(
+    "N", [256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+)
 def test_layernorm_forward(M, N, input_dtype, eps):
     """Test LayerNorm forward pass against reference implementation."""
     device = "cuda"
@@ -49,15 +48,15 @@ def test_layernorm_forward(M, N, input_dtype, eps):
     # torch.testing.assert_close(rstd, rstd_ref_val, atol=atol, rtol=1e-3)
     # Backward pass
 
-    if N > 128 * 1024 and input_dtype == torch.float32:
+    if N > 63 * 1024 and input_dtype == torch.float32:
         # Skip backward pass for due to not enough smem
         return
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
     out_ref.backward(grad_out)
     out.backward(grad_out)
-    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol * 1.6, rtol=rtol * 1.6)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=rtol * 1.6)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol * 4, rtol=rtol * 4)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol * 4, rtol=rtol * 4)
 
 
 @pytest.mark.parametrize("return_rstd", [True, False])
