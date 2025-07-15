@@ -686,10 +686,12 @@ def _rmsnorm_backward(
         torch.bfloat16,
         torch.float32,
     ], "Unsupported dtype"
+
     assert weight.dtype in [
         torch.float32,
         torch.bfloat16,
-    ], "Weight must be float32 or bfloate16"
+        torch.float16,
+    ], "Weight must be float32, float16 or bfloat16"
 
     M, N = x.shape
     dx = torch.empty_like(x)
