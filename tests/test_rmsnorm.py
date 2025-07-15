@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref
+from quack.rmsnorm import rmsnorm, rmsnorm_ref
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
@@ -143,9 +143,7 @@ def test_rmsnorm_input_validation():
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
     weight_wrong = torch.randn(512, device=device, dtype=torch.float32)
 
-    with pytest.raises(
-        AssertionError, match="Last dimension of input must match weight dimension"
-    ):
+    with pytest.raises(AssertionError, match="Last dimension of input must match weight dimension"):
         rmsnorm(x, weight_wrong)
 
     # Test CPU tensors (should fail)
@@ -164,10 +162,38 @@ def test_rmsnorm_input_validation():
 
     # Test wrong weight dtype
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
-    weight_wrong_dtype = torch.randn(1024, device=device, dtype=torch.float16)
+    weight_wrong_dtype = torch.randn(1024, device=device, dtype=torch.float64)
 
-    with pytest.raises(AssertionError, match="Weight must be float32"):
+    with pytest.raises(AssertionError, match="Weight must be float32 or bfloate16"):
         rmsnorm(x, weight_wrong_dtype)
+
+
+def test_rmsnorm_bf16_weights():
+    """Test that bfloat16 weights work correctly with rmsnorm."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+
+    # Test with bfloat16 input and weights
+    x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+    weight_bf16 = torch.randn(N, device=device, dtype=torch.bfloat16)
+
+    # Run rmsnorm with bfloat16 weights
+    out_bf16 = rmsnorm(x, weight_bf16, eps=eps)
+
+    # Verify output shape and dtype
+    assert out_bf16.shape == x.shape
+    assert out_bf16.dtype == torch.bfloat16
+
+    # Convert to float32 for reference comparison
+    x_fp32 = x.to(torch.float32)
+    weight_fp32 = weight_bf16.to(torch.float32)
+
+    # Run reference implementation with float32
+    out_ref = rmsnorm_ref(x_fp32, weight_fp32, eps=eps).to(torch.bfloat16)
+
+    # Verify output values match reference implementation
+    torch.testing.assert_close(out_bf16, out_ref, atol=1e-1, rtol=1e-2)
 
 
 def test_rmsnorm_compile_cache():
