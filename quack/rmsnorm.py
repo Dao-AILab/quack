@@ -257,7 +257,8 @@ def _rmsnorm_fwd(
     assert weight.dtype in [
         torch.float32,
         torch.bfloat16,
-    ], "Weight must be float32 or bfloat16"
+        torch.float16,
+    ], "Weight must be float32, float16 or bfloat16"
 
     M, N = x.shape
     device = x.device
@@ -641,17 +642,22 @@ class RMSNormBackward(ReductionBase):
                     tXsdW_other = cute.make_tensor(tXsdW.iterator + i * sdW.stride[0], tXsdW.layout)
                     cute.autovec_copy(tXsdW_other, tXrdW_other)
                     tXrdW.store(tXrdW.load() + tXrdW_other.load())
-                # Convert from fp32 to weight dtype at and only when storing
+                # Only convert for storing to weight.dtype if weights are not fp32
+                if cutlass.const_expr(tdWgdW.element_type != cutlass.Float32):
+                    tdWrdW_converted = cute.make_fragment_like(tdWgdW)
+                    tdWrdW_converted.store(tXrdW.load().to(tdWgdW.element_type))
+                    cute.copy(copy_atom_store_dW, tdWrdW_converted, tdWgdW, pred=tdWpdW)
+                else:
+                    cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
+
+        else:
+            # Only convert from fp32 to weight dtype if needed and only when storing
+            if cutlass.const_expr(tdWgdW.element_type != cutlass.Float32):
                 tdWrdW_converted = cute.make_fragment_like(tdWgdW)
                 tdWrdW_converted.store(tXrdW.load().to(tdWgdW.element_type))
-
+                cute.copy(copy_atom_store_dW, tdWrdW_converted, tdWgdW, pred=tdWpdW)
+            else:
                 cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
-        else:
-            # Convert from fp32 to weight dtype at and only when storing
-            tdWrdW_converted = cute.make_fragment_like(tdWgdW)
-            tdWrdW_converted.store(tXrdW.load().to(tdWgdW.element_type))
-
-            cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
 
 
 def _rmsnorm_backward(
