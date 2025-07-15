@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref
+from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref, _rmsnorm_fwd
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
@@ -114,12 +114,12 @@ def test_rmsnorm_return_rstd_option(return_rstd):
     weight = torch.randn(N, device=device, dtype=torch.float32)
 
     if return_rstd:
-        out, rstd = rmsnorm(x, weight, eps=eps, return_rstd=True)
+        out, rstd = _rmsnorm_fwd(x, weight, eps=eps, return_rstd=True)
         assert out.shape == (M, N)
         assert rstd.shape == (M,)
         assert rstd.dtype == torch.float32
     else:
-        out = rmsnorm(x, weight, eps=eps, return_rstd=False)
+        out = _rmsnorm_fwd(x, weight, eps=eps, return_rstd=False)
         assert out.shape == (M, N)
         assert isinstance(out, torch.Tensor)
 
@@ -143,9 +143,7 @@ def test_rmsnorm_input_validation():
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
     weight_wrong = torch.randn(512, device=device, dtype=torch.float32)
 
-    with pytest.raises(
-        AssertionError, match="Last dimension of input must match weight dimension"
-    ):
+    with pytest.raises(AssertionError, match="Last dimension of input must match weight dimension"):
         rmsnorm(x, weight_wrong)
 
     # Test CPU tensors (should fail)
@@ -177,30 +175,30 @@ def test_rmsnorm_compile_cache():
     eps = 1e-6
 
     # Clear cache
-    rmsnorm.compile_cache.clear()
-    assert len(rmsnorm.compile_cache) == 0
+    _rmsnorm_fwd.compile_cache.clear()
+    assert len(_rmsnorm_fwd.compile_cache) == 0
 
     x1 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight1 = torch.randn(N, device=device, dtype=torch.float32)
 
     # First call should compile
-    out1 = rmsnorm(x1, weight1, eps=eps)
-    assert len(rmsnorm.compile_cache) == 1
+    out1 = _rmsnorm_fwd(x1, weight1, eps=eps)
+    assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Same shape should reuse cache
     x2 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
-    out2 = rmsnorm(x2, weight2, eps=eps)
-    assert len(rmsnorm.compile_cache) == 1
+    out2 = _rmsnorm_fwd(x2, weight2, eps=eps)
+    assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Different shape should create new cache entry
     x3 = torch.randn(M, N * 2, device=device, dtype=torch.float16)
     weight3 = torch.randn(N * 2, device=device, dtype=torch.float32)
-    out3 = rmsnorm(x3, weight3, eps=eps)
-    assert len(rmsnorm.compile_cache) == 2
+    out3 = _rmsnorm_fwd(x3, weight3, eps=eps)
+    assert len(_rmsnorm_fwd.compile_cache) == 2
 
     # Different dtype should create new cache entry
     x4 = torch.randn(M, N, device=device, dtype=torch.float32)
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
-    out4 = rmsnorm(x4, weight4, eps=eps)
-    assert len(rmsnorm.compile_cache) == 3
+    out4 = _rmsnorm_fwd(x4, weight4, eps=eps)
+    assert len(_rmsnorm_fwd.compile_cache) == 3

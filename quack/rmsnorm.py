@@ -322,6 +322,7 @@ class RMSNormBackward(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
         # 2 stages for double buffering when computing mean of x_hat * wdy
         super().__init__(dtype, N, stage=2, reduction_dtype=cutlass.Float32)
+        self.reload_wdy = None if N <= 16 * 1024 else "smem"
         if self.N > 128 * 1024 and self.dtype.width >= 32:
             # Not enough smem
             raise ValueError("RMSNormBackward does not support N > 128k with dtype >= 32 bits")
@@ -591,6 +592,7 @@ class RMSNormBackward(ReductionBase):
                 )
                 / shape[1]
             )
+
             if cutlass.const_expr(self.cluster_n > 1):
                 # It's faster to have 1 lane per warp to signal the mbar, rather than all lanes
                 # Requires adjusting the thread_count when initializing the mbar
@@ -600,12 +602,19 @@ class RMSNormBackward(ReductionBase):
                     cute.arch.mbarrier_arrive(
                         mbar_empty_ptr + stage, peer_cta_rank_in_cluster=lane_idx
                     )
+
+            if cutlass.const_expr(self.reload_wdy == "smem"):
+                cute.autovec_copy(tXsdOut[None, None, None, stage], tXrdOut)
+                dout = tXrdOut.load().to(cute.Float32)
+                wdy = dout * weight
+
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
             tXrdX.store(dx.to(tXrdOut.element_type))
             if row < M or tiler_mn[0] == 1:
                 tXgdX_cur = utils.coord_offset_i64(bidx, tXgdX, dim=3)[None, None, None, 0]
                 cute.copy(copy_atom_store_dX, tXrdX, tXgdX_cur, pred=tXpX)
             tXrdW.store(tXrdW.load() + dout * x_hat)
+
             stage ^= 1
             if stage == 0:
                 consumer_phase ^= 1
