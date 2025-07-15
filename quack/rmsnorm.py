@@ -648,7 +648,7 @@ class RMSNormBackward(ReductionBase):
                 cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
         else:
             # Convert from fp32 to weight dtype at and only when storing
-            tdWrdW_converted = cute.make_fragment_likd(tdWgdW)
+            tdWrdW_converted = cute.make_fragment_like(tdWgdW)
             tdWrdW_converted.store(tXrdW.load().to(tdWgdW.element_type))
 
             cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
