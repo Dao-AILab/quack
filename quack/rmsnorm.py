@@ -787,6 +787,8 @@ class RMSNormFunction(torch.autograd.Function):
     def backward(ctx, dout):
         x, weight, rstd = ctx.saved_tensors
         x_shape_start = ctx.x_shape_start
+        # Reshape dout to match the flattened shape used in forward
+        dout = dout.view(-1, dout.shape[-1])
         dx, dw = _rmsnorm_backward(x, weight, dout, rstd)
         dx = dx.view(x_shape_start)
         # dx is returned for input gradient,
@@ -807,3 +809,39 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.T
         Normalized output tensor of same shape as x
     """
     return RMSNormFunction.apply(x, weight, eps)
+
+
+class QuackRMSNorm(torch.nn.Module):
+    """RMSNorm module that behaves like torch.nn.RMSNorm.
+
+    This class provides a drop-in replacement for torch.nn.RMSNorm that uses
+    the quack.rmsnorm implementation under the hood.
+
+    Args:
+        dim (int): The dimension to normalize over
+        eps (float, optional): A small constant for numerical stability. Default: 1e-6
+
+    Attributes:
+        weight (torch.nn.Parameter): The learnable weight parameter
+        eps (float): A small constant for numerical stability
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RMSNorm to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Normalized tensor
+        """
+        return rmsnorm(x, self.weight, self.eps)
+
+    def reset_parameters(self):
+        """Reset the weight parameter to ones."""
+        torch.nn.init.ones_(self.weight)
