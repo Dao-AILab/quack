@@ -72,7 +72,7 @@ Every tier of memory has a read & write primitive available for local reduction.
 |----------------------------|-------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Threads                    | Registers (1st memory tier)    | Each thread can own up to 255 registers.                                                                                                              |
 | Warps                      | Registers (1st memory tier)    | Each warp has 32 consecutive threads, and it is the smallest parallel execution unit. Within the same warp, each thread can fetch registers owned by other threads via warp shuffle. |
-| Thread Blocks              | Shared Memory (2nd memory tier)| Each thread block can contain up to 1024 threads or 16 warps. All threads within each thread block are executed on the same SM and can read/write to the same shared memory.          |
+| Thread Blocks              | Shared Memory (2nd memory tier)| Each thread block can contain up to 1024 threads or 32 warps. All threads within each thread block are executed on the same SM and can read/write to the same shared memory.          |
 | Thread Block Clusters      | Distributed Shared Memory (3rd memory tier) | Neighboring (up to 16) thread blocks can read and write to others’ shared memory via a dedicated SM-to-SM network. This abstraction is “distributed shared memory”. |
 | Grids                      | Global Memory                  | All threads within the same kernel can read and write to the global memory.                                                                          |
 
