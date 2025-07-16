@@ -41,11 +41,22 @@ def benchmark_implementation(
     def benchmark_fn():
         return model(input_data)
 
+    # Reset CUDA memory stats before benchmarking
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+
+    # Record starting memory
+    start_mem = torch.cuda.memory_allocated()
+
     # Use Triton's do_bench to benchmark the function
     # This ensures L2 cache is cleared between runs
     avg_time_ms = triton.testing.do_bench(
         benchmark_fn, warmup=warmup_ms, rep=rep_ms, return_mode="mean"
     )
+
+    # Record peak memory usage during benchmarking
+    peak_mem = torch.cuda.max_memory_allocated()
+    peak_mem_mb = (peak_mem - start_mem) / (1024 * 1024)  # Convert to MB
 
     # Calculate total time (approximate)
     total_time_ms = avg_time_ms * num_iterations
@@ -54,6 +65,7 @@ def benchmark_implementation(
         "implementation": implementation_name,
         "avg_time_ms": avg_time_ms,
         "total_time_ms": total_time_ms,
+        "peak_mem_mb": peak_mem_mb,
     }
 
 
@@ -104,6 +116,7 @@ def display_results_table(all_results):
         "Hidden Size",
         "Implementation",
         "Avg Time (ms)",
+        "Peak Mem (MB)",
         "Speedup",
     ]
 
@@ -150,6 +163,7 @@ def display_results_table(all_results):
                     hidden_size,
                     result["implementation"],
                     f"{result['avg_time_ms']:.4f}",
+                    f"{result['peak_mem_mb']:.2f}",
                     f"{speedup:.2f}x",
                 ]
             )
@@ -180,6 +194,36 @@ def display_results_table(all_results):
         quack_vs_torchcompile_speedups.append(quack_vs_torchcompile)
         config_labels.append(f"BS={batch_size}, Seq={seq_len}")
 
+    # Collect memory usage data
+    pytorch_mem = []
+    torchcompile_mem = []
+    quack_mem = []
+
+    for config in configs:
+        results = all_results[config]
+        for result in results:
+            if result["implementation"] == "PyTorch RMSNorm":
+                pytorch_mem.append(result["peak_mem_mb"])
+            elif result["implementation"] == "TorchCompile RMSNorm":
+                torchcompile_mem.append(result["peak_mem_mb"])
+            elif result["implementation"] == "Quack RMSNorm":
+                quack_mem.append(result["peak_mem_mb"])
+
+    # Calculate average memory usage
+    avg_pytorch_mem = sum(pytorch_mem) / len(pytorch_mem) if pytorch_mem else 0
+    avg_torchcompile_mem = sum(torchcompile_mem) / len(torchcompile_mem) if torchcompile_mem else 0
+    avg_quack_mem = sum(quack_mem) / len(quack_mem) if quack_mem else 0
+
+    # Calculate memory savings percentages
+    mem_savings_vs_pytorch = (
+        ((avg_pytorch_mem - avg_quack_mem) / avg_pytorch_mem * 100) if avg_pytorch_mem > 0 else 0
+    )
+    mem_savings_vs_torchcompile = (
+        ((avg_torchcompile_mem - avg_quack_mem) / avg_torchcompile_mem * 100)
+        if avg_torchcompile_mem > 0
+        else 0
+    )
+
     # Calculate and print average and median speedups
     avg_quack_vs_pytorch = sum(quack_vs_pytorch_speedups) / len(quack_vs_pytorch_speedups)
     avg_quack_vs_torchcompile = sum(quack_vs_torchcompile_speedups) / len(
@@ -208,6 +252,8 @@ def display_results_table(all_results):
         ) / 2
 
     print("\n" + "=" * 80)
+    print("PERFORMANCE SUMMARY")
+    print("-" * 80)
     print(f"Average Quack vs PyTorch Speedup: {avg_quack_vs_pytorch:.2f}x across all sizes tested")
     print(
         f"Median Quack vs PyTorch Speedup: {median_quack_vs_pytorch:.2f}x across all sizes tested"
@@ -218,6 +264,15 @@ def display_results_table(all_results):
     print(
         f"Median Quack vs TorchCompile Speedup: {median_quack_vs_torchcompile:.2f}x across all sizes tested"
     )
+
+    print("\n" + "-" * 80)
+    print("MEMORY USAGE SUMMARY")
+    print("-" * 80)
+    print(f"Average PyTorch RMSNorm Memory: {avg_pytorch_mem:.2f} MB")
+    print(f"Average TorchCompile RMSNorm Memory: {avg_torchcompile_mem:.2f} MB")
+    print(f"Average Quack RMSNorm Memory: {avg_quack_mem:.2f} MB")
+    print(f"Memory Savings vs PyTorch: {mem_savings_vs_pytorch:.2f}%")
+    print(f"Memory Savings vs TorchCompile: {mem_savings_vs_torchcompile:.2f}%")
     print("=" * 80)
 
     # Generate and save graphs
