@@ -40,11 +40,17 @@ def benchmark_backward_implementation(
     warmup_ms = 25  # Default warmup time in ms
     rep_ms = 100  # Default repetition time in ms
 
-    # Define the function to benchmark
+    # Pre-clone the input data and set requires_grad outside the benchmark function
+    # This ensures we're not including the clone time in our measurements
+    input_with_grad = input_data.clone().requires_grad_(True)
+
+    # Define the function to benchmark (without the clone operation)
     def benchmark_fn():
-        input_data_clone = input_data.clone().requires_grad_(True)
-        output = model(input_data_clone)
+        output = model(input_with_grad)
         output.backward(grad_output)
+        # Reset gradients for next iteration
+        if input_with_grad.grad is not None:
+            input_with_grad.grad.zero_()
         return output  # Return is needed for do_bench but not used
 
     # Use Triton's do_bench to benchmark the function
@@ -259,6 +265,7 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
     plt.xticks(x, config_labels, rotation=45, ha="right")
 
     # Add grid lines at .5 intervals
+    # Need to figure out better way to auto add finer lines when needed, but .5 for now...
     max_speedup = max(max(quack_vs_pytorch), max(quack_vs_torchcompile))
     y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
     plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
@@ -281,7 +288,7 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
     plt.title("Quack RMSNorm vs PyTorch RMSNorm Backward Pass Speedup")
     plt.xticks(x, config_labels, rotation=45, ha="right")
 
-    # Add grid lines at .5 intervals
+    # Add grid lines at .5 intervals (same issue, need a more holistic way to generate grid lines)
     max_speedup = max(quack_vs_pytorch)
     y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
     plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
@@ -317,9 +324,10 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
 
 if __name__ == "__main__":
     # Define batch sizes and sequence lengths to benchmark
+    # TODO - I used llama3-8B which has 4096 hidden dim as fixed hidden dim....let's look at MoE models next
     batch_sizes = [1, 4, 8, 16, 32]
     sequence_lengths = [4096, 8192, 16384, 32768, 65536]
-    hidden_features = 4096  # Fixed hidden dimension
+    hidden_features = 4096  # Fixed hidden dimension (based on llama3-8B)
     dtype = torch.bfloat16
 
     num_benchmark_iterations = 50
@@ -345,6 +353,7 @@ if __name__ == "__main__":
         for batch_size in batch_sizes:
             for sequence_length in sequence_lengths:
                 # Skip very large configurations that might cause OOM
+                # TODO - we should figure out a better way to determine this, ala check GPU memory before running...
                 if batch_size * sequence_length * hidden_features > 2**31:
                     print(f"Skipping BS={batch_size}, SeqLen={sequence_length} (too large)")
                     continue
