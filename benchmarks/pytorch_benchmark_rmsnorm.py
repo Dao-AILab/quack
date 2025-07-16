@@ -5,6 +5,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import triton.testing
 
 from quack.rmsnorm import QuackRMSNorm
 from tabulate import tabulate
@@ -30,28 +31,29 @@ def benchmark_implementation(
     num_iterations=100,
     warmup_iterations=10,
 ):
-    """Benchmark a specific implementation and return timing results."""
-    # Warmup
-    for _ in range(warmup_iterations):
-        _ = model(input_data)
-    torch.cuda.synchronize()
+    """Benchmark a specific implementation and return timing results using Triton's do_bench."""
+    # Convert iterations to time in ms (approximate)
+    # We'll use warmup_ms and rep_ms instead of iterations to ensure consistent timing
+    warmup_ms = 25  # Default warmup time in ms
+    rep_ms = 100  # Default repetition time in ms
 
-    # Benchmark
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(num_iterations):
-        _ = model(input_data)
-    end_event.record()
-    torch.cuda.synchronize()
+    # Define the function to benchmark
+    def benchmark_fn():
+        return model(input_data)
 
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    avg_time_ms = elapsed_time_ms / num_iterations
+    # Use Triton's do_bench to benchmark the function
+    # This ensures L2 cache is cleared between runs
+    avg_time_ms = triton.testing.do_bench(
+        benchmark_fn, warmup=warmup_ms, rep=rep_ms, return_mode="mean"
+    )
+
+    # Calculate total time (approximate)
+    total_time_ms = avg_time_ms * num_iterations
 
     return {
         "implementation": implementation_name,
         "avg_time_ms": avg_time_ms,
-        "total_time_ms": elapsed_time_ms,
+        "total_time_ms": total_time_ms,
     }
 
 

@@ -5,6 +5,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import triton.testing
 
 from quack.rmsnorm import QuackRMSNorm
 from tabulate import tabulate
@@ -30,37 +31,35 @@ def benchmark_backward_implementation(
     num_iterations=100,
     warmup_iterations=10,
 ):
-    """Benchmark a specific implementation's backward pass and return timing results."""
+    """Benchmark a specific implementation's backward pass and return timing results using Triton's do_bench."""
     # Create gradient tensor of the same shape as the output
     grad_output = torch.randn_like(input_data)
 
-    # Warmup
-    for _ in range(warmup_iterations):
+    # Convert iterations to time in ms (approximate)
+    # We'll use warmup_ms and rep_ms instead of iterations to ensure consistent timing
+    warmup_ms = 25  # Default warmup time in ms
+    rep_ms = 100  # Default repetition time in ms
+
+    # Define the function to benchmark
+    def benchmark_fn():
         input_data_clone = input_data.clone().requires_grad_(True)
         output = model(input_data_clone)
         output.backward(grad_output)
-        torch.cuda.synchronize()
+        return output  # Return is needed for do_bench but not used
 
-    # Benchmark
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    # Use Triton's do_bench to benchmark the function
+    # This ensures L2 cache is cleared between runs
+    avg_time_ms = triton.testing.do_bench(
+        benchmark_fn, warmup=warmup_ms, rep=rep_ms, return_mode="mean"
+    )
 
-    start_event.record()
-    for _ in range(num_iterations):
-        input_data_clone = input_data.clone().requires_grad_(True)
-        output = model(input_data_clone)
-        output.backward(grad_output)
-    end_event.record()
-
-    torch.cuda.synchronize()
-
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    avg_time_ms = elapsed_time_ms / num_iterations
+    # Calculate total time (approximate)
+    total_time_ms = avg_time_ms * num_iterations
 
     return {
         "implementation": implementation_name,
         "avg_time_ms": avg_time_ms,
-        "total_time_ms": elapsed_time_ms,
+        "total_time_ms": total_time_ms,
     }
 
 
