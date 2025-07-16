@@ -642,22 +642,11 @@ class RMSNormBackward(ReductionBase):
                     tXsdW_other = cute.make_tensor(tXsdW.iterator + i * sdW.stride[0], tXsdW.layout)
                     cute.autovec_copy(tXsdW_other, tXrdW_other)
                     tXrdW.store(tXrdW.load() + tXrdW_other.load())
-                # Only convert for storing to weight.dtype if weights are not fp32
-                if cutlass.const_expr(tdWgdW.element_type != cutlass.Float32):
-                    tdWrdW_converted = cute.make_fragment_like(tdWgdW)
-                    tdWrdW_converted.store(tXrdW.load().to(tdWgdW.element_type))
-                    cute.copy(copy_atom_store_dW, tdWrdW_converted, tdWgdW, pred=tdWpdW)
-                else:
-                    cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
+                cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
 
         else:
-            # Only convert from fp32 to weight dtype if needed and only when storing
-            if cutlass.const_expr(tdWgdW.element_type != cutlass.Float32):
-                tdWrdW_converted = cute.make_fragment_like(tdWgdW)
-                tdWrdW_converted.store(tXrdW.load().to(tdWgdW.element_type))
-                cute.copy(copy_atom_store_dW, tdWrdW_converted, tdWgdW, pred=tdWpdW)
-            else:
-                cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
+            # dw is already in fp32, so we can directly copy to global memory
+            cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
 
 
 def _rmsnorm_backward(
