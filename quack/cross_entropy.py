@@ -1,16 +1,16 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-import torch
 from typing import Optional, Type
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
+import torch
+from cutlass.cute.runtime import from_dlpack
 from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 
 
@@ -79,7 +79,7 @@ class CrossEntropy(ReductionBase):
         self.kernel(mX, mTarget, mLoss, mLSE, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
+            cluster=([1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None),
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -111,7 +111,9 @@ class CrossEntropy(ReductionBase):
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
-            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+            mX.element_type,
+            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+            byte_alignment=16,
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
@@ -166,7 +168,9 @@ class CrossEntropy(ReductionBase):
                 reduction_buffer[None, None, 0],
                 mbar_ptr + 0 if cutlass.const_expr(self.cluster_n > 1) else None,
                 init_val=-cutlass.Float32.inf,
-                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+                hook_fn=(
+                    cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None
+                ),
             )
             if cutlass.const_expr(self.reload_from == "smem"):
                 cute.autovec_copy(tXsX, tXrX)
@@ -191,7 +195,9 @@ class CrossEntropy(ReductionBase):
                 threads_per_row,
                 reduction_buffer[None, None, 0],
                 mbar_ptr,
-                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+                hook_fn=(
+                    cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None
+                ),
             )
 
         if (
@@ -225,7 +231,11 @@ def _cross_entropy(
     assert target.dim() == 1, "Target must be 1D"
     assert x.shape[0] == target.shape[0], "Batch dimensions must match"
     assert x.is_cuda and target.is_cuda, "Tensors must be on CUDA device"
-    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
+    assert x.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
     M, N = x.shape
     device = x.device
@@ -314,13 +324,16 @@ class CrossEntropyBackward:
         num_threads = cute.size(tv_layout, mode=[0])
 
         mDLoss = cute.make_tensor(
-            mDLoss.iterator, cute.append(mDLoss.layout, cute.make_layout((self.N,), stride=(0,)))
+            mDLoss.iterator,
+            cute.append(mDLoss.layout, cute.make_layout((self.N,), stride=(0,))),
         )
         mTarget = cute.make_tensor(
-            mTarget.iterator, cute.append(mTarget.layout, cute.make_layout((self.N,), stride=(0,)))
+            mTarget.iterator,
+            cute.append(mTarget.layout, cute.make_layout((self.N,), stride=(0,))),
         )
         mLSE = cute.make_tensor(
-            mLSE.iterator, cute.append(mLSE.layout, cute.make_layout((self.N,), stride=(0,)))
+            mLSE.iterator,
+            cute.append(mLSE.layout, cute.make_layout((self.N,), stride=(0,))),
         )
 
         smem_size = cute.size_in_bytes(
@@ -364,7 +377,9 @@ class CrossEntropyBackward:
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
-            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+            mX.element_type,
+            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+            byte_alignment=16,
         )
 
         idX = cute.make_identity_tensor(shape)
@@ -474,7 +489,11 @@ def _cross_entropy_backward(
     assert (
         x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda
     ), "Tensors must be on CUDA device"
-    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
+    assert x.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
 
     M, N = x.shape
@@ -532,15 +551,37 @@ class CrossEntropyFunction(torch.autograd.Function):
 
 
 def cross_entropy(
-    x: torch.Tensor, target: torch.Tensor, inplace_backward: bool = False
+    x: torch.Tensor,
+    target: torch.Tensor,
+    inplace_backward: bool = True,
+    reduction: str = "none",
 ) -> torch.Tensor:
     """Cross entropy loss with automatic differentiation support.
 
     Args:
         x: Input logits tensor of shape (M, N)
         target: Target class indices tensor of shape (M,)
+        inplace_backward: Whether to perform backward pass in-place
+        reduction: Specifies the reduction to apply to the output:
+            'none': no reduction will be applied (default)
+            'mean': the sum of the output will be divided by the number of elements
+            'sum': the output will be summed
 
     Returns:
-        Cross entropy loss tensor of shape (M,)
+        Cross entropy loss tensor:
+            - If reduction='none': tensor of shape (M,) with per-example losses
+            - If reduction='mean': scalar tensor with mean loss
+            - If reduction='sum': scalar tensor with sum of losses
     """
-    return CrossEntropyFunction.apply(x, target, inplace_backward)
+    loss = CrossEntropyFunction.apply(x, target, inplace_backward)
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none":
+        return loss
+    else:
+        raise ValueError(
+            f"Invalid reduction mode: {reduction}. Expected one of 'none', 'mean', or 'sum'"
+        )
