@@ -23,26 +23,35 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed
 
 
-def benchmark_implementation(
+def benchmark_backward_implementation(
     implementation_name,
     model,
     input_data,
     num_iterations=100,
     warmup_iterations=10,
 ):
-    """Benchmark a specific implementation and return timing results."""
+    """Benchmark a specific implementation's backward pass and return timing results."""
+    # Create gradient tensor of the same shape as the output
+    grad_output = torch.randn_like(input_data)
+
     # Warmup
     for _ in range(warmup_iterations):
-        _ = model(input_data)
-    torch.cuda.synchronize()
+        input_data_clone = input_data.clone().requires_grad_(True)
+        output = model(input_data_clone)
+        output.backward(grad_output)
+        torch.cuda.synchronize()
 
     # Benchmark
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
+
     start_event.record()
     for _ in range(num_iterations):
-        _ = model(input_data)
+        input_data_clone = input_data.clone().requires_grad_(True)
+        output = model(input_data_clone)
+        output.backward(grad_output)
     end_event.record()
+
     torch.cuda.synchronize()
 
     elapsed_time_ms = start_event.elapsed_time(end_event)
@@ -55,27 +64,27 @@ def benchmark_implementation(
     }
 
 
-def benchmark_rmsnorm_cuda(
+def benchmark_rmsnorm_backward_cuda(
     input_shape,
     normalized_dim,
     num_iterations=100,
     warmup_iterations=10,
     dtype=torch.bfloat16,
 ):
-    """Run benchmarks for different RMSNorm implementations and return results."""
+    """Run backward pass benchmarks for different RMSNorm implementations and return results."""
     input_data = torch.randn(input_shape, device="cuda", dtype=dtype)
     results = []
 
     # Benchmark PyTorch RMSNorm
     rms_norm_layer = torch.nn.RMSNorm(normalized_dim, device="cuda", dtype=dtype)
-    result = benchmark_implementation(
+    result = benchmark_backward_implementation(
         "PyTorch RMSNorm", rms_norm_layer, input_data, num_iterations, warmup_iterations
     )
     results.append(result)
 
     # Benchmark TorchCompile RMSNorm
     compiled_rms_norm = torch.compile(RMSNorm(dim=normalized_dim)).cuda().to(dtype)
-    result = benchmark_implementation(
+    result = benchmark_backward_implementation(
         "TorchCompile RMSNorm",
         compiled_rms_norm,
         input_data,
@@ -86,7 +95,7 @@ def benchmark_rmsnorm_cuda(
 
     # Benchmark QuackRMSNorm
     quack_rms_norm = QuackRMSNorm(dim=normalized_dim).cuda().to(dtype)
-    result = benchmark_implementation(
+    result = benchmark_backward_implementation(
         "Quack RMSNorm", quack_rms_norm, input_data, num_iterations, warmup_iterations
     )
     results.append(result)
@@ -112,7 +121,7 @@ def display_results_table(all_results):
     current_batch = None
 
     print("\n" + "=" * 80)
-    print("RMSNorm Benchmark Results")
+    print("RMSNorm Backward Pass Benchmark Results")
     print("=" * 80)
 
     # Collect speedup data for graphs
@@ -247,41 +256,62 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
     # Add labels and title
     plt.xlabel("Configuration (Batch Size, Sequence Length)")
     plt.ylabel("Speedup Factor (higher is better)")
-    plt.title("RMSNorm Implementation Speedup Comparison")
+    plt.title("RMSNorm Backward Pass Implementation Speedup Comparison")
     plt.xticks(x, config_labels, rotation=45, ha="right")
+
+    # Add grid lines at .5 intervals
+    max_speedup = max(max(quack_vs_pytorch), max(quack_vs_torchcompile))
+    y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
+    plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
+    plt.grid(axis="y", linestyle="-", alpha=0.3)
+
     plt.tight_layout()
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
     plt.legend()
 
     # Save the figure
-    output_path = os.path.join(visual_output_dir, "rmsnorm_speedup_comparison.png")
+    output_path = os.path.join(visual_output_dir, "rmsnorm_backward_speedup_comparison.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"\nSpeedup graph saved to: {output_path}")
 
-    # Create separate graphs for each comparison
+    # Quack vs PyTorch comparison
     plt.figure(figsize=(14, 6))
     plt.bar(x, quack_vs_pytorch, color="blue", alpha=0.7)
     plt.axhline(y=1.0, color="r", linestyle="-", alpha=0.3)
     plt.xlabel("Configuration (Batch Size, Sequence Length)")
     plt.ylabel("Speedup Factor (higher is better)")
-    plt.title("Quack RMSNorm vs PyTorch RMSNorm Speedup")
+    plt.title("Quack RMSNorm vs PyTorch RMSNorm Backward Pass Speedup")
     plt.xticks(x, config_labels, rotation=45, ha="right")
+
+    # Add grid lines at .5 intervals
+    max_speedup = max(quack_vs_pytorch)
+    y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
+    plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
+    plt.grid(axis="y", linestyle="-", alpha=0.3)
+
     plt.tight_layout()
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-    output_path = os.path.join(visual_output_dir, "quack_vs_pytorch_speedup.png")
+
+    output_path = os.path.join(visual_output_dir, "quack_vs_pytorch_backward_speedup.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Quack vs PyTorch graph saved to: {output_path}")
 
+    # Quack vs TorchCompile comparison
     plt.figure(figsize=(14, 6))
     plt.bar(x, quack_vs_torchcompile, color="green", alpha=0.7)
     plt.axhline(y=1.0, color="r", linestyle="-", alpha=0.3)
     plt.xlabel("Configuration (Batch Size, Sequence Length)")
     plt.ylabel("Speedup Factor (higher is better)")
-    plt.title("Quack RMSNorm vs TorchCompile RMSNorm Speedup")
+    plt.title("Quack RMSNorm vs TorchCompile RMSNorm Backward Pass Speedup")
     plt.xticks(x, config_labels, rotation=45, ha="right")
+
+    # Add grid lines at .5 intervals
+    max_speedup = max(quack_vs_torchcompile)
+    y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
+    plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
+    plt.grid(axis="y", linestyle="-", alpha=0.3)
+
     plt.tight_layout()
-    plt.grid(axis="y", linestyle="--", alpha=0.7)
-    output_path = os.path.join(visual_output_dir, "quack_vs_torchcompile_speedup.png")
+
+    output_path = os.path.join(visual_output_dir, "quack_vs_torchcompile_backward_speedup.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Quack vs TorchCompile graph saved to: {output_path}")
 
@@ -289,14 +319,14 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
 if __name__ == "__main__":
     # Define batch sizes and sequence lengths to benchmark
     batch_sizes = [1, 4, 8, 16, 32]
-    sequence_lengths = [8192, 16384, 32768, 65536, 65536 * 2]
+    sequence_lengths = [4096, 8192, 16384, 32768, 65536]
     hidden_features = 4096  # Fixed hidden dimension
     dtype = torch.bfloat16
 
     num_benchmark_iterations = 50
     num_warmup_iterations = 20
 
-    print("Running RMSNorm benchmarks across different sequence lengths...")
+    print("Running RMSNorm backward pass benchmarks across different sequence lengths...")
     print(f"Hidden dimension: {hidden_features}, Data type: {dtype}")
     print(f"Iterations: {num_benchmark_iterations}, Warmup: {num_warmup_iterations}")
 
@@ -326,7 +356,7 @@ if __name__ == "__main__":
                 norm_dim = hidden_features
 
                 try:
-                    results = benchmark_rmsnorm_cuda(
+                    results = benchmark_rmsnorm_backward_cuda(
                         input_shape=shape,
                         normalized_dim=norm_dim,
                         num_iterations=num_benchmark_iterations,
@@ -338,7 +368,7 @@ if __name__ == "__main__":
                     print(f"Error benchmarking BS={batch_size}, SeqLen={sequence_length}: {e}")
 
         # Display results in a table
-        print("\n=== RMSNorm Benchmark Results ===")
+        print("\n=== RMSNorm Backward Pass Benchmark Results ===")
         display_results_table(all_results)
 
     except KeyboardInterrupt:
