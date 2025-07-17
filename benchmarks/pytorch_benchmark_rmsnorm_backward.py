@@ -28,98 +28,6 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed
 
 
-def benchmark_backward_direct(
-    implementation_name,
-    model,
-    input_data,
-    num_iterations=100,
-    warmup_iterations=10,
-):
-    """Benchmark the backward pass directly.
-
-    This approach measures the backward pass time directly:
-    1. Run forward pass once to create the computational graph (not timed)
-    2. Measure just the backward pass time using do_bench
-
-    Note: This approach may not work for all implementations due to issues with retain_graph=True.
-    """
-    # Create gradient tensor of the same shape as the output
-    grad_output = torch.randn_like(input_data)
-
-    # Clear cache before starting
-    torch.cuda.empty_cache()
-
-    # Convert iterations to time in ms
-    warmup_ms = 25  # Default warmup time in ms
-    rep_ms = 100  # Default repetition time in ms
-
-    # Create input with gradients outside the benchmark function
-    input_with_grad = input_data.clone().requires_grad_(True)
-
-    # Run forward pass once to create the computational graph
-    output = model(input_with_grad)
-
-    try:
-        # Define the backward-only function
-        def backward_fn():
-            # Reset gradients before backward pass
-            if input_with_grad.grad is not None:
-                input_with_grad.grad = None
-
-            # Run only the backward pass
-            output.backward(grad_output, retain_graph=True)
-            return input_with_grad.grad
-
-        # Measure backward time directly
-        backward_time_ms = triton.testing.do_bench(
-            backward_fn,
-            warmup=warmup_ms,
-            rep=rep_ms,
-            return_mode="mean",
-            grad_to_none=[input_with_grad],  # Set grad to None instead of zeroing
-        )
-
-        print(
-            f"{implementation_name} backward time (direct): {backward_time_ms:.4f} ms"
-        )
-
-    except RuntimeError as e:
-        print(f"Direct backward measurement failed: {e}")
-        print("Falling back to subtraction method")
-        return benchmark_backward_by_subtraction(
-            implementation_name, model, input_data, num_iterations, warmup_iterations
-        )
-
-    # Now measure memory usage for backward pass only
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-
-    # Record starting memory before backward pass
-    start_mem = torch.cuda.memory_allocated()
-
-    # Run a few iterations of backward-only to get accurate memory measurement
-    for _ in range(5):  # A few iterations to ensure accurate measurement
-        if input_with_grad.grad is not None:
-            input_with_grad.grad = None
-        output.backward(grad_output, retain_graph=True)
-
-    # Record peak memory usage during backward pass only
-    peak_mem = torch.cuda.max_memory_allocated()
-    peak_mem_mb = (peak_mem - start_mem) / (1024 * 1024)  # Convert to MB
-
-    print(f"{implementation_name} backward-only memory: {peak_mem_mb:.2f} MB")
-
-    # Calculate total benchmark time
-    total_benchmark_time_ms = backward_time_ms * num_iterations
-
-    return {
-        "implementation": implementation_name,
-        "avg_time_ms": backward_time_ms,
-        "total_time_ms": total_benchmark_time_ms,
-        "peak_mem_mb": peak_mem_mb,
-    }
-
-
 def benchmark_backward_by_subtraction(
     implementation_name,
     model,
@@ -193,28 +101,30 @@ def benchmark_backward_by_subtraction(
     )
 
     # Now measure memory usage for backward pass only
-    torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
 
-    # Record starting memory before backward pass
-    start_mem = torch.cuda.memory_allocated()
+    # Create a fresh input tensor with gradients enabled
+    fresh_input = input_data.clone().requires_grad_(True)
 
-    # Run a few iterations of backward-only to get accurate memory measurement
-    for _ in range(5):  # A few iterations to ensure accurate measurement
-        if input_with_grad.grad is not None:
-            input_with_grad.grad = None
+    # First, run forward pass with gradient tracking
+    output = model(fresh_input)
 
-        # Run forward pass without tracking in benchmark
-        with torch.no_grad():
-            output = model(input_with_grad)
+    # Synchronize to ensure forward pass is complete
+    torch.cuda.synchronize()
 
-        # Run backward pass and track memory
-        output.requires_grad_(True)
-        output.backward(grad_output)
+    # Measure memory after forward pass
+    torch.cuda.reset_peak_memory_stats()
+    forward_mem = torch.cuda.memory_allocated()
+
+    # Then run backward pass
+    output.backward(grad_output)
+
+    # Synchronize to ensure backward pass is complete
+    torch.cuda.synchronize()
 
     # Record peak memory usage during backward pass only
     peak_mem = torch.cuda.max_memory_allocated()
-    peak_mem_mb = (peak_mem - start_mem) / (1024 * 1024)  # Convert to MB
+    peak_mem_mb = (peak_mem - forward_mem) / (1024 * 1024)  # Convert to MB
 
     print(f"{implementation_name} backward-only memory: {peak_mem_mb:.2f} MB")
 
@@ -236,26 +146,15 @@ def benchmark_backward_implementation(
     num_iterations=100,
     warmup_iterations=10,
 ):
-    """Benchmark function that tries direct method first, falls back to subtraction if needed."""
-    # Try the direct method first (more accurate if it works)
-    try:
-        return benchmark_backward_direct(
-            implementation_name,
-            model,
-            input_data,
-            num_iterations,
-            warmup_iterations,
-        )
-    except Exception as e:
-        print(f"Direct method failed for {implementation_name}: {e}")
-        print(f"Falling back to subtraction method for {implementation_name}")
-        return benchmark_backward_by_subtraction(
-            implementation_name,
-            model,
-            input_data,
-            num_iterations,
-            warmup_iterations,
-        )
+    """Benchmark function that uses the same approach for all implementations."""
+    # Use the subtraction-based benchmark for all implementations
+    return benchmark_backward_by_subtraction(
+        implementation_name,
+        model,
+        input_data,
+        num_iterations,
+        warmup_iterations,
+    )
 
 
 def benchmark_rmsnorm_backward_cuda(
