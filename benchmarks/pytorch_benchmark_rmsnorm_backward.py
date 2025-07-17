@@ -96,9 +96,7 @@ def benchmark_backward_by_subtraction(
     # Print the timing results
     print(f"{implementation_name} forward time: {forward_time_ms:.4f} ms")
     print(f"{implementation_name} total time: {total_time_ms:.4f} ms")
-    print(
-        f"{implementation_name} backward time (subtraction): {backward_time_ms:.4f} ms"
-    )
+    print(f"{implementation_name} backward time (subtraction): {backward_time_ms:.4f} ms")
 
     # Now measure memory usage for backward pass only
     torch.cuda.empty_cache()
@@ -261,18 +259,14 @@ def display_results_table(all_results):
 
         # Calculate baseline (PyTorch RMSNorm) time for speedup calculation
         baseline_time = next(
-            r["avg_time_ms"]
-            for r in results
-            if r["implementation"] == "PyTorch RMSNorm"
+            r["avg_time_ms"] for r in results if r["implementation"] == "PyTorch RMSNorm"
         )
 
         # Prepare data for this configuration
         table_data = []
         for result in results:
             speedup = (
-                baseline_time / result["avg_time_ms"]
-                if result["avg_time_ms"] > 0
-                else float("inf")
+                baseline_time / result["avg_time_ms"] if result["avg_time_ms"] > 0 else float("inf")
             )
             table_data.append(
                 [
@@ -287,30 +281,22 @@ def display_results_table(all_results):
             )
 
         # Print this configuration group
-        print(
-            f"\nBatch Size: {batch_size}, Sequence Length: {seq_len}, Hidden Size: {hidden_size}"
-        )
+        print(f"\nBatch Size: {batch_size}, Sequence Length: {seq_len}, Hidden Size: {hidden_size}")
         print(tabulate(table_data, headers=headers, tablefmt="grid"))
 
         # Calculate and print the speedup of Quack vs TorchCompile
         pytorch_time = next(
-            r["avg_time_ms"]
-            for r in results
-            if r["implementation"] == "PyTorch RMSNorm"
+            r["avg_time_ms"] for r in results if r["implementation"] == "PyTorch RMSNorm"
         )
         torchcompile_time = next(
-            r["avg_time_ms"]
-            for r in results
-            if r["implementation"] == "TorchCompile RMSNorm"
+            r["avg_time_ms"] for r in results if r["implementation"] == "TorchCompile RMSNorm"
         )
         quack_time = next(
             r["avg_time_ms"] for r in results if r["implementation"] == "Quack RMSNorm"
         )
 
         quack_vs_pytorch = pytorch_time / quack_time if quack_time > 0 else float("inf")
-        quack_vs_torchcompile = (
-            torchcompile_time / quack_time if quack_time > 0 else float("inf")
-        )
+        quack_vs_torchcompile = torchcompile_time / quack_time if quack_time > 0 else float("inf")
 
         print(f"Quack vs PyTorch Speedup: {quack_vs_pytorch:.2f}x")
         print(f"Quack vs TorchCompile Speedup: {quack_vs_torchcompile:.2f}x")
@@ -337,16 +323,12 @@ def display_results_table(all_results):
 
     # Calculate average memory usage
     avg_pytorch_mem = sum(pytorch_mem) / len(pytorch_mem) if pytorch_mem else 0
-    avg_torchcompile_mem = (
-        sum(torchcompile_mem) / len(torchcompile_mem) if torchcompile_mem else 0
-    )
+    avg_torchcompile_mem = sum(torchcompile_mem) / len(torchcompile_mem) if torchcompile_mem else 0
     avg_quack_mem = sum(quack_mem) / len(quack_mem) if quack_mem else 0
 
     # Calculate memory savings percentages
     mem_savings_vs_pytorch = (
-        ((avg_pytorch_mem - avg_quack_mem) / avg_pytorch_mem * 100)
-        if avg_pytorch_mem > 0
-        else 0
+        ((avg_pytorch_mem - avg_quack_mem) / avg_pytorch_mem * 100) if avg_pytorch_mem > 0 else 0
     )
     mem_savings_vs_torchcompile = (
         ((avg_torchcompile_mem - avg_quack_mem) / avg_torchcompile_mem * 100)
@@ -355,17 +337,13 @@ def display_results_table(all_results):
     )
 
     # Calculate and print average and median speedups
-    avg_quack_vs_pytorch = sum(quack_vs_pytorch_speedups) / len(
-        quack_vs_pytorch_speedups
-    )
+    avg_quack_vs_pytorch = sum(quack_vs_pytorch_speedups) / len(quack_vs_pytorch_speedups)
     avg_quack_vs_torchcompile = sum(quack_vs_torchcompile_speedups) / len(
         quack_vs_torchcompile_speedups
     )
 
     # Calculate median speedups
-    median_quack_vs_pytorch = sorted(quack_vs_pytorch_speedups)[
-        len(quack_vs_pytorch_speedups) // 2
-    ]
+    median_quack_vs_pytorch = sorted(quack_vs_pytorch_speedups)[len(quack_vs_pytorch_speedups) // 2]
     median_quack_vs_torchcompile = sorted(quack_vs_torchcompile_speedups)[
         len(quack_vs_torchcompile_speedups) // 2
     ]
@@ -388,9 +366,7 @@ def display_results_table(all_results):
     print("\n" + "=" * 80)
     print("PERFORMANCE SUMMARY")
     print("-" * 80)
-    print(
-        f"Average Quack vs PyTorch Speedup: {avg_quack_vs_pytorch:.2f}x across all sizes tested"
-    )
+    print(f"Average Quack vs PyTorch Speedup: {avg_quack_vs_pytorch:.2f}x across all sizes tested")
     print(
         f"Median Quack vs PyTorch Speedup: {median_quack_vs_pytorch:.2f}x across all sizes tested"
     )
@@ -443,20 +419,28 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
     plt.title("RMSNorm Backward Pass Implementation Speedup Comparison")
     plt.xticks(x, config_labels, rotation=45, ha="right")
 
-    # Add grid lines at .5 intervals
-    # Need to figure out better way to auto add finer lines when needed, but .5 for now...
+    # Determine appropriate y-axis tick intervals based on max value
     max_speedup = max(max(quack_vs_pytorch), max(quack_vs_torchcompile))
     y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
-    plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
+
+    # Choose appropriate tick interval based on the maximum value
+    if y_max <= 5:
+        tick_interval = 0.5
+    elif y_max <= 10:
+        tick_interval = 1.0
+    elif y_max <= 20:
+        tick_interval = 2.0
+    else:
+        tick_interval = 5.0
+
+    plt.yticks(np.arange(0, y_max + tick_interval, tick_interval))
     plt.grid(axis="y", linestyle="-", alpha=0.3)
 
     plt.tight_layout()
     plt.legend()
 
     # Save the figure
-    output_path = os.path.join(
-        visual_output_dir, "rmsnorm_backward_speedup_comparison.png"
-    )
+    output_path = os.path.join(visual_output_dir, "rmsnorm_backward_speedup_comparison.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"\nSpeedup graph saved to: {output_path}")
 
@@ -469,17 +453,26 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
     plt.title("Quack RMSNorm vs PyTorch RMSNorm Backward Pass Speedup")
     plt.xticks(x, config_labels, rotation=45, ha="right")
 
-    # Add grid lines at .5 intervals (same issue, need a more holistic way to generate grid lines)
+    # Determine appropriate y-axis tick intervals based on max value
     max_speedup = max(quack_vs_pytorch)
     y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
-    plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
+
+    # Choose appropriate tick interval based on the maximum value
+    if y_max <= 5:
+        tick_interval = 0.5
+    elif y_max <= 10:
+        tick_interval = 1.0
+    elif y_max <= 20:
+        tick_interval = 2.0
+    else:
+        tick_interval = 5.0
+
+    plt.yticks(np.arange(0, y_max + tick_interval, tick_interval))
     plt.grid(axis="y", linestyle="-", alpha=0.3)
 
     plt.tight_layout()
 
-    output_path = os.path.join(
-        visual_output_dir, "quack_vs_pytorch_backward_speedup.png"
-    )
+    output_path = os.path.join(visual_output_dir, "quack_vs_pytorch_backward_speedup.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Quack vs PyTorch graph saved to: {output_path}")
 
@@ -492,17 +485,26 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
     plt.title("Quack RMSNorm vs TorchCompile RMSNorm Backward Pass Speedup")
     plt.xticks(x, config_labels, rotation=45, ha="right")
 
-    # Add grid lines at .5 intervals
+    # Determine appropriate y-axis tick intervals based on max value
     max_speedup = max(quack_vs_torchcompile)
     y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
-    plt.yticks(np.arange(0, y_max + 0.5, 0.5))  # Major ticks at 0.5 intervals
+
+    # Choose appropriate tick interval based on the maximum value
+    if y_max <= 5:
+        tick_interval = 0.5
+    elif y_max <= 10:
+        tick_interval = 1.0
+    elif y_max <= 20:
+        tick_interval = 2.0
+    else:
+        tick_interval = 5.0
+
+    plt.yticks(np.arange(0, y_max + tick_interval, tick_interval))
     plt.grid(axis="y", linestyle="-", alpha=0.3)
 
     plt.tight_layout()
 
-    output_path = os.path.join(
-        visual_output_dir, "quack_vs_torchcompile_backward_speedup.png"
-    )
+    output_path = os.path.join(visual_output_dir, "quack_vs_torchcompile_backward_speedup.png")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Quack vs TorchCompile graph saved to: {output_path}")
 
@@ -518,9 +520,7 @@ if __name__ == "__main__":
     num_benchmark_iterations = 50
     num_warmup_iterations = 20
 
-    print(
-        "Running RMSNorm backward pass benchmarks across different sequence lengths..."
-    )
+    print("Running RMSNorm backward pass benchmarks across different sequence lengths...")
     print(f"Hidden dimension: {hidden_features}, Data type: {dtype}")
     print(f"Iterations: {num_benchmark_iterations}, Warmup: {num_warmup_iterations}")
 
@@ -542,9 +542,7 @@ if __name__ == "__main__":
                 # Skip very large configurations that might cause OOM
                 # TODO - we should figure out a better way to determine this, ala check GPU memory before running...
                 if batch_size * sequence_length * hidden_features > 2**31:
-                    print(
-                        f"Skipping BS={batch_size}, SeqLen={sequence_length} (too large)"
-                    )
+                    print(f"Skipping BS={batch_size}, SeqLen={sequence_length} (too large)")
                     continue
 
                 print(f"\nBenchmarking: BS={batch_size}, SeqLen={sequence_length}...")
@@ -560,13 +558,9 @@ if __name__ == "__main__":
                         warmup_iterations=num_warmup_iterations,
                         dtype=dtype,
                     )
-                    all_results[(batch_size, sequence_length, hidden_features)] = (
-                        results
-                    )
+                    all_results[(batch_size, sequence_length, hidden_features)] = results
                 except Exception as e:
-                    print(
-                        f"Error benchmarking BS={batch_size}, SeqLen={sequence_length}: {e}"
-                    )
+                    print(f"Error benchmarking BS={batch_size}, SeqLen={sequence_length}: {e}")
 
         # Display results in a table
         print("\n=== RMSNorm Backward Pass Benchmark Results ===")
