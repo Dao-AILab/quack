@@ -53,16 +53,14 @@ def benchmark_backward_by_subtraction(
     rep_ms = 100  # Default repetition time in ms
 
     # Create clones outside the benchmark functions to avoid including clone time
-    with torch.no_grad():
-        input_no_grad = input_data.clone()
+    input_no_grad = input_data.clone()
 
     # Create input with gradients outside the benchmark function
     input_with_grad = input_data.clone().requires_grad_(True)
 
     # Define the forward-only function
     def forward_fn():
-        with torch.no_grad():
-            output = model(input_no_grad)
+        output = model(input_no_grad)
         return output
 
     # Define the forward+backward function
