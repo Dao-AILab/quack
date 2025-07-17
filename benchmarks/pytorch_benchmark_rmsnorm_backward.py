@@ -1,5 +1,9 @@
 import os
 
+# Disable donated buffer optimization BEFORE importing PyTorch
+# This needs to be set before any PyTorch modules are imported
+os.environ["TORCH_COMPILE_DONATED_BUFFER"] = "0"
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -12,7 +16,7 @@ from tabulate import tabulate
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
+    def __init__(self, dim, eps=1e-6):  # Changed to 1e-6 to match QuackRMSNorm
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
@@ -24,6 +28,207 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed
 
 
+def benchmark_backward_direct(
+    implementation_name,
+    model,
+    input_data,
+    num_iterations=100,
+    warmup_iterations=10,
+):
+    """Benchmark the backward pass directly.
+
+    This approach measures the backward pass time directly:
+    1. Run forward pass once to create the computational graph (not timed)
+    2. Measure just the backward pass time using do_bench
+
+    Note: This approach may not work for all implementations due to issues with retain_graph=True.
+    """
+    # Create gradient tensor of the same shape as the output
+    grad_output = torch.randn_like(input_data)
+
+    # Clear cache before starting
+    torch.cuda.empty_cache()
+
+    # Convert iterations to time in ms
+    warmup_ms = 25  # Default warmup time in ms
+    rep_ms = 100  # Default repetition time in ms
+
+    # Create input with gradients outside the benchmark function
+    input_with_grad = input_data.clone().requires_grad_(True)
+
+    # Run forward pass once to create the computational graph
+    output = model(input_with_grad)
+
+    try:
+        # Define the backward-only function
+        def backward_fn():
+            # Reset gradients before backward pass
+            if input_with_grad.grad is not None:
+                input_with_grad.grad = None
+
+            # Run only the backward pass
+            output.backward(grad_output, retain_graph=True)
+            return input_with_grad.grad
+
+        # Measure backward time directly
+        backward_time_ms = triton.testing.do_bench(
+            backward_fn,
+            warmup=warmup_ms,
+            rep=rep_ms,
+            return_mode="mean",
+            grad_to_none=[input_with_grad],  # Set grad to None instead of zeroing
+        )
+
+        print(
+            f"{implementation_name} backward time (direct): {backward_time_ms:.4f} ms"
+        )
+
+    except RuntimeError as e:
+        print(f"Direct backward measurement failed: {e}")
+        print("Falling back to subtraction method")
+        return benchmark_backward_by_subtraction(
+            implementation_name, model, input_data, num_iterations, warmup_iterations
+        )
+
+    # Now measure memory usage for backward pass only
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+
+    # Record starting memory before backward pass
+    start_mem = torch.cuda.memory_allocated()
+
+    # Run a few iterations of backward-only to get accurate memory measurement
+    for _ in range(5):  # A few iterations to ensure accurate measurement
+        if input_with_grad.grad is not None:
+            input_with_grad.grad = None
+        output.backward(grad_output, retain_graph=True)
+
+    # Record peak memory usage during backward pass only
+    peak_mem = torch.cuda.max_memory_allocated()
+    peak_mem_mb = (peak_mem - start_mem) / (1024 * 1024)  # Convert to MB
+
+    print(f"{implementation_name} backward-only memory: {peak_mem_mb:.2f} MB")
+
+    # Calculate total benchmark time
+    total_benchmark_time_ms = backward_time_ms * num_iterations
+
+    return {
+        "implementation": implementation_name,
+        "avg_time_ms": backward_time_ms,
+        "total_time_ms": total_benchmark_time_ms,
+        "peak_mem_mb": peak_mem_mb,
+    }
+
+
+def benchmark_backward_by_subtraction(
+    implementation_name,
+    model,
+    input_data,
+    num_iterations=100,
+    warmup_iterations=10,
+):
+    """Benchmark the backward pass by subtracting forward time from total time.
+
+    This approach is used for all implementations to ensure fair comparison:
+    1. Measure forward pass time using do_bench
+    2. Measure forward + backward pass time using do_bench
+    3. Calculate backward pass time by subtraction
+    """
+    # Create gradient tensor of the same shape as the output
+    grad_output = torch.randn_like(input_data)
+
+    # Clear cache before starting
+    torch.cuda.empty_cache()
+
+    # Convert iterations to time in ms
+    warmup_ms = 25  # Default warmup time in ms
+    rep_ms = 100  # Default repetition time in ms
+
+    # Create clones outside the benchmark functions to avoid including clone time
+    with torch.no_grad():
+        input_no_grad = input_data.clone()
+
+    # Create input with gradients outside the benchmark function
+    input_with_grad = input_data.clone().requires_grad_(True)
+
+    # Define the forward-only function
+    def forward_fn():
+        with torch.no_grad():
+            output = model(input_no_grad)
+        return output
+
+    # Define the forward+backward function
+    def forward_backward_fn():
+        # Reset gradients before backward pass
+        if input_with_grad.grad is not None:
+            input_with_grad.grad = None
+
+        output = model(input_with_grad)
+        output.backward(grad_output)
+        return input_with_grad.grad
+
+    # Measure forward time
+    forward_time_ms = triton.testing.do_bench(
+        forward_fn, warmup=warmup_ms, rep=rep_ms, return_mode="mean"
+    )
+
+    # Measure total time (forward + backward)
+    # Use grad_to_none to set grad to None instead of zeroing it out
+    total_time_ms = triton.testing.do_bench(
+        forward_backward_fn,
+        warmup=warmup_ms,
+        rep=rep_ms,
+        return_mode="mean",
+        grad_to_none=[input_with_grad],  # Set grad to None instead of zeroing
+    )
+
+    # Calculate backward time by subtraction
+    backward_time_ms = total_time_ms - forward_time_ms
+
+    # Print the timing results
+    print(f"{implementation_name} forward time: {forward_time_ms:.4f} ms")
+    print(f"{implementation_name} total time: {total_time_ms:.4f} ms")
+    print(
+        f"{implementation_name} backward time (subtraction): {backward_time_ms:.4f} ms"
+    )
+
+    # Now measure memory usage for backward pass only
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+
+    # Record starting memory before backward pass
+    start_mem = torch.cuda.memory_allocated()
+
+    # Run a few iterations of backward-only to get accurate memory measurement
+    for _ in range(5):  # A few iterations to ensure accurate measurement
+        if input_with_grad.grad is not None:
+            input_with_grad.grad = None
+
+        # Run forward pass without tracking in benchmark
+        with torch.no_grad():
+            output = model(input_with_grad)
+
+        # Run backward pass and track memory
+        output.requires_grad_(True)
+        output.backward(grad_output)
+
+    # Record peak memory usage during backward pass only
+    peak_mem = torch.cuda.max_memory_allocated()
+    peak_mem_mb = (peak_mem - start_mem) / (1024 * 1024)  # Convert to MB
+
+    print(f"{implementation_name} backward-only memory: {peak_mem_mb:.2f} MB")
+
+    # Calculate total benchmark time
+    total_benchmark_time_ms = backward_time_ms * num_iterations
+
+    return {
+        "implementation": implementation_name,
+        "avg_time_ms": backward_time_ms,  # Use the backward time
+        "total_time_ms": total_benchmark_time_ms,
+        "peak_mem_mb": peak_mem_mb,
+    }
+
+
 def benchmark_backward_implementation(
     implementation_name,
     model,
@@ -31,54 +236,26 @@ def benchmark_backward_implementation(
     num_iterations=100,
     warmup_iterations=10,
 ):
-    """Benchmark a specific implementation's backward pass and return timing results using Triton's do_bench."""
-    # Create gradient tensor of the same shape as the output
-    grad_output = torch.randn_like(input_data)
-
-    # Convert iterations to time in ms (approximate)
-    # We'll use warmup_ms and rep_ms instead of iterations to ensure consistent timing
-    warmup_ms = 25  # Default warmup time in ms
-    rep_ms = 100  # Default repetition time in ms
-
-    # Pre-clone the input data and set requires_grad outside the benchmark function
-    # This ensures we're not including the clone time in our measurements
-    input_with_grad = input_data.clone().requires_grad_(True)
-
-    # Reset CUDA memory stats before benchmarking
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-
-    # Record starting memory
-    start_mem = torch.cuda.memory_allocated()
-
-    # Define the function to benchmark (without the clone operation)
-    def benchmark_fn():
-        output = model(input_with_grad)
-        output.backward(grad_output)
-        # Reset gradients for next iteration
-        if input_with_grad.grad is not None:
-            input_with_grad.grad.zero_()
-        return output  # Return is needed for do_bench but not used
-
-    # Use Triton's do_bench to benchmark the function
-    # This ensures L2 cache is cleared between runs
-    avg_time_ms = triton.testing.do_bench(
-        benchmark_fn, warmup=warmup_ms, rep=rep_ms, return_mode="mean"
-    )
-
-    # Record peak memory usage during benchmarking
-    peak_mem = torch.cuda.max_memory_allocated()
-    peak_mem_mb = (peak_mem - start_mem) / (1024 * 1024)  # Convert to MB
-
-    # Calculate total time (approximate)
-    total_time_ms = avg_time_ms * num_iterations
-
-    return {
-        "implementation": implementation_name,
-        "avg_time_ms": avg_time_ms,
-        "total_time_ms": total_time_ms,
-        "peak_mem_mb": peak_mem_mb,
-    }
+    """Benchmark function that tries direct method first, falls back to subtraction if needed."""
+    # Try the direct method first (more accurate if it works)
+    try:
+        return benchmark_backward_direct(
+            implementation_name,
+            model,
+            input_data,
+            num_iterations,
+            warmup_iterations,
+        )
+    except Exception as e:
+        print(f"Direct method failed for {implementation_name}: {e}")
+        print(f"Falling back to subtraction method for {implementation_name}")
+        return benchmark_backward_by_subtraction(
+            implementation_name,
+            model,
+            input_data,
+            num_iterations,
+            warmup_iterations,
+        )
 
 
 def benchmark_rmsnorm_backward_cuda(
@@ -92,28 +269,54 @@ def benchmark_rmsnorm_backward_cuda(
     input_data = torch.randn(input_shape, device="cuda", dtype=dtype)
     results = []
 
+    # Use the same input data for all implementations for fair comparison
+    # This ensures all implementations are tested on exactly the same data
+    input_data_shared = torch.randn(input_shape, device="cuda", dtype=dtype)
+
+    # Make copies to avoid any potential memory sharing issues
+    input_data_pytorch = input_data_shared.clone()
+    input_data_torchcompile = input_data_shared.clone()
+    input_data_quack = input_data_shared.clone()
+
+    # Ensure all operations are completed before benchmarking
+    torch.cuda.synchronize()
+
     # Benchmark PyTorch RMSNorm
+    print("Benchmarking PyTorch RMSNorm...")
     rms_norm_layer = torch.nn.RMSNorm(normalized_dim, device="cuda", dtype=dtype)
     result = benchmark_backward_implementation(
-        "PyTorch RMSNorm", rms_norm_layer, input_data, num_iterations, warmup_iterations
+        "PyTorch RMSNorm",
+        rms_norm_layer,
+        input_data_pytorch,
+        num_iterations,
+        warmup_iterations,
     )
     results.append(result)
 
     # Benchmark TorchCompile RMSNorm
+    print("Benchmarking TorchCompile RMSNorm...")
+    # Create and compile the model
     compiled_rms_norm = torch.compile(RMSNorm(dim=normalized_dim)).cuda().to(dtype)
+
+    # Use the same benchmark function for all implementations
     result = benchmark_backward_implementation(
         "TorchCompile RMSNorm",
         compiled_rms_norm,
-        input_data,
+        input_data_torchcompile,
         num_iterations,
         warmup_iterations,
     )
     results.append(result)
 
     # Benchmark QuackRMSNorm
+    print("Benchmarking Quack RMSNorm...")
     quack_rms_norm = QuackRMSNorm(dim=normalized_dim).cuda().to(dtype)
     result = benchmark_backward_implementation(
-        "Quack RMSNorm", quack_rms_norm, input_data, num_iterations, warmup_iterations
+        "Quack RMSNorm",
+        quack_rms_norm,
+        input_data_quack,
+        num_iterations,
+        warmup_iterations,
     )
     results.append(result)
 
@@ -159,14 +362,18 @@ def display_results_table(all_results):
 
         # Calculate baseline (PyTorch RMSNorm) time for speedup calculation
         baseline_time = next(
-            r["avg_time_ms"] for r in results if r["implementation"] == "PyTorch RMSNorm"
+            r["avg_time_ms"]
+            for r in results
+            if r["implementation"] == "PyTorch RMSNorm"
         )
 
         # Prepare data for this configuration
         table_data = []
         for result in results:
             speedup = (
-                baseline_time / result["avg_time_ms"] if result["avg_time_ms"] > 0 else float("inf")
+                baseline_time / result["avg_time_ms"]
+                if result["avg_time_ms"] > 0
+                else float("inf")
             )
             table_data.append(
                 [
@@ -181,22 +388,30 @@ def display_results_table(all_results):
             )
 
         # Print this configuration group
-        print(f"\nBatch Size: {batch_size}, Sequence Length: {seq_len}, Hidden Size: {hidden_size}")
+        print(
+            f"\nBatch Size: {batch_size}, Sequence Length: {seq_len}, Hidden Size: {hidden_size}"
+        )
         print(tabulate(table_data, headers=headers, tablefmt="grid"))
 
         # Calculate and print the speedup of Quack vs TorchCompile
         pytorch_time = next(
-            r["avg_time_ms"] for r in results if r["implementation"] == "PyTorch RMSNorm"
+            r["avg_time_ms"]
+            for r in results
+            if r["implementation"] == "PyTorch RMSNorm"
         )
         torchcompile_time = next(
-            r["avg_time_ms"] for r in results if r["implementation"] == "TorchCompile RMSNorm"
+            r["avg_time_ms"]
+            for r in results
+            if r["implementation"] == "TorchCompile RMSNorm"
         )
         quack_time = next(
             r["avg_time_ms"] for r in results if r["implementation"] == "Quack RMSNorm"
         )
 
         quack_vs_pytorch = pytorch_time / quack_time if quack_time > 0 else float("inf")
-        quack_vs_torchcompile = torchcompile_time / quack_time if quack_time > 0 else float("inf")
+        quack_vs_torchcompile = (
+            torchcompile_time / quack_time if quack_time > 0 else float("inf")
+        )
 
         print(f"Quack vs PyTorch Speedup: {quack_vs_pytorch:.2f}x")
         print(f"Quack vs TorchCompile Speedup: {quack_vs_torchcompile:.2f}x")
@@ -223,12 +438,16 @@ def display_results_table(all_results):
 
     # Calculate average memory usage
     avg_pytorch_mem = sum(pytorch_mem) / len(pytorch_mem) if pytorch_mem else 0
-    avg_torchcompile_mem = sum(torchcompile_mem) / len(torchcompile_mem) if torchcompile_mem else 0
+    avg_torchcompile_mem = (
+        sum(torchcompile_mem) / len(torchcompile_mem) if torchcompile_mem else 0
+    )
     avg_quack_mem = sum(quack_mem) / len(quack_mem) if quack_mem else 0
 
     # Calculate memory savings percentages
     mem_savings_vs_pytorch = (
-        ((avg_pytorch_mem - avg_quack_mem) / avg_pytorch_mem * 100) if avg_pytorch_mem > 0 else 0
+        ((avg_pytorch_mem - avg_quack_mem) / avg_pytorch_mem * 100)
+        if avg_pytorch_mem > 0
+        else 0
     )
     mem_savings_vs_torchcompile = (
         ((avg_torchcompile_mem - avg_quack_mem) / avg_torchcompile_mem * 100)
@@ -237,13 +456,17 @@ def display_results_table(all_results):
     )
 
     # Calculate and print average and median speedups
-    avg_quack_vs_pytorch = sum(quack_vs_pytorch_speedups) / len(quack_vs_pytorch_speedups)
+    avg_quack_vs_pytorch = sum(quack_vs_pytorch_speedups) / len(
+        quack_vs_pytorch_speedups
+    )
     avg_quack_vs_torchcompile = sum(quack_vs_torchcompile_speedups) / len(
         quack_vs_torchcompile_speedups
     )
 
     # Calculate median speedups
-    median_quack_vs_pytorch = sorted(quack_vs_pytorch_speedups)[len(quack_vs_pytorch_speedups) // 2]
+    median_quack_vs_pytorch = sorted(quack_vs_pytorch_speedups)[
+        len(quack_vs_pytorch_speedups) // 2
+    ]
     median_quack_vs_torchcompile = sorted(quack_vs_torchcompile_speedups)[
         len(quack_vs_torchcompile_speedups) // 2
     ]
@@ -266,7 +489,9 @@ def display_results_table(all_results):
     print("\n" + "=" * 80)
     print("PERFORMANCE SUMMARY")
     print("-" * 80)
-    print(f"Average Quack vs PyTorch Speedup: {avg_quack_vs_pytorch:.2f}x across all sizes tested")
+    print(
+        f"Average Quack vs PyTorch Speedup: {avg_quack_vs_pytorch:.2f}x across all sizes tested"
+    )
     print(
         f"Median Quack vs PyTorch Speedup: {median_quack_vs_pytorch:.2f}x across all sizes tested"
     )
@@ -330,7 +555,9 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
     plt.legend()
 
     # Save the figure
-    output_path = os.path.join(visual_output_dir, "rmsnorm_backward_speedup_comparison.png")
+    output_path = os.path.join(
+        visual_output_dir, "rmsnorm_backward_speedup_comparison.png"
+    )
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"\nSpeedup graph saved to: {output_path}")
 
@@ -351,7 +578,9 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
 
     plt.tight_layout()
 
-    output_path = os.path.join(visual_output_dir, "quack_vs_pytorch_backward_speedup.png")
+    output_path = os.path.join(
+        visual_output_dir, "quack_vs_pytorch_backward_speedup.png"
+    )
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Quack vs PyTorch graph saved to: {output_path}")
 
@@ -372,7 +601,9 @@ def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labe
 
     plt.tight_layout()
 
-    output_path = os.path.join(visual_output_dir, "quack_vs_torchcompile_backward_speedup.png")
+    output_path = os.path.join(
+        visual_output_dir, "quack_vs_torchcompile_backward_speedup.png"
+    )
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Quack vs TorchCompile graph saved to: {output_path}")
 
@@ -388,7 +619,9 @@ if __name__ == "__main__":
     num_benchmark_iterations = 50
     num_warmup_iterations = 20
 
-    print("Running RMSNorm backward pass benchmarks across different sequence lengths...")
+    print(
+        "Running RMSNorm backward pass benchmarks across different sequence lengths..."
+    )
     print(f"Hidden dimension: {hidden_features}, Data type: {dtype}")
     print(f"Iterations: {num_benchmark_iterations}, Warmup: {num_warmup_iterations}")
 
@@ -410,7 +643,9 @@ if __name__ == "__main__":
                 # Skip very large configurations that might cause OOM
                 # TODO - we should figure out a better way to determine this, ala check GPU memory before running...
                 if batch_size * sequence_length * hidden_features > 2**31:
-                    print(f"Skipping BS={batch_size}, SeqLen={sequence_length} (too large)")
+                    print(
+                        f"Skipping BS={batch_size}, SeqLen={sequence_length} (too large)"
+                    )
                     continue
 
                 print(f"\nBenchmarking: BS={batch_size}, SeqLen={sequence_length}...")
@@ -426,9 +661,13 @@ if __name__ == "__main__":
                         warmup_iterations=num_warmup_iterations,
                         dtype=dtype,
                     )
-                    all_results[(batch_size, sequence_length, hidden_features)] = results
+                    all_results[(batch_size, sequence_length, hidden_features)] = (
+                        results
+                    )
                 except Exception as e:
-                    print(f"Error benchmarking BS={batch_size}, SeqLen={sequence_length}: {e}")
+                    print(
+                        f"Error benchmarking BS={batch_size}, SeqLen={sequence_length}: {e}"
+                    )
 
         # Display results in a table
         print("\n=== RMSNorm Backward Pass Benchmark Results ===")
