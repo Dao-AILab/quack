@@ -191,29 +191,33 @@ def test_rmsnorm_compile_cache():
     weight1 = torch.randn(N, device=device, dtype=torch.float32)
 
     # First call should compile
-    out1 = _rmsnorm_fwd(x1, weight1, eps=eps)
+    out1 = torch.empty_like(x1)
+    _rmsnorm_fwd(x1, weight1, eps=eps, out=out1, rstd=None)
     assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Same shape should reuse cache
     x2 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
-    out2 = _rmsnorm_fwd(x2, weight2, eps=eps)
+    out2 = torch.empty_like(x2)
+    _rmsnorm_fwd(x2, weight2, eps=eps, out=out2, rstd=None)
     assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Changing batch size should reuse cache
     x2 = torch.randn(M * 2, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
-    out2 = _rmsnorm_fwd(x2, weight2, eps=eps)
+    _rmsnorm_fwd(x2, weight2, eps=eps, out=out2, rstd=None)
     assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Different shape should create new cache entry
     x3 = torch.randn(M, N * 2, device=device, dtype=torch.float16)
     weight3 = torch.randn(N * 2, device=device, dtype=torch.float32)
-    out3 = _rmsnorm_fwd(x3, weight3, eps=eps)
+    out3 = torch.empty_like(x3)
+    _rmsnorm_fwd(x3, weight3, eps=eps, out=out3, rstd=None)
     assert len(_rmsnorm_fwd.compile_cache) == 2
 
     # Different dtype should create new cache entry
     x4 = torch.randn(M, N, device=device, dtype=torch.float32)
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
-    out4 = _rmsnorm_fwd(x4, weight4, eps=eps)
+    out4 = torch.empty_like(x4)
+    _rmsnorm_fwd(x4, weight4, eps=eps, out=out4, rstd=None)
     assert len(_rmsnorm_fwd.compile_cache) == 3

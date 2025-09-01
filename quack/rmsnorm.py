@@ -246,12 +246,14 @@ class RMSNorm(ReductionBase):
             cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tXpX)
 
 
+@torch.library.custom_op("quack::_rmsnorm_fwd", mutates_args={"out", "rstd"})
 def _rmsnorm_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
+    out: torch.Tensor,
+    rstd: torch.Tensor | None,
     eps: float = 1e-6,
-    return_rstd: bool = False,
-) -> torch.Tensor:
+) -> None:
     """RMSNorm forward pass.
     Args:
         x: Input tensor of shape (M, N)
@@ -278,10 +280,7 @@ def _rmsnorm_fwd(
         torch.float16,
     ], "Weight must be float32, float16 or bfloat16"
 
-    M, N = x.shape
-    device = x.device
-    out = torch.empty_like(x)
-    rstd = torch.empty(M, device=device, dtype=torch.float32) if return_rstd else None
+    N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     # convert_from_dlpack = lambda x: (
     #     from_dlpack(x.detach(), assumed_align=16).mark_compact_shape_dynamic(
@@ -312,7 +311,6 @@ def _rmsnorm_fwd(
     _rmsnorm_fwd.compile_cache[compile_key](
         x_tensor, weight_tensor, out_tensor, rstd_tensor, current_stream, eps
     )
-    return (out, rstd) if return_rstd else out
 
 
 _rmsnorm_fwd.compile_cache = {}
@@ -797,7 +795,11 @@ class RMSNormFunction(torch.autograd.Function):
         # Flatten input
         x = x.view(-1, x.shape[-1])
 
-        out, rstd = _rmsnorm_fwd(x, weight, eps, return_rstd=True)
+        M = x.size(0)
+        out = torch.empty_like(x)
+        rstd = torch.empty(M, device=x.device, dtype=torch.float32)
+
+        _rmsnorm_fwd(x, weight, out, rstd, eps)
         ctx.save_for_backward(x, weight, rstd)
         ctx.eps = eps
         ctx.x_shape_start = x_shape_start
