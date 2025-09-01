@@ -267,7 +267,7 @@ class TileScheduler:
         return self.get_current_work(loc=loc, ip=ip)
 
     @cute.jit
-    def fetch_next_work(self, is_scheduler_warp: bool | Boolean, *, loc=None, ip=None):
+    def fetch_next_work(self, is_scheduler_warp: bool | Boolean=False, *, loc=None, ip=None):
         """is_scheduler_warp should only be true for one warp in the whole cluster"""
         if const_expr(self.params.tile_count_semaphore is not None):
             params = self.params
