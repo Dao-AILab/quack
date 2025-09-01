@@ -43,10 +43,10 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, const_expr
 
+from quack.cute_dsl_utils import ParamsBase
 from quack.tile_scheduler import (
     TileSchedulerArguments,
     TileScheduler,
-    ParamsBase,
     RasterOrderOption,
 )
 

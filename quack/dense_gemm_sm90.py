@@ -15,12 +15,13 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Boolean, const_expr
 
+
+from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
 from quack.tile_scheduler import (
     TileSchedulerArguments,
     TileScheduler,
     VarlenMTileSchedulerArguments,
     VarlenMTileScheduler,
-    ParamsBase,
     RasterOrderOption,
 )
 from quack.tensormap_manager import TensorMapManagerSm90
@@ -65,6 +66,7 @@ Constraints:
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 8, 16 for Float16, and Float8, respectively.
 """
+
 
 class NamedBarrierGemm(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
@@ -116,6 +118,9 @@ class GemmSm90:
 
     bytes_per_tensormap = 128
     num_tensormaps = 1  # For D only
+
+    EpilogueArguments = ArgumentsBase
+    EpilogueParams = ParamsBase
 
     def __init__(
         self,
@@ -250,7 +255,7 @@ class GemmSm90:
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
-    def _setup_attributes(self):
+    def _setup_attributes(self, epilogue_args: EpilogueArguments):
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -280,6 +285,7 @@ class GemmSm90:
             self.b_dtype,
             self.d_dtype,
             self.c_dtype,
+            epilogue_args,
             self.smem_capacity,
             self.occupancy,
             # epi_smem will reuse smem ab if not persistent.
@@ -315,6 +321,7 @@ class GemmSm90:
         mB: cute.Tensor,
         mD: cute.Tensor,
         mC: Optional[cute.Tensor],
+        epilogue_args: EpilogueArguments,
         mAIdx: Optional[cute.Tensor],
         mCuSeqlensM: Optional[cute.Tensor],
         mTensormaps: Optional[cute.Tensor],
@@ -367,7 +374,7 @@ class GemmSm90:
             for t in (mA, mD)
         ]
 
-        self._setup_attributes()
+        self._setup_attributes(epilogue_args)
 
         tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
@@ -422,6 +429,8 @@ class GemmSm90:
         else:
             tma_atom_c, tma_tensor_c = None, None
 
+        epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
+
         if const_expr(mCuSeqlensM is None):
             problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.tile_shape_mnk[:2]) + (
                 mD.shape[2],
@@ -464,9 +473,7 @@ class GemmSm90:
             0
             if mCuSeqlensM is None
             or self.tensormap_update_mode == cutlass.utils.TensorMapUpdateMode.GMEM
-            else GemmSm90.num_tensormaps
-            * GemmSm90.bytes_per_tensormap
-            // 8
+            else GemmSm90.num_tensormaps * GemmSm90.bytes_per_tensormap // 8
         ) * (1 if not self.pingpong else 2)
 
         @cute.struct
@@ -489,6 +496,7 @@ class GemmSm90:
                 ],
                 self.buffer_align_bytes,
             ]
+            epi: self.epi_get_smem_struct(epilogue_params)
             sA: cute.struct.Align[
                 cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -510,6 +518,7 @@ class GemmSm90:
             tma_tensor_d,
             tma_atom_c,
             tma_tensor_c,
+            epilogue_params,
             mAIdx,
             mCuSeqlensM,
             mTensormaps,
@@ -543,6 +552,7 @@ class GemmSm90:
         mD_mnl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
+        epilogue_params: EpilogueParams,
         mAIdx: Optional[cute.Tensor],
         cu_seqlens_m: Optional[cute.Tensor],
         tensormaps: Optional[cute.Tensor],
@@ -694,6 +704,7 @@ class GemmSm90:
             )
         else:
             sC = None
+        epi_smem_tensors = self.epi_get_smem_tensors(epilogue_params, storage)
 
         # Get tensormap buffer address
         if const_expr(varlen):
@@ -1009,12 +1020,22 @@ class GemmSm90:
                     tma_desc_ptr = None
 
                 bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
-                    tma_atom_d, mD_mnl, self.epi_tile, sD, tile_coord_mnkl, cu_seqlens_m,
+                    tma_atom_d,
+                    mD_mnl,
+                    self.epi_tile,
+                    sD,
+                    tile_coord_mnkl,
+                    cu_seqlens_m,
                 )
                 copy_D = partial(cute.copy, tma_atom_d, tma_desc_ptr=tma_desc_ptr)
                 if const_expr(has_C):
                     bGS_sC, bGS_gC = self.epilog_gmem_copy_and_partition(
-                        tma_atom_c, mC_mnl, self.epi_tile, sC, tile_coord_mnkl, cu_seqlens_m,
+                        tma_atom_c,
+                        mC_mnl,
+                        self.epi_tile,
+                        sC,
+                        tile_coord_mnkl,
+                        cu_seqlens_m,
                     )
                     copy_C = partial(cute.copy, tma_atom_c)
                     epi_load_g2s = partial(self.epi_load_g2s, epi_pipeline, copy_C, bGS_gC, bGS_sC)
@@ -1036,7 +1057,11 @@ class GemmSm90:
                 if const_expr(not self.is_persistent):
                     epilogue_barrier.arrive_and_wait()
 
+                self.epi_visit_acc(epilogue_params, acc, tiled_mma, tile_coord_mnkl, tidx)
+
                 epi_read_state, epi_producer_state = self.epilogue(
+                    epilogue_params,
+                    epi_smem_tensors,
                     epi_pipeline,
                     epi_read_state,
                     epi_producer_state,
@@ -1052,8 +1077,11 @@ class GemmSm90:
                     bSG_sD,
                     bSG_gD,
                     epi_load_g2s,
+                    tile_coord_mnkl,
+                    cu_seqlens_m,
                     epilogue_barrier,
                     tile_scheduler,
+                    tidx,
                     is_tma_warp,
                 )
 
@@ -1321,6 +1349,8 @@ class GemmSm90:
     @cute.jit
     def epilogue(
         self,
+        params: EpilogueParams,
+        epi_smem_tensors: Tuple[cute.Tensor, ...],
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,
@@ -1336,8 +1366,11 @@ class GemmSm90:
         bSG_sD: cute.Tensor,
         bSG_gD: cute.Tensor,
         epi_load_g2s: Optional[Callable],
+        tile_coord_mnkl: cute.Coord,
+        cu_seqlens_m: Optional[cute.Tensor],
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tile_scheduler,
+        tidx: Int32,
         is_tma_warp: Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
@@ -1369,7 +1402,7 @@ class GemmSm90:
                 epi_producer_state = epi_load_g2s(
                     epi_producer_state, epi_idx + self.epi_c_stage, is_tma_warp
                 )
-            tRS_rEpi = self.epi_visit_acc_subtile(tRS_rD, tRS_rC)
+            tRS_rEpi = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
             # Type conversion
             tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
             tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
@@ -1419,10 +1452,45 @@ class GemmSm90:
         epi_producer_state.advance()
         return epi_producer_state
 
-    def epi_visit_acc_subtile(self, tRS_rD: cute.Tensor, tRS_rC: Optional[cute.Tensor]) -> Optional[cute.Tensor]:
+    def epi_visit_acc_subtile(
+        self,
+        params: EpilogueParams,
+        tRS_rD: cute.Tensor,
+        tRS_rC: Optional[cute.Tensor] = None,
+    ) -> Optional[cute.Tensor]:
         if const_expr(tRS_rC is not None):
             tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
         return None
+
+    @cute.jit
+    def epi_visit_acc(
+        self,
+        params: EpilogueParams,
+        acc: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        tile_coord_mnkl: cute.Coord,
+        tidx: Int32,
+    ) -> None:
+        pass
+
+    def epi_to_underlying_arguments(
+        self, args: EpilogueArguments, *, loc=None, ip=None
+    ) -> EpilogueParams:
+        return GemmSm90.EpilogueParams()
+
+    @staticmethod
+    def epi_smem_bytes_per_stage(
+        args: EpilogueArguments,
+        tile_shape_mnk: Tuple[int, int, int],
+        epi_tile: Tuple[int, int],
+    ) -> int:
+        return 0
+
+    def epi_get_smem_struct(self, params: EpilogueParams):
+        return cute.struct.MemRange[cutlass.Int32, 0]  # Dummy struct
+
+    def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Tuple[cute.Tensor, ...]:
+        return tuple()
 
     def pingpong_barrier_sync(self, warp_group_idx: Int32, stage: str):
         assert stage in ["mma", "epi"]
@@ -1509,9 +1577,7 @@ class GemmSm90:
         else:
             mD_mn = mD_mnl[None, None, batch_idx]
         # (bM, bN)
-        gD = cute.local_tile(
-            mD_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
-        )
+        gD = cute.local_tile(mD_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2])
         tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
         bSG_sD, bSG_gD = cpasync.tma_partition(
             atom,
@@ -1522,14 +1588,16 @@ class GemmSm90:
         )
         return bSG_sD, bSG_gD
 
-    @staticmethod
+    @classmethod
     def _compute_stages(
+        cls,
         tile_shape_mnk: Tuple[int, int, int],
-        epi_tile: Optional[Tuple[int, int]],
+        epi_tile: Tuple[int, int],
         a_dtype: Type[cutlass.Numeric],
         b_dtype: Type[cutlass.Numeric],
         d_dtype: Type[cutlass.Numeric],
         c_dtype: Optional[Type[cutlass.Numeric]],
+        epilogue_args: EpilogueArguments,
         smem_capacity: int,
         occupancy: int,
         overlap_sD_sA: bool,
@@ -1557,7 +1625,10 @@ class GemmSm90:
             epi_bytes = 0
         else:
             d_bytes_per_stage = cute.size(epi_tile) * d_dtype.width // 8
-            epi_bytes = d_bytes_per_stage * epi_stage
+            epi_bytes_per_stage = d_bytes_per_stage + cls.epi_smem_bytes_per_stage(
+                epilogue_args, tile_shape_mnk, epi_tile
+            )
+            epi_bytes = epi_bytes_per_stage * epi_stage
         epi_c_stage = 0 if c_dtype is None else 2
         if c_dtype is not None:
             epi_bytes += cute.size(epi_tile) * c_dtype.width // 8 * epi_c_stage
@@ -1578,7 +1649,7 @@ class GemmSm90:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
         if not overlap_sD_sA:
-            epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // d_bytes_per_stage
+            epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // epi_bytes_per_stage
         return ab_stage, epi_stage, epi_c_stage
 
     @staticmethod
@@ -1896,5 +1967,4 @@ class GemmSm90:
         # for Float8 types, this implementation only supports k-major layout
         if (a_dtype.width == 8 and a_major != "k") or (b_dtype.width == 8 and b_major != "k"):
             is_valid = False
-
         return is_valid
