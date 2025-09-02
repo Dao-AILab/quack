@@ -187,7 +187,8 @@ class Softmax(ReductionBase):
             cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
 
 
-def _softmax_fwd(x: torch.Tensor) -> torch.Tensor:
+@torch.library.custom_op("quack::_softmax_fwd", mutates_args={"out"})
+def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     """Softmax forward pass.
     Args:
         x: Input tensor of shape (M, N)
@@ -197,8 +198,7 @@ def _softmax_fwd(x: torch.Tensor) -> torch.Tensor:
     assert x.dim() == 2, "Input must be 2D"
     assert x.is_cuda, "Tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
-    M, N = x.shape
-    out = torch.empty_like(x)
+    N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     convert_from_dlpack = lambda tensor: (
         from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
@@ -214,10 +214,15 @@ def _softmax_fwd(x: torch.Tensor) -> torch.Tensor:
             softmax_op, x_tensor, out_tensor, current_stream
         )
     _softmax_fwd.compile_cache[compile_key](x_tensor, out_tensor, current_stream)
-    return out
 
 
 _softmax_fwd.compile_cache = {}
+
+
+def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    _softmax_fwd(x, out)
+    return out
 
 
 class SoftmaxBackward(ReductionBase):
@@ -437,7 +442,7 @@ _softmax_backward.compile_cache = {}
 class SoftmaxFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        y = _softmax_fwd(x)
+        y = softmax_fwd(x)
         ctx.save_for_backward(y)
         return y
 
