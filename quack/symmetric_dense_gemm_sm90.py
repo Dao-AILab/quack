@@ -907,8 +907,11 @@ class HopperSymmetricGemmKernel:
 
             acc_shape = tiled_mma.partition_shape_C(cute.select(self.tile_shape_mnk, mode=[0, 1]))
             acc = cute.make_fragment(acc_shape, self.acc_dtype)
-            if const_expr(self.fp8_slow_accum):
-                acc_slow = cute.make_fragment(acc_shape, self.acc_dtype)
+            acc_slow = (
+                cute.make_fragment(acc_shape, self.acc_dtype)
+                if const_expr(self.fp8_slow_accum)
+                else None
+            )
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:

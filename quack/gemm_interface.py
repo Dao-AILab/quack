@@ -8,7 +8,6 @@ from torch import Tensor
 from quack.gemm_config import GemmConfig, get_all_configs
 
 from quack.autotuner import autotune, AutotuneConfig
-from quack.lse import logsumexp
 
 
 def gemm_swiglu_out_ref(
@@ -279,7 +278,7 @@ def gemm_lse_tuned(
         config.raster_order,
         config.max_swizzle_size,
     )
-    lse = logsumexp(lse_partial)
+    lse = torch.logsumexp(lse_partial, dim=-1)
     return out, lse
 
 

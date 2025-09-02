@@ -170,9 +170,7 @@ class CrossEntropy(ReductionBase):
                 reduction_buffer[None, None, 0],
                 mbar_ptr + 0 if cutlass.const_expr(self.cluster_n > 1) else None,
                 init_val=-cutlass.Float32.inf,
-                hook_fn=(
-                    cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None
-                ),
+                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
             )
             if cutlass.const_expr(self.reload_from == "smem"):
                 cute.autovec_copy(tXsX, tXrX)
@@ -197,9 +195,7 @@ class CrossEntropy(ReductionBase):
                 threads_per_row,
                 reduction_buffer[None, None, 0],
                 mbar_ptr,
-                hook_fn=(
-                    cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None
-                ),
+                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
             )
 
         if (
@@ -233,11 +229,7 @@ def _cross_entropy(
     assert target.dim() == 1, "Target must be 1D"
     assert x.shape[0] == target.shape[0], "Batch dimensions must match"
     assert x.is_cuda and target.is_cuda, "Tensors must be on CUDA device"
-    assert x.dtype in [
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    ], "Unsupported input dtype"
+    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
     M, N = x.shape
     device = x.device
@@ -325,33 +317,19 @@ class CrossEntropyBackward:
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
 
-        mDLoss = cute.make_tensor(
-            mDLoss.iterator,
-            cute.append(mDLoss.layout, cute.make_layout((self.N,), stride=(0,))),
-        )
-        mTarget = cute.make_tensor(
-            mTarget.iterator,
-            cute.append(mTarget.layout, cute.make_layout((self.N,), stride=(0,))),
-        )
-        mLSE = cute.make_tensor(
-            mLSE.iterator,
-            cute.append(mLSE.layout, cute.make_layout((self.N,), stride=(0,))),
-        )
+        # (M,) -> (M, N) with stride 0 in the N dimension
+        mDLoss, mTarget, mLSE = [
+            cute.make_tensor(
+                X.iterator, cute.append(X.layout, cute.make_layout((self.N,), stride=(0,)))
+            )
+            for X in (mDLoss, mTarget, mLSE)
+        ]
 
         smem_size = cute.size_in_bytes(
             mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0))
         )
 
-        self.kernel(
-            mX,
-            mTarget,
-            mDLoss,
-            mdX,
-            mLSE,
-            mX.shape,
-            tv_layout,
-            tiler_mn,
-        ).launch(
+        self.kernel(mX, mTarget, mDLoss, mdX, mLSE, mX.shape, tv_layout, tiler_mn).launch(
             grid=[
                 cute.ceil_div(mX.shape[0], tiler_mn[0]),
                 cute.ceil_div(mX.shape[1], tiler_mn[1]),
@@ -485,14 +463,10 @@ def _cross_entropy_backward(
     assert x.shape[0] == target.shape[0], "Batch dimensions must match"
     assert x.shape[0] == dloss.shape[0], "Batch dimensions must match"
     assert x.shape[0] == lse.shape[0], "Batch dimensions must match"
-    assert x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda, (
-        "Tensors must be on CUDA device"
-    )
-    assert x.dtype in [
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    ], "Unsupported input dtype"
+    assert (
+        x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda
+    ), "Tensors must be on CUDA device"
+    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
 
     M, N = x.shape

@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
 from typing import Tuple, Optional
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from enum import IntEnum
 
 import cutlass
@@ -11,30 +11,7 @@ from cutlass import Int32, Boolean, const_expr
 import quack.utils as utils
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
-
-
-@dataclass
-class ParamsBase:
-    def __extract_mlir_values__(self):
-        all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [f for f in all_fields if not isinstance(f, cutlass.Constexpr)]
-        values, self._values_pos = [], []
-        for obj in non_constexpr_fields:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, cutlass.Constexpr)}
-        non_constexpr_fields = {
-            n: f for n, f in all_fields.items() if not isinstance(f, cutlass.Constexpr)
-        }
-        for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
-            values = values[n_items:]
-        return self.__class__(**non_constexpr_fields, **constexpr_fields)
+from quack.cute_dsl_utils import ParamsBase
 
 
 class RasterOrderOption(IntEnum):
