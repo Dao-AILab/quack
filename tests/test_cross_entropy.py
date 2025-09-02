@@ -21,7 +21,6 @@ def test_cross_entropy(M, N, input_dtype):
     device = "cuda"
     atol, rtol = 5e-5, 1e-5
     torch.random.manual_seed(0)
-    cutlass.cuda.initialize_cuda_context()
     # Create input tensors (scale down to avoid overflow)
     x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
