@@ -21,7 +21,7 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
     # [32768]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
-@pytest.mark.parametrize("M", [softmax, torch.compile(softmax, fullgraph=True)])
+@pytest.mark.parametrize("function", [softmax, torch.compile(softmax, fullgraph=True)])
 # @pytest.mark.parametrize("M", [1])
 def test_softmax(M, N, input_dtype, function):
     """Test Softmax forward and backward passes against reference implementation."""
