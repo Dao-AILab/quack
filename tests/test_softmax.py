@@ -72,7 +72,7 @@ def test_softmax(M, N, input_dtype, function):
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("M", [softmax, torch.compile(softmax, fullgraph=True)])
+@pytest.mark.parametrize("function", [softmax, torch.compile(softmax, fullgraph=True)])
 def test_softmax_extreme_values(input_dtype, function):
     """Test Softmax with extreme input values."""
     device = "cuda"
@@ -98,7 +98,7 @@ def test_softmax_extreme_values(input_dtype, function):
     assert (out_mixed[:, 1:] < 0.01).all()
 
 
-@pytest.mark.parametrize("M", [softmax, torch.compile(softmax, fullgraph=True)])
+@pytest.mark.parametrize("function", [softmax, torch.compile(softmax, fullgraph=True)])
 def test_softmax_numerical_stability(function):
     """Test that softmax is numerically stable."""
     device = "cuda"
