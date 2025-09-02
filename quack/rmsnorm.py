@@ -316,6 +316,19 @@ def _rmsnorm_fwd(
 _rmsnorm_fwd.compile_cache = {}
 
 
+def rmsnorm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    return_rstd: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor]:
+    M = x.size(0)
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=x.device, dtype=torch.float32)
+    _rmsnorm_fwd(x=x, weight=weight, out=out, rstd=rstd, eps=eps)
+    return (out, rstd) if return_rstd else out
+
+
 def rmsnorm_ref(x, w, eps=1e-6):
     x_f32 = x.float()
     return (x_f32 / (torch.sqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps)) * w).to(
@@ -795,11 +808,7 @@ class RMSNormFunction(torch.autograd.Function):
         # Flatten input
         x = x.view(-1, x.shape[-1])
 
-        M = x.size(0)
-        out = torch.empty_like(x)
-        rstd = torch.empty(M, device=x.device, dtype=torch.float32)
-
-        _rmsnorm_fwd(x, weight, out, rstd, eps)
+        out, rstd = rmsnorm_fwd(x, weight, eps, return_rstd=True)
         ctx.save_for_backward(x, weight, rstd)
         ctx.eps = eps
         ctx.x_shape_start = x_shape_start
