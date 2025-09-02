@@ -800,6 +800,26 @@ def _rmsnorm_backward(
 _rmsnorm_backward.compile_cache = {}
 
 
+def rmsnorm_bwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dout: torch.Tensor,
+    rstd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = x.device
+    N = x.size(1)
+    sm_count = _get_sm_count(N, device)
+
+    dx = torch.empty_like(x)
+    # Always store partial gradients in fp32 for numerical accuracy
+    dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+
+    _rmsnorm_backward(x, weight, dout, rstd, dx, dw_partial)
+    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
+    dw = dw_partial.sum(dim=0).to(weight.dtype)
+    return dx, dw
+
+
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps):
@@ -821,18 +841,7 @@ class RMSNormFunction(torch.autograd.Function):
         x_shape_start = ctx.x_shape_start
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
-
-        device = x.device
-        N = x.size(1)
-        sm_count = _get_sm_count(N, device)
-
-        dx = torch.empty_like(x)
-        # Always store partial gradients in fp32 for numerical accuracy
-        dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
-
-        _rmsnorm_backward(x, weight, dout, rstd, dx, dw_partial)
-        # we have summed the partial gradients in fp32, now we convert back to the weight dtype
-        dw = dw_partial.sum(dim=0).to(weight.dtype)
+        dx, dw = rmsnorm_bwd(x, weight, dout, rstd)
         dx = dx.view(x_shape_start)
         # dx is returned for input gradient,
         # dw is returned for weight gradient,
