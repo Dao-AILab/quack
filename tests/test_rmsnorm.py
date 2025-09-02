@@ -5,6 +5,10 @@ import torch
 
 from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd
 
+
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
+
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 # @pytest.mark.parametrize("eps", [1e-5])
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32])

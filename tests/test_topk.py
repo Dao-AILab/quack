@@ -7,6 +7,8 @@ import cutlass
 
 from quack.topk import topk
 
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
