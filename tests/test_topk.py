@@ -16,8 +16,9 @@ from quack.topk import topk
     # [(256, 4)]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
+@pytest.mark.parametrize("function", [topk, torch.compile(topk, fullgraph=True)])
 # @pytest.mark.parametrize("M", [1])
-def test_topk(M, N, k, input_dtype):
+def test_topk(M, N, k, input_dtype, function):
     """Test TopK against PyTorch reference implementation."""
     device = "cuda"
     # Set tolerance based on dtype
@@ -34,7 +35,7 @@ def test_topk(M, N, k, input_dtype):
     torch.random.manual_seed(0)
     # Create input tensors
     x = torch.randn(M, N, device=device, dtype=input_dtype)
-    out_val, out_idx = topk(x, k)
+    out_val, out_idx = function(x, k)
     out_val_ref, out_idx_ref = torch.topk(x, k, dim=-1, largest=True, sorted=True)
 
     # Check output shape and dtype

@@ -32,8 +32,9 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd
     # [262144]
 )
 @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
+@pytest.mark.parametrize("function", [rmsnorm, torch.compile(rmsnorm, fullgraph=True)])
 # @pytest.mark.parametrize("M", [1])
-def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
+def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, function):
     """Test RMSNorm forward pass against reference implementation."""
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
@@ -50,7 +51,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
     weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
-    out = rmsnorm(x, weight, eps=eps)
+    out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     assert out.shape == x.shape
     assert out.dtype == input_dtype
@@ -71,7 +72,8 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
 
 
-def test_rmsnorm_strided_tensor():
+@pytest.mark.parametrize("function", [rmsnorm, torch.compile(rmsnorm, fullgraph=True)])
+def test_rmsnorm_strided_tensor(function):
     """Test RMSNorm with strided tensor input where shape is (8, 4096, 512) and stride is (sth, 576, 1)."""
     device = "cuda"
     dtype = torch.bfloat16
@@ -86,7 +88,7 @@ def test_rmsnorm_strided_tensor():
     # Reference implementation
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
-    out = rmsnorm(x, weight, eps=eps)
+    out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     assert out.shape == x.shape
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
@@ -106,7 +108,8 @@ def test_rmsnorm_strided_tensor():
     # [262144]
 )
 @pytest.mark.parametrize("M", [32 * 1024])
-def test_rmsnorm_large_tensor(M, N, input_dtype, eps):
+@pytest.mark.parametrize("function", [rmsnorm, torch.compile(rmsnorm, fullgraph=True)])
+def test_rmsnorm_large_tensor(M, N, input_dtype, eps, function):
     """Test RMSNorm forward pass against reference implementation."""
     device = "cuda"
     # Set tolerance based on dtype
@@ -120,7 +123,7 @@ def test_rmsnorm_large_tensor(M, N, input_dtype, eps):
     torch.cuda.empty_cache()
     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=False)
     weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=False)
-    out = rmsnorm(x, weight, eps=eps)
+    out = function(x, weight, eps=eps)
     # Need to compile, otherwise it OOMs
     rmsnorm_compiled = torch.compile(rmsnorm_ref)
     # Run once with smaller input to avoid OOMs
