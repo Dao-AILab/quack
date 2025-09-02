@@ -38,7 +38,6 @@ def test_softmax(M, N, input_dtype):
     x_ref = x.detach().clone().requires_grad_(True)
 
     # Forward pass
-    cutlass.cuda.initialize_cuda_context()
     out = softmax(x)
     out_ref = F.softmax(x_ref, dim=-1)
 
