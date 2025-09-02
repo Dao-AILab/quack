@@ -454,7 +454,7 @@ class SoftmaxFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         (y,) = ctx.saved_tensors
-        dx = _softmax_backward(dy, y)
+        dx = softmax_bwd(dy, y)
         return dx
 
 
