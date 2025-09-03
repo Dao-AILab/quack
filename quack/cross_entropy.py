@@ -528,16 +528,6 @@ def _cross_entropy_bwd_no_inplace(
     _cross_entropy_backward(x, target, dloss, lse, dx)
 
 
-@torch.library.custom_op("quack::_cross_entropy_bwd_inplace", mutates_args={"x"})
-def _cross_entropy_bwd_inplace(
-    x: torch.Tensor,
-    target: torch.Tensor,
-    dloss: torch.Tensor,
-    lse: torch.Tensor,
-) -> None:
-    _cross_entropy_backward(x, target, dloss, lse, x)
-
-
 def cross_entropy_bwd(
     x: torch.Tensor,
     target: torch.Tensor,
@@ -546,8 +536,8 @@ def cross_entropy_bwd(
     inplace_backward: bool = False,
 ) -> None:
     if inplace_backward and not torch.compiler.is_compiling():
-        _cross_entropy_bwd_inplace(x=x, target=target, dloss=dloss, lse=lse)
         dx = x
+        _cross_entropy_backward(x=x, target=target, dloss=dloss, lse=lse, dx=x)
     else:
         dx = torch.empty_like(x)
         _cross_entropy_bwd_no_inplace(x=x, target=target, dloss=dloss, lse=lse, dx=dx)
