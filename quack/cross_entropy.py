@@ -545,7 +545,7 @@ def cross_entropy_bwd(
     lse: torch.Tensor,
     inplace_backward: bool = False,
 ) -> None:
-    if inplace_backward:
+    if inplace_backward and not torch.compiler.is_compiling():
         _cross_entropy_bwd_inplace(x=x, target=target, dloss=dloss, lse=lse)
         dx = x
     else:
