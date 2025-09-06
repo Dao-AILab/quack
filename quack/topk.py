@@ -167,7 +167,8 @@ class TopK:
                 cute.autovec_copy(topk_indices_store[None, i], mIndices_store[None, i])
 
 
-def _topk_fwd(x: torch.Tensor, k: int):
+@torch.library.custom_op("quack::_topk_fwd", mutates_args={"values", "indices"})
+def _topk_fwd(x: torch.Tensor, k: int, values: torch.Tensor, indices: torch.Tensor) -> None:
     """Top-k forward pass.
     Args:
         x: Input tensor of shape (M, N)
@@ -180,9 +181,7 @@ def _topk_fwd(x: torch.Tensor, k: int):
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert k > 0 and k <= x.shape[1], "k must be positive and <= N"
 
-    M, N = x.shape
-    values = torch.empty((M, k), dtype=x.dtype, device=x.device)
-    indices = torch.empty((M, k), dtype=torch.int32, device=x.device)
+    N = x.size(1)
 
     dtype = torch2cute_dtype_map[x.dtype]
     convert_from_dlpack = lambda tensor: (
@@ -203,8 +202,6 @@ def _topk_fwd(x: torch.Tensor, k: int):
         )
     _topk_fwd.compile_cache[compile_key](x_tensor, values_tensor, indices_tensor, current_stream)
 
-    return values, indices
-
 
 _topk_fwd.compile_cache = {}
 
@@ -219,4 +216,12 @@ def topk(x: torch.Tensor, k: int):
     Returns:
         Tuple of (values tensor of shape (M, k), indices tensor of shape (M, k))
     """
-    return _topk_fwd(x, k)
+
+    M = x.size(0)
+
+    values = torch.empty((M, k), dtype=x.dtype, device=x.device)
+    indices = torch.empty((M, k), dtype=torch.int32, device=x.device)
+
+    _topk_fwd(x, k, values, indices)
+
+    return values, indices

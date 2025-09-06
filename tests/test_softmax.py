@@ -9,6 +9,10 @@ import cutlass
 from quack.softmax import softmax
 
 
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
+
+
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
@@ -17,8 +21,9 @@ from quack.softmax import softmax
     # [32768]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
+@pytest.mark.parametrize("function", [softmax, torch.compile(softmax, fullgraph=True)])
 # @pytest.mark.parametrize("M", [1])
-def test_softmax(M, N, input_dtype):
+def test_softmax(M, N, input_dtype, function):
     """Test Softmax forward and backward passes against reference implementation."""
     device = "cuda"
     # Set tolerance based on dtype
@@ -38,8 +43,7 @@ def test_softmax(M, N, input_dtype):
     x_ref = x.detach().clone().requires_grad_(True)
 
     # Forward pass
-    cutlass.cuda.initialize_cuda_context()
-    out = softmax(x)
+    out = function(x)
     out_ref = F.softmax(x_ref, dim=-1)
 
     # Check output shape and dtype
@@ -68,32 +72,34 @@ def test_softmax(M, N, input_dtype):
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.float32])
-def test_softmax_extreme_values(input_dtype):
+@pytest.mark.parametrize("function", [softmax, torch.compile(softmax, fullgraph=True)])
+def test_softmax_extreme_values(input_dtype, function):
     """Test Softmax with extreme input values."""
     device = "cuda"
     M, N = 16, 1024
     # Test with large positive values
     x_large = torch.full((M, N), 10.0, device=device, dtype=input_dtype)
-    out_large = softmax(x_large)
+    out_large = function(x_large)
     # Should be uniform since all values are the same
     expected = torch.full_like(out_large, 1.0 / N)
     torch.testing.assert_close(out_large, expected, atol=1e-3, rtol=1e-3)
     # Test with large negative values
     x_small = torch.full((M, N), -10.0, device=device, dtype=input_dtype)
-    out_small = softmax(x_small)
+    out_small = function(x_small)
     # Should also be uniform
     torch.testing.assert_close(out_small, expected, atol=1e-3, rtol=1e-3)
     # Test with mixed extreme values
     x_mixed = torch.zeros((M, N), device=device, dtype=input_dtype)
     x_mixed[:, 0] = 10.0  # One large value per row
     x_mixed[:, 1:] = -10.0  # Rest are small
-    out_mixed = softmax(x_mixed)
+    out_mixed = function(x_mixed)
     # First column should be close to 1, rest close to 0
     assert (out_mixed[:, 0] > 0.99).all()
     assert (out_mixed[:, 1:] < 0.01).all()
 
 
-def test_softmax_numerical_stability():
+@pytest.mark.parametrize("function", [softmax, torch.compile(softmax, fullgraph=True)])
+def test_softmax_numerical_stability(function):
     """Test that softmax is numerically stable."""
     device = "cuda"
     M, N = 8, 512
@@ -101,8 +107,8 @@ def test_softmax_numerical_stability():
     x = torch.randn(M, N, device=device, dtype=torch.float32)
     # Add large constant to test numerical stability
     x_shifted = x + 100.0
-    out = softmax(x)
-    out_shifted = softmax(x_shifted)
+    out = function(x)
+    out_shifted = function(x_shifted)
     # Results should be identical (softmax is translation invariant)
     torch.testing.assert_close(out, out_shifted, atol=1e-6, rtol=1e-6)
 

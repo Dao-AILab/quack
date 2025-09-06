@@ -247,12 +247,14 @@ class RMSNorm(ReductionBase):
             cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tXpX)
 
 
+@torch.library.custom_op("quack::_rmsnorm_fwd", mutates_args={"out", "rstd"})
 def _rmsnorm_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
+    out: torch.Tensor,
+    rstd: torch.Tensor | None,
     eps: float = 1e-6,
-    return_rstd: bool = False,
-) -> torch.Tensor:
+) -> None:
     """RMSNorm forward pass.
     Args:
         x: Input tensor of shape (M, N)
@@ -279,10 +281,7 @@ def _rmsnorm_fwd(
         torch.float16,
     ], "Weight must be float32, float16 or bfloat16"
 
-    M, N = x.shape
-    device = x.device
-    out = torch.empty_like(x)
-    rstd = torch.empty(M, device=device, dtype=torch.float32) if return_rstd else None
+    N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     # convert_from_dlpack = lambda x: (
     #     from_dlpack(x.detach(), assumed_align=16).mark_compact_shape_dynamic(
@@ -313,10 +312,22 @@ def _rmsnorm_fwd(
     _rmsnorm_fwd.compile_cache[compile_key](
         x_tensor, weight_tensor, out_tensor, rstd_tensor, current_stream, eps
     )
-    return (out, rstd) if return_rstd else out
 
 
 _rmsnorm_fwd.compile_cache = {}
+
+
+def rmsnorm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    return_rstd: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor]:
+    M = x.size(0)
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=x.device, dtype=torch.float32)
+    _rmsnorm_fwd(x=x, weight=weight, out=out, rstd=rstd, eps=eps)
+    return (out, rstd) if return_rstd else out
 
 
 def rmsnorm_ref(x, w, eps=1e-6):
@@ -685,12 +696,32 @@ class RMSNormBackward(ReductionBase):
             cute.copy(copy_atom_store_dW, tXrdW, tXgdW, pred=tXpdW)
 
 
+def _get_sm_count(N: int, device: torch.device) -> int:
+    # This should be tuned on how many CTAs can be launched on each SM
+    sm_count_multiple = (
+        16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+    )
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    # By right, if we're using cluster, this should be cluster_count not sm_count.
+    # But for cluster >= 4, due to quantization we would need to query active max cluster.
+    # Instead we just do sm_count * 2, which is reasonably larger than active_cluster_count to
+    # avoid wave quantization.
+    sm_count = (
+        sm_count * sm_count_multiple if N <= 8192 else sm_count // 2 if N <= 16384 else sm_count * 2
+    )
+
+    return sm_count
+
+
+@torch.library.custom_op("quack::_rmsnorm_backward", mutates_args={"dx", "dw_partial"})
 def _rmsnorm_backward(
     x: torch.Tensor,
     weight: torch.Tensor,
     dout: torch.Tensor,
     rstd: torch.Tensor,
-) -> (torch.Tensor, torch.Tensor):
+    dx: torch.Tensor,
+    dw_partial: torch.Tensor,
+) -> None:
     """RMSNorm backward pass.
     Args:
         x: Input tensor of shape (M, N)
@@ -718,26 +749,9 @@ def _rmsnorm_backward(
         torch.float16,
     ], "Weight must be float32, float16 or bfloat16"
 
-    M, N = x.shape
-    dx = torch.empty_like(x)
-
+    N = x.size(1)
     device = x.device
-
-    # This should be tuned on how many CTAs can be launched on each SM
-    sm_count_multiple = (
-        16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
-    )
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    # By right, if we're using cluster, this should be cluster_count not sm_count.
-    # But for cluster >= 4, due to quantization we would need to query active max cluster.
-    # Instead we just do sm_count * 2, which is reasonably larger than active_cluster_count to
-    # avoid wave quantization.
-    sm_count = (
-        sm_count * sm_count_multiple if N <= 8192 else sm_count // 2 if N <= 16384 else sm_count * 2
-    )
-
-    # Always store partial gradients in fp32 for numerical accuracy
-    dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+    sm_count = _get_sm_count(N, device)
 
     dtype = torch2cute_dtype_map[x.dtype]
 
@@ -782,12 +796,29 @@ def _rmsnorm_backward(
         sm_count,
         current_stream,
     )
-    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
-    dw = dw_partial.sum(dim=0).to(weight.dtype)
-    return dx, dw
 
 
 _rmsnorm_backward.compile_cache = {}
+
+
+def rmsnorm_bwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dout: torch.Tensor,
+    rstd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = x.device
+    N = x.size(1)
+    sm_count = _get_sm_count(N, device)
+
+    dx = torch.empty_like(x)
+    # Always store partial gradients in fp32 for numerical accuracy
+    dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+
+    _rmsnorm_backward(x, weight, dout, rstd, dx, dw_partial)
+    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
+    dw = dw_partial.sum(dim=0).to(weight.dtype)
+    return dx, dw
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -798,7 +829,7 @@ class RMSNormFunction(torch.autograd.Function):
         # Flatten input
         x = x.view(-1, x.shape[-1])
 
-        out, rstd = _rmsnorm_fwd(x, weight, eps, return_rstd=True)
+        out, rstd = rmsnorm_fwd(x, weight, eps, return_rstd=True)
         ctx.save_for_backward(x, weight, rstd)
         ctx.eps = eps
         ctx.x_shape_start = x_shape_start
@@ -811,7 +842,7 @@ class RMSNormFunction(torch.autograd.Function):
         x_shape_start = ctx.x_shape_start
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
-        dx, dw = _rmsnorm_backward(x, weight, dout, rstd)
+        dx, dw = rmsnorm_bwd(x, weight, dout, rstd)
         dx = dx.view(x_shape_start)
         # dx is returned for input gradient,
         # dw is returned for weight gradient,

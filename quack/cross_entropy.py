@@ -212,11 +212,13 @@ class CrossEntropy(ReductionBase):
                 mLSE[row] = lse
 
 
+@torch.library.custom_op("quack::_cross_entropy", mutates_args={"loss", "lse"})
 def _cross_entropy(
     x: torch.Tensor,
     target: torch.Tensor,
-    return_lse: bool = False,
-) -> torch.Tensor:
+    loss: torch.Tensor,
+    lse: torch.Tensor | None,
+) -> None:
     """Cross entropy forward pass.
 
     Args:
@@ -232,10 +234,7 @@ def _cross_entropy(
     assert x.is_cuda and target.is_cuda, "Tensors must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
-    M, N = x.shape
-    device = x.device
-    loss = torch.empty(M, device=device, dtype=torch.float32)
-    lse = torch.empty(M, device=device, dtype=torch.float32) if return_lse else None
+    N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     convert_from_dlpack = lambda tensor: (
         from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
@@ -261,10 +260,22 @@ def _cross_entropy(
     _cross_entropy.compile_cache[compile_key](
         x_tensor, target_tensor, loss_tensor, lse_tensor, stream
     )
-    return loss if not return_lse else (loss, lse)
 
 
 _cross_entropy.compile_cache = {}
+
+
+def cross_entropy_fwd(
+    x: torch.Tensor,
+    target: torch.Tensor,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor]:
+    M = x.size(0)
+    device = x.device
+    loss = torch.empty(M, device=device, dtype=torch.float32)
+    lse = torch.empty(M, device=device, dtype=torch.float32) if return_lse else None
+    _cross_entropy(x, target, loss, lse)
+    return loss if not return_lse else (loss, lse)
 
 
 class CrossEntropyBackward:
@@ -446,8 +457,8 @@ def _cross_entropy_backward(
     target: torch.Tensor,
     dloss: torch.Tensor,
     lse: torch.Tensor,
-    inplace_backward: bool = False,
-) -> torch.Tensor:
+    dx: torch.Tensor,
+) -> None:
     """Cross entropy backward pass.
     Args:
         x: Input logits tensor of shape (M, N)
@@ -470,8 +481,7 @@ def _cross_entropy_backward(
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
 
-    M, N = x.shape
-    dx = torch.empty_like(x) if not inplace_backward else x
+    N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
 
     convert_from_dlpack = lambda tensor: (
@@ -503,16 +513,43 @@ def _cross_entropy_backward(
     _cross_entropy_backward.compile_cache[compile_key](
         x_tensor, target_tensor, dloss_tensor, dx_tensor, lse_tensor, stream
     )
-    return dx
 
 
 _cross_entropy_backward.compile_cache = {}
 
 
+@torch.library.custom_op("quack::_cross_entropy_bwd_no_inplace", mutates_args={"dx"})
+def _cross_entropy_bwd_no_inplace(
+    x: torch.Tensor,
+    target: torch.Tensor,
+    dloss: torch.Tensor,
+    lse: torch.Tensor,
+    dx: torch.Tensor,
+) -> None:
+    _cross_entropy_backward(x, target, dloss, lse, dx)
+
+
+def cross_entropy_bwd(
+    x: torch.Tensor,
+    target: torch.Tensor,
+    dloss: torch.Tensor,
+    lse: torch.Tensor,
+    inplace_backward: bool = False,
+) -> None:
+    if inplace_backward and not torch.compiler.is_compiling():
+        dx = x
+        _cross_entropy_backward(x=x, target=target, dloss=dloss, lse=lse, dx=x)
+    else:
+        dx = torch.empty_like(x)
+        _cross_entropy_bwd_no_inplace(x=x, target=target, dloss=dloss, lse=lse, dx=dx)
+
+    return dx
+
+
 class CrossEntropyFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, target, inplace_backward=False):
-        loss, lse = _cross_entropy(x, target, return_lse=True)
+        loss, lse = cross_entropy_fwd(x, target, return_lse=True)
         ctx.save_for_backward(x, target, lse)
         ctx.inplace_backward = inplace_backward
         return loss
@@ -520,7 +557,7 @@ class CrossEntropyFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dloss):
         x, target, lse = ctx.saved_tensors
-        dx = _cross_entropy_backward(x, target, dloss, lse, inplace_backward=ctx.inplace_backward)
+        dx = cross_entropy_bwd(x, target, dloss, lse, inplace_backward=ctx.inplace_backward)
         return dx, None, None
 
 

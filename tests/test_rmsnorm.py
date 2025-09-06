@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd
+from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd, rmsnorm_fwd
+
+
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 # @pytest.mark.parametrize("eps", [1e-5])
@@ -32,8 +36,9 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd
     # [262144]
 )
 @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
+@pytest.mark.parametrize("function", [rmsnorm, torch.compile(rmsnorm, fullgraph=True)])
 # @pytest.mark.parametrize("M", [1])
-def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
+def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, function):
     """Test RMSNorm forward pass against reference implementation."""
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
@@ -50,7 +55,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
     weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
-    out = rmsnorm(x, weight, eps=eps)
+    out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     assert out.shape == x.shape
     assert out.dtype == input_dtype
@@ -71,7 +76,8 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
 
 
-def test_rmsnorm_strided_tensor():
+@pytest.mark.parametrize("function", [rmsnorm, torch.compile(rmsnorm, fullgraph=True)])
+def test_rmsnorm_strided_tensor(function):
     """Test RMSNorm with strided tensor input where shape is (8, 4096, 512) and stride is (sth, 576, 1)."""
     device = "cuda"
     dtype = torch.bfloat16
@@ -86,7 +92,7 @@ def test_rmsnorm_strided_tensor():
     # Reference implementation
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
-    out = rmsnorm(x, weight, eps=eps)
+    out = function(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     assert out.shape == x.shape
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
@@ -106,7 +112,8 @@ def test_rmsnorm_strided_tensor():
     # [262144]
 )
 @pytest.mark.parametrize("M", [32 * 1024])
-def test_rmsnorm_large_tensor(M, N, input_dtype, eps):
+@pytest.mark.parametrize("function", [rmsnorm, torch.compile(rmsnorm, fullgraph=True)])
+def test_rmsnorm_large_tensor(M, N, input_dtype, eps, function):
     """Test RMSNorm forward pass against reference implementation."""
     device = "cuda"
     # Set tolerance based on dtype
@@ -120,7 +127,7 @@ def test_rmsnorm_large_tensor(M, N, input_dtype, eps):
     torch.cuda.empty_cache()
     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=False)
     weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=False)
-    out = rmsnorm(x, weight, eps=eps)
+    out = function(x, weight, eps=eps)
     # Need to compile, otherwise it OOMs
     rmsnorm_compiled = torch.compile(rmsnorm_ref)
     # Run once with smaller input to avoid OOMs
@@ -191,29 +198,29 @@ def test_rmsnorm_compile_cache():
     weight1 = torch.randn(N, device=device, dtype=torch.float32)
 
     # First call should compile
-    out1 = _rmsnorm_fwd(x1, weight1, eps=eps)
+    out1 = rmsnorm_fwd(x1, weight1, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Same shape should reuse cache
     x2 = torch.randn(M, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
-    out2 = _rmsnorm_fwd(x2, weight2, eps=eps)
+    out2 = rmsnorm_fwd(x2, weight2, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Changing batch size should reuse cache
     x2 = torch.randn(M * 2, N, device=device, dtype=torch.float16)
     weight2 = torch.randn(N, device=device, dtype=torch.float32)
-    out2 = _rmsnorm_fwd(x2, weight2, eps=eps)
+    out2 = rmsnorm_fwd(x2, weight2, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 1
 
     # Different shape should create new cache entry
     x3 = torch.randn(M, N * 2, device=device, dtype=torch.float16)
     weight3 = torch.randn(N * 2, device=device, dtype=torch.float32)
-    out3 = _rmsnorm_fwd(x3, weight3, eps=eps)
+    out3 = rmsnorm_fwd(x3, weight3, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 2
 
     # Different dtype should create new cache entry
     x4 = torch.randn(M, N, device=device, dtype=torch.float32)
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
-    out4 = _rmsnorm_fwd(x4, weight4, eps=eps)
+    out4 = rmsnorm_fwd(x4, weight4, eps=eps)
     assert len(_rmsnorm_fwd.compile_cache) == 3

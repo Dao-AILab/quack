@@ -7,6 +7,8 @@ import cutlass
 
 from quack.topk import topk
 
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
@@ -16,8 +18,9 @@ from quack.topk import topk
     # [(256, 4)]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
+@pytest.mark.parametrize("function", [topk, torch.compile(topk, fullgraph=True)])
 # @pytest.mark.parametrize("M", [1])
-def test_topk(M, N, k, input_dtype):
+def test_topk(M, N, k, input_dtype, function):
     """Test TopK against PyTorch reference implementation."""
     device = "cuda"
     # Set tolerance based on dtype
@@ -34,7 +37,7 @@ def test_topk(M, N, k, input_dtype):
     torch.random.manual_seed(0)
     # Create input tensors
     x = torch.randn(M, N, device=device, dtype=input_dtype)
-    out_val, out_idx = topk(x, k)
+    out_val, out_idx = function(x, k)
     out_val_ref, out_idx_ref = torch.topk(x, k, dim=-1, largest=True, sorted=True)
 
     # Check output shape and dtype
