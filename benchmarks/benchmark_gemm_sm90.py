@@ -341,14 +341,12 @@ def run(
         cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
         mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=4).mark_layout_dynamic(leading_dim=0)
         if use_cpu_varlen_m:
-            mCuSeqlensMCpu = list(range(0, l + 1)) * m
-        else:
-            mCuSeqlensMCpu = None
+            mCuSeqlensM = list(range(0, (l + 1) * m, m))
         if gather_A:
             a_idx_reshaped = rearrange(a_idx_reshaped, "m l -> (l m)")
             mAIdx = from_dlpack(a_idx_reshaped, assumed_align=4).mark_layout_dynamic(leading_dim=0)
     else:
-        cu_seqlens_m, mCuSeqlensM, mCuSeqlensMCpu = None, None, None
+        cu_seqlens_m, mCuSeqlensM = None, None
 
     if varlen_k:
         from einops import rearrange
@@ -362,11 +360,9 @@ def run(
         cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * k
         mCuSeqlensK = from_dlpack(cu_seqlens_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)
         if use_cpu_varlen_k:
-            mCuSeqlensKCpu = list(range(0, l + 1)) * k
-        else:
-            mCuSeqlensKCpu = None
+            mCuSeqlensK = list(range(0, (l + 1) * k, k))
     else:
-        cu_seqlens_k, mCuSeqlensK, mCuSeqlensKCpu = None, None, None
+        cu_seqlens_k, mCuSeqlensK = None, None
 
 
     if varlen_m or varlen_k:  # Need to allocate space in gmem to store tensormaps
@@ -426,7 +422,7 @@ def run(
     )
 
     epi_args = gemm.EpilogueArguments()
-    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensMCpu, mCuSeqlensK, mCuSeqlensKCpu, tensormaps_tensor)
+    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(

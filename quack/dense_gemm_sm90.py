@@ -360,27 +360,27 @@ class GemmSm90:
         )
 
     @cute.jit
-    def _get_fragment_tensor(
-        self, seqlens: Optional[List[cutlass.Int32]], tensor: Optional[cute.Tensor]
-    ):
-        if const_expr(seqlens is not None):
-            r_cu_seqlens = cute.make_fragment(len(seqlens), dtype=cutlass.Int32)
-            for i, x in enumerate(seqlens):
-                r_cu_seqlens[i] = x
-        else:
-            r_cu_seqlens = None
-        cu_seqlens = tensor if const_expr(tensor is not None) else None
-        return r_cu_seqlens, cu_seqlens
+    def _get_fragment_tensor(self, seqlens: cute.Tensor | List[cutlass.Int32]):
+        if const_expr(isinstance(seqlens, cute.Tensor)):
+            return seqlens
+        cu_seqlens = cute.make_fragment((len(seqlens),), dtype=cutlass.Int32)
+        for i, x in enumerate(seqlens):
+            cu_seqlens[i] = x
+        return cu_seqlens.load()
 
     @cute.jit
     def _process_varlen_args(self, varlen_args: VarlenArguments):
-        r_cu_seqlens_m, cu_seqlens_m = self._get_fragment_tensor(
-            varlen_args.mCuSeqlensMCpu, varlen_args.mCuSeqlensM
+        cu_seqlens_m = (
+            self._get_fragment_tensor(varlen_args.mCuSeqlensM)
+            if varlen_args.mCuSeqlensM is not None
+            else None
         )
-        r_cu_seqlens_k, cu_seqlens_k = self._get_fragment_tensor(
-            varlen_args.mCuSeqlensKCpu, varlen_args.mCuSeqlensK
+        cu_seqlens_k = (
+            self._get_fragment_tensor(varlen_args.mCuSeqlensK)
+            if varlen_args.mCuSeqlensK is not None
+            else None
         )
-        return r_cu_seqlens_m, cu_seqlens_m, r_cu_seqlens_k, cu_seqlens_k
+        return cu_seqlens_m, cu_seqlens_k
 
     @cute.jit
     def __call__(
@@ -480,18 +480,12 @@ class GemmSm90:
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
 
-        varlen_m = varlen_args.mCuSeqlensM is not None or varlen_args.mCuSeqlensMCpu is not None
-        varlen_k = varlen_args.mCuSeqlensK is not None or varlen_args.mCuSeqlensKCpu is not None
-        r_cu_seqlens_m, cu_seqlens_m, r_cu_seqlens_k, cu_seqlens_k = self._process_varlen_args(
-            varlen_args
-        )
+        varlen_m = varlen_args.mCuSeqlensM is not None
+        varlen_k = varlen_args.mCuSeqlensK is not None
+        cu_seqlens_m, cu_seqlens_k = self._process_varlen_args(varlen_args)
         if const_expr(not varlen_m):
             if const_expr(varlen_k):
-                seqlens_k_shape = (
-                    cu_seqlens_k.shape[0] - 1
-                    if cu_seqlens_k is not None
-                    else r_cu_seqlens_k.shape[0] - 1
-                )
+                seqlens_k_shape = cu_seqlens_k.shape[0] - 1
             else:
                 seqlens_k_shape = None
             num_problems = (
@@ -512,15 +506,13 @@ class GemmSm90:
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
-                cu_seqlens_m.shape[0] - 1
-                if cu_seqlens_m is not None
-                else r_cu_seqlens_m.shape[0] - 1,
+                cu_seqlens_m.shape[0] - 1,
             )
             TileSchedulerCls = VarlenMTileScheduler
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=mD.shape[0] if mD is not None else mAIdx.shape[0],
-                cu_seqlens_m=cu_seqlens_m if cu_seqlens_m is not None else r_cu_seqlens_m,
+                cu_seqlens_m=cu_seqlens_m,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mn=self.tile_shape_mnk[:2],
@@ -567,7 +559,6 @@ class GemmSm90:
             ]
 
         self.shared_storage = SharedStorage
-
         # Launch the kernel synchronously
         self.kernel(
             tma_atom_a,
@@ -580,8 +571,8 @@ class GemmSm90:
             tma_tensor_c,
             epilogue_params,
             mAIdx,
-            cu_seqlens_m if cu_seqlens_m is not None else r_cu_seqlens_m,
-            varlen_args.mCuSeqlensK,
+            cu_seqlens_m,
+            cu_seqlens_k,
             varlen_args.mTensormaps,
             self.tiled_mma,
             self.cluster_layout_mnk,
@@ -615,8 +606,8 @@ class GemmSm90:
         mC_mnl: Optional[cute.Tensor],
         epilogue_params: ParamsBase,
         mAIdx: Optional[cute.Tensor],
-        cu_seqlens_m: Optional[cute.Tensor],
-        cu_seqlens_k: Optional[cute.Tensor],
+        cu_seqlens_m: Optional[cute.Tensor | cute.TensorSSA],
+        cu_seqlens_k: Optional[cute.Tensor | cute.TensorSSA],
         tensormaps: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
@@ -653,7 +644,6 @@ class GemmSm90:
         :param epi_smem_layout: Shared memory layout for epilogue
         :type epi_smem_layout: cute.ComposedLayout
         """
-
         varlen_m = const_expr(cu_seqlens_m is not None)
         varlen_k = const_expr(cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
@@ -1698,6 +1688,7 @@ class GemmSm90:
         tSR_rC = thr_copy_s2r.retile(tRS_rC)
         return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
 
+    @cute.jit
     def epilog_gmem_copy_and_partition(
         self,
         atom: Union[cute.CopyAtom, cute.TiledCopy],
@@ -1706,7 +1697,7 @@ class GemmSm90:
         epi_tile: cute.Tile,
         sD: cute.Tensor,
         tile_coord_mnkl: cute.Coord,
-        cu_seqlens_m: Optional[cute.Tensor] = None,
+        cu_seqlens_m: Optional[cute.Tensor | cute.TensorSSA] = None,
     ) -> Tuple[cute.Tensor, cute.Tensor]:
         batch_idx = tile_coord_mnkl[3]
         if const_expr(cu_seqlens_m is not None):
