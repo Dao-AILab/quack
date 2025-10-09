@@ -130,7 +130,7 @@ def sqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
         llvm.inline_asm(
             T.f32(),
             [Float32(a).ir_value(loc=loc, ip=ip)],
-            "srqt.approx.f32 $0, $1;",
+            "sqrt.approx.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
             is_align_stack=False,
