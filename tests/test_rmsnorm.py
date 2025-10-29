@@ -272,9 +272,9 @@ def test_rmsnorm_with_bias(use_compile):
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
 
-
+@pytest.mark.parametrize("backward_type", ["only_output", "both"])
 @pytest.mark.parametrize("use_compile", [False, True])
-def test_rmsnorm_with_residual(use_compile):
+def test_rmsnorm_with_residual(backward_type, use_compile):
     """Test RMSNorm with residual connection - both forward and backward."""
     device = "cuda"
     M, N = 32, 1024
@@ -302,8 +302,15 @@ def test_rmsnorm_with_residual(use_compile):
 
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
-    out_ref.backward(grad_out)
-    out.backward(grad_out)
+    if backward_type == "only_residual":    
+        residual_out_ref.backward(grad_out)
+        residual_out.backward(grad_out)
+    elif backward_type == "only_output":
+        out_ref.backward(grad_out)
+        out.backward(grad_out)
+    else:
+        (out_ref + residual_out_ref).backward(grad_out)
+        (out + residual_out).backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)

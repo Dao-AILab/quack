@@ -779,8 +779,8 @@ class RMSNormBackward(ReductionBase):
             x = tXrX.load().to(cute.Float32)
             cute.autovec_copy(tXsdO[None, None, None, stage], tXrdO)
             dout = tXrdO.load().to(cute.Float32)
-            if const_expr(mdResO is not None):
-                dout += tXrdResO.load().to(cute.Float32)
+            # if const_expr(mdResO is not None):
+            #     dout += tXrdResO.load().to(cute.Float32)
             x_hat = x * rstd
             wdy = dout
             if const_expr(mW is not None):
@@ -817,13 +817,15 @@ class RMSNormBackward(ReductionBase):
             if const_expr(self.reload_wdy == "smem"):
                 cute.autovec_copy(tXsdO[None, None, None, stage], tXrdO)
                 dout = tXrdO.load().to(cute.Float32)
-                if const_expr(mdResO is not None):
-                    dout += tXrdResO.load().to(cute.Float32)
+                # if const_expr(mdResO is not None):
+                #     dout += tXrdResO.load().to(cute.Float32)
                 wdy = dout
                 if const_expr(mW is not None):
                     wdy *= tXrW.load().to(Float32)
 
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
+            if const_expr(mdResO is not None):
+                dx += tXrdResO.load().to(cute.Float32)
             tXrdX.store(dx.to(tXrdX.element_type))
             if row < M or tiler_mn[0] == 1:
                 tXgdX_cur = utils.coord_offset_i64(bidx, tXgdX, dim=3)[None, None, None, 0]
@@ -1145,7 +1147,7 @@ class RMSNormFunction(torch.autograd.Function):
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
-
+        
         dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias)
         dx = dx.view(x_shape_og)
         if dresidual_out is not None:
