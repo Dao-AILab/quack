@@ -371,4 +371,4 @@ def test_rmsnorm_prenorm_false(use_compile):
 
     torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-3)
-    assert residual.grad is None
+    torch.testing.assert_close(residual.grad, residual_ref.grad, atol=1e-2, rtol=1e-3)

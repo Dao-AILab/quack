@@ -1066,6 +1066,7 @@ def rmsnorm_bwd(
     rstd: Tensor,
     dresidual_out: Optional[Tensor] = None,  # grad wrt residual_out
     has_bias: bool = False,
+    has_residual: bool = False,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     device = x.device
     N = x.size(1)
@@ -1090,7 +1091,7 @@ def rmsnorm_bwd(
     dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
     db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
     # dresidual is the same as dx in this case
-    if dresidual_out is not None and dresidual_out.dtype == dx.dtype:
+    if has_residual and dresidual is None:
         dresidual = dx
     return dx, dw, db, dresidual
 
@@ -1147,11 +1148,8 @@ class RMSNormFunction(torch.autograd.Function):
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
-        
-        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias)
+        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias, has_residual=ctx.residual_dtype is not None)
         dx = dx.view(x_shape_og)
-        if dresidual_out is not None:
-            dresidual_out = dresidual_out.reshape(x_shape_og)
         if dresidual is not None:
             dresidual = dresidual.reshape(x_shape_og)
 
