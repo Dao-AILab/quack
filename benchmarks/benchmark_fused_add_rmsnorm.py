@@ -86,9 +86,9 @@ def run_fused_add_rmsnorm(
     )
 
     print("\nComparisons:")
-    print(f"Fused Add RMSNorm Kernel vs RMSNorm kernel with Residual Path: {rmsnorm_time / fused_time:6.2f}x speedup")
-    print(f"Fused Add RMSNorm Kernel vs PyTorch compiled baseline: {pytorch_compiled_time / fused_time:6.2f}x")
-    print(f"Fused Add RMSNorm Kernel vs PyTorch eager baseline: {pytorch_eager_time / fused_time:6.2f}x")
+    print(f"Fused Add RMSNorm Forward Kernel vs RMSNorm kernel with Residual Path: {rmsnorm_time / fused_time:6.2f}x speedup")
+    print(f"Fused Add RMSNorm Forward Kernel vs PyTorch compiled baseline: {pytorch_compiled_time / fused_time:6.2f}x speedup")
+    print(f"Fused Add RMSNorm Forward Kernel vs PyTorch eager baseline: {pytorch_eager_time / fused_time:6.2f}x speedup")
 
     return fused_time, rmsnorm_time, pytorch_compiled_time, pytorch_eager_time
 
@@ -184,9 +184,9 @@ def run_fused_add_rmsnorm_backward(
     )
 
     print("\nComparisons:")
-    print(f"Fused backward kernel vs PyTorch eager backward: {pytorch_eager_time / fused_time:6.2f}x")
+    print(f"Fused Add RMSNorm Backward Kernel vs PyTorch eager backward: {pytorch_eager_time / fused_time:6.2f}x speedup")
     print(
-        f"Fused backward kernel vs PyTorch compiled backward: {pytorch_compiled_time / fused_time:6.2f}x"
+        f"Fused Add RMSNorm Backward Kernel vs PyTorch compiled backward: {pytorch_compiled_time / fused_time:6.2f}x speedup"
     )
 
     return fused_time, pytorch_eager_time, pytorch_compiled_time
