@@ -49,8 +49,8 @@ def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
         return cute.arch.fmax(x[0], Float32(0.0)), cute.arch.fmax(x[1], Float32(0.0))
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def drelu(
     x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
@@ -73,8 +73,8 @@ def relu_sq(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
         return utils.mul_packed_f32x2(relu_x, x)
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def drelu_sq(
     x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
@@ -392,8 +392,8 @@ def reglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x
         return utils.mul_packed_f32x2(relu_x, y)
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def dreglu(
     x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
