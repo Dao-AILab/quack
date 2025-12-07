@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Tuple, Optional, Callable
 from functools import partial
 from torch import Tensor
 from quack.gemm_act import GemmActMixin, act_fn_map, gemm_act
@@ -7,16 +7,189 @@ from quack.gemm_sm100 import GemmSm100
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from quack.varlen_utils import VarlenManager
+import quack.copy_utils as copy_utils
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
-from cutlass import Float32
 from cutlass.cute.runtime import make_ptr
+from cutlass import Int32, Float32, Boolean, const_expr
+import cutlass.utils.hopper_helpers as sm90_utils_og
+from cutlass.cutlass_dsl import if_generate
 
 
 class GemmSymmetricMixin(GemmActMixin, GemmSm90):
     def get_scheduler_class(self, varlen_m: bool = False):
         return TriangularTileScheduler
+
+    @cute.jit
+    def epilogue(
+        self,
+        params: GemmActMixin.EpilogueParams,
+        epi_smem_tensors: Tuple[cute.Tensor, ...],
+        tma_desc_epi_ptrs: list[Optional[cute.Pointer]],
+        epi_pipeline: cutlass.pipeline.PipelineAsync,
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
+        epi_read_state: cutlass.pipeline.PipelineState,
+        epi_producer_state: cutlass.pipeline.PipelineState,
+        epi_tile: cute.Tile,
+        load_acc_subtile: Callable,
+        tRS_rD: cute.Tensor,
+        tRS_rC: Optional[cute.Tensor],
+        tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
+        tiled_copy_r2s: cute.TiledCopy,
+        tRS_sD: cute.Tensor,
+        tiled_copy_s2r: Optional[cute.TiledCopy],
+        tSR_rC: Optional[cute.Tensor],
+        tSR_sC: Optional[cute.Tensor],
+        copy_D: Optional[Callable],
+        copy_C: Optional[Callable],
+        tile_coord_mnkl: cute.Coord,
+        varlen_manager: VarlenManager,
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        tile_scheduler,
+        tidx: Int32,
+        is_tma_warp: Boolean,
+    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        has_C = const_expr(tRS_rC is not None)
+        has_D = const_expr(copy_D is not None)
+
+        tma_atom_postact = params.tma_atom_postact
+        mPostAct_mnl = params.mPostAct_mnl
+        sRowVec, sColVec, sPostAct = epi_smem_tensors
+        get_smem_store_op = (
+            partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
+            if self.arch == 100
+            else sm90_utils_og.sm90_get_smem_store_op
+        )
+        copy_atom_postact_r2s = get_smem_store_op(
+            self.postact_layout, self.postact_dtype, self.acc_dtype
+        )
+        # tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
+        # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
+        tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
+        tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
+        (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
+        batch_idx = tile_coord_mnkl[3]
+        copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
+            tma_atom_postact,
+            varlen_manager.offset_batch_epi(mPostAct_mnl, batch_idx),
+            self.cta_tile_shape_postact_mn,
+            params.epi_tile_postact,
+            sPostAct,
+            tile_coord_mnkl,
+            tma_desc_ptr=tma_desc_postact_ptr,
+        )
+
+        # We iterate over epi tiles in the N dimension first before the M dimension
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+        epi_tile_num = cute.size(epi_tile_shape)
+        num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
+
+        epi_tensors = self.epi_begin(
+            params,
+            epi_smem_tensors,
+            epi_tile,
+            tiled_copy_t2r,
+            tiled_copy_r2s,
+            tile_coord_mnkl,
+            varlen_manager,
+            epilogue_barrier,
+            tidx,
+        )
+
+        if const_expr(copy_C is not None):
+            for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
+                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
+                if is_tma_warp:
+                    epi_pipeline.producer_acquire(epi_producer_state)
+                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
+                    epi_pipeline.producer_commit(epi_producer_state)
+                epi_producer_state.advance()
+
+        def tma_store_fn(src_idx, dst_idx, tile_coord_mnkl):
+            pid_m = tile_coord_mnkl[0]
+            pid_n = tile_coord_mnkl[1]
+            # Fence and barrier to make sure shared memory store is visible to TMA store
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            epilogue_barrier.arrive_and_wait()
+            # Copy from shared memory to global memory
+            if is_tma_warp: 
+                square_tile_m = pid_m // self.cluster_shape_mnk[0] 
+                square_tile_n = pid_n // self.cluster_shape_mnk[1]
+                if const_expr(has_D):
+                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
+                if square_tile_m != square_tile_n: # don't write twice to the same tile
+                    copy_postact(src_idx=src_idx, dst_idx=dst_idx)
+            # Can't use if statement here, epi_store_pipeline object isn't captured somehow
+            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
+            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
+            epilogue_barrier.arrive_and_wait()
+
+        delay_tma_store = True
+
+        src_idx_prev, dst_idx_prev = None, None
+        for epi_idx in cutlass.range_constexpr(epi_tile_num):
+            # The global memory coordinate for the current epi tile
+            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            # Copy from acc to D registers
+            load_acc_subtile(tRS_rD, epi_idx)
+            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
+            if const_expr(has_C):
+                epi_pipeline.consumer_wait(epi_read_state)
+                cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
+                # Fence to make sure shared memory read is visible to TMA load
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    epi_pipeline.consumer_release(epi_read_state)
+                epi_read_state.advance()
+            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
+                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                if is_tma_warp:
+                    epi_pipeline.producer_acquire(epi_producer_state)
+                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
+                    epi_pipeline.producer_commit(epi_producer_state)
+                epi_producer_state.advance()
+            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+            if const_expr(delay_tma_store):
+                if const_expr(epi_idx > 0):
+                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl)
+                src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
+            # Copy from D registers to shared memory
+            if const_expr(has_D):
+                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+            cute.copy(
+                tiled_copy_postact_r2s,
+                tiled_copy_postact_r2s.retile(tRS_rPostAct),
+                tRS_sPostAct[None, None, None, epi_buffer],
+            )
+            if const_expr(not delay_tma_store):
+                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord, tile_coord_mnkl=tile_coord_mnkl)
+
+        if const_expr(delay_tma_store):
+            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl)
+
+        self.epi_end(
+            params,
+            epi_tensors,
+            epi_tile,
+            tiled_copy_t2r,
+            tiled_copy_r2s,
+            tile_coord_mnkl,
+            varlen_manager,
+            tidx,
+        )
+
+        return epi_read_state, epi_producer_state
 
 
 class GemmSymmetricSm90(GemmSymmetricMixin, GemmSm90):
