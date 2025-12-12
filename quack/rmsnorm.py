@@ -48,18 +48,6 @@ class RMSNorm(ReductionBase):
                 return
         self.cluster_n = 16
 
-    def _smem_size_in_bytes(self, tiler_mn, num_warps, dtype_res=None):
-        return (
-            cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn))
-            + (
-                cute.size_in_bytes(dtype_res, cute.make_layout(tiler_mn))
-                if dtype_res is not None
-                else 0
-            )
-            + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
-            + self.stage * (cutlass.Int64.width // 8)
-        )
-
     @cute.jit
     def __call__(
         self,
@@ -99,7 +87,6 @@ class RMSNorm(ReductionBase):
             num_copy_bits=128 // largest_dtype_width * mX.element_type.width
         )
         num_threads = cute.size(tv_layout, mode=[0])
-        num_warps = num_threads // cute.arch.WARP_SIZE
         if const_expr(mW is not None):
             mW_expanded_layout = cute.prepend(
                 mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
@@ -121,9 +108,6 @@ class RMSNorm(ReductionBase):
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=([1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None),
-            smem=self._smem_size_in_bytes(
-                tiler_mn, num_warps, dtype_res=mRes.element_type if mRes is not None else None
-            ),
             stream=stream,
         )
 
@@ -504,17 +488,6 @@ class RMSNormBackward(ReductionBase):
                 return
         self.cluster_n = 16
 
-    def _smem_size_in_bytes(self, tiler_mn, num_warps, do_dtype=None):
-        if do_dtype is None:
-            do_dtype = self.dtype
-        return (
-            # We need space for X and dO, and multiply by 2 due to double buffering
-            cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn)) * 2
-            + cute.size_in_bytes(do_dtype, cute.make_layout(tiler_mn)) * 2
-            + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
-            + self.stage * (cutlass.Int64.width // 8) * 2  # mult 2 as we need 2 mbar per stage
-        )
-
     @cute.jit
     def __call__(
         self,
@@ -555,19 +528,16 @@ class RMSNormBackward(ReductionBase):
             num_copy_bits=128 // largest_dtype_width * mX.element_type.width
         )
         num_threads = cute.size(tv_layout, mode=[0])
-        num_warps = num_threads // cute.arch.WARP_SIZE
         if const_expr(mW is not None):
             mW_expanded_layout = cute.prepend(
                 mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
             )
             mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
-
         num_blocks = sm_count
         self.kernel(mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tv_layout, tiler_mn).launch(
             grid=[num_blocks, self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
-            smem=self._smem_size_in_bytes(tiler_mn, num_warps, do_dtype=mdO.element_type),
             stream=stream,
         )
 

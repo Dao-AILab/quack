@@ -70,14 +70,12 @@ class CrossEntropy(ReductionBase):
         num_copy_bits = math.gcd(self.N, 128 // self.dtype.width) * self.dtype.width
         tiler_mn, tv_layout = self._get_tv_layout(num_copy_bits=num_copy_bits)
         num_threads = cute.size(tv_layout, mode=[0])
-        num_warps = num_threads // cute.arch.WARP_SIZE
         self.kernel(
             mX, mTarget, mTargetLogit, mLoss, mLSE, mdX, ignore_index, tv_layout, tiler_mn
         ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=([1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None),
-            smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
 

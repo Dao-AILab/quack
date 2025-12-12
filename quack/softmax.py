@@ -221,14 +221,6 @@ class SoftmaxBackward(ReductionBase):
     def _get_num_threads(self):
         return 128 if self.N <= 8192 else 256
 
-    def _smem_size_in_bytes(self, tiler_mn, num_warps):
-        return (
-            # Multiply by 2 since we need space for Y and dY
-            cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn)) * 2
-            + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
-            + self.stage * (Int64.width // 8)
-        )
-
     @cute.jit
     def __call__(
         self,
@@ -243,12 +235,10 @@ class SoftmaxBackward(ReductionBase):
         self._set_cluster_n()
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
-        num_warps = num_threads // cute.arch.WARP_SIZE
         self.kernel(mdY, mY, mdX, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mdY.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
-            smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
 

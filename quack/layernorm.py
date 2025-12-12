@@ -59,7 +59,6 @@ class LayerNorm(ReductionBase):
         self._set_cluster_n()
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
-        num_warps = num_threads // cute.arch.WARP_SIZE
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
         mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
         if const_expr(mRstd is not None):
@@ -76,7 +75,6 @@ class LayerNorm(ReductionBase):
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
-            smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
 

@@ -42,13 +42,6 @@ class ReductionBase:
         )
         return tiler_mn, tv_layout
 
-    def _smem_size_in_bytes(self, tiler_mn, num_warps):
-        return (
-            cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn))
-            + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
-            + self.stage * (Int64.width // 8)
-        )
-
     def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         warps_per_row = max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
