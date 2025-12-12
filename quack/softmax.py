@@ -7,7 +7,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int64, Float32, const_expr
-from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
 from quack.reduce import row_reduce, online_softmax_reduce
@@ -169,20 +168,23 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
-    convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1)
-        )
-    )
-    x_tensor, out_tensor = [convert_from_dlpack(tensor) for tensor in (x, out)]
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compile_key = (dtype, N)
     if compile_key not in _softmax_fwd.compile_cache:
+        batch_sym = cute.sym_int()
+        x_cute, out_cute = [
+            cute.runtime.make_fake_tensor(
+                dtype,
+                (batch_sym, N),
+                stride=(cute.sym_int(divisibility=128 // dtype.width), 1),
+                assumed_align=16,
+            )
+        ] * 2
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         softmax_op = Softmax(dtype, N)
         _softmax_fwd.compile_cache[compile_key] = cute.compile(
-            softmax_op, x_tensor, out_tensor, current_stream
+            softmax_op, x_cute, out_cute, stream, options="--enable-tvm-ffi"
         )
-    _softmax_fwd.compile_cache[compile_key](x_tensor, out_tensor, current_stream)
+    _softmax_fwd.compile_cache[compile_key](x, out)
 
 
 _softmax_fwd.compile_cache = {}
@@ -354,21 +356,23 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
 
     N = dy.size(1)
     dtype = torch2cute_dtype_map[dy.dtype]
-    convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1)
-        )
-    )
-    dy_tensor, y_tensor, dx_tensor = [convert_from_dlpack(tensor) for tensor in (dy, y, dx)]
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
     compile_key = (dtype, N)
     if compile_key not in _softmax_backward.compile_cache:
+        batch_sym = cute.sym_int()
+        dy_cute, y_cute, dx_cute = [
+            cute.runtime.make_fake_tensor(
+                dtype,
+                (batch_sym, N),
+                stride=(cute.sym_int(divisibility=128 // dtype.width), 1),
+                assumed_align=16,
+            )
+        ] * 3
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         softmax_backward_op = SoftmaxBackward(dtype, N)
         _softmax_backward.compile_cache[compile_key] = cute.compile(
-            softmax_backward_op, dy_tensor, y_tensor, dx_tensor, current_stream
+            softmax_backward_op, dy_cute, y_cute, dx_cute, stream, options="--enable-tvm-ffi"
         )
-    _softmax_backward.compile_cache[compile_key](dy_tensor, y_tensor, dx_tensor, current_stream)
+    _softmax_backward.compile_cache[compile_key](dy, y, dx)
 
 
 _softmax_backward.compile_cache = {}
