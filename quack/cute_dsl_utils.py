@@ -1,9 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
-import os
-import pathlib
 from typing import Tuple
-from functools import partial, lru_cache
+from functools import lru_cache
 from dataclasses import dataclass, fields
 
 import torch
@@ -15,7 +13,7 @@ except ImportError:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float16, BFloat16, Float32
+from cutlass import Int32, Float16, BFloat16, Float32
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
 
@@ -30,6 +28,7 @@ cute_compile_og = cute.compile
 torch2cute_dtype_map = {
     torch.float16: Float16,
     torch.bfloat16: BFloat16,
+    torch.int32: Int32,
     torch.float32: Float32,
 }
 
@@ -102,24 +101,3 @@ class ArgumentsBase(JitArgument):
             non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
             values = values[n_items:]
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
-
-
-def load_cubin_module_data_patched(cubin_data, filepath):
-    pathlib.Path(filepath).write_bytes(cubin_data)
-    return load_cubin_module_data_og(cubin_data)
-
-
-def cute_compile_patched(*args, **kwargs):
-    """A patched version of cute.compile that dump the SASS to a file if CUTE_CUBIN_PATH is set."""
-    cubin_path = os.getenv("CUTE_CUBIN_PATH", None)
-    if cubin_path is not None:
-        cutlass.base_dsl.runtime.cuda.load_cubin_module_data = partial(
-            load_cubin_module_data_patched, filepath=cubin_path
-        )
-    output = cute_compile_og(*args, **kwargs)
-    if cubin_path is not None:
-        cutlass.base_dsl.runtime.cuda.load_cubin_module_data = load_cubin_module_data_og
-        if extract is not None:
-            sass = extract(cubin_path, None)
-            pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
-    return output
