@@ -33,39 +33,22 @@ class CrossEntropy(ReductionBase):
 
     def _calculate_threads_per_row(self):
         N = self.N
-        return (
-            8
-            if N <= 64
-            else (
-                16
-                if N <= 128
-                else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
-            )
-        )
+        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
+            if N <= limit:
+                return threads
+        return 256
 
     def _set_cluster_n(self):
         N = self.N
         if const_expr(self.dtype.width == 16):
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 32 * 1024
-                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-                )
-            )
-        else:  # fp32
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 64 * 1024
-                    else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
-                )
-            )
-        self.cluster_n = cluster_n
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        else:
+            thresholds = [(16 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
+        for limit, cluster in thresholds:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
 
     @cute.jit
     def __call__(
@@ -407,15 +390,10 @@ class CrossEntropyBackward:
 
     def _calculate_threads_per_row(self):
         N = min(self.N, 16384)  # We split by blocks of 16k
-        return (
-            8
-            if N <= 64
-            else (
-                16
-                if N <= 128
-                else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
-            )
-        )
+        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
+            if N <= limit:
+                return threads
+        return 256
 
     def _get_tv_layout(self, num_copy_bits=128):
         vecsize = num_copy_bits // self.dtype.width

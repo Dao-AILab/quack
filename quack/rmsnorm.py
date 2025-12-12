@@ -28,56 +28,25 @@ class RMSNorm(ReductionBase):
         self.delay_w_load = False
 
     def _calculate_threads_per_row(self):
-        """Calculate the number of threads per row for the RMSNorm kernel."""
         N = self.N
-        if N <= 64:
-            return 8
-        elif N <= 128:
-            return 16
-        elif N <= 3072:
-            return 32
-        elif N <= 6144:
-            return 64
-        elif N <= 16384:
-            return 128
-        else:
-            return 256
+        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
+            if N <= limit:
+                return threads
+        return 256
 
     def _set_cluster_n(self):
-        """
-        Set the number of clusters for the RMSNorm kernel.
-        Stored in self.cluster_n.
-        """
         N = self.N
-
         # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
         # Similarly cluster_n = 8 is faster for N=128k
         if const_expr(self.dtype.width == 16):
-            # 16-bit types (fp16, bf16)
-            if N <= 16 * 1024:
-                cluster_n = 1
-            elif N <= 32 * 1024:
-                cluster_n = 2
-            elif N <= 64 * 1024:
-                cluster_n = 4
-            elif N <= 128 * 1024:
-                cluster_n = 8
-            else:
-                cluster_n = 16
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
-            # 32-bit types (fp32)
-            if N <= 32 * 1024:
-                cluster_n = 1
-            elif N <= 64 * 1024:
-                cluster_n = 2
-            elif N <= 128 * 1024:
-                cluster_n = 4
-            elif N <= 256 * 1024:
-                cluster_n = 8
-            else:
-                cluster_n = 16
-
-        self.cluster_n = cluster_n
+            thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
+        for limit, cluster in thresholds:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
 
     def _smem_size_in_bytes(self, tiler_mn, num_warps, dtype_res=None):
         return (
@@ -522,24 +491,18 @@ class RMSNormBackward(ReductionBase):
 
     def _calculate_threads_per_row(self):
         N = self.N
-        return (
-            8
-            if N <= 64
-            else (
-                16
-                if N <= 128
-                else (32 if N <= 256 else (64 if N <= 512 else (128 if N <= 4096 else 256)))
-            )
-        )
+        for limit, threads in [(64, 8), (128, 16), (256, 32), (512, 64), (4096, 128)]:
+            if N <= limit:
+                return threads
+        return 256
 
     def _set_cluster_n(self):
         N = self.N
-        cluster_n = (
-            1
-            if N <= 8 * 1024
-            else (2 if N <= 16 * 1024 else (4 if N <= 32 * 1024 else (8 if N <= 64 * 1024 else 16)))
-        )
-        self.cluster_n = cluster_n
+        for limit, cluster in [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
 
     def _smem_size_in_bytes(self, tiler_mn, num_warps, do_dtype=None):
         if do_dtype is None:

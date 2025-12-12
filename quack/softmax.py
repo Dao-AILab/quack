@@ -28,39 +28,22 @@ class Softmax(ReductionBase):
 
     def _calculate_threads_per_row(self):
         N = self.N
-        return (
-            8
-            if N <= 64
-            else (
-                16
-                if N <= 128
-                else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
-            )
-        )
+        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
+            if N <= limit:
+                return threads
+        return 256
 
     def _set_cluster_n(self):
         N = self.N
         if const_expr(self.dtype.width == 16):
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 32 * 1024
-                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-                )
-            )
-        else:  # fp32
-            cluster_n = (
-                1
-                if N <= 32 * 1024
-                else (
-                    2
-                    if N <= 64 * 1024
-                    else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
-                )
-            )
-        self.cluster_n = cluster_n
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        else:
+            thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
+        for limit, cluster in thresholds:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
 
     @cute.jit
     def __call__(
@@ -74,12 +57,10 @@ class Softmax(ReductionBase):
         self._set_cluster_n()
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
-        num_warps = num_threads // cute.arch.WARP_SIZE
         self.kernel(mX, mO, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
-            smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
 
@@ -93,10 +74,7 @@ class Softmax(ReductionBase):
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        if const_expr(self.cluster_n > 1):
-            cluster_y = cute.arch.block_idx()[1]
-        else:
-            cluster_y = const_expr(0)
+        cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
 
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
@@ -116,7 +94,6 @@ class Softmax(ReductionBase):
         copy_atom_store_O = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=128
         )
-
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
         thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
 
@@ -232,39 +209,22 @@ class SoftmaxBackward(ReductionBase):
 
     def _calculate_threads_per_row(self):
         N = self.N
-        return (
-            8
-            if N <= 64
-            else (
-                16
-                if N <= 128
-                else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 8192 else 256)))
-            )
-        )
+        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (8192, 128)]:
+            if N <= limit:
+                return threads
+        return 256
 
     def _set_cluster_n(self):
         N = self.N
         if const_expr(self.dtype.width == 16):
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 32 * 1024
-                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-                )
-            )
-        else:  # fp32
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 32 * 1024
-                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-                )
-            )
-        self.cluster_n = cluster_n
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        else:
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        for limit, cluster in thresholds:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
 
     def _get_num_threads(self):
         return 128 if self.N <= 8192 else 256

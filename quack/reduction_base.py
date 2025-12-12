@@ -63,7 +63,7 @@ class ReductionBase:
         reduction_buffer = smem.allocate_tensor(
             self.reduction_dtype,
             self._get_reduction_buffer_layout(tv_layout, self.cluster_n),
-            byte_alignment=4,
+            byte_alignment=8,
         )
         if const_expr(self.cluster_n > 1):
             mbar_ptr = smem.allocate_array(
