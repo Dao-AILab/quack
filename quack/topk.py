@@ -9,7 +9,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from cutlass import const_expr
+from cutlass import Int32, Float32, const_expr
 
 import quack.utils as utils
 from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -61,7 +61,7 @@ class TopK:
     ):
         assert mX.element_type == self.dtype
         assert mValues.element_type == self.dtype
-        assert mIndices.element_type == cutlass.Int32
+        assert mIndices.element_type == Int32
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
         self.kernel(mX, mValues, mIndices, tv_layout, tiler_mn).launch(
@@ -107,13 +107,13 @@ class TopK:
         )
         if tXcX[0][0] < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
-        tXrX_f32 = cute.make_fragment(tXrX.shape, cutlass.Float32)
-        tXrX_f32.store(tXrX.load().to(cutlass.Float32))
+        tXrX_f32 = cute.make_fragment(tXrX.shape, Float32)
+        tXrX_f32.store(tXrX.load().to(Float32))
 
         # Encode the indices into the bottom bits of values.
         log_N = int(math.log2(self.N))
         idx_mask = (1 << log_N) - 1
-        vecsize = cutlass.const_expr(tv_layout.shape[1][0])
+        vecsize = const_expr(tv_layout.shape[1][0])
         tXrX_u32 = cute.recast_tensor(tXrX_f32, cutlass.Uint32)
         # Encode indices into the last log_N bits of tXrX_u32
         for i in cutlass.range(cute.size(tXrX_u32), unroll_full=True):
@@ -136,7 +136,7 @@ class TopK:
 
         # Extract indices and clean values
         topk_vals_u32 = cute.recast_tensor(topk_vals, cutlass.Uint32)
-        topk_indices = cute.make_fragment(self.k, cutlass.Int32)
+        topk_indices = cute.make_fragment(self.k, Int32)
         for i in cutlass.range(self.k):
             # Extract the encoded index from the last log_N bits
             encoded_idx = topk_vals_u32[i] & idx_mask
@@ -144,7 +144,7 @@ class TopK:
             topk_vals_u32[i] = topk_vals_u32[i] & ~idx_mask  # Clear last log_N bits
             # If positive, we need to invert the bits back to get original index
             col_idx = ~encoded_idx if topk_vals[i] >= 0 else encoded_idx
-            topk_indices[i] = cutlass.Int32(col_idx & idx_mask)
+            topk_indices[i] = Int32(col_idx & idx_mask)
 
         # Convert cleaned values to output type
         topk_vals_out = cute.make_fragment_like(topk_vals, mValues.element_type)

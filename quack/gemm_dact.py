@@ -6,7 +6,7 @@ from torch import Tensor
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import const_expr
+from cutlass import Float32, const_expr
 import cutlass.torch as cutlass_torch
 
 from quack.gemm_sm90 import GemmSm90
@@ -130,7 +130,7 @@ def gemm_dact(
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
     GemmCls = GemmDActSm100 if device_capacity[0] > 9 else GemmDActSm90
 
-    acc_dtype = cutlass.Float32
+    acc_dtype = Float32
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     if not GemmCls.is_valid_dtypes(

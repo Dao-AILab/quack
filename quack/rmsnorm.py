@@ -252,7 +252,7 @@ class RMSNorm(ReductionBase):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
             utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
         )
@@ -1148,7 +1148,15 @@ class RMSNormFunction(torch.autograd.Function):
         x_shape_og = ctx.x_shape_og
         # Reshape dout to match the flattened shape used in forward
         dout = dout.view(-1, dout.shape[-1])
-        dx, dw, db, dresidual = rmsnorm_bwd(x, weight, dout, rstd, dresidual_out, has_bias, has_residual=ctx.residual_dtype is not None)
+        dx, dw, db, dresidual = rmsnorm_bwd(
+            x,
+            weight,
+            dout,
+            rstd,
+            dresidual_out,
+            has_bias,
+            has_residual=ctx.residual_dtype is not None,
+        )
         dx = dx.view(x_shape_og)
         if dresidual is not None:
             dresidual = dresidual.reshape(x_shape_og)

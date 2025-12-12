@@ -5,6 +5,7 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Int32, Float32, const_expr
 
 import quack.utils as utils
 from quack.sort.utils import compare_and_swap
@@ -19,7 +20,7 @@ def bitonic_merge(
     ascending: cutlass.Constexpr[bool] = True,
 ) -> None:
     """Merge a bitonic sequence into a sorted sequence using iterative approach."""
-    if cutlass.const_expr(n > 1):
+    if const_expr(n > 1):
         num_levels = int(math.log2(n))
         assert n == 2**num_levels, "n must be a power of 2"
         # This one must be range_constexpr otherwise it's very slow for n = 128
@@ -48,11 +49,11 @@ def bitonic_sort(
         start: Starting index (default 0)
         ascending: Sort in ascending order (default True)
     """
-    if cutlass.const_expr(n is None):
+    if const_expr(n is None):
         n = cute.size(arr.shape)
     assert n <= 128
-    if cutlass.const_expr(n > 1):
-        if cutlass.const_expr(n in [2, 4, 8, 16, 32, 64]):
+    if const_expr(n > 1):
+        if const_expr(n in [2, 4, 8, 16, 32, 64]):
             optimal_sort(arr, n, start, ascending)
         else:  # Fall back to bitonic sort
             assert n % 2 == 0
@@ -73,9 +74,9 @@ def bitonic_topk_merge(
     start1: cutlass.Constexpr[int] = 0,
     ascending: cutlass.Constexpr[bool] = False,
 ) -> None:
-    if cutlass.const_expr(k is None):
+    if const_expr(k is None):
         k = cute.size(arr0.shape)
-    if cutlass.const_expr(arr0.element_type == cutlass.Float32):
+    if const_expr(arr0.element_type == Float32):
         minmax_fn = utils.fmin if ascending else cute.arch.fmax
     else:
         minmax_fn = min if ascending else max
@@ -101,7 +102,7 @@ def bitonic_topk(
         k: must be power of 2 and <= 128
         ascending: Sort in ascending order (default False)
     """
-    assert arr.element_type in [cutlass.Float32, cutlass.Int32]
+    assert arr.element_type in [Float32, Int32]
     n = cute.size(arr.shape)
     assert k == 1 << int(math.log2(k)), "k must be a power of 2"
     assert n % k == 0, "n must be divisible by k"

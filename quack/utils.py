@@ -7,7 +7,7 @@ from typing import Optional, Tuple, Type, Union
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.runtime import from_dlpack
@@ -62,11 +62,11 @@ def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
 
 @dsl_user_op
 def set_block_rank(
-    smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None
-) -> cutlass.Int32:
+    smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None
+) -> Int32:
     """Map the given smem pointer to the address at another CTA rank in the cluster."""
     smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    return cutlass.Int32(
+    return Int32(
         llvm.inline_asm(
             T.i32(),
             [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
@@ -214,7 +214,7 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
         ),
-        cutlass.Boolean,
+        Boolean,
     )
     for rest_v in cutlass.range_constexpr(tApA.shape[0]):
         for rest_k in cutlass.range_constexpr(tApA.shape[2]):
@@ -303,7 +303,7 @@ def coord_offset_i64(
 
 
 @cute.jit
-def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
     if const_expr(lane is None):
         lane = cute.arch.lane_idx()
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):

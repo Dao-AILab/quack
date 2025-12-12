@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass import Int32, Int64, Float32, Boolean, const_expr
 from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
@@ -26,7 +26,7 @@ class CrossEntropy(ReductionBase):
             dtype,
             N,
             stage=2 if not online_softmax else 1,
-            reduction_dtype=Float32 if not online_softmax else cutlass.Int64,
+            reduction_dtype=Float32 if not online_softmax else Int64,
         )
         self.online_softmax = online_softmax
         self.reload_from = None if N <= 16384 or online_softmax else "smem"
@@ -551,7 +551,7 @@ class CrossEntropyBackward:
         log2_e = math.log2(math.e)
         probs = cute.math.exp2(x * log2_e - (lse * log2_e), fastmath=True)
         prob_shifted = probs - 1.0
-        mask = cute.make_fragment_like(tXrX, cutlass.Boolean)
+        mask = cute.make_fragment_like(tXrX, Boolean)
         for i in cutlass.range(cute.size(tXcFull), unroll_full=True):
             mask[i] = tXcFull[i][1] == target
         grad = cute.where(mask.load(), prob_shifted, probs)

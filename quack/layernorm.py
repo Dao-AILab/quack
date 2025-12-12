@@ -8,6 +8,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Float32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import quack.utils as utils
 from quack.reduce import row_reduce
@@ -37,7 +38,7 @@ class LayerNorm(ReductionBase):
         N = self.N
         # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
         # Similarly cluster_n = 8 is faster for N=128k
-        if cutlass.const_expr(self.dtype.width == 16):
+        if const_expr(self.dtype.width == 16):
             cluster_n = (
                 1
                 if N <= 16 * 1024
@@ -68,7 +69,7 @@ class LayerNorm(ReductionBase):
         mRstd: Optional[cute.Tensor],
         mMean: Optional[cute.Tensor],
         stream: cuda.CUstream,
-        eps: cutlass.Float32 = 1e-6,
+        eps: Float32 = 1e-6,
     ):
         assert mX.element_type == self.dtype
         assert mO.element_type == self.dtype
@@ -78,12 +79,12 @@ class LayerNorm(ReductionBase):
         num_warps = num_threads // cute.arch.WARP_SIZE
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
         mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
-        if cutlass.const_expr(mRstd is not None):
+        if const_expr(mRstd is not None):
             mRstd_expanded_layout = cute.append(
                 mRstd.layout, cute.make_layout((self.N,), stride=(0,))
             )
             mRstd = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
-        if cutlass.const_expr(mMean is not None):
+        if const_expr(mMean is not None):
             mMean_expanded_layout = cute.append(
                 mMean.layout, cute.make_layout((self.N,), stride=(0,))
             )
@@ -91,7 +92,7 @@ class LayerNorm(ReductionBase):
         self.kernel(mX, mW, mO, mRstd, mMean, eps, tv_layout, tiler_mn, self.reload_from).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
+            cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -112,10 +113,10 @@ class LayerNorm(ReductionBase):
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(self.cluster_n > 1):
+        if const_expr(self.cluster_n > 1):
             cluster_y = cute.arch.block_idx()[1]
         else:
-            cluster_y = cutlass.const_expr(0)
+            cluster_y = const_expr(0)
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -133,12 +134,12 @@ class LayerNorm(ReductionBase):
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
         gRstd = (
             cute.local_tile(mRstd, tiler_mn, (bidx, cluster_y))
-            if cutlass.const_expr(mRstd is not None)
+            if const_expr(mRstd is not None)
             else None
         )
         gMean = (
             cute.local_tile(mMean, tiler_mn, (bidx, cluster_y))
-            if cutlass.const_expr(mMean is not None)
+            if const_expr(mMean is not None)
             else None
         )
 
@@ -166,8 +167,8 @@ class LayerNorm(ReductionBase):
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
         tXgO = thr_copy_O.partition_D(gO)
-        tXrRstd = thr_copy_O.partition_D(gRstd) if cutlass.const_expr(mRstd is not None) else None
-        tXrMean = thr_copy_O.partition_D(gMean) if cutlass.const_expr(mMean is not None) else None
+        tXrRstd = thr_copy_O.partition_D(gRstd) if const_expr(mRstd is not None) else None
+        tXrMean = thr_copy_O.partition_D(gMean) if const_expr(mMean is not None) else None
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
@@ -185,7 +186,7 @@ class LayerNorm(ReductionBase):
         cute.arch.cp_async_commit_group()
 
         tWpW = utils.predicate_k(thr_copy_W.partition_S(cX), limit=shape[1])
-        if cutlass.const_expr(not delay_w_load):
+        if const_expr(not delay_w_load):
             cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
 
         cute.arch.cp_async_wait_group(0)
@@ -197,15 +198,15 @@ class LayerNorm(ReductionBase):
             cute.ReductionOp.ADD,
             threads_per_row,
             reduction_buffer[None, None, 0],
-            mbar_ptr + 0 if cutlass.const_expr(self.cluster_n > 1) else None,
+            mbar_ptr + 0 if const_expr(self.cluster_n > 1) else None,
             init_val=0.0,
-            hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+            hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
         )
         mean = sum_x / shape[1]
-        if cutlass.const_expr(reload_from == "smem"):
+        if const_expr(reload_from == "smem"):
             cute.autovec_copy(tXsX, tXrX)
             x = tXrX.load().to(cute.Float32)
-        elif cutlass.const_expr(reload_from == "gmem"):
+        elif const_expr(reload_from == "gmem"):
             cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
             x = tXrX.load().to(cute.Float32)
 
@@ -214,11 +215,11 @@ class LayerNorm(ReductionBase):
             cute.ReductionOp.ADD,
             threads_per_row,
             reduction_buffer[None, None, 1],
-            mbar_ptr + 1 if cutlass.const_expr(self.cluster_n > 1) else None,
+            mbar_ptr + 1 if const_expr(self.cluster_n > 1) else None,
             init_val=0.0,
         )
         rstd = cute.math.rsqrt(sum_sq_x_sub_mean / shape[1] + eps, fastmath=True)
-        if cutlass.const_expr(mRstd is not None):
+        if const_expr(mRstd is not None):
             # Only the thread corresponding to column 0 writes out the rstd to gmem
             if (
                 tXcX[0][1] == 0
@@ -226,7 +227,7 @@ class LayerNorm(ReductionBase):
                 and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
             ):
                 tXrRstd[0] = rstd
-        if cutlass.const_expr(mMean is not None):
+        if const_expr(mMean is not None):
             # Only the thread corresponding to column 0 writes out the mean to gmem
             if (
                 tXcX[0][1] == 0
@@ -234,12 +235,12 @@ class LayerNorm(ReductionBase):
                 and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
             ):
                 tXrMean[0] = mean
-        if cutlass.const_expr(delay_w_load):
+        if const_expr(delay_w_load):
             cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
-        if cutlass.const_expr(reload_from == "smem"):
+        if const_expr(reload_from == "smem"):
             cute.autovec_copy(tXsX, tXrX)
             x = tXrX.load().to(cute.Float32)
-        elif cutlass.const_expr(reload_from == "gmem"):
+        elif const_expr(reload_from == "gmem"):
             cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
             x = tXrX.load().to(cute.Float32)
         x_hat = (x - mean) * rstd
@@ -295,7 +296,7 @@ def layernorm(
         for t in (x, out)
     ]
     weight_tensor = utils.convert_from_dlpack(
-        weight.detach(), leading_dim=0, divisibility=128 // cutlass.Float32.width
+        weight.detach(), leading_dim=0, divisibility=128 // Float32.width
     )
     rstd_tensor = (
         from_dlpack(rstd.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)

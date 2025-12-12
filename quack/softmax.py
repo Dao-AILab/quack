@@ -6,6 +6,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Int64, Float32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
@@ -21,7 +22,7 @@ class Softmax(ReductionBase):
             dtype,
             N,
             stage=2 if not online_softmax else 1,
-            reduction_dtype=cutlass.Float32 if not online_softmax else cutlass.Int64,
+            reduction_dtype=Float32 if not online_softmax else Int64,
         )
         self.online_softmax = online_softmax
 
@@ -39,7 +40,7 @@ class Softmax(ReductionBase):
 
     def _set_cluster_n(self):
         N = self.N
-        if cutlass.const_expr(self.dtype.width == 16):
+        if const_expr(self.dtype.width == 16):
             cluster_n = (
                 1
                 if N <= 16 * 1024
@@ -77,7 +78,7 @@ class Softmax(ReductionBase):
         self.kernel(mX, mO, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
+            cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -92,18 +93,15 @@ class Softmax(ReductionBase):
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(self.cluster_n > 1):
+        if const_expr(self.cluster_n > 1):
             cluster_y = cute.arch.block_idx()[1]
         else:
-            cluster_y = cutlass.const_expr(0)
+            cluster_y = const_expr(0)
 
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
-        mX, mO = [utils.domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mX, mO)]
-        gX, gO = [cute.local_tile(mT, tiler_mn, (0, cluster_y)) for mT in (mX, mO)]
-        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
+        gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -133,7 +131,7 @@ class Softmax(ReductionBase):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
             utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
         )
@@ -142,21 +140,21 @@ class Softmax(ReductionBase):
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         # Fill OOB values with -inf
-        if cutlass.const_expr(not is_even_N):
+        if const_expr(not is_even_N):
             utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
 
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)
         threads_per_row = tv_layout.shape[0][0]
-        if cutlass.const_expr(not self.online_softmax):
+        if const_expr(not self.online_softmax):
             max_x = row_reduce(
                 x,
                 cute.ReductionOp.MAX,
                 threads_per_row,
                 reduction_buffer[None, None, 0],
-                mbar_ptr + 0 if cutlass.const_expr(self.cluster_n > 1) else None,
-                init_val=-cutlass.Float32.inf,
-                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+                mbar_ptr + 0 if const_expr(self.cluster_n > 1) else None,
+                init_val=-Float32.inf,
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
             )
             log2_e = math.log2(math.e)
             exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=True)
@@ -165,7 +163,7 @@ class Softmax(ReductionBase):
                 cute.ReductionOp.ADD,
                 threads_per_row,
                 reduction_buffer[None, None, 1],
-                mbar_ptr + 1 if cutlass.const_expr(self.cluster_n > 1) else None,
+                mbar_ptr + 1 if const_expr(self.cluster_n > 1) else None,
                 init_val=0.0,
             )
         else:
@@ -174,7 +172,7 @@ class Softmax(ReductionBase):
                 threads_per_row,
                 reduction_buffer[None, None, 0],
                 mbar_ptr,
-                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
                 return_exp_x=True,
             )
         # y = exp_x * (1.0 / denom)
@@ -182,7 +180,7 @@ class Softmax(ReductionBase):
         tXrO.store(y.to(tXrO.element_type))
         tOpO = (
             utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
-            if cutlass.const_expr(not is_even_N)
+            if const_expr(not is_even_N)
             else None
         )
         if tXcX[0][0] < shape[0]:
@@ -230,7 +228,7 @@ def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
 class SoftmaxBackward(ReductionBase):
     def __init__(self, dtype: Type[cutlass.Numeric], N: int):
         # 1 stage for computing dot product
-        super().__init__(dtype, N, stage=1, reduction_dtype=cutlass.Float32)
+        super().__init__(dtype, N, stage=1, reduction_dtype=Float32)
 
     def _calculate_threads_per_row(self):
         N = self.N
@@ -246,7 +244,7 @@ class SoftmaxBackward(ReductionBase):
 
     def _set_cluster_n(self):
         N = self.N
-        if cutlass.const_expr(self.dtype.width == 16):
+        if const_expr(self.dtype.width == 16):
             cluster_n = (
                 1
                 if N <= 16 * 1024
@@ -276,7 +274,7 @@ class SoftmaxBackward(ReductionBase):
             # Multiply by 2 since we need space for Y and dY
             cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn)) * 2
             + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
-            + self.stage * (cutlass.Int64.width // 8)
+            + self.stage * (Int64.width // 8)
         )
 
     @cute.jit
@@ -297,7 +295,7 @@ class SoftmaxBackward(ReductionBase):
         self.kernel(mdY, mY, mdX, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mdY.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
+            cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -313,14 +311,17 @@ class SoftmaxBackward(ReductionBase):
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        if cutlass.const_expr(self.cluster_n > 1):
+        if const_expr(self.cluster_n > 1):
             cluster_y = cute.arch.block_idx()[1]
         else:
-            cluster_y = cutlass.const_expr(0)
+            cluster_y = const_expr(0)
 
         shape = mdY.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
+        gdY, gY, gdX, cX = [
+            cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mdY, mY, mdX, idX)
+        ]
         mdY, mY, mdX = [
             utils.domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mdY, mY, mdX)
         ]
@@ -360,10 +361,10 @@ class SoftmaxBackward(ReductionBase):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tdYpdY = (
             utils.predicate_k(thr_copy_load.partition_S(cX), limit=shape[1])
-            if cutlass.const_expr(not is_even_N)
+            if const_expr(not is_even_N)
             else None
         )
 
@@ -385,9 +386,9 @@ class SoftmaxBackward(ReductionBase):
             cute.ReductionOp.ADD,
             threads_per_row,
             reduction_buffer[None, None, 0],
-            mbar_ptr if cutlass.const_expr(self.cluster_n > 1) else None,
+            mbar_ptr if const_expr(self.cluster_n > 1) else None,
             init_val=0.0,
-            hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+            hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
         )
 
         # Compute gradient: dx_i = y_i × (dy_i - dot)
@@ -395,7 +396,7 @@ class SoftmaxBackward(ReductionBase):
         tdXrdX.store(dx.to(tdXrdX.element_type))
         tdXpdX = (
             utils.predicate_k(thr_copy_store.partition_S(cX), limit=shape[1])
-            if cutlass.const_expr(not is_even_N)
+            if const_expr(not is_even_N)
             else None
         )
         if tXcX[0][0] < shape[0]:

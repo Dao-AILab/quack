@@ -15,6 +15,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import make_ptr
 from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.utils.hopper_helpers as sm90_utils_og
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import if_generate
 
 
@@ -119,12 +120,12 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
             )
             epilogue_barrier.arrive_and_wait()
             # Copy from shared memory to global memory
-            if is_tma_warp: 
-                square_tile_m = pid_m // self.cluster_shape_mnk[0] 
+            if is_tma_warp:
+                square_tile_m = pid_m // self.cluster_shape_mnk[0]
                 square_tile_n = pid_n // self.cluster_shape_mnk[1]
                 if const_expr(has_D):
                     copy_D(src_idx=src_idx, dst_idx=dst_idx)
-                if square_tile_m != square_tile_n: # don't write twice to the same tile
+                if square_tile_m != square_tile_n:  # don't write twice to the same tile
                     copy_postact(src_idx=src_idx, dst_idx=dst_idx)
             # Can't use if statement here, epi_store_pipeline object isn't captured somehow
             if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
@@ -162,7 +163,9 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(delay_tma_store):
                 if const_expr(epi_idx > 0):
-                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl)
+                    tma_store_fn(
+                        src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl
+                    )
                 src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
             # Copy from D registers to shared memory
             if const_expr(has_D):
@@ -173,10 +176,14 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
             if const_expr(not delay_tma_store):
-                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord, tile_coord_mnkl=tile_coord_mnkl)
+                tma_store_fn(
+                    src_idx=epi_buffer, dst_idx=gmem_coord, tile_coord_mnkl=tile_coord_mnkl
+                )
 
         if const_expr(delay_tma_store):
-            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl)
+            tma_store_fn(
+                src_idx=src_idx_prev, dst_idx=dst_idx_prev, tile_coord_mnkl=tile_coord_mnkl
+            )
 
         self.epi_end(
             params,
@@ -238,7 +245,7 @@ def gemm_symmetric(
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
     GemmCls = GemmSymmetricSm90 if device_capacity[0] == 9 else GemmSymmetricSm100
 
-    acc_dtype = cutlass.Float32
+    acc_dtype = Float32
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     if not GemmCls.is_valid_dtypes(

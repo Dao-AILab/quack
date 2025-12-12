@@ -6,7 +6,7 @@ from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 
 import quack.utils as utils
 from quack.fast_math import FastDivmod
@@ -397,7 +397,7 @@ class TriangularTileScheduler(TileScheduler):
     class Params(ParamsBase):
         problem_shape_ncluster_mnl: cute.Shape
         num_clusters_per_problem_divmod: FastDivmod
-        group_size_inv_f32: cutlass.Float32
+        group_size_inv_f32: Float32
         num_groups_regular: Int32
         group_size_divmod: FastDivmod
         group_size_tail_divmod: FastDivmod
@@ -428,7 +428,7 @@ class TriangularTileScheduler(TileScheduler):
             return TriangularTileScheduler.Params(
                 problem_shape_ncluster_mnl,
                 FastDivmod.create(num_clusters_per_problem),
-                cutlass.Float32(1.0 / group_size),
+                Float32(1.0 / group_size),
                 num_groups_regular,
                 FastDivmod.create(group_size),
                 # Don't divide by 0

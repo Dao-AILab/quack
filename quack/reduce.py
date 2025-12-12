@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Int32, Int64, Float32, const_expr
 
 import quack.utils as utils
 
@@ -17,7 +17,7 @@ def warp_reduce(
     op: Callable,
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
-    if cutlass.const_expr(isinstance(val, cute.TensorSSA)):
+    if const_expr(isinstance(val, cute.TensorSSA)):
         res = cute.make_fragment(val.shape, val.dtype)
         res.store(val)
         for i in cutlass.range_constexpr(cute.size(val.shape)):
@@ -53,7 +53,7 @@ def cluster_reduce(
     reduction_buffer: cute.Tensor,
     mbar_ptr: cute.Pointer,
     init_val: cute.Numeric = 0.0,
-    phase: Optional[cutlass.Int32] = None,
+    phase: Optional[Int32] = None,
 ) -> cute.Numeric:
     """reduction_buffer has shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
@@ -90,11 +90,11 @@ def block_or_cluster_reduce(
     op: Callable,
     reduction_buffer: cute.Tensor,
     mbar_ptr: Optional[cute.Pointer],
-    phase: Optional[cutlass.Int32] = None,
+    phase: Optional[Int32] = None,
     init_val: cute.Numeric = 0.0,
 ) -> cute.Numeric:
     """Perform either block or cluster reduction based on whether mbar_ptr is provided."""
-    if cutlass.const_expr(mbar_ptr is None):
+    if const_expr(mbar_ptr is None):
         return block_reduce(val, op, reduction_buffer, init_val=init_val)
     else:
         return cluster_reduce(val, op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val)
@@ -107,18 +107,18 @@ def row_reduce(
     threads_per_row: cutlass.Constexpr[int],
     reduction_buffer: Optional[cute.Tensor] = None,
     mbar_ptr: Optional[cute.Pointer] = None,
-    phase: Optional[cutlass.Int32] = None,
+    phase: Optional[Int32] = None,
     init_val: cute.Numeric = 0.0,
     hook_fn: Optional[Callable] = None,
 ) -> cute.Numeric:
     """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
-    if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
+    if const_expr(isinstance(x, cute.TensorSSA)):
         val = x.reduce(op, init_val=init_val, reduction_profile=0)
     else:
         val = x
     warp_op = {
         cute.ReductionOp.ADD: operator.add,
-        cute.ReductionOp.MAX: cute.arch.fmax if cutlass.const_expr(x.dtype == Float32) else max,
+        cute.ReductionOp.MAX: cute.arch.fmax if const_expr(x.dtype == Float32) else max,
         cute.ReductionOp.MIN: min,
         cute.ReductionOp.MUL: operator.mul,
     }[op]
@@ -127,14 +127,14 @@ def row_reduce(
         warp_op,
         width=min(threads_per_row, cute.arch.WARP_SIZE),
     )
-    if cutlass.const_expr(hook_fn is not None):
+    if const_expr(hook_fn is not None):
         hook_fn()
-    if cutlass.const_expr(reduction_buffer is not None):
+    if const_expr(reduction_buffer is not None):
         warps_per_row, cluster_n = reduction_buffer.shape[1]
         assert cluster_n == 1 or mbar_ptr is not None, (
             "mbar_ptr must be provided for cluster reduction"
         )
-        if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
+        if const_expr(warps_per_row > 1 or cluster_n > 1):
             val = block_or_cluster_reduce(
                 val, warp_op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val
             )
@@ -148,7 +148,7 @@ def online_softmax_reduce(
     reduction_buffer: Optional[cute.Tensor] = None,
     mbar_ptr: Optional[cute.Pointer] = None,
     hook_fn: Optional[Callable] = None,
-    phase: Optional[cutlass.Int32] = None,
+    phase: Optional[Int32] = None,
     return_exp_x: bool = False,
 ) -> [Float32, Float32, Optional[cute.TensorSSA]]:
     assert x.dtype == Float32, "x must be of type Float32"
@@ -165,20 +165,20 @@ def online_softmax_reduce(
         operator.add,
         width=min(threads_per_row, cute.arch.WARP_SIZE),
     )
-    if cutlass.const_expr(hook_fn is not None):
+    if const_expr(hook_fn is not None):
         hook_fn()
-    if cutlass.const_expr(reduction_buffer is not None):
+    if const_expr(reduction_buffer is not None):
         rows_per_block, (warps_per_row, cluster_n) = reduction_buffer.shape
         assert cluster_n == 1 or mbar_ptr is not None, (
             "mbar_ptr must be provided for cluster reduction"
         )
-        if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-            assert reduction_buffer.element_type == cutlass.Int64, (
+        if const_expr(warps_per_row > 1 or cluster_n > 1):
+            assert reduction_buffer.element_type == Int64, (
                 "reduction_buffer must be of type cute.Int64"
             )
             lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
             row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
-            if cutlass.const_expr(mbar_ptr is None):
+            if const_expr(mbar_ptr is None):
                 if lane_idx == 0:
                     reduction_buffer[row_idx, col_idx] = utils.f32x2_to_i64(max_x, sum_exp_x)
                 cute.arch.barrier()
@@ -191,7 +191,7 @@ def online_softmax_reduce(
                 max_x_final = warp_reduce(max_x_single_warp, cute.arch.fmax)
                 sum_exp_x *= cute.math.exp(max_x_single_warp - max_x_final, fastmath=True)
                 sum_exp_x = warp_reduce(sum_exp_x, operator.add)
-                if cutlass.const_expr(return_exp_x):
+                if const_expr(return_exp_x):
                     exp_x *= cute.math.exp(max_x - max_x_final, fastmath=True)
                 max_x = max_x_final
             else:
@@ -234,7 +234,7 @@ def online_softmax_reduce(
                         max_x_single_warp[i] - max_x_final, fastmath=True
                     )
                 sum_exp_x = warp_reduce(sum_exp_x, operator.add)
-                if cutlass.const_expr(return_exp_x):
+                if const_expr(return_exp_x):
                     exp_x *= cute.math.exp(max_x - max_x_final, fastmath=True)
                 max_x = max_x_final
-    return max_x, sum_exp_x, (exp_x if cutlass.const_expr(return_exp_x) else None)
+    return max_x, sum_exp_x, (exp_x if const_expr(return_exp_x) else None)

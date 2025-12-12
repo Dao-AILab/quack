@@ -14,7 +14,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Float32, Float16, Boolean, const_expr
 from cutlass.cutlass_dsl import if_generate
 from cutlass.utils import LayoutEnum
 
@@ -115,7 +115,7 @@ class GemmSm90:
 
     Example:
         >>> gemm = GemmSm90(
-        ...     acc_dtype=cutlass.Float32,
+        ...     acc_dtype=Float32,
         ...     tile_shape_mn=(128, 256),
         ...     cluster_shape_mnk=(1, 1, 1)
         ... )
@@ -472,7 +472,7 @@ class GemmSm90:
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
-            tile_count: cute.struct.MemRange[cutlass.Int32, self.sched_stage]
+            tile_count: cute.struct.MemRange[Int32, self.sched_stage]
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
@@ -1526,7 +1526,7 @@ class GemmSm90:
         return 0
 
     def epi_get_smem_struct(self, params: EpilogueParams):
-        return cute.struct.MemRange[cutlass.Int32, 0]  # Dummy struct
+        return cute.struct.MemRange[Int32, 0]  # Dummy struct
 
     def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Tuple[cute.Tensor, ...]:
         return tuple()
@@ -1553,7 +1553,7 @@ class GemmSm90:
                 self.d_layout.is_m_major_c() if self.d_layout is not None else False,
                 num_matrices=4 if self.epi_tile[1] % 16 == 0 else 2,
             ),
-            cutlass.Float16,  # this is just to get the right source layout
+            Float16,  # this is just to get the right source layout
         )
         tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
         return tiled_copy_C_atom
@@ -2034,7 +2034,7 @@ class GemmSm90:
         """
         is_valid = True
         if a_dtype not in {
-            cutlass.Float16,
+            Float16,
             cutlass.BFloat16,
             cutlass.Float8E4M3FN,
             cutlass.Float8E5M2,
@@ -2042,19 +2042,19 @@ class GemmSm90:
             is_valid = False
         # tested b_dtype
         if b_dtype not in {
-            cutlass.Float16,
+            Float16,
             cutlass.BFloat16,
             cutlass.Float8E4M3FN,
             cutlass.Float8E5M2,
         }:
             is_valid = False
-        if acc_dtype not in {cutlass.Float32, cutlass.Float16}:
+        if acc_dtype not in {Float32, Float16}:
             is_valid = False
         # tested d_dtype
         if d_dtype not in {
             None,
-            cutlass.Float32,
-            cutlass.Float16,
+            Float32,
+            Float16,
             cutlass.BFloat16,
             cutlass.Float8E4M3FN,
             cutlass.Float8E5M2,

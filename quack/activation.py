@@ -3,9 +3,8 @@
 import math
 from typing import Tuple
 
-import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, const_expr
+from cutlass import Float32, Boolean, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -55,11 +54,11 @@ def drelu(
     x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
     if const_expr(not isinstance(x, tuple)):
-        x_pos = cutlass.Boolean(x > 0)
+        x_pos = Boolean(x > 0)
         return dout if x_pos else Float32(0.0), cute.arch.fmax(x, Float32(0.0))
     else:
-        x0_pos = cutlass.Boolean(x[0] > 0)
-        x1_pos = cutlass.Boolean(x[1] > 0)
+        x0_pos = Boolean(x[0] > 0)
+        x1_pos = Boolean(x[1] > 0)
         dx = (dout[0] if x0_pos else Float32(0.0), dout[1] if x1_pos else Float32(0.0))
         return dx, relu(x)
 
@@ -406,15 +405,15 @@ def dreglu(
     - reglu_out = relu(x) * y
     """
     if const_expr(not isinstance(x, tuple)):
-        x_pos = cutlass.Boolean(x > 0)
+        x_pos = Boolean(x > 0)
         relu_x = cute.arch.fmax(x, Float32(0.0))
         dx = (dout * y) if x_pos else Float32(0.0)
         dy = dout * relu_x
         reglu_out = relu_x * y
         return dx, dy, reglu_out
     else:
-        x0_pos = cutlass.Boolean(x[0] > 0)
-        x1_pos = cutlass.Boolean(x[1] > 0)
+        x0_pos = Boolean(x[0] > 0)
+        x1_pos = Boolean(x[1] > 0)
         relu_x = relu(x)
         dout_y = utils.mul_packed_f32x2(dout, y)
         dx = ((dout_y[0] if x0_pos else Float32(0.0)), (dout_y[1] if x1_pos else Float32(0.0)))

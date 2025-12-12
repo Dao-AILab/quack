@@ -4,12 +4,11 @@ from typing import Type, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Int32, Int64, Float32, const_expr
 
 
 class ReductionBase:
-    def __init__(
-        self, dtype: Type[cutlass.Numeric], N: int, stage: int, reduction_dtype=cutlass.Float32
-    ):
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int, stage: int, reduction_dtype=Float32):
         self.dtype = dtype
         self.N = N
         self.stage = stage
@@ -47,7 +46,7 @@ class ReductionBase:
         return (
             cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn))
             + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
-            + self.stage * (cutlass.Int64.width // 8)
+            + self.stage * (Int64.width // 8)
         )
 
     def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
@@ -66,9 +65,9 @@ class ReductionBase:
             self._get_reduction_buffer_layout(tv_layout, self.cluster_n),
             byte_alignment=4,
         )
-        if cutlass.const_expr(self.cluster_n > 1):
+        if const_expr(self.cluster_n > 1):
             mbar_ptr = smem.allocate_array(
-                cutlass.Int64, num_elems=self.stage if not is_persistent else self.stage * 2
+                Int64, num_elems=self.stage if not is_persistent else self.stage * 2
             )
         else:
             mbar_ptr = None
@@ -77,15 +76,15 @@ class ReductionBase:
     @cute.jit
     def _initialize_cluster(
         self,
-        tidx: cutlass.Int32,
+        tidx: Int32,
         mbar_ptr: cute.Pointer,
         num_warps: int,
         is_persistent: bool = False,
     ):
-        if cutlass.const_expr(self.cluster_n > 1):
+        if const_expr(self.cluster_n > 1):
             if tidx < self.stage:  # Initialize full barrier
                 cute.arch.mbarrier_init(mbar_ptr + tidx, 1)
-                if cutlass.const_expr(is_persistent):  # Initialize empty barrier
+                if const_expr(is_persistent):  # Initialize empty barrier
                     cute.arch.mbarrier_init(
                         mbar_ptr + self.stage + tidx, num_warps * self.cluster_n
                     )
