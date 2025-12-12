@@ -87,7 +87,6 @@ class Softmax(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        # declare the atoms which will be used later for memory copy
         copy_atom_load_X = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128
         )
@@ -102,16 +101,13 @@ class Softmax(ReductionBase):
         tXgO = thr_copy_O.partition_D(gO)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
-        # allocate fragments for gmem->rmem
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
-        )
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
         if tXcX[0][0] < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
         cute.arch.cp_async_commit_group()
@@ -155,11 +151,7 @@ class Softmax(ReductionBase):
         # y = exp_x * (1.0 / denom)
         y = exp_x * cute.arch.rcp_approx(denom)
         tXrO.store(y.to(tXrO.element_type))
-        tOpO = (
-            utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
-            if const_expr(not is_even_N)
-            else None
-        )
+        tOpO = None if is_even_N else utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
         if tXcX[0][0] < shape[0]:
             cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
 
@@ -271,10 +263,7 @@ class SoftmaxBackward(ReductionBase):
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        if const_expr(self.cluster_n > 1):
-            cluster_y = cute.arch.block_idx()[1]
-        else:
-            cluster_y = const_expr(0)
+        cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
 
         shape = mdY.shape
         idX = cute.make_identity_tensor(shape)
@@ -297,7 +286,6 @@ class SoftmaxBackward(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        # declare the atoms which will be used later for memory copy
         copy_atom_load = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), mdY.element_type, num_bits_per_copy=128
         )
@@ -315,7 +303,6 @@ class SoftmaxBackward(ReductionBase):
         tdXgdX = thr_copy_store.partition_D(gdX)
         tXcX = thr_copy_load.partition_S(cX)[(0, None), None, None]
 
-        # allocate fragments for gmem->rmem
         tdYrdY, tYrY, tdXrdX = [cute.make_fragment_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
@@ -323,9 +310,7 @@ class SoftmaxBackward(ReductionBase):
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tdYpdY = (
-            utils.predicate_k(thr_copy_load.partition_S(cX), limit=shape[1])
-            if const_expr(not is_even_N)
-            else None
+            None if is_even_N else utils.predicate_k(thr_copy_load.partition_S(cX), limit=shape[1])
         )
 
         if tXcX[0][0] < shape[0]:
@@ -355,9 +340,7 @@ class SoftmaxBackward(ReductionBase):
         dx = y * (dy - dot)
         tdXrdX.store(dx.to(tdXrdX.element_type))
         tdXpdX = (
-            utils.predicate_k(thr_copy_store.partition_S(cX), limit=shape[1])
-            if const_expr(not is_even_N)
-            else None
+            None if is_even_N else utils.predicate_k(thr_copy_store.partition_S(cX), limit=shape[1])
         )
         if tXcX[0][0] < shape[0]:
             cute.copy(copy_atom_store, tdXrdX, tdXgdX, pred=tdXpdX)
