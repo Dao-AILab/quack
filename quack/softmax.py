@@ -92,13 +92,13 @@ class Softmax(ReductionBase):
         copy_atom_store_O = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=128
         )
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_ld = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_st = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
 
-        tXgX = thr_copy_X.partition_S(gX)
-        tXsX = thr_copy_X.partition_D(sX)
-        tXgO = thr_copy_O.partition_D(gO)
-        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
+        tXgX = thr_copy_ld.partition_S(gX)
+        tXsX = thr_copy_ld.partition_D(sX)
+        tXgO = thr_copy_st.partition_D(gO)
+        tXcX = thr_copy_ld.partition_S(cX)[(0, None), None, None]
 
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
@@ -106,7 +106,7 @@ class Softmax(ReductionBase):
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy_ld.partition_S(cX), limit=shape[1])
         if tXcX[0][0] < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
         cute.arch.cp_async_commit_group()
@@ -150,9 +150,8 @@ class Softmax(ReductionBase):
         # y = exp_x * (1.0 / denom)
         y = exp_x * cute.arch.rcp_approx(denom)
         tXrO.store(y.to(tXrO.element_type))
-        tOpO = None if is_even_N else utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
+            cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tXpX)
 
 
 @torch.library.custom_op("quack::_softmax_fwd", mutates_args={"out"})
@@ -263,11 +262,6 @@ class SoftmaxBackward(ReductionBase):
         gdY, gY, gdX, cX = [
             cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mdY, mY, mdX, idX)
         ]
-        mdY, mY, mdX = [
-            utils.domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mdY, mY, mdX)
-        ]
-        gdY, gY, gdX = [cute.local_tile(mT, tiler_mn, (0, cluster_y)) for mT in (mdY, mY, mdX)]
-        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
         smem = cutlass.utils.SmemAllocator()
         sdY = smem.allocate_tensor(
@@ -284,16 +278,15 @@ class SoftmaxBackward(ReductionBase):
         copy_atom_store = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), gdX.element_type, num_bits_per_copy=128
         )
+        thr_copy_ld = cute.make_tiled_copy(copy_atom_load, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_st = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn).get_slice(tidx)
 
-        thr_copy_load = cute.make_tiled_copy(copy_atom_load, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn).get_slice(tidx)
-
-        tdYgdY = thr_copy_load.partition_S(gdY)
-        tdYsdY = thr_copy_load.partition_D(sdY)
-        tYgY = thr_copy_load.partition_S(gY)
-        tYsY = thr_copy_load.partition_D(sY)
-        tdXgdX = thr_copy_store.partition_D(gdX)
-        tXcX = thr_copy_load.partition_S(cX)[(0, None), None, None]
+        tdYgdY = thr_copy_ld.partition_S(gdY)
+        tdYsdY = thr_copy_ld.partition_D(sdY)
+        tYgY = thr_copy_ld.partition_S(gY)
+        tYsY = thr_copy_ld.partition_D(sY)
+        tdXgdX = thr_copy_st.partition_D(gdX)
+        tXcX = thr_copy_ld.partition_S(cX)[(0, None), None, None]
 
         tdYrdY, tYrY, tdXrdX = [cute.make_fragment_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
 
@@ -301,13 +294,11 @@ class SoftmaxBackward(ReductionBase):
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tdYpdY = (
-            None if is_even_N else utils.predicate_k(thr_copy_load.partition_S(cX), limit=shape[1])
-        )
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy_ld.partition_S(cX), limit=shape[1])
 
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_load, tdYgdY, tdYsdY, pred=tdYpdY)
-            cute.copy(copy_atom_load, tYgY, tYsY, pred=tdYpdY)
+            cute.copy(copy_atom_load, tdYgdY, tdYsdY, pred=tXpX)
+            cute.copy(copy_atom_load, tYgY, tYsY, pred=tXpX)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
 
@@ -331,11 +322,8 @@ class SoftmaxBackward(ReductionBase):
         # Compute gradient: dx_i = y_i × (dy_i - dot)
         dx = y * (dy - dot)
         tdXrdX.store(dx.to(tdXrdX.element_type))
-        tdXpdX = (
-            None if is_even_N else utils.predicate_k(thr_copy_store.partition_S(cX), limit=shape[1])
-        )
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_store, tdXrdX, tdXgdX, pred=tdXpdX)
+            cute.copy(copy_atom_store, tdXrdX, tdXgdX, pred=tXpX)
 
 
 @torch.library.custom_op("quack::_softmax_backward", mutates_args={"dx"})
