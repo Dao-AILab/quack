@@ -11,7 +11,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
-from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
 from quack.reduce import row_reduce, online_softmax_reduce
@@ -75,7 +74,7 @@ class CrossEntropy(ReductionBase):
         ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=([1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None),
+            cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             stream=stream,
         )
 
@@ -94,24 +93,16 @@ class CrossEntropy(ReductionBase):
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        if const_expr(self.cluster_n > 1):
-            cluster_y = cute.arch.block_idx()[1]
-        else:
-            cluster_y = const_expr(0)
+        cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
 
-        shape: cute.Shape = mX.shape
+        shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
-        mX_off = utils.domain_offset_i64((bidx * tiler_mn[0], 0), mX)
-        gX = cute.local_tile(mX_off, tiler_mn, (0, cluster_y))
-        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
+        gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, idX)]
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
-            mX.element_type,
-            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
-            byte_alignment=16,
+            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
@@ -138,11 +129,7 @@ class CrossEntropy(ReductionBase):
             target = Int32(mTarget[row])
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
-            if const_expr(not is_even_N)
-            else None
-        )
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
         if row < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
         cute.arch.cp_async_commit_group()
@@ -158,9 +145,7 @@ class CrossEntropy(ReductionBase):
         if row < shape[0] and tXcX[0][1] == 0 and not should_ignore:
             # Only load target logit if not ignoring this index
             if const_expr(cute.rank(mTargetLogit.shape) == 2):
-                # Use Int64 for indexing to deal with large tensors
-                mTargetLogit_off = utils.domain_offset_i64((row, 0), mTargetLogit)
-                target_logit = Float32(mTargetLogit_off[0, target])
+                target_logit = Float32(mTargetLogit[row, target])
             else:
                 assert cute.rank(mTargetLogit.shape) == 1
                 target_logit = Float32(mTargetLogit[row])
@@ -224,8 +209,7 @@ class CrossEntropy(ReductionBase):
                 else Float32.zero
             )
             probs = exp_x * denom_inv
-            mdX_off = utils.domain_offset_i64((bidx * tiler_mn[0], 0), mdX)
-            gdX = cute.local_tile(mdX_off, tiler_mn, (0, cluster_y))
+            gdX = cute.local_tile(mdX, tiler_mn, (bidx, cluster_y))
             # Setup copy atom for storing gradient
             copy_atom_store = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), mdX.element_type, num_bits_per_copy=num_copy_bits_X
@@ -242,13 +226,8 @@ class CrossEntropy(ReductionBase):
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                     tXrdX_f32[i] = tXrdX_f32[i] if tXcFull[i][1] != target else tXrdX_f32[i] - 1.0
             tXrdX.store(tXrdX_f32.load().to(tXrdX.element_type))
-            tXpdX = (
-                utils.predicate_k(thr_copy_dX.partition_S(cX), limit=shape[1])
-                if not is_even_N
-                else None
-            )
             if row < shape[0]:
-                cute.copy(copy_atom_store, tXrdX, tXgdX, pred=tXpdX)
+                cute.copy(copy_atom_store, tXrdX, tXgdX, pred=tXpX)
 
 
 @torch.library.custom_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
@@ -278,77 +257,83 @@ def cross_entropy_fwd_out(
     """
     assert x.dim() == 2, "Input must be 2D"
     assert target.dim() == 1, "Target must be 1D"
-    assert x.shape[0] == target.shape[0], "Batch dimensions must match"
     assert x.is_cuda and target.is_cuda, "Tensors must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
     if target_logit is not None:
-        assert target_logit.shape[0] == x.shape[0]
         assert target_logit.is_cuda, "Target logits must be on CUDA device"
         assert target_logit.dtype in [torch.float16, torch.bfloat16, torch.float32]
     if dx is not None:
-        assert dx.shape == x.shape, "dx must have same shape as x"
         assert dx.is_cuda, "dx must be on CUDA device"
-        assert dx.dtype == x.dtype, "dx must have same dtype as x"
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
-    convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1)
-        )
+    target_dtype = torch2cute_dtype_map[target.dtype]
+    target_logit_dtype = (
+        torch2cute_dtype_map[target_logit.dtype] if target_logit is not None else None
     )
-    x_tensor = convert_from_dlpack(x)
-    loss_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_layout_dynamic()
-    lse_tensor = (
-        from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic()
-        if lse is not None
-        else None
-    )
-    target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_layout_dynamic()
-    target_logit_tensor = (
-        from_dlpack(target_logit.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=target_logit.ndim - 1
-        )
-        if target_logit is not None
-        else None
-    )
-    dx_tensor = convert_from_dlpack(dx) if dx is not None else None
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
     compile_key = (
         dtype,
+        target_dtype,
+        target_logit_dtype,
         N,
-        target_logit.dtype if target_logit is not None else None,
-        lse.dtype if lse is not None else None,
+        lse is not None,
         dx is not None,
-        loss.stride(),
-        lse.stride() if lse is not None else None,
-        target.stride(),
-        target_logit.stride(-1) if target_logit is not None else None,
     )
     if compile_key not in cross_entropy_fwd_out.compile_cache:
+        batch_sym = cute.sym_int()
+        divisibility = math.gcd(128 // dtype.width, N)
+        x_cute, dx_cute = [
+            cute.runtime.make_fake_tensor(
+                dtype,
+                (batch_sym, N),
+                stride=(cute.sym_int(divisibility=divisibility), 1),
+                assumed_align=divisibility * dtype.width // 8,
+            )
+            if t is not None
+            else None
+            for t in (x, dx)
+        ]
+        target_cute = cute.runtime.make_fake_tensor(
+            target_dtype, (batch_sym,), stride=(cute.sym_int(),)
+        )
+        if target_logit is not None:
+            if target_logit.ndim == 2:
+                divisibility = math.gcd(128 // dtype.width, N)
+                target_logit_cute = cute.runtime.make_fake_tensor(
+                    target_logit_dtype,
+                    (batch_sym, cute.sym_int()),
+                    stride=(cute.sym_int(divisibility=divisibility), 1),
+                    assumed_align=divisibility * target_logit_dtype.width // 8,
+                )
+            else:
+                target_logit_cute = cute.runtime.make_fake_tensor(
+                    target_logit_dtype, (batch_sym,), stride=(1,)
+                )
+        else:
+            target_logit_cute = None
+        loss_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
+        lse_cute = (
+            cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
+            if lse is not None
+            else None
+        )
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
         cross_entropy_op = CrossEntropy(dtype, N, online_softmax=dx is None)
         cross_entropy_fwd_out.compile_cache[compile_key] = cute.compile(
             cross_entropy_op,
-            x_tensor,
-            target_tensor,
-            target_logit_tensor,
-            loss_tensor,
-            lse_tensor,
-            dx_tensor,
-            Int32(ignore_index),
+            x_cute,
+            target_cute,
+            target_logit_cute,
+            loss_cute,
+            lse_cute,
+            dx_cute,
+            Int32(0),  # ignore_index, just for compilation
             stream,
+            options="--enable-tvm-ffi",
         )
     cross_entropy_fwd_out.compile_cache[compile_key](
-        x_tensor,
-        target_tensor,
-        target_logit_tensor,
-        loss_tensor,
-        lse_tensor,
-        dx_tensor,
-        Int32(ignore_index),
-        stream,
+        x, target, target_logit, loss, lse, dx, Int32(ignore_index)
     )
 
 
@@ -435,9 +420,6 @@ class CrossEntropyBackward:
             )
             for X in (mDLoss, mTarget, mLSE)
         ]
-        smem_size = cute.size_in_bytes(
-            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0))
-        )
         self.kernel(
             mX, mTarget, mDLoss, mdX, mLSE, ignore_index, mX.shape, tv_layout, tiler_mn
         ).launch(
@@ -447,7 +429,6 @@ class CrossEntropyBackward:
                 1,
             ],
             block=[num_threads, 1, 1],
-            smem=smem_size,
             stream=stream,
         )
 
@@ -469,16 +450,11 @@ class CrossEntropyBackward:
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
-            mX.element_type,
-            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
-            byte_alignment=16,
+            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
         )
 
         idX = cute.make_identity_tensor(shape)
-        # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
-        mX, mdX = [utils.domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mX, mdX)]
-        gX, gdX = [cute.local_tile(mT, tiler_mn, (0, bidy)) for mT in (mX, mdX)]
-        cX = cute.local_tile(idX, tiler_mn, (bidx, bidy))
+        gX, gdX, cX = [cute.local_tile(mT, tiler_mn, (bidx, bidy)) for mT in (mX, mdX, idX)]
 
         num_copy_elems_X = tv_layout.shape[1][0]
         num_copy_bits_X = mX.element_type.width * num_copy_elems_X
@@ -521,7 +497,8 @@ class CrossEntropyBackward:
             target = Int32(mTarget[row])
             should_ignore = Boolean(target == ignore_index)
             # Set dloss to 0 if this index should be ignored
-            dloss = Float32(mDLoss[row]) if not should_ignore else Float32.zero
+            if not should_ignore:
+                dloss = Float32(mDLoss[row])
             lse = Float32(mLSE[row])
 
         log2_e = math.log2(math.e)
@@ -534,13 +511,8 @@ class CrossEntropyBackward:
         grad = grad * dloss
 
         tXrdX.store(grad.to(tXrdX.element_type))
-        tXpdX = (
-            utils.predicate_k(thr_copy_dX.partition_S(cX), limit=shape[1])
-            if not is_even_N
-            else None
-        )
         if row < shape[0]:
-            cute.copy(copy_atom_store_dX, tXrdX, tXgdX, pred=tXpdX)
+            cute.copy(copy_atom_store_dX, tXrdX, tXgdX, pred=tXpX)
 
 
 def _cross_entropy_backward(
@@ -575,34 +547,40 @@ def _cross_entropy_backward(
 
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
-
-    convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1)
-        )
-    )
-    x_tensor = convert_from_dlpack(x)
-    dx_tensor = convert_from_dlpack(dx)
-    dloss_tensor = from_dlpack(dloss.detach(), assumed_align=4).mark_layout_dynamic()
-    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic()
-    target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_layout_dynamic()
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compile_key = (dtype, N, target.dtype, dloss.stride(), lse.stride(), target.stride())
+    target_dtype = torch2cute_dtype_map[target.dtype]
+    compile_key = (dtype, target_dtype, N)
     if compile_key not in _cross_entropy_backward.compile_cache:
+        batch_sym = cute.sym_int()
+        divisibility = math.gcd(128 // dtype.width, N)
+        x_cute, dx_cute = [
+            cute.runtime.make_fake_tensor(
+                dtype,
+                (batch_sym, N),
+                stride=(cute.sym_int(divisibility=divisibility), 1),
+                assumed_align=divisibility * dtype.width // 8,
+            )
+            for _ in (x, dx)
+        ]
+        target_cute = cute.runtime.make_fake_tensor(
+            target_dtype, (batch_sym,), stride=(cute.sym_int(),)
+        )
+        dloss_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
+        lse_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         cross_entropy_backward_op = CrossEntropyBackward(dtype, N)
         _cross_entropy_backward.compile_cache[compile_key] = cute.compile(
             cross_entropy_backward_op,
-            x_tensor,
-            target_tensor,
-            dloss_tensor,
-            dx_tensor,
-            lse_tensor,
-            Int32(ignore_index),
+            x_cute,
+            target_cute,
+            dloss_cute,
+            dx_cute,
+            lse_cute,
+            Int32(0),  # ignore_index, just for compilation
             stream,
+            options="--enable-tvm-ffi",
         )
     _cross_entropy_backward.compile_cache[compile_key](
-        x_tensor, target_tensor, dloss_tensor, dx_tensor, lse_tensor, Int32(ignore_index), stream
+        x, target, dloss, dx, lse, Int32(ignore_index)
     )
 
 

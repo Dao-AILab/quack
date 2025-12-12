@@ -13,7 +13,7 @@ except ImportError:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float16, BFloat16, Float32
+from cutlass import Int32, Int64, Float16, BFloat16, Float32
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
 
@@ -28,8 +28,9 @@ cute_compile_og = cute.compile
 torch2cute_dtype_map = {
     torch.float16: Float16,
     torch.bfloat16: BFloat16,
-    torch.int32: Int32,
     torch.float32: Float32,
+    torch.int32: Int32,
+    torch.int64: Int64,
 }
 
 

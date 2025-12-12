@@ -100,8 +100,6 @@ def run_cross_entropy_backward(
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
     mem_bw_ref = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() +
                         dloss.numel() * dloss.element_size()) / (avg_time_ref / 1000) / 1e9)
-    print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
-    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
     time.sleep(0.5)
     fn = lambda: torch.autograd.grad(loss, x, grad_outputs=dloss, retain_graph=True)
@@ -111,6 +109,8 @@ def run_cross_entropy_backward(
                     dloss.numel() * dloss.element_size()) / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
+    print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
+    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
     return mem_bw, mem_bw_ref
 
