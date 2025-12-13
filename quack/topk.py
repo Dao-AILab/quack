@@ -131,10 +131,31 @@ class TopK:
         threads_per_row = tv_layout.shape[0][0]
         topk_vals = bitonic_topk(tXrX_f32, self.k, warp_width=threads_per_row)
 
+        # Thread 0 in each row contains all the top-k values, so we split those into multiple threads
+        vecsize_out = const_expr(min(self.k, vecsize, 128 // mIndices.element_type.width))
+        assert self.k % vecsize_out == 0
+        nvec_per_thread = const_expr(cute.ceil_div(self.k, vecsize_out * threads_per_row))
+        # 1 -> 0b11111, 2 -> 0b11110, 4 -> 0b11100, 8 -> 0b11000, 16 -> 0b10000, 32 -> 0b00000
+        mask = cute.arch.WARP_SIZE - threads_per_row
+        mask_and_clamp = mask << 8 | (cute.arch.WARP_SIZE - 1)
+        topk_vals_split = cute.make_fragment((vecsize_out, nvec_per_thread), Float32)
+        for i in cutlass.range(cute.ceil_div(self.k, vecsize_out), unroll_full=True):
+            should_receive = tidx % threads_per_row == i % threads_per_row
+            for v in cutlass.range(vecsize_out, unroll_full=True):
+                if const_expr(threads_per_row > 1):
+                    if i * vecsize_out + v < self.k:
+                        val = cute.arch.shuffle_sync(
+                            topk_vals[i * vecsize_out + v], offset=0, mask_and_clamp=mask_and_clamp
+                        )
+                        if should_receive:
+                            topk_vals_split[v, i // threads_per_row] = val
+                else:
+                    topk_vals_split[v, i // threads_per_row] = topk_vals[i * vecsize_out + v]
+
         # Extract indices and clean values
-        topk_vals_i32 = cute.recast_tensor(topk_vals, Int32)
-        topk_indices = cute.make_fragment(self.k, Int32)
-        for i in cutlass.range(self.k):
+        topk_vals_i32 = cute.recast_tensor(topk_vals_split, Int32)
+        topk_indices = cute.make_fragment(topk_vals_i32.shape, Int32)
+        for i in cutlass.range(cute.size(topk_vals_i32), unroll_full=True):
             # Extract the encoded index from the last log_N bits
             encoded_idx = topk_vals_i32[i] & idx_mask
             # Check if original value was positive by looking at the cleaned value
@@ -144,24 +165,33 @@ class TopK:
             topk_indices[i] = Int32(col_idx & idx_mask)
 
         # Convert cleaned values to output type
-        topk_vals_out = cute.make_fragment_like(topk_vals, mValues.element_type)
-        topk_vals_out.store(topk_vals.load().to(mValues.element_type))
+        topk_vals_out = cute.make_fragment_like(topk_vals_split, mValues.element_type)
+        topk_vals_out.store(topk_vals_split.load().to(mValues.element_type))
 
         row = tXcX[0][0]
-        # Only the 1st thread in this row writes the top-k values and indices
-        if row < shape[0] and tXcX[0][1] == 0:
-            # for i in cutlass.range(self.k):
-            #     mValues[row, i] = topk_vals_out[i]
-            #     mIndices[row, i] = topk_indices[i]
+        # # Only the 1st thread in this row writes the top-k values and indices
+        # if row < shape[0] and tXcX[0][1] == 0:
+        #     # for i in cutlass.range(self.k):
+        #     #     mValues[row, i] = topk_vals_out[i]
+        #     #     mIndices[row, i] = topk_indices[i]
+        #     # Vectorized write
+        #     elems_per_store = const_expr(math.gcd(vecsize, self.k))
+        #     mValues_store = cute.tiled_divide(mValues[row, None], (elems_per_store,))
+        #     mIndices_store = cute.tiled_divide(mIndices[row, None], (elems_per_store,))
+        #     topk_vals_out_store = cute.tiled_divide(topk_vals_out, (elems_per_store,))
+        #     topk_indices_store = cute.tiled_divide(topk_indices, (elems_per_store,))
+        #     for i in cutlass.range(cute.size(topk_vals_out_store.shape, [1]), unroll_full=True):
+        #         cute.autovec_copy(topk_vals_out_store[None, i], mValues_store[None, i])
+        #         cute.autovec_copy(topk_indices_store[None, i], mIndices_store[None, i])
+        if tiler_mn[0] == 0 or row < shape[0]:
             # Vectorized write
-            elems_per_store = const_expr(math.gcd(vecsize, self.k))
-            mValues_store = cute.tiled_divide(mValues[row, None], (elems_per_store,))
-            mIndices_store = cute.tiled_divide(mIndices[row, None], (elems_per_store,))
-            topk_vals_out_store = cute.tiled_divide(topk_vals_out, (elems_per_store,))
-            topk_indices_store = cute.tiled_divide(topk_indices, (elems_per_store,))
-            for i in cutlass.range(cute.size(topk_vals_out_store.shape, [1]), unroll_full=True):
-                cute.autovec_copy(topk_vals_out_store[None, i], mValues_store[None, i])
-                cute.autovec_copy(topk_indices_store[None, i], mIndices_store[None, i])
+            mValues_store = cute.tiled_divide(mValues[row, None], (vecsize_out,))
+            mIndices_store = cute.tiled_divide(mIndices[row, None], (vecsize_out,))
+            for i in cutlass.range(cute.size(topk_vals_out.shape, [1]), unroll_full=True):
+                col = i * threads_per_row + tidx % threads_per_row
+                if col < self.k // vecsize_out:
+                    cute.autovec_copy(topk_vals_out[None, i], mValues_store[None, col])
+                    cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
 
 
 @torch.library.custom_op("quack::_topk_fwd", mutates_args={"values", "indices"})

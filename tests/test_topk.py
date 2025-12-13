@@ -18,8 +18,9 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
     # [(256, 4)]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
-@pytest.mark.parametrize("function", [topk, torch.compile(topk, fullgraph=True)])
 # @pytest.mark.parametrize("M", [1])
+@pytest.mark.parametrize("function", [topk, torch.compile(topk, fullgraph=True)])
+# @pytest.mark.parametrize("function", [topk])
 def test_topk(M, N, k, input_dtype, function):
     """Test TopK against PyTorch reference implementation."""
     device = "cuda"

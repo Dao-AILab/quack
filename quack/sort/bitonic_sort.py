@@ -110,8 +110,8 @@ def bitonic_topk(
     for v in cutlass.range(k, unroll_full=True):
         topk_vals[v] = arr[v]
     bitonic_sort(topk_vals, ascending=ascending)
-    other_vals = cute.make_fragment(k, arr.element_type)
     for i in cutlass.range(1, n // k, unroll_full=True):
+        other_vals = cute.make_fragment(k, arr.element_type)
         for v in cutlass.range(k, unroll_full=True):
             other_vals[v] = arr[i * k + v]
         bitonic_sort(other_vals, ascending=ascending)
