@@ -10,7 +10,6 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, nvvm, vector
-from cutlass.cute.runtime import from_dlpack
 
 
 # cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
@@ -25,13 +24,14 @@ sub_packed_f32x2 = partial(
 )
 
 
-def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
-    return (
-        from_dlpack(x, assumed_align=alignment)
-        .mark_layout_dynamic(leading_dim=leading_dim)
-        .mark_compact_shape_dynamic(
-            mode=leading_dim, stride_order=x.dim_order(), divisibility=divisibility
-        )
+def make_fake_tensor(dtype, shape, divisibility=1) -> Optional[cute.Tensor]:
+    if dtype is None:
+        return None
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        shape,
+        stride=(*[cute.sym_int64(divisibility=divisibility)] * (len(shape) - 1), 1),
+        assumed_align=divisibility * dtype.width // 8,
     )
 
 
@@ -275,22 +275,6 @@ def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=No
         "Coordinate and stride must have the same length"
     )
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    new_ptr = cute.make_ptr(
-        tensor.element_type,
-        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
-        tensor.memspace,
-        assumed_align=tensor.iterator.max_alignment,
-    )
-    return cute.make_tensor(new_ptr, tensor.layout)
-
-
-@dsl_user_op
-def coord_offset_i64(
-    idx: cute.typing.Int, tensor: cute.Tensor, dim: int, *, loc=None, ip=None
-) -> cute.Tensor:
-    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
     assert isinstance(tensor.iterator, cute.Pointer)
     # HACK: we assume that applying the offset does not change the pointer alignment
     new_ptr = cute.make_ptr(

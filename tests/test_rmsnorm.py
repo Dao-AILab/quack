@@ -272,6 +272,7 @@ def test_rmsnorm_with_bias(use_compile):
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(bias.grad, bias_ref.grad, atol=1e-4, rtol=1e-3)
 
+
 @pytest.mark.parametrize("backward_type", ["only_output", "both"])
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_with_residual(backward_type, use_compile):
@@ -302,7 +303,7 @@ def test_rmsnorm_with_residual(backward_type, use_compile):
 
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
-    if backward_type == "only_residual":    
+    if backward_type == "only_residual":
         residual_out_ref.backward(grad_out)
         residual_out.backward(grad_out)
     elif backward_type == "only_output":
@@ -323,14 +324,11 @@ def test_amp_bf16_training():
     device = "cuda"
     M, N = 32768, 1024
     eps = 1e-6
-
     dy = torch.randn(M, N, device=device, dtype=torch.bfloat16, requires_grad=True)
     x = torch.randn(M, N, device=device, dtype=torch.float32, requires_grad=True)
     weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
     rstd = torch.randn(M, device=device, dtype=torch.float32, requires_grad=True)
-
     dx, dw, _, _ = rmsnorm_bwd(x, weight, dy, rstd)
-
     assert dx is not None
     assert dw is not None
 

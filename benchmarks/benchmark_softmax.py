@@ -11,6 +11,11 @@ import cutlass.torch as cutlass_torch
 
 from quack.softmax import softmax
 
+try:
+    from liger_kernel.transformers.functional import liger_softmax
+except ImportError:
+    liger_softmax = None
+
 
 def run_softmax(
     M,
@@ -33,6 +38,7 @@ def run_softmax(
     print(f"Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     out = softmax(x)
+    # compiled_func_ref = torch.compile(lambda x: F.softmax(x, dim=-1))
     compiled_func_ref = torch.compile(lambda x: F.softmax(x, dim=-1))
     fn = lambda: softmax(x)
     time.sleep(0.5)
@@ -46,8 +52,17 @@ def run_softmax(
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
-    print(f"Ref kernel execution time: {avg_time:.4f} ms")
-    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
+    print(f"Torch compile kernel execution time: {avg_time:.4f} ms")
+    print(f"Torch compile mem throughput: {mem_bw_ref:.2f} GB/s")
+
+    if liger_softmax is not None:
+        fn = lambda: liger_softmax(x)
+        for _ in range(5): fn()  # warm up
+        time.sleep(0.5)
+        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+        mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
+        print(f"Liger kernel execution time: {avg_time:.4f} ms")
+        print(f"Liger mem throughput: {mem_bw_ref:.2f} GB/s")
 
     return mem_bw, mem_bw_ref
 

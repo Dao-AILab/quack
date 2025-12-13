@@ -9,6 +9,7 @@ import cutlass.cute as cute
 from cutlass import Int64, Float32, const_expr
 
 import quack.utils as utils
+from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -170,18 +171,15 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     compile_key = (dtype, N)
     if compile_key not in _softmax_fwd.compile_cache:
         batch_sym = cute.sym_int()
-        x_cute, out_cute = [
-            cute.runtime.make_fake_tensor(
-                dtype,
-                (batch_sym, N),
-                stride=(cute.sym_int(divisibility=128 // dtype.width), 1),
-                assumed_align=16,
-            )
-        ] * 2
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        div = math.gcd(128 // dtype.width, N)
+        x_cute, out_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
         softmax_op = Softmax(dtype, N)
         _softmax_fwd.compile_cache[compile_key] = cute.compile(
-            softmax_op, x_cute, out_cute, stream, options="--enable-tvm-ffi"
+            softmax_op,
+            x_cute,
+            out_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
     _softmax_fwd.compile_cache[compile_key](x, out)
 
@@ -347,18 +345,16 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     compile_key = (dtype, N)
     if compile_key not in _softmax_backward.compile_cache:
         batch_sym = cute.sym_int()
-        dy_cute, y_cute, dx_cute = [
-            cute.runtime.make_fake_tensor(
-                dtype,
-                (batch_sym, N),
-                stride=(cute.sym_int(divisibility=128 // dtype.width), 1),
-                assumed_align=16,
-            )
-        ] * 3
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        div = math.gcd(128 // dtype.width, N)
+        dy_cute, y_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 3
         softmax_backward_op = SoftmaxBackward(dtype, N)
         _softmax_backward.compile_cache[compile_key] = cute.compile(
-            softmax_backward_op, dy_cute, y_cute, dx_cute, stream, options="--enable-tvm-ffi"
+            softmax_backward_op,
+            dy_cute,
+            y_cute,
+            dx_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
     _softmax_backward.compile_cache[compile_key](dy, y, dx)
 

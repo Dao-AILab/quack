@@ -85,10 +85,7 @@ class TopK:
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
-        mX = utils.domain_offset_i64((bidx * tiler_mn[0], 0), mX)
-        gX = cute.local_tile(mX, tiler_mn, (0, 0))
-        cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
+        gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, 0)) for mT in (mX, idX)]
 
         # declare the atoms which will be used later for memory copy
         copy_atom_load_X = cute.make_copy_atom(

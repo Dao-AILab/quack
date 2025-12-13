@@ -13,6 +13,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
 
 import quack.utils as utils
+from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -281,43 +282,21 @@ def cross_entropy_fwd_out(
     )
     if compile_key not in cross_entropy_fwd_out.compile_cache:
         batch_sym = cute.sym_int()
-        divisibility = math.gcd(128 // dtype.width, N)
-        x_cute, dx_cute = [
-            cute.runtime.make_fake_tensor(
-                dtype,
-                (batch_sym, N),
-                stride=(cute.sym_int(divisibility=divisibility), 1),
-                assumed_align=divisibility * dtype.width // 8,
-            )
-            if t is not None
-            else None
-            for t in (x, dx)
-        ]
-        target_cute = cute.runtime.make_fake_tensor(
-            target_dtype, (batch_sym,), stride=(cute.sym_int(),)
-        )
+        div = math.gcd(128 // dtype.width, N)
+        x_cute = fake_tensor(dtype, (batch_sym, N), div)
+        dx_cute = fake_tensor(dtype, (batch_sym, N), div) if dx is not None else None
+        target_cute = fake_tensor(target_dtype, (batch_sym,))
         if target_logit is not None:
             if target_logit.ndim == 2:
-                divisibility = math.gcd(128 // dtype.width, N)
-                target_logit_cute = cute.runtime.make_fake_tensor(
-                    target_logit_dtype,
-                    (batch_sym, cute.sym_int()),
-                    stride=(cute.sym_int(divisibility=divisibility), 1),
-                    assumed_align=divisibility * target_logit_dtype.width // 8,
+                target_logit_cute = fake_tensor(
+                    target_logit_dtype, (batch_sym, cute.sym_int()), div
                 )
             else:
-                target_logit_cute = cute.runtime.make_fake_tensor(
-                    target_logit_dtype, (batch_sym,), stride=(1,)
-                )
+                target_logit_cute = fake_tensor(target_logit_dtype, (batch_sym,))
         else:
             target_logit_cute = None
-        loss_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
-        lse_cute = (
-            cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
-            if lse is not None
-            else None
-        )
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        loss_cute = fake_tensor(Float32, (batch_sym,))
+        lse_cute = fake_tensor(Float32, (batch_sym,)) if lse is not None else None
         # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
         cross_entropy_op = CrossEntropy(dtype, N, online_softmax=dx is None)
         cross_entropy_fwd_out.compile_cache[compile_key] = cute.compile(
@@ -329,7 +308,7 @@ def cross_entropy_fwd_out(
             lse_cute,
             dx_cute,
             Int32(0),  # ignore_index, just for compilation
-            stream,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
     cross_entropy_fwd_out.compile_cache[compile_key](
@@ -551,22 +530,10 @@ def _cross_entropy_backward(
     compile_key = (dtype, target_dtype, N)
     if compile_key not in _cross_entropy_backward.compile_cache:
         batch_sym = cute.sym_int()
-        divisibility = math.gcd(128 // dtype.width, N)
-        x_cute, dx_cute = [
-            cute.runtime.make_fake_tensor(
-                dtype,
-                (batch_sym, N),
-                stride=(cute.sym_int(divisibility=divisibility), 1),
-                assumed_align=divisibility * dtype.width // 8,
-            )
-            for _ in (x, dx)
-        ]
-        target_cute = cute.runtime.make_fake_tensor(
-            target_dtype, (batch_sym,), stride=(cute.sym_int(),)
-        )
-        dloss_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
-        lse_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int(),))
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        div = math.gcd(128 // dtype.width, N)
+        x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
+        target_cute = fake_tensor(target_dtype, (batch_sym,))
+        dloss_cute, lse_cute = [fake_tensor(Float32, (batch_sym,))] * 2
         cross_entropy_backward_op = CrossEntropyBackward(dtype, N)
         _cross_entropy_backward.compile_cache[compile_key] = cute.compile(
             cross_entropy_backward_op,
@@ -576,7 +543,7 @@ def _cross_entropy_backward(
             dx_cute,
             lse_cute,
             Int32(0),  # ignore_index, just for compilation
-            stream,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
     _cross_entropy_backward.compile_cache[compile_key](
