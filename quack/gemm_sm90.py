@@ -31,7 +31,6 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
-import quack.utils as utils
 import quack.copy_utils as copy_utils
 import quack.sm90_utils as quack_sm90_utils
 
@@ -1593,7 +1592,7 @@ class GemmSm90:
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
-        copy_atom_s2r = utils.sm90_get_smem_load_op(c_layout, dtype)
+        copy_atom_s2r = copy_utils.sm90_get_smem_load_op(c_layout, dtype)
         tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_C_atom)
         thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
         tSR_sC = thr_copy_s2r.partition_S(sC)

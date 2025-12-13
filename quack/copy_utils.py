@@ -68,7 +68,7 @@ def tiled_copy_1d(
 
 
 def tiled_copy_2d(
-    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = True
+    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
 ) -> cute.TiledCopy:
     num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
     copy_elems = num_copy_bits // dtype.width
@@ -82,6 +82,57 @@ def tiled_copy_2d(
     )
     val_layout = cute.make_layout((1, copy_elems))
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
+@dsl_user_op
+def sm90_get_smem_load_op(
+    layout_c: cutlass.utils.LayoutEnum,
+    elem_ty_c: Type[cutlass.Numeric],
+    *,
+    loc=None,
+    ip=None,
+) -> cute.CopyAtom:
+    """
+    Selects the largest vectorized smem load atom available subject to constraint of gmem layout.
+
+    Parameters:
+    -----------
+    layout_c : LayoutEnum
+        The layout enum of the output tensor D.
+
+    elem_ty_c : Type[Numeric]
+        The element type for output tensor D.
+
+    Returns:
+    --------
+    Either SmemLoadMatrix or SimtSyncCopy, based on the input parameters.
+    """
+
+    if not isinstance(elem_ty_c, cutlass.cutlass_dsl.NumericMeta):
+        raise TypeError(f"elem_ty_c must be a Numeric, but got {elem_ty_c}")
+    is_m_major = layout_c.is_m_major_c()
+    if elem_ty_c.width == 16:
+        return cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(is_m_major, 4), elem_ty_c, loc=loc, ip=ip
+        )
+    else:
+        return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), elem_ty_c, loc=loc, ip=ip)
+
+
+def get_smem_store_atom(
+    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+) -> cute.CopyAtom:
+    if const_expr(arch < 90 or element_type.width != 16):
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            element_type,
+            num_bits_per_copy=(2 if not transpose else 1) * element_type.width,
+        )
+    else:
+        return cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+            element_type,
+        )
 
 
 def tma_get_copy_fn(
