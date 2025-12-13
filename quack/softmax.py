@@ -1,8 +1,10 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-import torch
 from typing import Type
+from functools import partial
+
+import torch
 
 import cuda.bindings.driver as cuda
 
@@ -11,6 +13,7 @@ import cutlass.cute as cute
 from cutlass import Int64, Float32, const_expr
 
 import quack.utils as utils
+import quack.copy_utils as copy_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
@@ -55,9 +58,11 @@ class Softmax(ReductionBase):
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
-        assert mO.element_type == self.dtype
         self._set_cluster_n()
-        tiler_mn, tv_layout = self._get_tv_layout()
+        largest_dtype_width = const_expr(max(t.element_type.width for t in [mX, mO]))
+        tiler_mn, tv_layout = self._get_tv_layout(
+            num_copy_bits=128 // largest_dtype_width * mX.element_type.width
+        )
         num_threads = cute.size(tv_layout, mode=[0])
         self.kernel(mX, mO, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
@@ -89,29 +94,26 @@ class Softmax(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        copy_atom_load_X = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128
-        )
-        copy_atom_store_O = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=128
-        )
-        thr_copy_ld = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_st = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
+        num_copy_elems_X = tv_layout.shape[1][0]
+        copy_atom_load_X = copy_utils.get_copy_atom(mX.element_type, num_copy_elems_X)
+        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
 
-        tXgX = thr_copy_ld.partition_S(gX)
-        tXsX = thr_copy_ld.partition_D(sX)
-        tXgO = thr_copy_st.partition_D(gO)
-        tXcX = thr_copy_ld.partition_S(cX)[(0, None), None, None]
-
+        tXgX = thr_copy_X.partition_S(gX)
+        tXsX = thr_copy_X.partition_D(sX)
+        tXgO = thr_copy_X.partition_D(gO)
+        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
+
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+        # Each copy will use the same number of elements as X and same predicate
+        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems_X)
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy_ld.partition_S(cX), limit=shape[1])
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
+            copy(tXgX, tXsX, is_async=True)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         # Fill OOB values with -inf
@@ -154,7 +156,7 @@ class Softmax(ReductionBase):
         y = exp_x * cute.arch.rcp_approx(denom)
         tXrO.store(y.to(tXrO.element_type))
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tXpX)
+            copy(tXrO, tXgO)
 
 
 @torch.library.custom_op("quack::_softmax_fwd", mutates_args={"out"})
@@ -169,12 +171,12 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     assert x.is_cuda, "Tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     N = x.size(1)
-    dtype = torch2cute_dtype_map[x.dtype]
-    compile_key = (dtype, N)
+    dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
+    compile_key = (dtype, out_dtype, N)
     if compile_key not in _softmax_fwd.compile_cache:
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
-        x_cute, out_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
+        x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
         softmax_op = Softmax(dtype, N)
         _softmax_fwd.compile_cache[compile_key] = cute.compile(
             softmax_op,
@@ -231,10 +233,11 @@ class SoftmaxBackward(ReductionBase):
         stream: cuda.CUstream,
     ):
         assert mdY.element_type == self.dtype
-        assert mY.element_type == self.dtype
-        assert mdX.element_type == self.dtype
         self._set_cluster_n()
-        tiler_mn, tv_layout = self._get_tv_layout()
+        largest_dtype_width = const_expr(max(t.element_type.width for t in [mdY, mY, mdX]))
+        tiler_mn, tv_layout = self._get_tv_layout(
+            num_copy_bits=128 // largest_dtype_width * mdY.element_type.width
+        )
         num_threads = cute.size(tv_layout, mode=[0])
         self.kernel(mdY, mY, mdX, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mdY.shape[0], tiler_mn[0]), self.cluster_n, 1],
@@ -272,33 +275,29 @@ class SoftmaxBackward(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        copy_atom_load = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), mdY.element_type, num_bits_per_copy=128
-        )
-        copy_atom_store = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), gdX.element_type, num_bits_per_copy=128
-        )
-        thr_copy_ld = cute.make_tiled_copy(copy_atom_load, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_st = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn).get_slice(tidx)
+        num_copy_elems = tv_layout.shape[1][0]
+        copy_atom = copy_utils.get_copy_atom(mdY.element_type, num_copy_elems)
+        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
 
-        tdYgdY = thr_copy_ld.partition_S(gdY)
-        tdYsdY = thr_copy_ld.partition_D(sdY)
-        tYgY = thr_copy_ld.partition_S(gY)
-        tYsY = thr_copy_ld.partition_D(sY)
-        tdXgdX = thr_copy_st.partition_D(gdX)
-        tXcX = thr_copy_ld.partition_S(cX)[(0, None), None, None]
-
+        tdYgdY = thr_copy.partition_S(gdY)
+        tdYsdY = thr_copy.partition_D(sdY)
+        tYgY = thr_copy.partition_S(gY)
+        tYsY = thr_copy.partition_D(sY)
+        tdXgdX = thr_copy.partition_D(gdX)
+        tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
         tdYrdY, tYrY, tdXrdX = [cute.make_fragment_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
+
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        # Each copy will use the same number of elements as X and same predicate
+        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy_ld.partition_S(cX), limit=shape[1])
-
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_load, tdYgdY, tdYsdY, pred=tXpX)
-            cute.copy(copy_atom_load, tYgY, tYsY, pred=tXpX)
+            copy(tdYgdY, tdYsdY, is_async=True)
+            copy(tYgY, tYsY, is_async=True)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
 
@@ -323,7 +322,7 @@ class SoftmaxBackward(ReductionBase):
         dx = y * (dy - dot)
         tdXrdX.store(dx.to(tdXrdX.element_type))
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_store, tdXrdX, tdXgdX, pred=tXpX)
+            copy(tdXrdX, tdXgdX)
 
 
 @torch.library.custom_op("quack::_softmax_backward", mutates_args={"dx"})
@@ -343,12 +342,14 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     assert y.dtype == dy.dtype, "dy and y must have same dtype"
 
     N = dy.size(1)
-    dtype = torch2cute_dtype_map[dy.dtype]
-    compile_key = (dtype, N)
+    dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
+    compile_key = (dtype, y_dtype, dx_dtype, N)
     if compile_key not in _softmax_backward.compile_cache:
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
-        dy_cute, y_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 3
+        dy_cute, y_cute, dx_cute = [
+            fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
+        ]
         softmax_backward_op = SoftmaxBackward(dtype, N)
         _softmax_backward.compile_cache[compile_key] = cute.compile(
             softmax_backward_op,

@@ -20,6 +20,12 @@ def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
     return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
 
 
+def expand(a: cute.Tensor, dim: int, size: Int32 | int) -> cute.Tensor:
+    shape = (*a.shape[:dim], size, *a.shape[dim:])
+    stride = (*a.layout.stride[:dim], 0, *a.layout.stride[dim:])
+    return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
+
+
 @cute.jit
 def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
     assert t.element_type.width == 16

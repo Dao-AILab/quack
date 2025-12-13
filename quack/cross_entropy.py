@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
+from functools import partial
 from typing import Optional, Type, Literal
 
 import torch
@@ -13,6 +14,8 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
 
 import quack.utils as utils
+import quack.copy_utils as copy_utils
+import quack.layout_utils as layout_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
@@ -65,6 +68,8 @@ class CrossEntropy(ReductionBase):
         assert mX.element_type == self.dtype
         if const_expr(mTargetLogit is None):
             mTargetLogit = mX
+        if const_expr(mdX is not None):
+            assert mdX.element_type == self.dtype
         self._set_cluster_n()
         # e.g. if self.N isn't divisible by 8 for bf16, we might use 64 bits (4 elements) copy
         num_copy_bits = math.gcd(self.N, 128 // self.dtype.width) * self.dtype.width
@@ -107,19 +112,18 @@ class CrossEntropy(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        # declare the atoms which will be used later for memory copy
-        num_copy_elems_X = tv_layout.shape[1][0]
-        num_copy_bits_X = mX.element_type.width * num_copy_elems_X
-        copy_atom_load_X = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=num_copy_bits_X
-        )
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+        num_copy_elems = tv_layout.shape[1][0]
+        copy_atom = copy_utils.get_copy_atom(mX.element_type, num_copy_elems)
+        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
 
-        #### Partition to get thread view
-        tXgX = thr_copy_X.partition_S(gX)
-        tXsX = thr_copy_X.partition_D(sX)
-        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
+        tXgX = thr_copy.partition_S(gX)
+        tXsX = thr_copy.partition_D(sX)
+        tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
         tXrX = cute.make_fragment_like(tXgX)
+
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
@@ -129,10 +133,8 @@ class CrossEntropy(ReductionBase):
         if row < shape[0]:
             target = Int32(mTarget[row])
 
-        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
         if row < shape[0]:
-            cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
+            copy(tXgX, tXsX, is_async=True)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         # Fill OOB values with -inf
@@ -211,14 +213,9 @@ class CrossEntropy(ReductionBase):
             )
             probs = exp_x * denom_inv
             gdX = cute.local_tile(mdX, tiler_mn, (bidx, cluster_y))
-            # Setup copy atom for storing gradient
-            copy_atom_store = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), mdX.element_type, num_bits_per_copy=num_copy_bits_X
-            )
-            thr_copy_dX = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn).get_slice(tidx)
-            tXgdX = thr_copy_dX.partition_D(gdX)
+            tXgdX = thr_copy.partition_D(gdX)
             tXrdX = cute.make_fragment_like(tXgdX)
-            tXcFull = thr_copy_X.partition_S(cX)
+            tXcFull = thr_copy.partition_S(cX)
             # Compute gradient: probs for all classes, (probs - 1) for target class
             # If ignored, gradient is already zero
             tXrdX_f32 = cute.make_fragment_like(tXrX, Float32)
@@ -228,7 +225,7 @@ class CrossEntropy(ReductionBase):
                     tXrdX_f32[i] = tXrdX_f32[i] if tXcFull[i][1] != target else tXrdX_f32[i] - 1.0
             tXrdX.store(tXrdX_f32.load().to(tXrdX.element_type))
             if row < shape[0]:
-                cute.copy(copy_atom_store, tXrdX, tXgdX, pred=tXpX)
+                copy(tXrdX, tXgdX)
 
 
 @torch.library.custom_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
@@ -394,10 +391,7 @@ class CrossEntropyBackward:
         num_threads = cute.size(tv_layout, mode=[0])
         # (M,) -> (M, N) with stride 0 in the N dimension
         mDLoss, mTarget, mLSE = [
-            cute.make_tensor(
-                X.iterator, cute.append(X.layout, cute.make_layout((self.N,), stride=(0,)))
-            )
-            for X in (mDLoss, mTarget, mLSE)
+            layout_utils.expand(X, dim=1, size=self.N) for X in (mDLoss, mTarget, mLSE)
         ]
         self.kernel(
             mX, mTarget, mDLoss, mdX, mLSE, ignore_index, mX.shape, tv_layout, tiler_mn
@@ -435,33 +429,24 @@ class CrossEntropyBackward:
         idX = cute.make_identity_tensor(shape)
         gX, gdX, cX = [cute.local_tile(mT, tiler_mn, (bidx, bidy)) for mT in (mX, mdX, idX)]
 
-        num_copy_elems_X = tv_layout.shape[1][0]
-        num_copy_bits_X = mX.element_type.width * num_copy_elems_X
-        copy_atom_load_X = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=num_copy_bits_X
-        )
-        copy_atom_store_dX = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), gdX.element_type, num_bits_per_copy=num_copy_bits_X
-        )
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_dX = cute.make_tiled_copy(copy_atom_store_dX, tv_layout, tiler_mn).get_slice(tidx)
+        num_copy_elems = tv_layout.shape[1][0]
+        copy_atom = copy_utils.get_copy_atom(mX.element_type, num_copy_elems)
+        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
 
-        #### Partition to get thread view
-        tXgX = thr_copy_X.partition_S(gX)
-        tXsX = thr_copy_X.partition_S(sX)
-        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
-        tXcFull = thr_copy_X.partition_S(cX)
-        tXgdX = thr_copy_dX.partition_D(gdX)
-        # allocate fragments for gmem->rmem
+        tXgX = thr_copy.partition_S(gX)
+        tXsX = thr_copy.partition_S(sX)
+        tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
+        tXcFull = thr_copy.partition_S(cX)
+        tXgdX = thr_copy.partition_D(gdX)
         tXrX, tXrdX = [cute.make_fragment_like(thr) for thr in (tXgX, tXgdX)]
 
         is_even_N = const_expr(shape[1] % tiler_mn[1] == 0)
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
+
         row = tXcX[0][0]
-        tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
-        )
         if row < shape[0]:
-            cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
+            copy(tXgX, tXsX, is_async=True)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         if const_expr(not is_even_N):
@@ -491,7 +476,7 @@ class CrossEntropyBackward:
 
         tXrdX.store(grad.to(tXrdX.element_type))
         if row < shape[0]:
-            cute.copy(copy_atom_store_dX, tXrdX, tXgdX, pred=tXpX)
+            copy(tXrdX, tXgdX)
 
 
 def _cross_entropy_backward(
