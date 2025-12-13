@@ -1,17 +1,20 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Tri Dao.
 
 import math
-import torch
+from functools import partial
 from typing import Type
+
+import torch
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 from cutlass import Int32, Float32, const_expr
 
 import quack.utils as utils
+import quack.copy_utils as copy_utils
+from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.sort.bitonic_sort import bitonic_topk
 
@@ -87,23 +90,20 @@ class TopK:
         # slice for CTAs
         gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, 0)) for mT in (mX, idX)]
 
-        # declare the atoms which will be used later for memory copy
-        copy_atom_load_X = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128
-        )
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-        tXgX = thr_copy_X.partition_S(gX)
-        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
+        num_copy_elems = tv_layout.shape[1][0]
+        copy_atom = copy_utils.get_copy_atom(mX.element_type, num_copy_elems)
+        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
 
-        # allocate fragments for gmem->rmem
+        tXgX = thr_copy.partition_S(gX)
+        tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
         tXrX = cute.make_fragment_like(tXgX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
-        tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
-        )
+        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
+
         if tXcX[0][0] < shape[0]:
-            cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
+            copy(tXgX, tXrX)
         tXrX_f32 = cute.make_fragment(tXrX.shape, Float32)
         tXrX_f32.store(tXrX.load().to(Float32))
 
@@ -111,18 +111,18 @@ class TopK:
         log_N = int(math.log2(self.N))
         idx_mask = (1 << log_N) - 1
         vecsize = const_expr(tv_layout.shape[1][0])
-        tXrX_u32 = cute.recast_tensor(tXrX_f32, cutlass.Uint32)
-        # Encode indices into the last log_N bits of tXrX_u32
-        for i in cutlass.range(cute.size(tXrX_u32), unroll_full=True):
+        tXrX_i32 = cute.recast_tensor(tXrX_f32, Int32)
+        # Encode indices into the last log_N bits of tXrX_i32
+        for i in cutlass.range(cute.size(tXrX_i32), unroll_full=True):
             # tXcX only keeps track of the indices for every @vecsize elements
-            col_idx = cutlass.Uint32(tXcX[i // vecsize][1] + i % vecsize)
+            col_idx = Int32(tXcX[i // vecsize][1] + i % vecsize)
             # If positive, invert the bits of the index, so that if there's a tie,
             # indices coming from a earlier column will win.
             encoded_idx = ~col_idx if tXrX_f32[i] >= 0 else col_idx
             # Mask to keep only the last log_N bits of the encoded index
             encoded_idx = encoded_idx & idx_mask
             # Clear the last log_N bits and set them to our encoded index
-            tXrX_u32[i] = (tXrX_u32[i] & ~idx_mask) | encoded_idx
+            tXrX_i32[i] = (tXrX_i32[i] & ~idx_mask) | encoded_idx
 
         # Fill OOB values with -inf for top-k
         if const_expr(not is_even_N):
@@ -132,13 +132,13 @@ class TopK:
         topk_vals = bitonic_topk(tXrX_f32, self.k, warp_width=threads_per_row)
 
         # Extract indices and clean values
-        topk_vals_u32 = cute.recast_tensor(topk_vals, cutlass.Uint32)
+        topk_vals_i32 = cute.recast_tensor(topk_vals, Int32)
         topk_indices = cute.make_fragment(self.k, Int32)
         for i in cutlass.range(self.k):
             # Extract the encoded index from the last log_N bits
-            encoded_idx = topk_vals_u32[i] & idx_mask
+            encoded_idx = topk_vals_i32[i] & idx_mask
             # Check if original value was positive by looking at the cleaned value
-            topk_vals_u32[i] = topk_vals_u32[i] & ~idx_mask  # Clear last log_N bits
+            topk_vals_i32[i] = topk_vals_i32[i] & ~idx_mask  # Clear last log_N bits
             # If positive, we need to invert the bits back to get original index
             col_idx = ~encoded_idx if topk_vals[i] >= 0 else encoded_idx
             topk_indices[i] = Int32(col_idx & idx_mask)
@@ -179,25 +179,24 @@ def _topk_fwd(x: torch.Tensor, k: int, values: torch.Tensor, indices: torch.Tens
     assert k > 0 and k <= x.shape[1], "k must be positive and <= N"
 
     N = x.size(1)
-
     dtype = torch2cute_dtype_map[x.dtype]
-    convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1)
-        )
-    )
-
-    x_tensor, values_tensor, indices_tensor = [
-        convert_from_dlpack(tensor) for tensor in (x, values, indices)
-    ]
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compile_key = (dtype, N, k)
     if compile_key not in _topk_fwd.compile_cache:
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        x_cute = fake_tensor(dtype, (batch_sym, N), div)
+        values_cute = fake_tensor(dtype, (batch_sym, k), div)
+        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
         topk_op = TopK(dtype, N, k)
         _topk_fwd.compile_cache[compile_key] = cute.compile(
-            topk_op, x_tensor, values_tensor, indices_tensor, current_stream
+            topk_op,
+            x_cute,
+            values_cute,
+            indices_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
-    _topk_fwd.compile_cache[compile_key](x_tensor, values_tensor, indices_tensor, current_stream)
+    _topk_fwd.compile_cache[compile_key](x, values, indices)
 
 
 _topk_fwd.compile_cache = {}
