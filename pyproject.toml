@@ -9,6 +9,8 @@ requires-python = ">=3.10"
 dependencies = [
     "nvidia-cutlass-dsl==4.3.3",
     "torch",
+    "apache-tvm-ffi>=0.1.5,<0.2",
+    "torch-c-dlpack-ext",
 ]
 
 [project.optional-dependencies]
