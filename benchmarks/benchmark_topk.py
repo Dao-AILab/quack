@@ -21,6 +21,7 @@ def run_topk(
     N,
     k,
     dtype: Type[cutlass.Numeric],
+    softmax: bool = False,
     warmup_iterations=10,
     iterations=1000,
 ):
@@ -37,11 +38,11 @@ def run_topk(
 
     print(f"Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
-    out, idx = topk(x, k)
+    out, idx = topk(x, k, softmax=softmax)
     print(f"Output shape: {out.shape}")
 
     # Benchmark our implementation
-    fn = lambda: topk(x, k)
+    fn = lambda: topk(x, k, softmax=softmax)
     fn()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
@@ -89,6 +90,7 @@ if __name__ == "__main__":
     parser.add_argument("--N", default=1024, type=int)
     parser.add_argument("--k", default=32, type=int)
     parser.add_argument("--dtype", type=cutlass.dtype, choices=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32], default=cutlass.BFloat16)
+    parser.add_argument("--softmax", action="store_true", help="Apply softmax to top-k values")
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--sweep", action="store_true", help="Run sweep across different N and k values")
@@ -116,6 +118,7 @@ if __name__ == "__main__":
                         N,
                         k,
                         dtype=args.dtype,
+                        softmax=args.softmax,
                         warmup_iterations=args.warmup_iterations,
                         iterations=args.iterations,
                     )
@@ -134,6 +137,7 @@ if __name__ == "__main__":
             args.N,
             args.k,
             dtype=args.dtype,
+            softmax=args.softmax,
             warmup_iterations=args.warmup_iterations,
             iterations=args.iterations,
         )

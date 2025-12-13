@@ -20,11 +20,12 @@ from quack.sort.bitonic_sort import bitonic_topk
 
 
 class TopK:
-    def __init__(self, dtype: Type[cutlass.Numeric], N: int, k: int):
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int, k: int, softmax: bool = False):
         self.dtype = dtype
         self.N = N
         self.vecsize = 128 // dtype.width
         self.k = k
+        self.softmax = softmax
         assert N == 2 ** int(math.log2(N)), "N must be a power of 2"
         assert k == 2 ** int(math.log2(k)), "N must be a power of 2"
         assert k <= 128
@@ -164,6 +165,26 @@ class TopK:
             col_idx = ~encoded_idx if topk_vals[i] >= 0 else encoded_idx
             topk_indices[i] = Int32(col_idx & idx_mask)
 
+        # Compute softmax if requested
+        if const_expr(self.softmax):
+            # Need masking as some elements may be OOB
+            for i in cutlass.range(cute.size(topk_vals_split, mode=[1]), unroll_full=True):
+                col = i * threads_per_row + tidx % threads_per_row
+                if col >= self.k // vecsize_out:
+                    for v in cutlass.range(vecsize_out, unroll_full=True):
+                        topk_vals_split[v, i] = -Float32.inf
+            # Get max from thread 0 (topk_vals[0] is the max since sorted descending)
+            max_val = cute.arch.shuffle_sync(topk_vals[0], offset=0, mask_and_clamp=mask_and_clamp)
+            log2_e = math.log2(math.e)
+            exp_x = cute.math.exp2(
+                topk_vals_split.load() * log2_e - (max_val * log2_e), fastmath=True
+            )
+            denom = cute.arch.warp_reduction_sum(
+                exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
+                threads_in_group=threads_per_row,
+            )
+            topk_vals_split.store(exp_x * cute.arch.rcp_approx(denom))
+
         # Convert cleaned values to output type
         topk_vals_out = cute.make_fragment_like(topk_vals_split, mValues.element_type)
         topk_vals_out.store(topk_vals_split.load().to(mValues.element_type))
@@ -195,11 +216,14 @@ class TopK:
 
 
 @torch.library.custom_op("quack::_topk_fwd", mutates_args={"values", "indices"})
-def _topk_fwd(x: torch.Tensor, k: int, values: torch.Tensor, indices: torch.Tensor) -> None:
+def _topk_fwd(
+    x: torch.Tensor, k: int, softmax: bool, values: torch.Tensor, indices: torch.Tensor
+) -> None:
     """Top-k forward pass.
     Args:
         x: Input tensor of shape (M, N)
         k: Number of top elements to return
+        softmax: Whether to apply softmax to the top-k values
     Returns:
         Tuple of (values tensor of shape (M, k), indices tensor of shape (M, k))
     """
@@ -210,14 +234,14 @@ def _topk_fwd(x: torch.Tensor, k: int, values: torch.Tensor, indices: torch.Tens
 
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
-    compile_key = (dtype, N, k)
+    compile_key = (dtype, N, k, softmax)
     if compile_key not in _topk_fwd.compile_cache:
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
         x_cute = fake_tensor(dtype, (batch_sym, N), div)
         values_cute = fake_tensor(dtype, (batch_sym, k), div)
         indices_cute = fake_tensor(Int32, (batch_sym, k), div)
-        topk_op = TopK(dtype, N, k)
+        topk_op = TopK(dtype, N, k, softmax=softmax)
         _topk_fwd.compile_cache[compile_key] = cute.compile(
             topk_op,
             x_cute,
@@ -232,22 +256,19 @@ def _topk_fwd(x: torch.Tensor, k: int, values: torch.Tensor, indices: torch.Tens
 _topk_fwd.compile_cache = {}
 
 
-def topk(x: torch.Tensor, k: int):
+def topk(x: torch.Tensor, k: int, softmax: bool = False):
     """Top-k operation.
 
     Args:
         x: Input tensor of shape (M, N)
         k: Number of top elements to return
+        softmax: Whether to apply softmax to the top-k values
 
     Returns:
         Tuple of (values tensor of shape (M, k), indices tensor of shape (M, k))
     """
-
     M = x.size(0)
-
     values = torch.empty((M, k), dtype=x.dtype, device=x.device)
     indices = torch.empty((M, k), dtype=torch.int32, device=x.device)
-
-    _topk_fwd(x, k, values, indices)
-
+    _topk_fwd(x, k, softmax, values, indices)
     return values, indices
