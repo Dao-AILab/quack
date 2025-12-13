@@ -15,6 +15,7 @@ from torch import Tensor
 
 import quack.utils as utils
 import quack.copy_utils as copy_utils
+import quack.layout_utils as layout_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
@@ -72,26 +73,14 @@ class RMSNorm(ReductionBase):
             num_copy_bits=128 // largest_dtype_width * mX.element_type.width
         )
         num_threads = cute.size(tv_layout, mode=[0])
-        if const_expr(mW is not None):
-            mW_expanded_layout = cute.prepend(
-                mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
-            )
-            mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
-        if const_expr(mB is not None):
-            mB_expanded_layout = cute.prepend(
-                mB.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
-            )
-            mB = cute.make_tensor(mB.iterator, mB_expanded_layout)
-        if const_expr(mRstd is not None):
-            mRstd_expanded_layout = cute.append(
-                mRstd.layout, cute.make_layout((self.N,), stride=(0,))
-            )
-            mRstd = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
-        if const_expr(mMean is not None):
-            mMean_expanded_layout = cute.append(
-                mMean.layout, cute.make_layout((self.N,), stride=(0,))
-            )
-            mMean = cute.make_tensor(mMean.iterator, mMean_expanded_layout)
+        mW, mB = [
+            layout_utils.expand(mT, dim=0, size=tiler_mn[0]) if const_expr(mT is not None) else None
+            for mT in (mW, mB)
+        ]
+        mRstd, mMean = [
+            layout_utils.expand(mT, dim=1, size=self.N) if const_expr(mT is not None) else None
+            for mT in (mRstd, mMean)
+        ]
         self.kernel(mX, mW, mB, mRes, mO, mResO, mRstd, mMean, eps, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
@@ -143,12 +132,8 @@ class RMSNorm(ReductionBase):
         ]
 
         num_copy_elems_X = tv_layout.shape[1][0]
-        copy_atom_load_X_async = copy_utils.get_copy_atom(
-            mX.element_type, num_copy_elems_X, is_async=True
-        )
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(
-            tidx
-        )
+        copy_atom_load_X = copy_utils.get_copy_atom(mX.element_type, num_copy_elems_X)
+        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
 
         tXgW = thr_copy_X.partition_S(gW) if const_expr(mW is not None) else None
         tXgB = thr_copy_X.partition_S(gB) if const_expr(mB is not None) else None
@@ -500,11 +485,9 @@ class RMSNormBackward(ReductionBase):
             num_copy_bits=128 // largest_dtype_width * mX.element_type.width
         )
         num_threads = cute.size(tv_layout, mode=[0])
-        if const_expr(mW is not None):
-            mW_expanded_layout = cute.prepend(
-                mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))
-            )
-            mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        mW = (
+            layout_utils.expand(mW, dim=0, size=tiler_mn[0]) if const_expr(mW is not None) else None
+        )
         num_blocks = sm_count
         self.kernel(mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tv_layout, tiler_mn).launch(
             grid=[num_blocks, self.cluster_n, 1],
@@ -552,9 +535,7 @@ class RMSNormBackward(ReductionBase):
             mbar_full_ptr, mbar_empty_ptr = None, None
 
         num_copy_elems_X = tv_layout.shape[1][0]
-        copy_atom_load_X = copy_utils.get_copy_atom(
-            mX.element_type, num_copy_elems_X, is_async=False
-        )
+        copy_atom_load_X = copy_utils.get_copy_atom(mX.element_type, num_copy_elems_X)
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
 
         gX, gdO, gdResO, gdX, gdRes, cX = [
