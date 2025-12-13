@@ -682,8 +682,6 @@ class RMSNormBackward(ReductionBase):
             x = tXrX.load().to(cute.Float32)
             cute.autovec_copy(tXsdO[None, None, None, stage], tXrdO)
             dout = tXrdO.load().to(cute.Float32)
-            # if const_expr(mdResO is not None):
-            #     dout += tXrdResO.load().to(cute.Float32)
             x_hat = x * rstd
             wdy = dout
             if const_expr(mW is not None):
@@ -720,8 +718,6 @@ class RMSNormBackward(ReductionBase):
             if const_expr(self.reload_wdy == "smem"):
                 cute.autovec_copy(tXsdO[None, None, None, stage], tXrdO)
                 dout = tXrdO.load().to(cute.Float32)
-                # if const_expr(mdResO is not None):
-                #     dout += tXrdResO.load().to(cute.Float32)
                 wdy = dout
                 if const_expr(mW is not None):
                     wdy *= tXrW.load().to(Float32)

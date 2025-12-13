@@ -12,24 +12,6 @@ import quack.utils as utils
 
 
 @cute.jit
-def warp_reduce(
-    val: cute.TensorSSA | cute.Numeric,
-    op: Callable,
-    width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
-) -> cute.TensorSSA | cute.Numeric:
-    if const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_fragment(val.shape, val.dtype)
-        res.store(val)
-        for i in cutlass.range_constexpr(cute.size(val.shape)):
-            res[i] = warp_reduce(res[i], op, width)
-        return res.load()
-    else:
-        for i in cutlass.range_constexpr(int(math.log2(width))):
-            val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
-    return val
-
-
-@cute.jit
 def block_reduce(
     val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0
 ) -> cute.Numeric:
@@ -43,7 +25,7 @@ def block_reduce(
     block_reduce_val = init_val
     if lane_idx < warps_per_row:
         block_reduce_val = reduction_buffer[row_idx, lane_idx]
-    return warp_reduce(block_reduce_val, op)
+    return cute.arch.warp_reduction(block_reduce_val, op)
 
 
 @cute.jit
@@ -81,7 +63,7 @@ def cluster_reduce(
         idx = lane_idx + i * cute.arch.WARP_SIZE
         if idx < cute.size(reduction_buffer, mode=[1]):
             block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
-    return warp_reduce(block_reduce_val, op)
+    return cute.arch.warp_reduction(block_reduce_val, op)
 
 
 @cute.jit
@@ -122,10 +104,10 @@ def row_reduce(
         cute.ReductionOp.MIN: min,
         cute.ReductionOp.MUL: operator.mul,
     }[op]
-    val = warp_reduce(
+    val = cute.arch.warp_reduction(
         val,
         warp_op,
-        width=min(threads_per_row, cute.arch.WARP_SIZE),
+        threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     if const_expr(hook_fn is not None):
         hook_fn()
@@ -153,17 +135,17 @@ def online_softmax_reduce(
 ) -> [Float32, Float32, Optional[cute.TensorSSA]]:
     assert x.dtype == Float32, "x must be of type Float32"
     """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n), 2)"""
-    max_x = warp_reduce(
+    max_x = cute.arch.warp_reduction(
         x.reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
         cute.arch.fmax,
-        width=min(threads_per_row, cute.arch.WARP_SIZE),
+        threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     log2_e = math.log2(math.e)
     exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=True)
-    sum_exp_x = warp_reduce(
+    sum_exp_x = cute.arch.warp_reduction(
         exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
         operator.add,
-        width=min(threads_per_row, cute.arch.WARP_SIZE),
+        threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     if const_expr(hook_fn is not None):
         hook_fn()
@@ -188,9 +170,9 @@ def online_softmax_reduce(
                     max_x_single_warp, sum_exp_x = utils.i64_to_f32x2(
                         reduction_buffer[row_idx, lane_idx]
                     )
-                max_x_final = warp_reduce(max_x_single_warp, cute.arch.fmax)
+                max_x_final = cute.arch.warp_reduction(max_x_single_warp, cute.arch.fmax)
                 sum_exp_x *= cute.math.exp(max_x_single_warp - max_x_final, fastmath=True)
-                sum_exp_x = warp_reduce(sum_exp_x, operator.add)
+                sum_exp_x = cute.arch.warp_reduction(sum_exp_x, operator.add)
                 if const_expr(return_exp_x):
                     exp_x *= cute.math.exp(max_x - max_x_final, fastmath=True)
                 max_x = max_x_final
@@ -227,13 +209,13 @@ def online_softmax_reduce(
                 max_x_final = max_x_single_warp.load().reduce(
                     cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0
                 )
-                max_x_final = warp_reduce(max_x_final, cute.arch.fmax)
+                max_x_final = cute.arch.warp_reduction(max_x_final, cute.arch.fmax)
                 sum_exp_x = 0.0
                 for i in cutlass.range_constexpr(num_iter):
                     sum_exp_x += sum_exp_x_single_warp[i] * cute.math.exp(
                         max_x_single_warp[i] - max_x_final, fastmath=True
                     )
-                sum_exp_x = warp_reduce(sum_exp_x, operator.add)
+                sum_exp_x = cute.arch.warp_reduction(sum_exp_x, operator.add)
                 if const_expr(return_exp_x):
                     exp_x *= cute.math.exp(max_x - max_x_final, fastmath=True)
                 max_x = max_x_final
