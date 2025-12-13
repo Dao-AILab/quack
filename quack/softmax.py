@@ -1,3 +1,5 @@
+# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+
 import math
 import torch
 from typing import Type

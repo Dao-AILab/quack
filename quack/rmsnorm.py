@@ -1,15 +1,14 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Type
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
-from cutlass import const_expr
+from cutlass import Float32, Int32, const_expr
 
 import torch
 from torch import Tensor
@@ -23,9 +22,10 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 
 
 class RMSNorm(ReductionBase):
-    def __init__(self, dtype: cutlass.Numeric, N: int):
-        super().__init__(dtype, N, stage=1)
-        self.reload_from = None if N <= 8192 else "smem"
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int, is_layernorm: bool = False):
+        super().__init__(dtype, N, stage=2 if is_layernorm else 1)
+        self.is_layernorm = is_layernorm
+        self.reload_from = None if N <= (16384 if is_layernorm else 8192) else "smem"
         self.delay_w_load = False
 
     def _calculate_threads_per_row(self):
@@ -59,6 +59,7 @@ class RMSNorm(ReductionBase):
         mO: cute.Tensor,
         mResO: Optional[cute.Tensor],
         mRstd: Optional[cute.Tensor],
+        mMean: Optional[cute.Tensor],
         eps: Float32,
         stream: cuda.CUstream,
     ):
@@ -86,7 +87,12 @@ class RMSNorm(ReductionBase):
                 mRstd.layout, cute.make_layout((self.N,), stride=(0,))
             )
             mRstd = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
-        self.kernel(mX, mW, mB, mRes, mO, mResO, mRstd, eps, tv_layout, tiler_mn).launch(
+        if const_expr(mMean is not None):
+            mMean_expanded_layout = cute.append(
+                mMean.layout, cute.make_layout((self.N,), stride=(0,))
+            )
+            mMean = cute.make_tensor(mMean.iterator, mMean_expanded_layout)
+        self.kernel(mX, mW, mB, mRes, mO, mResO, mRstd, mMean, eps, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
@@ -103,6 +109,7 @@ class RMSNorm(ReductionBase):
         mO: cute.Tensor,
         mResO: Optional[cute.Tensor],
         mRstd: Optional[cute.Tensor],
+        mMean: Optional[cute.Tensor],
         eps: Float32,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
@@ -126,9 +133,9 @@ class RMSNorm(ReductionBase):
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        gX, gRes, gO, gResO, gRstd, cX = [
+        gX, gRes, gO, gResO, gRstd, gMean, cX = [
             cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) if mT is not None else None
-            for mT in (mX, mRes, mO, mResO, mRstd, idX)
+            for mT in (mX, mRes, mO, mResO, mRstd, mMean, idX)
         ]
         gW, gB = [
             cute.local_tile(mT, tiler_mn, (0, cluster_y)) if const_expr(mT is not None) else None
@@ -154,6 +161,7 @@ class RMSNorm(ReductionBase):
         if const_expr(mResO is not None):
             tXgResO = thr_copy_X.partition_D(gResO)
         tXrRstd = thr_copy_X.partition_D(gRstd) if const_expr(mRstd is not None) else None
+        tXrMean = thr_copy_X.partition_D(gMean) if const_expr(mMean is not None) else None
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
@@ -199,16 +207,61 @@ class RMSNorm(ReductionBase):
                 copy(tXrResO, tXgResO)
 
         threads_per_row = tv_layout.shape[0][0]
-        sum_sq_x = row_reduce(
-            x * x,
-            cute.ReductionOp.ADD,
-            threads_per_row,
-            reduction_buffer[None, None, 0],
-            mbar_ptr,
-            init_val=0.0,
-            hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
-        )
-        rstd = cute.math.rsqrt(sum_sq_x / shape[1] + eps, fastmath=True)
+        mean, rstd = None, None
+        if const_expr(self.is_layernorm):
+            # LayerNorm: compute mean first, then variance
+            sum_x = row_reduce(
+                x,
+                cute.ReductionOp.ADD,
+                threads_per_row,
+                reduction_buffer[None, None, 0],
+                mbar_ptr + 0 if const_expr(self.cluster_n > 1) else None,
+                init_val=0.0,
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
+            )
+            mean = sum_x / shape[1]
+            if const_expr(mMean is not None):
+                # Only the thread corresponding to column 0 writes out the mean to gmem
+                if (
+                    tXcX[0][1] == 0
+                    and row < shape[0]
+                    and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
+                ):
+                    tXrMean[0] = mean
+            if const_expr(self.reload_from == "smem"):
+                cute.autovec_copy(tXsX, tXrX)
+                x = tXrX.load().to(cute.Float32)
+                if const_expr(mRes is not None):
+                    cute.autovec_copy(tXsRes, tXrRes)
+                    x += tXrRes.load().to(cute.Float32)
+            elif const_expr(self.reload_from == "gmem"):
+                copy(tXgX, tXrX)
+                x = tXrX.load().to(cute.Float32)
+                if const_expr(mRes is not None):
+                    copy(tXgRes, tXrRes)
+                    x += tXrRes.load().to(cute.Float32)
+            sum_sq_x_sub_mean = row_reduce(
+                (x - mean) * (x - mean),
+                cute.ReductionOp.ADD,
+                threads_per_row,
+                reduction_buffer[None, None, 1],
+                mbar_ptr + 1 if const_expr(self.cluster_n > 1) else None,
+                init_val=0.0,
+            )
+            rstd = cute.math.rsqrt(sum_sq_x_sub_mean / shape[1] + eps, fastmath=True)
+        else:
+            # RMSNorm: compute sum of squares directly
+            mean = const_expr(0.0)
+            sum_sq_x = row_reduce(
+                x * x,
+                cute.ReductionOp.ADD,
+                threads_per_row,
+                reduction_buffer[None, None, 0],
+                mbar_ptr,
+                init_val=0.0,
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
+            )
+            rstd = cute.math.rsqrt(sum_sq_x / shape[1] + eps, fastmath=True)
         if const_expr(mRstd is not None):
             # Only the thread corresponding to column 0 writes out the rstd to gmem
             if (
@@ -234,7 +287,7 @@ class RMSNorm(ReductionBase):
             x = tXrX.load().to(cute.Float32)
             if const_expr(mRes is not None):
                 x += tXrRes.load().to(cute.Float32)
-        x_hat = x * rstd
+        x_hat = (x - mean) * rstd if const_expr(self.is_layernorm) else x * rstd
         y = x_hat
         if const_expr(mW is not None):
             y *= tXrW.load().to(cute.Float32)
@@ -247,10 +300,10 @@ class RMSNorm(ReductionBase):
 
 @torch.library.custom_op(
     "quack::_rmsnorm_fwd",
-    mutates_args=("out", "rstd", "residual_out"),
+    mutates_args=("out", "rstd", "mean", "residual_out"),
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor? weight, Tensor(a2!) out, Tensor? bias, Tensor(a4!)? rstd, Tensor? residual, Tensor(a6!)? residual_out, float eps=1e-6) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor(a2!) out, Tensor? bias, Tensor(a4!)? rstd, Tensor(a5!)? mean, Tensor? residual, Tensor(a7!)? residual_out, float eps=1e-6, bool is_layernorm=False) -> ()",
 )
 def _rmsnorm_fwd(
     x: Tensor,
@@ -258,38 +311,28 @@ def _rmsnorm_fwd(
     out: Tensor,
     bias: Optional[Tensor] = None,
     rstd: Optional[Tensor] = None,
+    mean: Optional[Tensor] = None,
     residual: Optional[Tensor] = None,
     residual_out: Optional[Tensor] = None,
     eps: float = 1e-6,
+    is_layernorm: bool = False,
 ) -> None:
-    """RMSNorm forward pass.
+    """RMSNorm/LayerNorm forward pass.
     Args:
         x: Input tensor of shape (M, N)
         weight: Optional weight tensor of shape (N,)
         eps: Small value for numerical stability
+        is_layernorm: If True, compute LayerNorm instead of RMSNorm
     Returns:
         Normalized output tensor of same shape as x
     """
-    assert x.dim() == 2, "Input must be 2D"
-    assert x.is_cuda, "Input tensor must be on CUDA device"
-    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    # Don't need to check is_cuda since torch.library ensures that
+    supported_types = {torch.float16, torch.bfloat16, torch.float32}
+    assert x.dtype in supported_types, "Unsupported dtype"
     if weight is not None:
-        assert weight.dim() == 1, "Weight must be 1D"
-        assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
-        assert weight.is_cuda, "Weight tensor must be on CUDA device"
-        assert weight.dtype in [
-            torch.float32,
-            torch.bfloat16,
-            torch.float16,
-        ], "Weight must be float32, float16 or bfloat16"
+        assert weight.dtype in supported_types, "Weight must be float32, float16 or bfloat16"
     if residual is not None:
-        assert residual.shape == x.shape
-        assert residual.is_cuda
-        assert residual.dtype in [
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        ], "Residual must be float16, bfloat16, or float32"
+        assert residual.dtype in supported_types, "Residual must be float16, bfloat16, or float32"
 
     _, N = x.shape
     dtype, out_dtype, weight_dtype, bias_dtype, res_dtype, res_out_dtype = [
@@ -305,6 +348,8 @@ def _rmsnorm_fwd(
         res_out_dtype,
         N,
         rstd is not None,
+        mean is not None,
+        is_layernorm,
     )
     if compile_key not in _rmsnorm_fwd.compile_cache:
         batch_sym = cute.sym_int()
@@ -316,8 +361,9 @@ def _rmsnorm_fwd(
         ]
         weight_cute, bias_cute = [fake_tensor(dt, (N,), div) for dt in [weight_dtype, bias_dtype]]
         rstd_cute = fake_tensor(Float32, (batch_sym,)) if rstd is not None else None
+        mean_cute = fake_tensor(Float32, (batch_sym,)) if mean is not None else None
         _rmsnorm_fwd.compile_cache[compile_key] = cute.compile(
-            RMSNorm(dtype, N),
+            RMSNorm(dtype, N, is_layernorm=is_layernorm),
             x_cute,
             weight_cute,
             bias_cute,
@@ -325,11 +371,14 @@ def _rmsnorm_fwd(
             out_cute,
             res_out_cute,
             rstd_cute,
+            mean_cute,
             Float32(0),  # eps, just for compilation
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
-    _rmsnorm_fwd.compile_cache[compile_key](x, weight, bias, residual, out, residual_out, rstd, eps)
+    _rmsnorm_fwd.compile_cache[compile_key](
+        x, weight, bias, residual, out, residual_out, rstd, mean, eps
+    )
 
 
 _rmsnorm_fwd.compile_cache = {}
@@ -359,7 +408,7 @@ def rmsnorm_fwd(
         )
     else:
         residual_out = None
-    _rmsnorm_fwd(x, weight, out, bias, rstd, residual, residual_out, eps=eps)
+    _rmsnorm_fwd(x, weight, out, bias, rstd, None, residual, residual_out, eps, False)
     # residual_out is None if residual is None and residual_dtype == input_dtype and dropout_p == 0.0
     if residual_out is None:
         residual_out = x
@@ -1039,3 +1088,68 @@ class QuackRMSNorm(torch.nn.RMSNorm):
             Tensor: Normalized tensor
         """
         return rmsnorm(x, self.weight, eps=self.eps)
+
+
+def layernorm_fwd(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor] = None,
+    eps: float = 1e-6,
+    return_rstd: bool = False,
+    return_mean: bool = False,
+):
+    """LayerNorm forward pass using the unified RMSNorm/LayerNorm kernel.
+
+    Args:
+        x: Input tensor of shape (M, N)
+        weight: Weight tensor of shape (N,). Must be float32.
+        bias: Optional bias tensor of shape (N,). Must be float32.
+        eps: Small value for numerical stability
+        return_rstd: Whether to return the reciprocal standard deviation
+        return_mean: Whether to return the mean
+
+    Returns:
+        Normalized output tensor of same shape as x
+        If return_rstd is True, also returns rstd tensor of shape (M,)
+        If return_mean is True, also returns mean tensor of shape (M,)
+    """
+    assert x.dim() == 2, "Input must be 2D"
+    assert weight.dim() == 1, "Weight must be 1D"
+    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert weight.dtype == torch.float32, "Weight must be float32"
+    if bias is not None:
+        assert bias.dim() == 1, "Bias must be 1D"
+        assert bias.dtype == torch.float32, "Bias must be float32"
+
+    M, N = x.shape
+    device = x.device
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=device, dtype=torch.float32) if return_rstd else None
+    mean = torch.empty(M, device=device, dtype=torch.float32) if return_mean else None
+
+    _rmsnorm_fwd(x, weight, out, bias, rstd, mean, None, None, eps, True)
+
+    if return_rstd and return_mean:
+        return out, rstd, mean
+    elif return_rstd:
+        return out, rstd
+    elif return_mean:
+        return out, mean
+    return out
+
+
+def layernorm_ref(x: Tensor, w: Tensor, eps: float = 1e-6) -> Tensor:
+    """Reference implementation for LayerNorm."""
+    x_f32 = x.float()
+    return torch.nn.functional.layer_norm(x_f32, w.shape, w, None, eps).to(x.dtype)
+
+
+def layernorm_rstd_ref(x: torch.Tensor, eps: float = 1e-6):
+    x_f32 = x.float()
+    mean = x_f32.mean(dim=-1, keepdim=True)
+    var = ((x_f32 - mean) ** 2).mean(dim=-1)
+    return 1.0 / torch.sqrt(var + eps)
+
+
+def layernorm_mean_ref(x: torch.Tensor) -> torch.Tensor:
+    return x.float().mean(dim=-1)

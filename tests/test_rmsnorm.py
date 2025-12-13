@@ -168,7 +168,7 @@ def test_rmsnorm_input_validation():
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
     weight_wrong = torch.randn(512, device=device, dtype=torch.float32)
 
-    with pytest.raises(AssertionError, match="Last dimension of input must match weight dimension"):
+    with pytest.raises(ValueError, match="Mismatched mW.shape[0]*"):
         rmsnorm(x, weight_wrong)
 
     # Test CPU tensors (should fail)
