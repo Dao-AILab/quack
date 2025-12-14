@@ -15,11 +15,13 @@ from quack.sort.sorting_networks import optimal_sort
 @cute.jit
 def bitonic_merge(
     arr: cute.Tensor,
-    n: cutlass.Constexpr[int],
-    start: cutlass.Constexpr[int],
+    n: Optional[cutlass.Constexpr[int]] = None,
+    start: cutlass.Constexpr[int] = 0,
     ascending: cutlass.Constexpr[bool] = True,
 ) -> None:
     """Merge a bitonic sequence into a sorted sequence using iterative approach."""
+    if const_expr(n is None):
+        n = cute.size(arr.shape)
     if const_expr(n > 1):
         num_levels = int(math.log2(n))
         assert n == 2**num_levels, "n must be a power of 2"

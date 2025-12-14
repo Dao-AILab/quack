@@ -29,7 +29,7 @@ class RMSNorm(ReductionBase):
         self.reload_from = None if N <= (16384 if is_layernorm else 8192) else "smem"
         self.delay_w_load = False
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
             if N <= limit:
@@ -69,10 +69,9 @@ class RMSNorm(ReductionBase):
         largest_dtype_width = const_expr(
             max(*(t.element_type.width for t in [mX, mRes, mW, mB, mO, mResO] if t is not None))
         )
-        tiler_mn, tv_layout = self._get_tv_layout(
-            num_copy_bits=128 // largest_dtype_width * mX.element_type.width
-        )
-        num_threads = cute.size(tv_layout, mode=[0])
+        vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
+        num_threads = tiled_copy.size
         mW, mB = [
             layout_utils.expand(mT, dim=0, size=tiler_mn[0]) if const_expr(mT is not None) else None
             for mT in (mW, mB)
@@ -81,7 +80,9 @@ class RMSNorm(ReductionBase):
             layout_utils.expand(mT, dim=1, size=self.N) if const_expr(mT is not None) else None
             for mT in (mRstd, mMean)
         ]
-        self.kernel(mX, mW, mB, mRes, mO, mResO, mRstd, mMean, eps, tv_layout, tiler_mn).launch(
+        self.kernel(
+            mX, mW, mB, mRes, mO, mResO, mRstd, mMean, eps, tiler_mn, tiled_copy, threads_per_row
+        ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
@@ -100,12 +101,14 @@ class RMSNorm(ReductionBase):
         mRstd: Optional[cute.Tensor],
         mMean: Optional[cute.Tensor],
         eps: Float32,
-        tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
+        tv_layout = tiled_copy.layout_tv_tiled
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -131,9 +134,7 @@ class RMSNorm(ReductionBase):
             for mT in (mW, mB)
         ]
 
-        num_copy_elems_X = tv_layout.shape[1][0]
-        copy_atom_load_X = copy_utils.get_copy_atom(mX.element_type, num_copy_elems_X)
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_X = tiled_copy.get_slice(tidx)
 
         tXgW = thr_copy_X.partition_S(gW) if const_expr(mW is not None) else None
         tXgB = thr_copy_X.partition_S(gB) if const_expr(mB is not None) else None
@@ -156,15 +157,15 @@ class RMSNorm(ReductionBase):
         if const_expr(mRes is not None):
             tXrRes = cute.make_fragment_like(tXgRes)
 
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
             utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
         )
-        # Each copy will use the same number of elements as X and same predicate
-        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems_X)
+        # Each copy will use the same predicate
+        copy = partial(copy_utils.copy, pred=tXpX)
 
         row = tXcX[0][0]
         if row < shape[0]:
@@ -191,7 +192,6 @@ class RMSNorm(ReductionBase):
             if row < shape[0]:
                 copy(tXrResO, tXgResO)
 
-        threads_per_row = tv_layout.shape[0][0]
         mean, rstd = None, None
         if const_expr(self.is_layernorm):
             # LayerNorm: compute mean first, then variance
@@ -443,10 +443,10 @@ class RMSNormBackward(ReductionBase):
             # Not enough smem
             raise ValueError("RMSNormBackward does not support N > 128k with dtype >= 32 bits")
 
-    def _get_num_threads(self):
+    def _num_threads(self):
         return 128 if self.N <= 4096 else 256
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (256, 32), (512, 64), (4096, 128)]:
             if N <= limit:
@@ -481,15 +481,16 @@ class RMSNormBackward(ReductionBase):
         largest_dtype_width = const_expr(
             max(*(t.element_type.width for t in [mX, mW, mdO, mdResO, mdX, mdRes] if t is not None))
         )
-        tiler_mn, tv_layout = self._get_tv_layout(
-            num_copy_bits=128 // largest_dtype_width * mX.element_type.width
-        )
-        num_threads = cute.size(tv_layout, mode=[0])
+        vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
+        num_threads = tiled_copy.size
         mW = (
             layout_utils.expand(mW, dim=0, size=tiler_mn[0]) if const_expr(mW is not None) else None
         )
         num_blocks = sm_count
-        self.kernel(mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tv_layout, tiler_mn).launch(
+        self.kernel(
+            mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tiler_mn, tiled_copy, threads_per_row
+        ).launch(
             grid=[num_blocks, self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
@@ -508,13 +509,15 @@ class RMSNormBackward(ReductionBase):
         mdW: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
-        tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx_start, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
+        tv_layout = tiled_copy.layout_tv_tiled
 
         shape = mX.shape
         M, N = shape[0], shape[1]
@@ -534,9 +537,7 @@ class RMSNormBackward(ReductionBase):
         else:
             mbar_full_ptr, mbar_empty_ptr = None, None
 
-        num_copy_elems_X = tv_layout.shape[1][0]
-        copy_atom_load_X = copy_utils.get_copy_atom(mX.element_type, num_copy_elems_X)
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_X = tiled_copy.get_slice(tidx)
 
         gX, gdO, gdResO, gdX, gdRes, cX = [
             cute.local_tile(mT, tiler_mn, (None, cluster_y)) if mT is not None else None
@@ -578,7 +579,7 @@ class RMSNormBackward(ReductionBase):
             else utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
         )
         # Each copy will use the same number of elements as X
-        copy = partial(copy_utils.copy, num_copy_elems=num_copy_elems_X, pred=tXpX)
+        copy = partial(copy_utils.copy, pred=tXpX)
 
         tXgdW, tXrdW = None, None
         tXgdB, tXrdB = None, None
@@ -591,7 +592,7 @@ class RMSNormBackward(ReductionBase):
             # Always compute partial bias gradients in fp32
             tXrdB = cute.make_fragment_like(tXgdB, Float32)
 
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
 
         self._initialize_cluster(tidx, mbar_ptr, num_warps, is_persistent=True)
 
@@ -620,7 +621,6 @@ class RMSNormBackward(ReductionBase):
         if const_expr(self.cluster_n > 1):
             cute.arch.cluster_wait()
 
-        threads_per_row = tv_layout.shape[0][0]
         if const_expr(mdW is not None):
             tXrdW.fill(0.0)
         if const_expr(mdB is not None):

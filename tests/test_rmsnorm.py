@@ -71,8 +71,8 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
         return
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
-    out_ref.backward(grad_out)
     out.backward(grad_out)
+    out_ref.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     if weight_dtype is not None:
         if weight_dtype == torch.float32:

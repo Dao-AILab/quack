@@ -62,9 +62,8 @@ def test_softmax(M, N, input_dtype, function):
     # Test backward pass
     dy = torch.randn_like(out)
     torch.cuda.synchronize()  # without sync, torch.autograd gets wrong results
-    (dx_ref,) = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
-    # Call our implementation later, otherwise getting CUDA_ERROR_INVALID_CONTEXT
     (dx,) = torch.autograd.grad(out, x, grad_outputs=dy)
+    (dx_ref,) = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
     assert dx.shape == dy.shape
     assert dx.dtype == input_dtype
     torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)

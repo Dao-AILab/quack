@@ -6,6 +6,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, const_expr
 
+import quack.copy_utils as copy_utils
+
 
 class ReductionBase:
     def __init__(self, dtype: Type[cutlass.Numeric], N: int, stage: int, reduction_dtype=Float32):
@@ -14,37 +16,32 @@ class ReductionBase:
         self.stage = stage
         self.reduction_dtype = reduction_dtype
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         raise NotImplementedError()
+
+    def _num_threads(self):
+        return 128 if self.N <= 16384 else 256
 
     def _set_cluster_n(self):
         self.cluster_n = 1
 
-    def _get_num_threads(self):
-        return 128 if self.N <= 16384 else 256
-
-    def _get_tv_layout(self, num_copy_bits=128):
-        vecsize = num_copy_bits // self.dtype.width
+    def _get_tiled_copy(self, vecsize: int = 1):
         assert self.N % vecsize == 0, f"Input N {self.N} is not divisible by vector size {vecsize}"
-        num_threads = self._get_num_threads()
+        threads_per_row = self._threads_per_row()
+        num_threads = self._num_threads()
         assert num_threads % cute.arch.WARP_SIZE == 0
-
-        threads_per_row = self._calculate_threads_per_row()
         num_blocks_N = cute.ceil_div(self.N // vecsize, threads_per_row * self.cluster_n)
-        cols_per_block = num_threads // threads_per_row
-        tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)
-        tv_layout = cute.make_layout(
-            ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
-            stride=(
-                (vecsize * cols_per_block, 1),
-                (cols_per_block, cols_per_block * vecsize * threads_per_row),
-            ),
-        )
-        return tiler_mn, tv_layout
+        tiler_mn = (num_threads // threads_per_row, vecsize * num_blocks_N * threads_per_row)
+        tiled_copy = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, num_threads, vecsize)
+        return tiled_copy, tiler_mn, threads_per_row
 
     def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-        warps_per_row = max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+        warps_per_row = (
+            num_warps
+            if cute.rank(tv_layout.shape[0]) == 1
+            else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+        )
         return cute.make_ordered_layout(
             (num_warps // warps_per_row, (warps_per_row, cluster_n), self.stage),
             order=(1, 0, 2),

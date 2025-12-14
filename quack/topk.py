@@ -31,29 +31,25 @@ class TopK:
         assert k <= 128
         assert N <= 4096
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         # we want num_elems_per_thread >= self.k
         # and each thread can handle at most 64 elements
         N = self.N
         num_threads_per_row = max(min(N // self.k, 32, N // 64), 1)
         return num_threads_per_row
 
-    def _get_tv_layout(self):
+    def _get_tiled_copy(self):
         N = self.N
         vecsize = self.vecsize
         num_threads = 128 if N <= 16384 else 256
-        threads_per_row = self._calculate_threads_per_row()
+        threads_per_row = self._threads_per_row()
         cols_per_block = num_threads // threads_per_row
         num_blocks_N = cute.ceil_div(min(N, 16384) // vecsize, threads_per_row)
         tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)
-        tv_layout = cute.make_layout(
-            ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
-            stride=(
-                (vecsize * cols_per_block, 1),
-                (cols_per_block, cols_per_block * vecsize * threads_per_row),
-            ),
+        tiled_copy = copy_utils.tiled_copy_2d(
+            self.dtype, threads_per_row, num_threads, num_copy_elems=vecsize
         )
-        return tiler_mn, tv_layout
+        return tiled_copy, tiler_mn, threads_per_row
 
     @cute.jit
     def __call__(
@@ -66,9 +62,9 @@ class TopK:
         assert mX.element_type == self.dtype
         assert mValues.element_type == self.dtype
         assert mIndices.element_type == Int32
-        tiler_mn, tv_layout = self._get_tv_layout()
-        num_threads = cute.size(tv_layout, mode=[0])
-        self.kernel(mX, mValues, mIndices, tv_layout, tiler_mn).launch(
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy()
+        num_threads = tiled_copy.size
+        self.kernel(mX, mValues, mIndices, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), 1, 1],
             block=[num_threads, 1, 1],
             stream=stream,
@@ -80,20 +76,20 @@ class TopK:
         mX: cute.Tensor,
         mValues: cute.Tensor,
         mIndices: cute.Tensor,
-        tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        tv_layout = tiled_copy.layout_tv_tiled
 
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, 0)) for mT in (mX, idX)]
 
-        num_copy_elems = tv_layout.shape[1][0]
-        copy_atom = copy_utils.get_copy_atom(mX.element_type, num_copy_elems)
-        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy = tiled_copy.get_slice(tidx)
 
         tXgX = thr_copy.partition_S(gX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
@@ -101,7 +97,7 @@ class TopK:
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
         tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
-        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
+        copy = partial(copy_utils.copy, pred=tXpX)
 
         if tXcX[0][0] < shape[0]:
             copy(tXgX, tXrX)
@@ -111,7 +107,7 @@ class TopK:
         # Encode the indices into the bottom bits of values.
         log_N = int(math.log2(self.N))
         idx_mask = (1 << log_N) - 1
-        vecsize = const_expr(tv_layout.shape[1][0])
+        vecsize = const_expr(cute.size(tv_layout.shape[1]))
         tXrX_i32 = cute.recast_tensor(tXrX_f32, Int32)
         # Encode indices into the last log_N bits of tXrX_i32
         for i in cutlass.range(cute.size(tXrX_i32), unroll_full=True):
@@ -129,7 +125,6 @@ class TopK:
         if const_expr(not is_even_N):
             utils.fill_oob(tXrX_f32, tXpX, -tXrX_f32.element_type.inf)
 
-        threads_per_row = tv_layout.shape[0][0]
         topk_vals = bitonic_topk(tXrX_f32, self.k, warp_width=threads_per_row)
 
         # Thread 0 in each row contains all the top-k values, so we split those into multiple threads

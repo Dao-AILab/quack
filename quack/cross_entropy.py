@@ -34,7 +34,7 @@ class CrossEntropy(ReductionBase):
         self.online_softmax = online_softmax
         self.reload_from = None if N <= 16384 or online_softmax else "smem"
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
             if N <= limit:
@@ -71,12 +71,23 @@ class CrossEntropy(ReductionBase):
         if const_expr(mdX is not None):
             assert mdX.element_type == self.dtype
         self._set_cluster_n()
-        # e.g. if self.N isn't divisible by 8 for bf16, we might use 64 bits (4 elements) copy
-        num_copy_bits = math.gcd(self.N, 128 // self.dtype.width) * self.dtype.width
-        tiler_mn, tv_layout = self._get_tv_layout(num_copy_bits=num_copy_bits)
-        num_threads = cute.size(tv_layout, mode=[0])
+        largest_dtype_width = const_expr(mX.element_type.width)
+        if const_expr(mdX is not None):
+            largest_dtype_width = const_expr(max(largest_dtype_width, mdX.element_type.width))
+        vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
+        num_threads = tiled_copy.size
         self.kernel(
-            mX, mTarget, mTargetLogit, mLoss, mLSE, mdX, ignore_index, tv_layout, tiler_mn
+            mX,
+            mTarget,
+            mTargetLogit,
+            mLoss,
+            mLSE,
+            mdX,
+            ignore_index,
+            tiler_mn,
+            tiled_copy,
+            threads_per_row,
         ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
@@ -94,12 +105,14 @@ class CrossEntropy(ReductionBase):
         mLSE: Optional[cute.Tensor],  # (M,)
         mdX: Optional[cute.Tensor],  # (M, N) - if provided, compute gradient
         ignore_index: Int32,  # Index to ignore in loss computation
-        tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
+        tv_layout = tiled_copy.layout_tv_tiled
 
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
@@ -112,9 +125,7 @@ class CrossEntropy(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        num_copy_elems = tv_layout.shape[1][0]
-        copy_atom = copy_utils.get_copy_atom(mX.element_type, num_copy_elems)
-        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy = tiled_copy.get_slice(tidx)
 
         tXgX = thr_copy.partition_S(gX)
         tXsX = thr_copy.partition_D(sX)
@@ -123,9 +134,9 @@ class CrossEntropy(ReductionBase):
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
-        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
+        copy = partial(copy_utils.copy, pred=tXpX)
 
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         row = tXcX[0][0]
@@ -153,7 +164,6 @@ class CrossEntropy(ReductionBase):
                 assert cute.rank(mTargetLogit.shape) == 1
                 target_logit = Float32(mTargetLogit[row])
 
-        threads_per_row = tv_layout.shape[0][0]
         if const_expr(not self.online_softmax):
             max_x = row_reduce(
                 x,
@@ -347,30 +357,25 @@ class CrossEntropyBackward:
         self.N = N
         self.vecsize = 128 // dtype.width
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         N = min(self.N, 16384)  # We split by blocks of 16k
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
             if N <= limit:
                 return threads
         return 256
 
-    def _get_tv_layout(self, num_copy_bits=128):
-        vecsize = num_copy_bits // self.dtype.width
+    def _get_tiled_copy(self, vecsize: int):
         assert self.N % vecsize == 0, f"Input N {self.N} is not divisible by vector size {vecsize}"
         N = min(self.N, 16384)
         num_threads = 128 if N <= 16384 else 256
-        threads_per_row = self._calculate_threads_per_row()
+        threads_per_row = self._threads_per_row()
         cols_per_block = num_threads // threads_per_row
         num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row)
         tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)
-        tv_layout = cute.make_layout(
-            ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
-            stride=(
-                (vecsize * cols_per_block, 1),
-                (cols_per_block, cols_per_block * vecsize * threads_per_row),
-            ),
+        tiled_copy = copy_utils.tiled_copy_2d(
+            self.dtype, threads_per_row, num_threads, num_copy_elems=vecsize
         )
-        return tiler_mn, tv_layout
+        return tiled_copy, tiler_mn, threads_per_row
 
     @cute.jit
     def __call__(
@@ -386,15 +391,24 @@ class CrossEntropyBackward:
         assert mX.element_type == self.dtype
         assert mdX.element_type == self.dtype
         # e.g. if self.N isn't divisible by 8 for bf16, we might use 64 bits (4 elements) copy
-        num_copy_bits = math.gcd(self.N, 128 // self.dtype.width) * self.dtype.width
-        tiler_mn, tv_layout = self._get_tv_layout(num_copy_bits=num_copy_bits)
-        num_threads = cute.size(tv_layout, mode=[0])
+        vecsize = math.gcd(self.N, 128 // self.dtype.width)
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
+        num_threads = tiled_copy.size
         # (M,) -> (M, N) with stride 0 in the N dimension
         mDLoss, mTarget, mLSE = [
             layout_utils.expand(X, dim=1, size=self.N) for X in (mDLoss, mTarget, mLSE)
         ]
         self.kernel(
-            mX, mTarget, mDLoss, mdX, mLSE, ignore_index, mX.shape, tv_layout, tiler_mn
+            mX,
+            mTarget,
+            mDLoss,
+            mdX,
+            mLSE,
+            ignore_index,
+            mX.shape,
+            tiler_mn,
+            tiled_copy,
+            threads_per_row,
         ).launch(
             grid=[
                 cute.ceil_div(mX.shape[0], tiler_mn[0]),
@@ -415,8 +429,9 @@ class CrossEntropyBackward:
         mLSE: cute.Tensor,  # (M,)
         ignore_index: Int32,  # Index to ignore in gradient computation
         shape: cute.Shape,
-        tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
@@ -429,12 +444,10 @@ class CrossEntropyBackward:
         idX = cute.make_identity_tensor(shape)
         gX, gdX, cX = [cute.local_tile(mT, tiler_mn, (bidx, bidy)) for mT in (mX, mdX, idX)]
 
-        num_copy_elems = tv_layout.shape[1][0]
-        copy_atom = copy_utils.get_copy_atom(mX.element_type, num_copy_elems)
-        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy = tiled_copy.get_slice(tidx)
 
         tXgX = thr_copy.partition_S(gX)
-        tXsX = thr_copy.partition_S(sX)
+        tXsX = thr_copy.partition_D(sX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
         tXcFull = thr_copy.partition_S(cX)
         tXgdX = thr_copy.partition_D(gdX)
@@ -442,7 +455,7 @@ class CrossEntropyBackward:
 
         is_even_N = const_expr(shape[1] % tiler_mn[1] == 0)
         tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
-        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
+        copy = partial(copy_utils.copy, pred=tXpX)
 
         row = tXcX[0][0]
         if row < shape[0]:

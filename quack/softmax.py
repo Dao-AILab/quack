@@ -31,7 +31,7 @@ class Softmax(ReductionBase):
         )
         self.online_softmax = online_softmax
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
             if N <= limit:
@@ -60,11 +60,11 @@ class Softmax(ReductionBase):
         assert mX.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mX, mO]))
-        tiler_mn, tv_layout = self._get_tv_layout(
-            num_copy_bits=128 // largest_dtype_width * mX.element_type.width
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
+            vecsize=128 // largest_dtype_width
         )
-        num_threads = cute.size(tv_layout, mode=[0])
-        self.kernel(mX, mO, tv_layout, tiler_mn).launch(
+        num_threads = tiled_copy.size
+        self.kernel(mX, mO, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
@@ -76,9 +76,12 @@ class Softmax(ReductionBase):
         self,
         mX: cute.Tensor,
         mO: cute.Tensor,
-        tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
     ):
+        tv_layout = tiled_copy.layout_tv_tiled
+
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
@@ -94,9 +97,7 @@ class Softmax(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        num_copy_elems_X = tv_layout.shape[1][0]
-        copy_atom_load_X = copy_utils.get_copy_atom(mX.element_type, num_copy_elems_X)
-        thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_X = tiled_copy.get_slice(tidx)
 
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
@@ -106,10 +107,10 @@ class Softmax(ReductionBase):
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = None if is_even_N else utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
-        # Each copy will use the same number of elements as X and same predicate
-        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems_X)
+        # Each copy will use the same predicate
+        copy = partial(copy_utils.copy, pred=tXpX)
 
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         if tXcX[0][0] < shape[0]:
@@ -122,7 +123,6 @@ class Softmax(ReductionBase):
 
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)
-        threads_per_row = tv_layout.shape[0][0]
         if const_expr(not self.online_softmax):
             max_x = row_reduce(
                 x,
@@ -202,7 +202,7 @@ class SoftmaxBackward(ReductionBase):
         # 1 stage for computing dot product
         super().__init__(dtype, N, stage=1, reduction_dtype=Float32)
 
-    def _calculate_threads_per_row(self):
+    def _threads_per_row(self):
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (8192, 128)]:
             if N <= limit:
@@ -221,7 +221,7 @@ class SoftmaxBackward(ReductionBase):
                 return
         self.cluster_n = 16
 
-    def _get_num_threads(self):
+    def _num_threads(self):
         return 128 if self.N <= 8192 else 256
 
     @cute.jit
@@ -235,11 +235,11 @@ class SoftmaxBackward(ReductionBase):
         assert mdY.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mdY, mY, mdX]))
-        tiler_mn, tv_layout = self._get_tv_layout(
-            num_copy_bits=128 // largest_dtype_width * mdY.element_type.width
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
+            vecsize=128 // largest_dtype_width
         )
-        num_threads = cute.size(tv_layout, mode=[0])
-        self.kernel(mdY, mY, mdX, tv_layout, tiler_mn).launch(
+        num_threads = tiled_copy.size
+        self.kernel(mdY, mY, mdX, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mdY.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
@@ -252,12 +252,14 @@ class SoftmaxBackward(ReductionBase):
         mdY: cute.Tensor,
         mY: cute.Tensor,
         mdX: cute.Tensor,
-        tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
+        tv_layout = tiled_copy.layout_tv_tiled
 
         shape = mdY.shape
         idX = cute.make_identity_tensor(shape)
@@ -275,9 +277,7 @@ class SoftmaxBackward(ReductionBase):
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        num_copy_elems = tv_layout.shape[1][0]
-        copy_atom = copy_utils.get_copy_atom(mdY.element_type, num_copy_elems)
-        thr_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy = tiled_copy.get_slice(tidx)
 
         tdYgdY = thr_copy.partition_S(gdY)
         tdYsdY = thr_copy.partition_D(sdY)
@@ -289,10 +289,10 @@ class SoftmaxBackward(ReductionBase):
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
-        # Each copy will use the same number of elements as X and same predicate
-        copy = partial(copy_utils.copy, pred=tXpX, num_copy_elems=num_copy_elems)
+        # Each copy will use the same predicate
+        copy = partial(copy_utils.copy, pred=tXpX)
 
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         if tXcX[0][0] < shape[0]:
@@ -300,6 +300,7 @@ class SoftmaxBackward(ReductionBase):
             copy(tYgY, tYsY, is_async=True)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
+        # Don't need fill_oob since cp.async will automatically fills OOB elements with zeros
 
         cute.autovec_copy(tdYsdY, tdYrdY)
         cute.autovec_copy(tYsY, tYrY)
@@ -307,7 +308,6 @@ class SoftmaxBackward(ReductionBase):
         y = tYrY.load().to(cute.Float32)
 
         # Compute dot product: dot = Σⱼ dy_j × y_j
-        threads_per_row = tv_layout.shape[0][0]
         dot = row_reduce(
             dy * y,
             cute.ReductionOp.ADD,

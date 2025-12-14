@@ -66,8 +66,8 @@ def test_cross_entropy(M, N, input_dtype, use_compile):
     # Test backward pass
     dloss = torch.randn_like(loss)
     torch.cuda.synchronize()
-    (dx_ref,) = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
     (dx,) = torch.autograd.grad(loss, x, grad_outputs=dloss)
+    (dx_ref,) = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
     assert dx.shape == x.shape
     torch.testing.assert_close(dx, dx_ref.to(input_dtype), atol=atol, rtol=rtol)
 
