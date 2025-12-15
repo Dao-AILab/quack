@@ -15,16 +15,16 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
 @pytest.mark.parametrize(
     "N, k",
     [(64, 16), (128, 32), (256, 16), (512, 32), (1024, 32), (4096, 32), (4096, 64), (4096, 128)],
-    # [(256, 4)]
+    # [(64, 16)],
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
 # @pytest.mark.parametrize("M", [1])
 @pytest.mark.parametrize("softmax", [False, True])
 # @pytest.mark.parametrize("softmax", [False])
 @pytest.mark.parametrize("function", [topk, torch.compile(topk, fullgraph=True)])
-# @pytest.mark.parametrize("function", [topk])
+# @pytest.mark.parametrize("function", [torch.compile(topk, fullgraph=True)])
 def test_topk(M, N, k, input_dtype, softmax, function):
-    """Test TopK against PyTorch reference implementation."""
+    """Test TopK forward/backward against PyTorch reference implementation."""
     device = "cuda"
     # Set tolerance based on dtype
     if input_dtype == torch.bfloat16:
@@ -39,9 +39,9 @@ def test_topk(M, N, k, input_dtype, softmax, function):
 
     torch.random.manual_seed(0)
     # Create input tensors
-    x = torch.randn(M, N, device=device, dtype=input_dtype)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
     out_val, out_idx = function(x, k, softmax=softmax)
-    out_val_ref, out_idx_ref = torch.topk(x, k, dim=-1, largest=True, sorted=True)
+    out_val_ref, out_idx_ref = torch.topk(x.detach(), k, dim=-1, largest=True, sorted=True)
     if softmax:
         out_val_ref = torch.softmax(out_val_ref.float(), dim=-1).to(input_dtype)
 
@@ -51,19 +51,19 @@ def test_topk(M, N, k, input_dtype, softmax, function):
     # Check accuracy - values should match the reference
     torch.testing.assert_close(out_val, out_val_ref, atol=atol, rtol=rtol)
 
-    # Additional properties to check (only for non-softmax case):
     if not softmax:
         # 1. Values should be in descending order
         assert torch.all(out_val[:, :-1] >= out_val[:, 1:]), "Some rows not in descending order"
         # 2. Values indexed at output indices should match output values
         indexed_vals = torch.gather(x, 1, out_idx.long())
-        torch.testing.assert_close(
-            indexed_vals,
-            out_val,
-            atol=atol,
-            rtol=rtol,
-            msg="Values indexed from x don't match output values",
-        )
+        torch.testing.assert_close(indexed_vals, out_val, atol=atol, rtol=rtol)
+
+        # Backward check
+        dvalues = torch.randn_like(out_val)
+        out_val.backward(dvalues)
+        dx_ref = torch.zeros_like(x)
+        dx_ref.scatter_(1, out_idx.long(), dvalues)
+        torch.testing.assert_close(x.grad, dx_ref, atol=1e-3, rtol=1e-3)
     else:
         # For softmax case, check that probabilities sum to 1
         torch.testing.assert_close(
@@ -73,6 +73,14 @@ def test_topk(M, N, k, input_dtype, softmax, function):
             rtol=1e-2,
             msg="Softmax probabilities don't sum to 1",
         )
+        dvalues = torch.randn_like(out_val)
+        out_val.backward(dvalues)
+        dot = (dvalues.float() * out_val.float()).sum(dim=1, keepdim=True)
+        grad_topk = out_val.float() * (dvalues.float() - dot)
+        grad_topk = grad_topk.to(input_dtype)
+        dx_ref = torch.zeros_like(x)
+        dx_ref.scatter_(1, out_idx.long(), grad_topk)
+        torch.testing.assert_close(x.grad, dx_ref, atol=1e-3, rtol=1e-3)
 
 
 # @pytest.mark.parametrize("input_dtype", [torch.float16, torch.float32])
