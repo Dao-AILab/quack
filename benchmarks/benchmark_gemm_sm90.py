@@ -423,7 +423,8 @@ def run(
         batch_idx_permute=batch_idx_permute_tensor
     )
 
-    epi_args = gemm.EpilogueArguments(add_to_output=add_to_output)
+    # epi_args = gemm.EpilogueArguments(add_to_output=add_to_output)
+    epi_args = gemm.EpilogueArguments()
     varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor, mAIdx)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
