@@ -187,11 +187,12 @@ def dgelu_tanh_approx(
 
 
 @dsl_user_op
+@cute.jit
 def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     if const_expr(not isinstance(x, tuple)):
         use_linear = Boolean(x > 20.0)
         return (
-            cute.math.log(cute.math.exp(x, fastmath=True) + 1.0, fastmath=True)
+            cute.math.log(Float32(cute.math.exp(x, fastmath=True)) + 1.0, fastmath=True)
             if not use_linear
             else x
         )
