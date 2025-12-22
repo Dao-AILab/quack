@@ -187,17 +187,17 @@ def dgelu_tanh_approx(
 
 
 @dsl_user_op
-def silu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+def silu(x: F32_or_F32x2, *, already_halved: bool = False, loc=None, ip=None) -> F32_or_F32x2:
     """
     silu(x) = x * sigmoid(x) = x * (1 + tanh(x / 2)) / 2 = (0.5 * x) * tanh(0.5 * x) + (0.5 * x)
     This compiles down to 3 SASS instructions: FMUL to get 0.5 * x, MUFU.TANH, and FFMA.
     """
     if const_expr(not isinstance(x, tuple)):
-        x_half = 0.5 * x
+        x_half = 0.5 * x if const_expr(not already_halved) else x
         # return x_half * cute.math.tanh(x_half, fastmath=True) + x_half
         return x_half * tanh(x_half) + x_half
     else:
-        x_half = utils.mul_packed_f32x2((0.5, 0.5), x)
+        x_half = utils.mul_packed_f32x2((0.5, 0.5), x) if const_expr(not already_halved) else x
         tanh_x_half = (tanh(x_half[0]), tanh(x_half[1]))
         return utils.fma_packed_f32x2(x_half, tanh_x_half, x_half)
 
@@ -212,7 +212,13 @@ def swiglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32
 
 @dsl_user_op
 def dswiglu(
-    x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
+    x: F32_or_F32x2,
+    y: F32_or_F32x2,
+    dout: F32_or_F32x2,
+    *,
+    already_halved: bool = False,
+    loc=None,
+    ip=None,
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
     """
     SwiGLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
@@ -227,8 +233,13 @@ def dswiglu(
     if const_expr(not isinstance(x, tuple)):
         # Compute sigmoid(x) using tanh: sigmoid(x) = 0.5 * (1 + tanh(0.5 * x))
         # FMUL, MUFU.TANH, then FFMA
-        sigmoid_x = sigmoid(x)
-        silu_x = x * sigmoid_x  # FMUL
+        if const_expr(not already_halved):
+            sigmoid_x = sigmoid(x)
+            silu_x = x * sigmoid_x  # FMUL
+        else:
+            tanh_x = tanh(x)  # MUFU.TANH
+            sigmoid_x = 0.5 * tanh_x + 0.5  # FFMA
+            silu_x = x * tanh_x + x  # FFMA
         silu_x_dout = silu_x * dout  # FMUL
         #   d_silu(x) * dout
         # = sigmoid_x * (1 + x * (1 - sigmoid_x)) * dout
@@ -244,8 +255,13 @@ def dswiglu(
         return dx, dy, swiglu_out
     else:
         # Compute sigmoid(x) and silu(x)
-        sigmoid_x = sigmoid(x)
-        silu_x = utils.mul_packed_f32x2(x, sigmoid_x)
+        if const_expr(not already_halved):
+            sigmoid_x = sigmoid(x)
+            silu_x = utils.mul_packed_f32x2(x, sigmoid_x)
+        else:
+            tanh_x = (tanh(x[0]), tanh(x[1]))
+            sigmoid_x = utils.fma_packed_f32x2(tanh_x, (0.5, 0.5), (0.5, 0.5))
+            silu_x = utils.fma_packed_f32x2(x, tanh_x, x)
         silu_x_dout = utils.mul_packed_f32x2(silu_x, dout)
         # d_silu(x) * dout = (sigmoid_x - silu_x * sigmoid_x) * dout + silu_x * dout
         sigmoid_x_minus_silu_x_sigmoid_x = utils.fma_packed_f32x2(
