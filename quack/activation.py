@@ -187,6 +187,34 @@ def dgelu_tanh_approx(
 
 
 @dsl_user_op
+def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    if const_expr(not isinstance(x, tuple)):
+        use_linear = Boolean(x > 20.0)
+        return (
+            cute.math.log(cute.math.exp(x, fastmath=True) + 1.0, fastmath=True)
+            if not use_linear
+            else x
+        )
+    else:
+        log2_e = math.log2(math.e)
+        x_log2e = utils.mul_packed_f32x2(x, (log2_e, log2_e))
+        x_exp = (cute.math.exp(x_log2e[0], fastmath=True), cute.math.exp(x_log2e[1], fastmath=True))
+        x_exp_p1 = utils.add_packed_f32x2(x_exp, (1.0, 1.0))
+        log_x_exp_p1 = (
+            cute.math.log2(x_exp_p1[0], fastmath=True),
+            cute.math.log2(x_exp_p1[1], fastmath=True),
+        )
+        ln2 = math.log(2.0)
+        softplus_x = utils.mul_packed_f32x2(log_x_exp_p1, (ln2, ln2))
+        use_linear_0 = Boolean(x[0] > 20.0)
+        use_linear_1 = Boolean(x[1] > 20.0)
+        return (
+            softplus_x[0] if not use_linear_0 else x[0],
+            softplus_x[1] if not use_linear_1 else x[1],
+        )
+
+
+@dsl_user_op
 def silu(x: F32_or_F32x2, *, already_halved: bool = False, loc=None, ip=None) -> F32_or_F32x2:
     """
     silu(x) = x * sigmoid(x) = x * (1 + tanh(x / 2)) / 2 = (0.5 * x) * tanh(0.5 * x) + (0.5 * x)
