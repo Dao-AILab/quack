@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Float32, const_expr
+from cutlass import Int32, Int64, Float32, Boolean, const_expr
 
 import quack.utils as utils
 
@@ -220,3 +220,60 @@ def online_softmax_reduce(
                     exp_x *= cute.math.exp(max_x - max_x_final, fastmath=True)
                 max_x = max_x_final
     return max_x, sum_exp_x, (exp_x if const_expr(return_exp_x) else None)
+
+
+@cute.jit
+def sum_swap_shuffle(
+    X: cute.Tensor, elem_per_lane: int, subwarp_size: int = 1, warp_size: int = 32
+) -> cute.Tensor:
+    """
+    For warp reduction, we use Swap Shuffle
+    The normal way to reduction among threads:
+    use shuffle to let *** the first half of threads *** have *** whole data *** from the second half of threads.
+    After each step of reduction, a half of threads won't work in the following steps.
+    That is, as the reduction progresses, the efficiency of shuffle & reduction instructions gradually change from 1/2, 1/4 to 1/32 (the worst case).
+    To overcome this shortcoming, for a NxN matrix to be reduced among N threads as a 1XN vectors,
+    we use swap & shuffle aiming to let *** each half of threads *** have *** a half of data *** from the other half of threads.
+    After reduction, each half of threads should deal with a (N/2)x(N/2) sub-matrix independently in the following step.
+    We can recursively do this until the problem size is 1.
+    """
+    assert (
+        subwarp_size >= 1
+        and subwarp_size <= 32
+        and subwarp_size == 1 << int(math.log2(subwarp_size))
+    )
+    assert (
+        warp_size <= 32
+        and warp_size % subwarp_size == 0
+        and warp_size == 1 << int(math.log2(warp_size))
+    )
+    lane_idx = cute.arch.lane_idx() // subwarp_size
+    X = cute.logical_divide(X, cute.make_layout(elem_per_lane))  # (elem_per_lane, M)
+    numvec = cute.size(X, mode=[1])
+    assert numvec <= 32 // subwarp_size
+    # If X has more values than warp_size // subwarp_size, we first do a normal warp reduction
+    # to sum up values held by lanes further than size(X) away
+    for i in cutlass.range(
+        int(math.log2(numvec)), int(math.log2(warp_size // subwarp_size)), unroll_full=True
+    ):
+        for v in cutlass.range(cute.size(X), unroll_full=True):
+            shfl_val = cute.arch.shuffle_sync_bfly(X[v], offset=(1 << i) * subwarp_size)
+            X[v] = X[v] + shfl_val
+    for logm in cutlass.range_constexpr(int(math.log2(cute.size(X, mode=[1]))) - 1, -1, -1):
+        m = 1 << logm
+        for r in cutlass.range(m, unroll_full=True):
+            frg_A = X[None, r]
+            frg_B = X[None, r + m]
+            #  First half of threads swap fragments from the first half of data to the second
+            should_swap = not Boolean(lane_idx & m)
+            for v in cutlass.range(cute.size(frg_A), unroll_full=True):
+                # Step 1: swap
+                lower, upper = frg_A[v], frg_B[v]
+                frg_A[v] = upper if should_swap else lower
+                frg_B[v] = lower if should_swap else upper
+                # Step 2: shuffle
+                # each half of threads get a half of data from the other half of threads
+                shfl_val = cute.arch.shuffle_sync_bfly(frg_A[v], offset=m * subwarp_size)
+                # Step 3: reduction
+                frg_A[v] = frg_B[v] + shfl_val
+    return X[None, 0]
