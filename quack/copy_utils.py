@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import re
 from typing import Optional, Type, Tuple, Callable
 
 import cutlass
@@ -102,6 +103,73 @@ def tiled_copy_2d(
 #     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 
+def parse_swizzle_from_pointer(ptr: cute.Pointer) -> Tuple[int, int, int]:
+    """Extract swizzle parameters from a pointer's swizzle_type.
+
+    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
+    b, m, s are the swizzle parameters (bits, base, shift).
+
+    Returns:
+        A cute.Swizzle object constructed from the extracted parameters
+
+    Raises:
+        ValueError: If the swizzle_type string cannot be parsed
+    """
+    # Ideally there should be a better API to get swizzle parameters, but we'll just parse
+    # the string here.
+    swizzle_str = str(ptr.type.swizzle_type)
+    # Extract the inner part "S<b,m,s>"
+    match = re.search(r"S<(\d+),(\d+),(\d+)>", swizzle_str)
+    if match:
+        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        return b, m, s
+    else:
+        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
+
+
+def swizzle_int(ptr_int: Int32, b: int, m: int, s: int) -> Int32:
+    bit_msk = (1 << b) - 1
+    yyy_msk = bit_msk << (m + s)
+    return ptr_int ^ ((ptr_int & yyy_msk) >> s)
+
+
+def swizzle_ptr(ptr: cute.Pointer):
+    b, m, s = parse_swizzle_from_pointer(ptr)
+    ptr_int = swizzle_int(ptr.toint(), b, m, s)
+    return cute.make_ptr(ptr.dtype, ptr_int, ptr.memspace, assumed_align=ptr.alignment)
+
+
+def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
+    outer = tensor.layout
+    width = tensor.element_type.width
+    inner = cute.make_swizzle(*parse_swizzle_from_pointer(tensor.iterator))
+    # Need to recast the swizzle from byte (e.g. <3, 4, 3> to element units (e.g. <3, 3, 3> for
+    # for 16 bits and <3, 2, 3> for 32 bits)
+    new_layout = cute.recast_layout(
+        width, 8, cute.make_composed_layout(inner, 0, cute.recast_layout(8, width, outer))
+    )
+    # recast_ptr to remove the pointer swizzle
+    return cute.make_tensor(cute.recast_ptr(tensor.iterator, dtype=tensor.element_type), new_layout)
+
+
+def partition_D_position_independent(
+    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
+) -> cute.Tensor:
+    return cute.make_tensor(
+        swizzle_ptr(thr_copy.partition_D(tensor).iterator),
+        thr_copy.partition_D(as_position_independent_swizzle_tensor(tensor)).layout,
+    )
+
+
+def partition_S_position_independent(
+    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
+) -> cute.Tensor:
+    return cute.make_tensor(
+        swizzle_ptr(thr_copy.partition_S(tensor).iterator),
+        thr_copy.partition_S(as_position_independent_swizzle_tensor(tensor)).layout,
+    )
+
+
 @dsl_user_op
 def sm90_get_smem_load_op(
     layout_c: cutlass.utils.LayoutEnum,
@@ -200,7 +268,7 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
 
 @cute.jit
 def gather_m_get_copy_fn(
-    thr_copy_A: cute.core.ThrCopy,
+    thr_copy_A: cute.ThrCopy,
     mA: cute.Tensor,  # (whatever, K)
     sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
     gsAIdx: cute.Tensor,  # (tile_M), either gmem or smem
@@ -268,7 +336,7 @@ def gather_m_get_copy_fn(
 
 @cute.jit
 def gather_k_get_copy_fn(
-    thr_copy_A: cute.core.ThrCopy,
+    thr_copy_A: cute.ThrCopy,
     mA: cute.Tensor,  # (tile_M, whatever)
     sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
     gsAIdx: cute.Tensor,  # (tile_K, RestK), either gmem or smem
