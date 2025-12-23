@@ -1263,7 +1263,7 @@ class GemmSm90:
         tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
         tiled_copy_r2s: cute.TiledCopy,
         tRS_sD: cute.Tensor,
-        tiled_copy_s2r: Optional[cute.core.ThrCopy],
+        tiled_copy_s2r: Optional[cute.ThrCopy],
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
         copy_D: Optional[Callable],
@@ -1675,9 +1675,7 @@ class GemmSm90:
     def make_epi_store_pipeline(self):
         # Threads/warps participating in tma store pipeline
         num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
-        epi_store_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_epi_threads, num_epi_threads
-        )
+        epi_store_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_epi_threads)
         return pipeline.PipelineTmaStore.create(
             num_stages=self.epi_stage, producer_group=epi_store_producer_group
         )
