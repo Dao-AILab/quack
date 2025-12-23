@@ -32,6 +32,31 @@ def cvt_copy(
 
 
 @dsl_user_op
+def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    dst = cute.make_fragment_like(src, src.element_type, loc=loc, ip=ip)
+    cute.autovec_copy(src, dst, loc=loc, ip=ip)
+    return dst
+
+
+@dsl_user_op
+def load_s2r_retile(
+    tiled_copy: cute.TiledCopy,
+    src: cute.Tensor,
+    dst_shape: cute.Tensor | cute.Shape,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    # Will also accept dst_shape being a tensor, in which case we write into that tensor
+    if const_expr(not isinstance(dst_shape, cute.Tensor)):
+        dst = cute.make_fragment(dst_shape, src.element_type, loc=loc, ip=ip)
+    else:
+        dst = dst_shape
+    cute.copy(tiled_copy, src, tiled_copy.retile(dst), loc=loc, ip=ip)
+    return dst
+
+
+@dsl_user_op
 def get_copy_atom(
     dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
 ) -> cute.CopyAtom:
