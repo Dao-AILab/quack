@@ -41,6 +41,12 @@ def sigmoid(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 
 @dsl_user_op
+def dsigmoid_from_output(out: Float32, dout: Float32, *, loc=None, ip=None) -> Float32:
+    # return dout * out * (1.0 - out)
+    return dout * (out - out * out)
+
+
+@dsl_user_op
 def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     if const_expr(not isinstance(x, tuple)):
         return cute.arch.fmax(x, Float32(0.0))
@@ -213,6 +219,15 @@ def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
             softplus_x[0] if not use_linear_0 else x[0],
             softplus_x[1] if not use_linear_1 else x[1],
         )
+
+
+@dsl_user_op
+@cute.jit
+def dsoftplus_from_output(out: Float32, dout: Float32, *, loc=None, ip=None) -> Float32:
+    use_linear = Boolean(out > 20.0)
+    # dx = dout * (1.0 - cute.math.exp(-out, fastmath=True)) if not use_linear else dout
+    dx = dout - dout * cute.math.exp(-out, fastmath=True)
+    return dx if not use_linear else dout
 
 
 @dsl_user_op
