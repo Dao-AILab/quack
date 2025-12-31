@@ -224,7 +224,7 @@ def online_softmax_reduce(
 
 @cute.jit
 def sum_swap_shuffle(
-    X: cute.Tensor, elem_per_lane: int, subwarp_size: int = 1, warp_size: int = 32
+    X: cute.Tensor, elem_per_lane: int = 1, subwarp_size: int = 1, warp_size: int = 32
 ) -> cute.Tensor:
     """
     For warp reduction, we use Swap Shuffle
