@@ -133,7 +133,9 @@ class CrossEntropy(ReductionBase):
         tXrX = cute.make_fragment_like(tXgX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        tXpX = (
+            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        )
         copy = partial(copy_utils.copy, pred=tXpX)
 
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
@@ -454,7 +456,9 @@ class CrossEntropyBackward:
         tXrX, tXrdX = [cute.make_fragment_like(thr) for thr in (tXgX, tXgdX)]
 
         is_even_N = const_expr(shape[1] % tiler_mn[1] == 0)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        tXpX = (
+            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        )
         copy = partial(copy_utils.copy, pred=tXpX)
 
         row = tXcX[0][0]

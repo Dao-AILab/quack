@@ -162,7 +162,9 @@ class RMSNorm(ReductionBase):
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
+            copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+            if not is_even_N
+            else None
         )
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
@@ -576,7 +578,7 @@ class RMSNormBackward(ReductionBase):
         tXpX = (
             None
             if is_even_N
-            else utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
+            else copy_utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
         )
         # Each copy will use the same number of elements as X
         copy = partial(copy_utils.copy, pred=tXpX)

@@ -106,7 +106,11 @@ class Softmax(ReductionBase):
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+        tXpX = (
+            None
+            if is_even_N
+            else copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+        )
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
 
@@ -288,7 +292,9 @@ class SoftmaxBackward(ReductionBase):
         tdYrdY, tYrY, tdXrdX = [cute.make_fragment_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        tXpX = (
+            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        )
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
 

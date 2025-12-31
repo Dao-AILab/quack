@@ -7,7 +7,7 @@ from typing import Optional, Tuple, Union
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, nvvm, vector
 
@@ -149,22 +149,6 @@ def prmt(a: int | Int32, b: int | Int32, c: int | Int32, *, loc=None, ip=None) -
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
-
-
-@cute.jit
-def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
-    # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-    tApA = cute.make_fragment(
-        cute.make_layout(
-            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
-            stride=(cute.size(tAcA, mode=[2]), 0, 1),
-        ),
-        Boolean,
-    )
-    for rest_v in cutlass.range_constexpr(tApA.shape[0]):
-        for rest_k in cutlass.range_constexpr(tApA.shape[2]):
-            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
-    return tApA
 
 
 @cute.jit

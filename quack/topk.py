@@ -98,7 +98,9 @@ class TopK:
         tXrX = cute.make_fragment_like(tXgX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        tXpX = (
+            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        )
         copy = partial(copy_utils.copy, pred=tXpX)
 
         if tXcX[0][0] < shape[0]:
@@ -385,8 +387,10 @@ class TopKBackward(ReductionBase):
         tXrdX = cute.make_fragment_like(tXgdX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
-        tXpV = utils.predicate_k(thr_copy.partition_S(cTopK), limit=mdValues.shape[1])
-        tXpX = None if is_even_N else utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        tXpV = copy_utils.predicate_k(thr_copy.partition_S(cTopK), limit=mdValues.shape[1])
+        tXpX = (
+            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        )
         copy_k = partial(copy_utils.copy, pred=tXpV)
         copy_dx = partial(copy_utils.copy, pred=tXpX)
 
