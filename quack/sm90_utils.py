@@ -27,10 +27,11 @@ def make_smem_layout(
         sm90_utils_og.get_smem_layout_atom(layout, dtype, major_mode_size),
         dtype,
     )
+    order = (1, 0, 2) if const_expr(layout.is_m_major_c()) else (0, 1, 2)
     smem_layout_staged = cute.tile_to_shape(
         smem_layout_atom,
         cute.append(shape, stage) if const_expr(stage is not None) else shape,
-        order=(1, 0, 2) if layout.is_m_major_c() else (0, 1, 2),
+        order=order if const_expr(stage is not None) else order[:2],
     )
     return smem_layout_staged
 

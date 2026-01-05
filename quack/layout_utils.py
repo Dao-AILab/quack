@@ -187,6 +187,10 @@ def make_acc_tensor_mn_view(acc: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout))
 
 
+def reshape_acc_to_mn(acc: cute.Tensor) -> cute.Tensor:
+    return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout))
+
+
 @cute.jit
 def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
     # For back to back gemm, convert layout of acc0 to gemm 1 accept layout.
@@ -225,6 +229,10 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
             ),
         )
     return rA_mma_view
+
+
+def reshape_acc_to_frgA(acc: cute.Tensor) -> cute.Tensor:
+    return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
 
 
 def convert_layout_zero_stride(
