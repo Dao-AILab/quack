@@ -288,7 +288,7 @@ def get_smem_store_C(
     arch: int,
     transpose: bool = False,
     position_independent=False,
-) -> Tuple[cute.TiledCopy, cute.Tensor]:
+) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
     copy_atom = get_smem_store_atom(arch, dtype, transpose)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
@@ -311,7 +311,7 @@ def get_smem_load_C(
     arch: int,
     transpose: bool = False,
     position_independent=False,
-) -> Tuple[cute.TiledCopy, cute.Tensor]:
+) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
     copy_atom = get_smem_load_atom(arch, dtype, transpose)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
@@ -332,9 +332,33 @@ def get_smem_load_C(
     return copy_fn, thr_copy, tSR_sC
 
 
-def get_smem_load_A(
+def get_smem_store_A(
     tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, arch: int, position_independent=False
-) -> Tuple[cute.TiledCopy, cute.Tensor]:
+) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
+    dtype = sA.element_type
+    transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
+    copy_atom = get_smem_store_atom(arch, dtype, transpose)
+    tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
+    thr_copy = tiled_copy.get_slice(tidx)
+    if const_expr(not position_independent):
+        tRS_sA = thr_copy.partition_D(sA)
+    else:
+        tRS_sA = partition_D_position_independent(thr_copy, sA)
+
+    def copy_fn(src: cute.Tensor, dst_idx: Int32, **new_kwargs):
+        cvt_copy(tiled_copy, src, tRS_sA[None, None, None, dst_idx], retile=True, **new_kwargs)
+
+    return copy_fn, thr_copy, tRS_sA
+
+
+def get_smem_load_A(
+    tiled_mma: cute.TiledMma,
+    sA: cute.Tensor,
+    tidx: Int32,
+    arch: int,
+    with_dst_tensor: bool = False,
+    position_independent=False,
+) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sA.element_type
     transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
     copy_atom = get_smem_load_atom(arch, dtype, transpose)
@@ -346,13 +370,17 @@ def get_smem_load_A(
         tSR_sA = partition_S_position_independent(thr_copy, sA)
     copy_atom_RS = get_smem_store_atom(arch, dtype, transpose)
     thr_copy_RS = cute.make_tiled_copy_C(copy_atom_RS, tiled_mma).get_slice(tidx)
+    tRS_shape = tiled_mma.partition_shape_A(sA.shape[:2])
 
-    def copy_fn(src_idx: Int32, dst_shape_or_tensor: cute.Tensor | cute.Shape, **new_kwargs):
+    def copy_fn(src_idx: Int32, **new_kwargs):
         return load_s2r_retile(
-            tiled_copy, tSR_sA[None, None, None, src_idx], dst_shape_or_tensor, **new_kwargs
+            tiled_copy, tSR_sA[None, None, None, src_idx], dst_shape=tRS_shape, **new_kwargs
         )
 
-    return copy_fn, thr_copy, tSR_sA
+    def copy_fn_w_dst_tensor(src_idx: Int32, dst: cute.Tensor, **new_kwargs):
+        return load_s2r_retile(tiled_copy, tSR_sA[None, None, None, src_idx], dst, **new_kwargs)
+
+    return copy_fn if not with_dst_tensor else copy_fn_w_dst_tensor, thr_copy, tSR_sA
 
 
 def tma_get_copy_fn(
