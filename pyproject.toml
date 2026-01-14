@@ -20,7 +20,8 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-exclude = ["tests", "benchmarks"]
+where = ["."]
+include = ["quack*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "quack.__version__"}
