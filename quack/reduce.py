@@ -140,13 +140,11 @@ def online_softmax_reduce(
         cute.arch.fmax,
         threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
     )
+    if max_x == -Float32.inf:
+        max_x = Float32.zero
 
     log2_e = math.log2(math.e)
     exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=True)
-    # if max_x=-inf, exp_x=nan, which causes error result.
-    if max_x == -Float32.inf:
-        exp_x = cute.zeros_like(x)  
-        
     sum_exp_x = cute.arch.warp_reduction(
         exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
         operator.add,
