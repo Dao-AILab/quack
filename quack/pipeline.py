@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
-from cutlass.cutlass_dsl import if_generate, and_
+from cutlass.cutlass_dsl import if_generate, and_, dsl_user_op
 from cutlass.pipeline import MbarrierArray, CooperativeGroup, PipelineOp, pipeline_init_wait
 from cutlass.pipeline import PipelineAsync, PipelineTmaAsync, PipelineState, PipelineUserType
 from cutlass.pipeline import PipelineTmaUmma
@@ -126,31 +126,36 @@ class PipelineTmaCpAsync(PipelineTmaAsync):
             is_signalling_thread,
         )
 
+    @dsl_user_op
     def producer_acquire(
         self,
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         is_tma_warp: Optional[Boolean] = True,
+        *,
+        loc=None,
+        ip=None,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier.
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
         )
         # This is the difference between this and PipelineTmaAsync: we could have multiple
         # warps calling this, but only 1 warp should do the arrive on the full barrier
         if_generate(
             is_tma_warp,
-            lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
+            lambda: self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip),
         )
 
-    def producer_cpasync_commit(self, state: PipelineState):
+    @dsl_user_op
+    def producer_cpasync_commit(self, state: PipelineState, *, loc=None, ip=None):
         """
         We need the mbarrier to track the completion of cp.async
         """
-        cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state))
+        cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip)
 
 
 class MbarrierArrayWDropCount(MbarrierArray):
@@ -245,7 +250,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
             tx_count,
             drop_count=producer_drop_count,
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_empty = PipelineTmaUmma._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
         )
 
@@ -278,11 +283,15 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
             cta_group,
         )
 
+    @dsl_user_op
     def producer_acquire(
         self,
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         is_tma_warp: Optional[Boolean] = True,
+        *,
+        loc=None,
+        ip=None,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the
@@ -290,17 +299,18 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
         )
         # This is the difference between this and PipelineTmaAsync: we could have multiple
         # warps calling this, but only 1 warp should do the arrive on the full barrier
         if_generate(
             and_(self.is_leader_cta, is_tma_warp),
-            lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
+            lambda: self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip),
         )
 
-    def producer_cpasync_commit(self, state: PipelineState):
+    @dsl_user_op
+    def producer_cpasync_commit(self, state: PipelineState, *, loc=None, ip=None):
         """
         We need the mbarrier to track the completion of cp.async
         """
-        cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state))
+        cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip)
