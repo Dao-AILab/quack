@@ -159,6 +159,7 @@ class PipelineTmaCpAsync(PipelineTmaAsync):
 
 
 class MbarrierArrayWDropCount(MbarrierArray):
+    @dsl_user_op
     def __init__(
         self,
         barrier_storage: cute.Pointer,
@@ -166,6 +167,9 @@ class MbarrierArrayWDropCount(MbarrierArray):
         agent: tuple[PipelineOp, CooperativeGroup],
         tx_count: int = 0,
         drop_count: Optional[Int32] = None,
+        *,
+        loc=None,
+        ip=None,
     ) -> None:
         self.barrier_storage = barrier_storage
         self.tx_count = tx_count
@@ -188,7 +192,7 @@ class MbarrierArrayWDropCount(MbarrierArray):
         self.mbarrier_base = self.barrier_storage
 
         # Mbarrier initialization in constructor
-        self.mbarrier_init()
+        self.mbarrier_init(loc=loc, ip=ip)
 
     def __extract_mlir_values__(self):
         return [self.barrier_storage, self.drop_count]
