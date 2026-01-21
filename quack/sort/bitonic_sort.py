@@ -83,7 +83,7 @@ def bitonic_topk_merge(
     else:
         minmax_fn = min if ascending else max
     # Write the top k elements to the first half of the array
-    for i in cutlass.range(k, unfoll_full=True):
+    for i in cutlass.range(k, unroll_full=True):
         arr0[start0 + i] = minmax_fn(arr0[start0 + i], arr1[start1 + k - 1 - i])
     # Now the 1st half is bitonic, we just need to merge it
     bitonic_merge(arr0, k, start0, ascending)
