@@ -12,7 +12,8 @@ from cutlass.pipeline import PipelineTmaUmma
 
 
 class PipelineStateWAdvance(PipelineState):
-    def advance_iters(self, num_iterations: Int32):
+    @dsl_user_op
+    def advance_iters(self, num_iterations: Int32, *, loc=None, ip=None):
         self._count += Int32(num_iterations)
         new_index = self._index + Int32(num_iterations)
         # How many times did we cross the stages boundary
@@ -220,6 +221,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
         producer_drop_count: Optional[Int32] = None,
+        mcast_mode_mn: tuple[int, int] = (1, 1),
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineTmaUmma.
@@ -235,6 +237,8 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
         :type tx_count: int
         :param cta_layout_vmnk: Layout of the cluster shape
         :type cta_layout_vmnk: cute.Layout | None
+        :param mcast_mode_mn: Tuple specifying multicast modes for m and n dimensions (each 0 or 1)
+        :type mcast_mode_mn: tuple[int, int], optional
         """
         if not isinstance(barrier_storage, cute.Pointer):
             raise ValueError(
@@ -264,7 +268,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
             # All threadblocks are leaders if not using clusters
             is_leader_cta = True
         else:
-            producer_mask = PipelineTmaUmma._compute_mcast_arrival_mask(cta_layout_vmnk)
+            producer_mask = PipelineTmaUmma._compute_mcast_arrival_mask(cta_layout_vmnk, mcast_mode_mn)
             is_leader_cta = PipelineTmaUmma._compute_is_leader_cta(cta_layout_vmnk)
 
         cta_group = (
