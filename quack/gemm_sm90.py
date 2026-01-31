@@ -658,7 +658,7 @@ class GemmSm90:
         )
 
         if warp_idx >= self.ab_load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+            cute.arch.setmaxregister_decrease(self.num_regs_load)
             if (
                 warp_idx >= self.ab_load_warp_id
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
@@ -822,7 +822,7 @@ class GemmSm90:
                     tile_scheduler.producer_tail()
 
         if warp_idx < self.ab_load_warp_id:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
+            cute.arch.setmaxregister_increase(self.num_regs_mma)
             is_tma_warp = Boolean(
                 (not self.pingpong and warp_idx == 0)
                 or (self.pingpong and (warp_idx == 0 or warp_idx == 4))
