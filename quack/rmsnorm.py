@@ -686,9 +686,7 @@ class RMSNormBackward(ReductionBase):
 
             if const_expr(self.cluster_n > 1):
                 # Need this fence since the STAS from the producer is using the async proxy.
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                )
+                cute.arch.fence_proxy("async.shared", space="cta")
                 # It's faster to have 1 lane per warp to signal the mbar, rather than all lanes
                 # Requires adjusting the thread_count when initializing the mbar
                 cute.arch.sync_warp()

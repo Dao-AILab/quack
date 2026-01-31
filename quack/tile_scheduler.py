@@ -329,9 +329,7 @@ class TileScheduler:
                     # Need this fence since the STAS from the producer is using the async proxy.
                     # Without this, we get race condition / deadlock.
                     if const_expr(cute.size(params.cluster_shape_mn) > 1):
-                        cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                        )
+                        cute.arch.fence_proxy("async.shared", space="cta")
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
                         # if tidx % 32 == 0: cute.printf("bidx = {}, bidz = {}, tidx = {}, before empty arrive", bidx, bidz, tidx)
