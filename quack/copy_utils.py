@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Int32, Boolean, const_expr
-from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
 
@@ -242,9 +242,7 @@ def sm90_get_smem_load_op(
         raise TypeError(f"elem_ty_c must be a Numeric, but got {elem_ty_c}")
     is_m_major = layout_c.is_m_major_c()
     if elem_ty_c.width == 16:
-        return cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(is_m_major, 4), elem_ty_c, loc=loc, ip=ip
-        )
+        return cute.make_copy_atom(warp.LdMatrix8x8x16bOp(is_m_major, 4), elem_ty_c, loc=loc, ip=ip)
     else:
         return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), elem_ty_c, loc=loc, ip=ip)
 
@@ -260,7 +258,7 @@ def get_smem_store_atom(
         )
     else:
         return cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
             element_type,
         )
 
@@ -276,7 +274,7 @@ def get_smem_load_atom(
         )
     else:
         return cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+            warp.LdMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
             element_type,
         )
 
@@ -368,8 +366,6 @@ def get_smem_load_A(
         tSR_sA = thr_copy.partition_S(sA)
     else:
         tSR_sA = partition_S_position_independent(thr_copy, sA)
-    copy_atom_RS = get_smem_store_atom(arch, dtype, transpose)
-    thr_copy_RS = cute.make_tiled_copy_C(copy_atom_RS, tiled_mma).get_slice(tidx)
     tRS_shape = tiled_mma.partition_shape_A(sA.shape[:2])
 
     def copy_fn(src_idx: Int32, **new_kwargs):

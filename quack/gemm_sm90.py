@@ -226,8 +226,6 @@ class GemmSm90:
         self.num_epi_warps = (self.mma_warp_groups if not self.pingpong else 1) * 4
         self.num_ab_load_warps = 1 if not self.gather_A else 4
         self.ab_load_warp_id = self.mma_warp_groups * 4
-        # self.num_epi_load_threads = cute.arch.WARP_SIZE * 1
-        # self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
 
         regs_per_thread = math.prod(self.cta_tile_shape_mnk[:2]) // (
             math.prod(self.atom_layout_mnk) * self.num_threads_per_warp_group
@@ -585,17 +583,13 @@ class GemmSm90:
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # /////////////////////////////////////////////////////////////////////////////
-        #  Prefetch Tma desc
-        # /////////////////////////////////////////////////////////////////////////////
+        # Prefetch Tma desc
         if warp_idx == self.ab_load_warp_id:
             for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
-        # /////////////////////////////////////////////////////////////////////////////
-        #  Alloc and init AB full/empty + ACC full mbar (pipeline)
-        # /////////////////////////////////////////////////////////////////////////////
+        # Alloc and init AB full/empty + ACC full mbar (pipeline)
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
@@ -668,9 +662,7 @@ class GemmSm90:
                 varlen_manager.init_tensormap_AB(tma_atom_a, tma_atom_b, is_tma_warp)
                 tma_desc_a_ptr = varlen_manager.get_tma_desc_a_ptr()
                 tma_desc_b_ptr = varlen_manager.get_tma_desc_b_ptr()
-                # ///////////////////////////////////////////////////////////////////////////////
                 # Get mcast mask
-                # ///////////////////////////////////////////////////////////////////////////////
                 cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 block_in_cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
                 a_mcast_mask = cute.make_layout_image_mask(
@@ -698,14 +690,9 @@ class GemmSm90:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
                     varlen_manager.update_tensormap_AB(
-                        batch_idx,
-                        self.a_layout,
-                        self.b_layout,
-                        is_tma_warp,
+                        batch_idx, self.a_layout, self.b_layout, is_tma_warp
                     )
-                    # ///////////////////////////////////////////////////////////////////////////
-                    #  Local_tile partition global tensors
-                    # ///////////////////////////////////////////////////////////////////////////
+                    # Local_tile partition global tensors
                     if const_expr(not self.gather_A):
                         mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
                         # (bM, bK, RestK)
@@ -736,9 +723,7 @@ class GemmSm90:
                         cute.select(self.cta_tile_shape_mnk, [1, 2]),
                         (tile_coord_mnkl[1], None),
                     )
-                    # //////////////////////////////////////////////////////////////////////////
-                    #  Partition shared tensor for TMA load A/B
-                    # //////////////////////////////////////////////////////////////////////////
+                    # Partition shared tensor for TMA load A/B
                     varlen_manager.fence_tensormap_update_AB(is_tma_warp)
                     len_m = varlen_manager.len_m(batch_idx)
                     len_k = varlen_manager.len_k(batch_idx)
@@ -832,24 +817,20 @@ class GemmSm90:
             )
             tma_desc_d_ptr = varlen_manager.get_tma_desc_d_ptr()
             tma_desc_epi_ptrs = varlen_manager.get_tma_desc_epi_ptrs()
-            # //////////////////////////////////////////////////////////////////////////////
-            #  Partition global tensor for TiledMMA_A/B/C
-            # //////////////////////////////////////////////////////////////////////////////
+            # Partition global tensor for TiledMMA_A/B/C
             tidx, _, _ = cute.arch.thread_idx()
             warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
             if const_expr(self.pingpong):
                 tidx = tidx % self.num_threads_per_warp_group
             warp_group_thread_layout = cute.make_layout(
-                self.mma_warp_groups if not self.pingpong else 1,
+                self.mma_warp_groups if const_expr(not self.pingpong) else 1,
                 stride=self.num_threads_per_warp_group,
             )
             thr_mma = tiled_mma.get_slice(
                 warp_group_thread_layout(warp_group_idx if not self.pingpong else 0)
             )
 
-            # //////////////////////////////////////////////////////////////////////////////
-            #  Make fragments
-            # //////////////////////////////////////////////////////////////////////////////
+            # Make fragments
             tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
             tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
 
@@ -910,11 +891,7 @@ class GemmSm90:
                     epilogue_params, varlen_params.cu_seqlens_m, batch_idx
                 )
                 varlen_manager.update_tensormap_epi(
-                    batch_idx,
-                    self.d_layout,
-                    epi_shapes,
-                    epi_orders,
-                    is_tma_warp,
+                    batch_idx, self.d_layout, epi_shapes, epi_orders, is_tma_warp
                 )
                 len_k = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
@@ -933,9 +910,7 @@ class GemmSm90:
                     if k_tile_cnt == 0:
                         acc.fill(0.0)
 
-                # /////////////////////////////////////////////////////////////////////////////
-                #  EPILOGUE
-                # /////////////////////////////////////////////////////////////////////////////
+                # EPILOGUE
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
 
@@ -1073,9 +1048,7 @@ class GemmSm90:
         peek_ab_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
             peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
-        # /////////////////////////////////////////////////////////////////////////
         # TMA load
-        # /////////////////////////////////////////////////////////////////////////
         for k_tile in cutlass.range(k_tile_cnt, unroll=1):
             # Wait for A/B buffers to be empty before loading into them
             # Also sets the transaction barrier for the A/B buffers
@@ -1112,9 +1085,7 @@ class GemmSm90:
         peek_ab_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
             peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
-        # /////////////////////////////////////////////////////////////////////////
         # TMA load on B and cp.async on A
-        # /////////////////////////////////////////////////////////////////////////
         for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
             prefetch_out = ()
             if const_expr(prefetch_A is not None):  # Prefetch early, even before smem is free
@@ -1172,9 +1143,7 @@ class GemmSm90:
         k_tile_cnt: Int32,
         warp_group_idx: Int32,
     ) -> Tuple[cutlass.pipeline.PipelineState, cute.TiledMma]:
-        # /////////////////////////////////////////////////////////////////////////////
-        #  Prologue MMAs
-        # /////////////////////////////////////////////////////////////////////////////
+        # Prologue MMAs
         k_pipe_mmas = 1
         ab_release_state = ab_read_state.clone()
         num_prologue_mma = min(k_pipe_mmas, k_tile_cnt)
@@ -1204,13 +1173,10 @@ class GemmSm90:
             warpgroup.wait_group(0)
             acc_slow.store(acc.load())
 
-        # /////////////////////////////////////////////////////////////////////////////
-        #  MAINLOOP
-        # /////////////////////////////////////////////////////////////////////////////
+        # MAINLOOP
         for k_tile in cutlass.range(num_prologue_mma, k_tile_cnt, unroll=1):
             # Wait for TMA copies to complete
             ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
-            # WGMMA
             warpgroup.fence()
             if const_expr(self.fp8_slow_accum):
                 tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
