@@ -11,7 +11,7 @@ from quack.layout_utils import make_acc_tensor_mn_view
 @cute.jit
 def vec_op(tCrC: cute.Tensor, tCrVec: cute.Tensor, op: Callable, is_colvec: bool) -> None:
     if const_expr(tCrC.element_type != Float32):  # Convert to f32
-        tCrC_f32 = cute.make_fragment(tCrC.shape, Float32)
+        tCrC_f32 = cute.make_rmem_tensor(tCrC.shape, Float32)
         tCrC_f32.store(tCrC.load().to(Float32))
     else:
         tCrC_f32 = tCrC

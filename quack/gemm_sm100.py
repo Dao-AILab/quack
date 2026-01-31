@@ -1190,7 +1190,7 @@ class GemmSm100(GemmSm90):
                             tAgAIdx = thr_copy_AIdx.partition_S(gAIdx)
                             len_m = varlen_manager.len_m(batch_idx)
                             m_limit = len_m - tile_coord_mnkl[0] * tile_M
-                            tApAIdx_m = cute.make_fragment((1, tAsAIdx.shape[1]), Boolean)
+                            tApAIdx_m = cute.make_rmem_tensor((1, tAsAIdx.shape[1]), Boolean)
                             for m in cutlass.range(tAsAIdx.shape[1], unroll_full=True):
                                 tApAIdx_m[0, m] = tAcAIdx[0, m] < m_limit
                             a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
@@ -1220,7 +1220,7 @@ class GemmSm100(GemmSm90):
                             if 0 < k_tile_cnt:
                                 k_tile = k_tile_cnt - 1
                                 k_limit = len_k - k_tile * tile_K
-                                tApAIdx_k = cute.make_fragment((1, tAsAIdx.shape[1]), Boolean)
+                                tApAIdx_k = cute.make_rmem_tensor((1, tAsAIdx.shape[1]), Boolean)
                                 for m in cutlass.range(tAsAIdx.shape[1], unroll_full=True):
                                     tApAIdx_k[0, m] = tAcAIdx[0, m] < k_limit
                                 a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
@@ -1426,7 +1426,7 @@ class GemmSm100(GemmSm90):
                 epi_tidx, tCtAcc_base, epi_tile, use_2cta_instrs
             )
 
-            tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.acc_dtype)
+            tTR_rD = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
             tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                 tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
             )
@@ -1787,7 +1787,7 @@ class GemmSm100(GemmSm90):
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
         tTR_cAcc = thr_copy_t2r.partition_D(cAcc_epi)
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(tTR_cAcc[None, None, None, 0, 0].shape, self.acc_dtype)
+        tTR_rAcc = cute.make_rmem_tensor(tTR_cAcc[None, None, None, 0, 0].shape, self.acc_dtype)
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
     def epilog_smem_store_and_partition(
@@ -1860,7 +1860,7 @@ class GemmSm100(GemmSm90):
         thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
         # (R2S, R2S_M, R2S_N, PIPE_D)
         tSR_sC = thr_copy_s2r.partition_S(sC)
-        tRS_rC = cute.make_fragment(tRS_rD_layout, dtype)
+        tRS_rC = cute.make_rmem_tensor(tRS_rD_layout, dtype)
         # (R2S, R2S_M, R2S_N)
         tSR_rC = tiled_copy_s2r.retile(tRS_rC)
         return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC

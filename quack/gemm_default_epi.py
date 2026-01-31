@@ -101,7 +101,7 @@ class GemmDefaultEpiMixin:
             tRVsRV = thr_copy_RV.partition_D(sRowVec)
             tRVcRV = thr_copy_RV.partition_S(cute.make_identity_tensor(tile_N))
             limit_n = min(mRowVec.shape[0] - tile_coord_mnkl[1] * tile_N, tile_N)
-            tRVpRV = cute.make_fragment((1, cute.size(tRVsRV.shape[1])), Boolean)
+            tRVpRV = cute.make_rmem_tensor((1, cute.size(tRVsRV.shape[1])), Boolean)
             for m in cutlass.range(cute.size(tRVsRV.shape[1]), unroll_full=True):
                 tRVpRV[0, m] = tRVcRV[0, m] < limit_n
             cute.copy(thr_copy_RV, tRVgRV, tRVsRV, pred=tRVpRV)
@@ -132,7 +132,7 @@ class GemmDefaultEpiMixin:
             tCVsCV = thr_copy_CV.partition_D(sColVec)
             tCVcCV = thr_copy_CV.partition_S(cute.make_identity_tensor(tile_M))
             limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
-            tCVpCV = cute.make_fragment((1, cute.size(tCVsCV.shape[1])), Boolean)
+            tCVpCV = cute.make_rmem_tensor((1, cute.size(tCVsCV.shape[1])), Boolean)
             for m in cutlass.range(cute.size(tCVsCV.shape[1]), unroll_full=True):
                 tCVpCV[0, m] = tCVcCV[0, m] < limit_m
             cute.copy(thr_copy_CV, tCVgCV, tCVsCV, pred=tCVpCV)
@@ -158,7 +158,7 @@ class GemmDefaultEpiMixin:
                 None, None, None, epi_coord
             ]
             # tDrRowVec = cute.make_fragment_like(tDsRowVec_cur)
-            tDrRowVec = cute.make_fragment(tDsRowVec_cur.layout, tDsRowVec_cur.element_type)
+            tDrRowVec = cute.make_rmem_tensor(tDsRowVec_cur.layout, tDsRowVec_cur.element_type)
             cute.autovec_copy(cute.filter_zeros(tDsRowVec_cur), cute.filter_zeros(tDrRowVec))
             tDrRowVec_cvt = cute.make_fragment_like(tDrRowVec, self.acc_dtype)
             tDrRowVec_cvt.store(tDrRowVec.load().to(self.acc_dtype))
@@ -169,7 +169,7 @@ class GemmDefaultEpiMixin:
             ]
             # This somehow doesn't work, some dim with stride 0 turns to non-zero stride
             # tDrRowVec = cute.make_fragment_like(tDsRowVec_cur)
-            tDrColVec = cute.make_fragment(tDsColVec_cur.layout, tDsColVec_cur.element_type)
+            tDrColVec = cute.make_rmem_tensor(tDsColVec_cur.layout, tDsColVec_cur.element_type)
             cute.autovec_copy(cute.filter_zeros(tDsColVec_cur), cute.filter_zeros(tDrColVec))
             tDrColVec_cvt = cute.make_fragment_like(tDrColVec, self.acc_dtype)
             tDrColVec_cvt.store(tDrColVec.load().to(self.acc_dtype))

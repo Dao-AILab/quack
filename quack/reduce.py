@@ -196,9 +196,9 @@ def online_softmax_reduce(
                     )
                 cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
-                max_x_single_warp = cute.make_fragment(num_iter, Float32)
+                max_x_single_warp = cute.make_rmem_tensor(num_iter, Float32)
                 max_x_single_warp.fill(-Float32.inf)
-                sum_exp_x_single_warp = cute.make_fragment(num_iter, Float32)
+                sum_exp_x_single_warp = cute.make_rmem_tensor(num_iter, Float32)
                 sum_exp_x_single_warp.fill(0.0)
                 for i in cutlass.range_constexpr(num_iter):
                     idx = lane_idx + i * cute.arch.WARP_SIZE

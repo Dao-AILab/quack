@@ -39,7 +39,7 @@ class GemmDActMixin(GemmActMixin):
         tRS_rC_acc.store(tRS_rC.load().to(self.acc_dtype))
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
-            tRS_rPostAct = cute.make_fragment(tRS_rD.layout.shape, self.acc_dtype)
+            tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch < 100):
                 for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                     tRS_rD[i], tRS_rPostAct[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])

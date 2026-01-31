@@ -52,7 +52,7 @@ def load_s2r_retile(
 ) -> cute.Tensor:
     # Will also accept dst_shape being a tensor, in which case we write into that tensor
     if const_expr(not isinstance(dst_shape, cute.Tensor)):
-        dst = cute.make_fragment(dst_shape, src.element_type, loc=loc, ip=ip)
+        dst = cute.make_rmem_tensor(dst_shape, src.element_type, loc=loc, ip=ip)
     else:
         dst = dst_shape
     cute.copy(tiled_copy, src, tiled_copy.retile(dst), loc=loc, ip=ip)
@@ -117,7 +117,7 @@ def tiled_copy_2d(
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-    tApA = cute.make_fragment(
+    tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
@@ -464,7 +464,7 @@ def gather_m_get_copy_fn(
     # Read and cache indices for A
     rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
     cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
-    tApA_m = cute.make_fragment(rows_per_thread, Boolean)
+    tApA_m = cute.make_rmem_tensor(rows_per_thread, Boolean)
     for m in cutlass.range(rows_per_thread, unroll_full=True):
         tApA_m[m] = t0AcA[0, m, 0][0] < limit_m
     m_idx = cute.make_fragment(rows_per_thread, Int32)
@@ -480,7 +480,7 @@ def gather_m_get_copy_fn(
     def copy_fn(src_idx, dst_idx, pred: bool = False):
         tApA_k = None
         if const_expr(pred):
-            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
             limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
             for k in cutlass.range(cols_per_thread, unroll_full=True):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
@@ -538,7 +538,7 @@ def gather_k_get_copy_fn(
     # Read and cache indices for A
     rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
     cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
-    tApA_m = cute.make_fragment(rows_per_thread, Boolean)
+    tApA_m = cute.make_rmem_tensor(rows_per_thread, Boolean)
     for m in cutlass.range(rows_per_thread, unroll_full=True):
         tApA_m[m] = t0AcA[0, m, 0][0] < limit_m
     threads_per_col = const_expr(thr_copy_A.tiler_mn[0].shape // elems_per_load)
@@ -554,12 +554,12 @@ def gather_k_get_copy_fn(
         # Prefetch mAIdx early, even before smem is free
         tApA_k = None
         if const_expr(pred):
-            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
             limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
             for k in cutlass.range(cols_per_thread, unroll_full=True):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
         gAIdx_cur = gAIdx[None, src_idx]
-        k_idx = cute.make_fragment(cols_per_thread, Int32)
+        k_idx = cute.make_rmem_tensor(cols_per_thread, Int32)
         for k in cutlass.range(cols_per_thread):
             col_idx = tAcA[0, 0, k][1]
             if const_expr(not pred):
@@ -576,13 +576,13 @@ def gather_k_get_copy_fn(
     ) -> Tuple[cute.Tensor, cute.Tensor]:
         tApA_k = None
         if const_expr(pred):
-            tApA_k = cute.make_fragment(cols_per_thread, Boolean)
+            tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
             limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
             for k in cutlass.range(cols_per_thread, unroll_full=True):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
         a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
         sAIdx_cur = sAIdx[None, dst_idx]
-        k_idx = cute.make_fragment(cols_per_thread, Int32)
+        k_idx = cute.make_rmem_tensor(cols_per_thread, Int32)
         for k in cutlass.range(cols_per_thread):
             col_idx = tAcA[0, 0, k][1]
             k_idx[k] = sAIdx_cur[col_idx]

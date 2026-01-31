@@ -102,7 +102,7 @@ def gemm_zero_init(
             tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False
         )
     else:
-        acc = cute.make_fragment(tiled_mma.partition_shape_C(shape), Float32)
+        acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
         rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
         rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
         gemm(tiled_mma, acc, rA, rB, zero_init=True, wg_wait=wg_wait)
@@ -137,7 +137,7 @@ def partition_fragment_ABC(
 ):
     is_rs = thr_mma.op.a_src == warpgroup.OperandSource.RMEM
     if const_expr(not swap_AB):
-        acc = cute.make_fragment(thr_mma.partition_shape_C(shape_mnk[:2]), Float32)
+        acc = cute.make_rmem_tensor(thr_mma.partition_shape_C(shape_mnk[:2]), Float32)
         if const_expr(not is_rs):
             assert sA is not None
             tCrA = thr_mma.make_fragment_A(thr_mma.partition_A(sA))
@@ -146,7 +146,9 @@ def partition_fragment_ABC(
         assert sB is not None
         tCrB = thr_mma.make_fragment_B(thr_mma.partition_B(sB))
     else:
-        acc = cute.make_fragment(thr_mma.partition_shape_C((shape_mnk[1], shape_mnk[0])), Float32)
+        acc = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((shape_mnk[1], shape_mnk[0])), Float32
+        )
         if const_expr(not is_rs):
             assert sB is not None
             tCrB = thr_mma.make_fragment_A(thr_mma.partition_A(sB))

@@ -856,10 +856,10 @@ class GemmSm90:
             acc_shape = tiled_mma.partition_shape_C(
                 cute.select(self.cta_tile_shape_mnk, mode=[0, 1])
             )
-            acc = cute.make_fragment(acc_shape, self.acc_dtype)
+            acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
             acc_slow = None
             if const_expr(self.fp8_slow_accum):
-                acc_slow = cute.make_fragment(acc_shape, self.acc_dtype)
+                acc_slow = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -1579,7 +1579,7 @@ class GemmSm90:
         tRS_sD = thr_copy_r2s.partition_D(sD) if sD is not None else None
         sD_shape = sD.shape[:2] if sD is not None else self.epi_tile
         tRS_rD_shape = thr_copy_r2s.partition_S(cute.make_identity_tensor(sD_shape)).shape
-        tRS_rD = cute.make_fragment(tRS_rD_shape, self.acc_dtype)
+        tRS_rD = cute.make_rmem_tensor(tRS_rD_shape, self.acc_dtype)
         return tiled_copy_r2s, tRS_rD, tRS_sD
 
     def epilog_smem_load_and_partition(
@@ -1596,7 +1596,7 @@ class GemmSm90:
         tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_C_atom)
         thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
         tSR_sC = thr_copy_s2r.partition_S(sC)
-        tRS_rC = cute.make_fragment(tRS_rD_layout, dtype)
+        tRS_rC = cute.make_rmem_tensor(tRS_rD_layout, dtype)
         tSR_rC = thr_copy_s2r.retile(tRS_rC)
         return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
 

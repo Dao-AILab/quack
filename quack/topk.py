@@ -105,7 +105,7 @@ class TopK:
 
         if tXcX[0][0] < shape[0]:
             copy(tXgX, tXrX)
-        tXrX_f32 = cute.make_fragment(tXrX.shape, Float32)
+        tXrX_f32 = cute.make_rmem_tensor(tXrX.shape, Float32)
         tXrX_f32.store(tXrX.load().to(Float32))
 
         # Encode the indices into the bottom bits of values.
@@ -138,7 +138,7 @@ class TopK:
         # 1 -> 0b11111, 2 -> 0b11110, 4 -> 0b11100, 8 -> 0b11000, 16 -> 0b10000, 32 -> 0b00000
         mask = cute.arch.WARP_SIZE - threads_per_row
         mask_and_clamp = mask << 8 | (cute.arch.WARP_SIZE - 1)
-        topk_vals_split = cute.make_fragment((vecsize_out, nvec_per_thread), Float32)
+        topk_vals_split = cute.make_rmem_tensor((vecsize_out, nvec_per_thread), Float32)
         for i in cutlass.range(cute.ceil_div(self.k, vecsize_out), unroll_full=True):
             should_receive = tidx % threads_per_row == i % threads_per_row
             for v in cutlass.range(vecsize_out, unroll_full=True):
@@ -154,7 +154,7 @@ class TopK:
 
         # Extract indices and clean values
         topk_vals_i32 = cute.recast_tensor(topk_vals_split, Int32)
-        topk_indices = cute.make_fragment(topk_vals_i32.shape, Int32)
+        topk_indices = cute.make_rmem_tensor(topk_vals_i32.shape, Int32)
         for i in cutlass.range(cute.size(topk_vals_i32), unroll_full=True):
             # Extract the encoded index from the last log_N bits
             encoded_idx = topk_vals_i32[i] & idx_mask
@@ -420,7 +420,7 @@ class TopKBackward(ReductionBase):
             grads = vals_f32 * (dvals_f32 - dot)
         else:
             grads = dvals_f32
-        grad_cvt = cute.make_fragment(tXrdV.shape, mdX.element_type)
+        grad_cvt = cute.make_rmem_tensor(tXrdV.shape, mdX.element_type)
         grad_cvt.store(grads.to(mdX.element_type))
 
         # Scatter values to smem
