@@ -69,11 +69,11 @@ class TileScheduler:
     class Params(ParamsBase):
         problem_shape_ncluster_mnl: cute.Shape
         raster_order: RasterOrder
-        num_clusters_per_problem_divmod: FastDivmod
+        num_clusters_per_problem_fdd: FastDivmod
         num_groups_regular: Int32
-        group_size_divmod: FastDivmod
-        group_size_tail_divmod: FastDivmod
-        num_clusters_in_group_divmod: FastDivmod
+        group_size_fdd: FastDivmod
+        group_size_tail_fdd: FastDivmod
+        num_clusters_in_group_fdd: FastDivmod
         tile_count_semaphore: Optional[cute.Pointer]
         batch_idx_permute: Optional[cute.Tensor]
         cluster_shape_mn: cutlass.Constexpr[cute.Shape]
@@ -110,12 +110,12 @@ class TileScheduler:
             return TileScheduler.Params(
                 problem_shape_ncluster_mnl,
                 raster_order,
-                FastDivmod.create(num_clusters_per_problem),
+                FastDivmod(num_clusters_per_problem),
                 num_groups_regular,
-                FastDivmod.create(group_size),
+                FastDivmod(group_size),
                 # Don't divide by 0
-                FastDivmod.create(group_size_tail if group_size_tail > 0 else 1),
-                FastDivmod.create(num_clusters_in_group),
+                FastDivmod(group_size_tail if group_size_tail > 0 else 1),
+                FastDivmod(num_clusters_in_group),
                 args.tile_count_semaphore if const_expr(args.is_persistent) else None,
                 args.batch_idx_permute,
                 cluster_shape_mn,
@@ -212,12 +212,12 @@ class TileScheduler:
     ) -> Tuple[Int32, Int32]:
         # CTA Swizzle to promote L2 data reuse
         params = self.params
-        group_id, id_in_group = params.num_clusters_in_group_divmod.divmod(cluster_id_in_problem)
+        group_id, id_in_group = divmod(cluster_id_in_problem, params.num_clusters_in_group_fdd)
         cid_fast_in_group, cid_slow = Int32(0), Int32(0)
         if group_id < params.num_groups_regular:
-            cid_slow, cid_fast_in_group = params.group_size_divmod.divmod(id_in_group)
+            cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
         else:  # tail part
-            cid_slow, cid_fast_in_group = params.group_size_tail_divmod.divmod(id_in_group)
+            cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
         if group_id % 2 == 1:  # serpentine order
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
@@ -225,7 +225,7 @@ class TileScheduler:
                 else params.problem_shape_ncluster_mnl[0]
             )
             cid_slow = ncluster_slow - 1 - cid_slow
-        cid_fast = group_id * params.group_size_divmod.divisor + cid_fast_in_group
+        cid_fast = group_id * params.group_size_fdd.divisor + cid_fast_in_group
         cid_m, cid_n = cid_fast, cid_slow
         if params.raster_order == RasterOrder.AlongN:
             cid_m, cid_n = cid_slow, cid_fast
@@ -238,8 +238,8 @@ class TileScheduler:
             cluster_id_in_problem = self._current_work_linear_idx
             _, _, bidz = cute.arch.block_idx()
         else:
-            bidz, cluster_id_in_problem = params.num_clusters_per_problem_divmod.divmod(
-                self._current_work_linear_idx
+            bidz, cluster_id_in_problem = divmod(
+                self._current_work_linear_idx, params.num_clusters_per_problem_fdd
             )
         cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
         # Get the pid from cluster id
@@ -394,13 +394,13 @@ class TriangularTileScheduler(TileScheduler):
     @dataclass
     class Params(ParamsBase):
         problem_shape_ncluster_mnl: cute.Shape
-        num_clusters_per_problem_divmod: FastDivmod
+        num_clusters_per_problem_fdd: FastDivmod
         group_size_inv_f32: Float32
         num_groups_regular: Int32
-        group_size_divmod: FastDivmod
-        group_size_tail_divmod: FastDivmod
-        group_size_mul_group_size_divmod: FastDivmod
-        group_size_tail_mul_group_size_divmod: FastDivmod
+        group_size_fdd: FastDivmod
+        group_size_tail_fdd: FastDivmod
+        group_size_mul_group_size_fdd: FastDivmod
+        group_size_tail_mul_group_size_fdd: FastDivmod
         tile_count_semaphore: Optional[cute.Pointer]
         cluster_shape_mn: cutlass.Constexpr[cute.Shape]
         is_persistent: cutlass.Constexpr[bool]
@@ -425,14 +425,14 @@ class TriangularTileScheduler(TileScheduler):
             num_groups_regular = cluster_m // group_size
             return TriangularTileScheduler.Params(
                 problem_shape_ncluster_mnl,
-                FastDivmod.create(num_clusters_per_problem),
+                FastDivmod(num_clusters_per_problem),
                 Float32(1.0 / group_size),
                 num_groups_regular,
-                FastDivmod.create(group_size),
+                FastDivmod(group_size),
                 # Don't divide by 0
-                FastDivmod.create(group_size_tail if group_size_tail > 0 else 1),
-                FastDivmod.create(group_size * group_size),
-                FastDivmod.create((group_size_tail if group_size_tail > 0 else 1) * group_size),
+                FastDivmod(group_size_tail if group_size_tail > 0 else 1),
+                FastDivmod(group_size * group_size),
+                FastDivmod((group_size_tail if group_size_tail > 0 else 1) * group_size),
                 args.tile_count_semaphore if const_expr(args.is_persistent) else None,
                 cluster_shape_mn,
                 args.is_persistent,
@@ -485,7 +485,7 @@ class TriangularTileScheduler(TileScheduler):
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
         clusters = (
-            params.num_clusters_per_problem_divmod.divisor,
+            params.num_clusters_per_problem_fdd.divisor,
             1,
             params.problem_shape_ncluster_mnl[2],
         )
@@ -510,11 +510,11 @@ class TriangularTileScheduler(TileScheduler):
             cluster_id_in_problem = self._current_work_linear_idx
             _, _, bidz = cute.arch.block_idx()
         else:
-            bidz, cluster_id_in_problem = params.num_clusters_per_problem_divmod.divmod(
-                self._current_work_linear_idx
+            bidz, cluster_id_in_problem = divmod(
+                self._current_work_linear_idx, params.num_clusters_per_problem_fdd
             )
         # CTA Swizzle to promote L2 data reuse
-        group_size = params.group_size_divmod.divisor
+        group_size = params.group_size_fdd.divisor
         group_id = (
             utils.ceil(
                 (utils.sqrt(2 * cluster_id_in_problem + 2.25) - 0.5) * params.group_size_inv_f32
@@ -526,25 +526,23 @@ class TriangularTileScheduler(TileScheduler):
         group_size_actual = (
             group_size
             if group_id < params.num_groups_regular
-            else params.group_size_tail_divmod.divisor
+            else params.group_size_tail_fdd.divisor
         )
         group_col, group_remainder = Int32(0), Int32(0)
         if group_id < params.num_groups_regular:
-            group_col, group_remainder = params.group_size_mul_group_size_divmod.divmod(id_in_group)
+            group_col, group_remainder = divmod(id_in_group, params.group_size_mul_group_size_fdd)
         else:  # tail part
-            group_col, group_remainder = params.group_size_tail_mul_group_size_divmod.divmod(
-                id_in_group
+            group_col, group_remainder = divmod(
+                id_in_group, params.group_size_tail_mul_group_size_fdd
             )
         cid_m_in_group, cid_n_in_group = Int32(0), Int32(0)
         if id_in_group >= group_size_actual * group_size * group_id:  # triangular tail
             cid_m_in_group, cid_n_in_group = triangular_idx_to_coord(group_remainder)
         else:
             if group_id < params.num_groups_regular:
-                cid_n_in_group, cid_m_in_group = params.group_size_divmod.divmod(group_remainder)
+                cid_n_in_group, cid_m_in_group = divmod(group_remainder, params.group_size_fdd)
             else:
-                cid_n_in_group, cid_m_in_group = params.group_size_tail_divmod.divmod(
-                    group_remainder
-                )
+                cid_n_in_group, cid_m_in_group = divmod(group_remainder, params.group_size_tail_fdd)
         cid_m = cid_m_start + cid_m_in_group
         cid_n = group_col * group_size + cid_n_in_group
 
@@ -558,8 +556,7 @@ class TriangularTileScheduler(TileScheduler):
         else:
             is_valid = (
                 self._current_work_linear_idx
-                < params.num_clusters_per_problem_divmod.divisor
-                * params.problem_shape_ncluster_mnl[2]
+                < params.num_clusters_per_problem_fdd.divisor * params.problem_shape_ncluster_mnl[2]
             )
         # bidx, bidy, bidz = cute.arch.block_idx()
         # tidx, _, _ = cute.arch.thread_idx()
@@ -590,9 +587,9 @@ class VarlenMTileScheduler(TileScheduler):
         cu_seqlens_m: cute.Tensor
         raster_order: cutlass.Constexpr[RasterOrder]
         group_size: Int32
-        group_size_divmod: Optional[FastDivmod]
-        group_size_tail_divmod: Optional[FastDivmod]
-        num_clusters_in_group_divmod: FastDivmod
+        group_size_fdd: Optional[FastDivmod]
+        group_size_tail_fdd: Optional[FastDivmod]
+        num_clusters_in_group_fdd: FastDivmod
         tile_shape_mn: cutlass.Constexpr[cute.Shape]
         tile_count_semaphore: Optional[cute.Pointer]
         cluster_shape_mn: cutlass.Constexpr[cute.Shape]
@@ -644,14 +641,12 @@ class VarlenMTileScheduler(TileScheduler):
                 args.cu_seqlens_m,
                 raster_order,
                 group_size,
-                FastDivmod.create(group_size) if ncluster_fast is not None else None,
+                FastDivmod(group_size) if ncluster_fast is not None else None,
                 # Don't divide by 0
-                FastDivmod.create(group_size_tail if group_size_tail > 0 else 1)
+                FastDivmod(group_size_tail if group_size_tail > 0 else 1)
                 if group_size_tail is not None
                 else None,
-                FastDivmod.create(num_clusters_in_group)
-                if num_clusters_in_group is not None
-                else None,
+                FastDivmod(num_clusters_in_group) if num_clusters_in_group is not None else None,
                 args.tile_shape_mn,
                 args.tile_count_semaphore if const_expr(args.is_persistent) else None,
                 cluster_shape_mn,
@@ -760,25 +755,21 @@ class VarlenMTileScheduler(TileScheduler):
     ) -> Tuple[Int32, Int32]:
         params = self.params
         # CTA Swizzle to promote L2 data reuse
-        if const_expr(params.num_clusters_in_group_divmod is not None):
-            group_id, id_in_group = params.num_clusters_in_group_divmod.divmod(
-                cluster_id_in_problem
-            )
-            num_clusters_in_group = params.num_clusters_in_group_divmod.divisor
+        if const_expr(params.num_clusters_in_group_fdd is not None):
+            group_id, id_in_group = divmod(cluster_id_in_problem, params.num_clusters_in_group_fdd)
+            num_clusters_in_group = params.num_clusters_in_group_fdd.divisor
         else:
             assert params.raster_order == RasterOrder.AlongN
             num_clusters_in_group = params.group_size * num_clusters_m
             group_id = cluster_id_in_problem // num_clusters_in_group
             id_in_group = cluster_id_in_problem - group_id * num_clusters_in_group
         cid_fast_in_group, cid_slow = Int32(0), Int32(0)
-        if const_expr(
-            params.group_size_divmod is not None and params.group_size_tail_divmod is not None
-        ):
+        if const_expr(params.group_size_fdd is not None and params.group_size_tail_fdd is not None):
             num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
             if (group_id + 1) * num_clusters_in_group <= num_clusters:
-                cid_slow, cid_fast_in_group = params.group_size_divmod.divmod(id_in_group)
+                cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
             else:  # tail part
-                cid_slow, cid_fast_in_group = params.group_size_tail_divmod.divmod(id_in_group)
+                cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
         else:
             assert params.raster_order == RasterOrder.AlongM
             group_size_actual = cutlass.min(
