@@ -463,7 +463,7 @@ def gather_m_get_copy_fn(
     tApA_m = cute.make_rmem_tensor(rows_per_thread, Boolean)
     for m in cutlass.range(rows_per_thread, unroll_full=True):
         tApA_m[m] = t0AcA[0, m, 0][0] < limit_m
-    m_idx = cute.make_fragment(rows_per_thread, Int32)
+    m_idx = cute.make_rmem_tensor(rows_per_thread, Int32)
     for m in cutlass.range(rows_per_thread, unroll_full=True):
         row_idx = tAcA[0, m, 0][0]
         if tApA_m[m]:

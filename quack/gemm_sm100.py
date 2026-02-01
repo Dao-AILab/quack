@@ -1940,9 +1940,7 @@ class GemmSm100(GemmSm90):
         self, a_prefetch_pipeline_mbar_ptr: cute.Pointer
     ) -> pipeline.PipelineAsync:
         producer_cnt = 32
-        a_prefetch_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, producer_cnt, alignment=producer_cnt
-        )
+        a_prefetch_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         consumer_arrive_cnt = self.num_ab_load_warps - 1
         a_prefetch_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
