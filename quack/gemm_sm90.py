@@ -12,6 +12,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Float16, Boolean, const_expr
@@ -615,9 +616,10 @@ class GemmSm90:
             )
             tile_count = storage.tile_count.get_tensor((self.sched_stage,))
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Generate smem tensor A/B
-        # ///////////////////////////////////////////////////////////////////////////////
+        # Cluster arrive after barrier init
+        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
+
+        # Generate smem tensor A/B
         sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
         sD = None
@@ -650,6 +652,9 @@ class GemmSm90:
         TileSchedulerCls = partial(
             TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
         )
+
+        # Cluster wait for barrier init
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk[:-1])
 
         if warp_idx >= self.ab_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
@@ -1613,6 +1618,7 @@ class GemmSm90:
             consumer_group=ab_pipeline_consumer_group,
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
     def make_epi_pipeline(
@@ -1632,6 +1638,7 @@ class GemmSm90:
             producer_group=epi_pipeline_producer_group,
             consumer_group=epi_pipeline_consumer_group,
             tx_count=tma_copy_c_bytes,
+            defer_sync=True,
         )
 
     def make_epi_store_pipeline(self):
@@ -1665,6 +1672,7 @@ class GemmSm90:
             consumer_group=sched_pipeline_consumer_group,
             # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
             consumer_mask=None if const_expr(cluster_size == 1) else 0,
+            defer_sync=True,
         )
 
     @classmethod

@@ -13,6 +13,7 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.torch as cutlass_torch
 import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu.warp import (
@@ -758,9 +759,7 @@ class GemmSm100(GemmSm90):
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # /////////////////////////////////////////////////////////////////////////////
-        #  Prefetch Tma desc
-        # /////////////////////////////////////////////////////////////////////////////
+        # Prefetch Tma desc
         if warp_idx == self.ab_load_warp_id:
             for tma_atom in (
                 tma_atom_a,
@@ -834,6 +833,9 @@ class GemmSm100(GemmSm90):
                 storage.a_prefetch_pipeline_array_ptr.data_ptr(),
             )
 
+        # Cluster arrive after barrier init
+        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+
         # Setup smem tensor A/B/D
         # (MMA, MMA_M, MMA_K, STAGE)
         sA_mma = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
@@ -896,6 +898,9 @@ class GemmSm100(GemmSm90):
             epi_load_barrier = pipeline.NamedBarrier(
                 barrier_id=int(NamedBarrierGemm.EpilogueLoad), num_threads=2 * cute.arch.WARP_SIZE
             )
+
+        # Cluster wait before tensor memory alloc
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
         #
         # Specialized AB load warps
@@ -1565,9 +1570,7 @@ class GemmSm100(GemmSm90):
         peek_a_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
             peek_a_empty_status = a_pipeline.producer_try_acquire(a_producer_state)
-        # /////////////////////////////////////////////////////////////////////////
         # cp.async on A
-        # /////////////////////////////////////////////////////////////////////////
         is_tma_warp = False
         for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
             smem_idx = a_producer_state.index
@@ -1901,6 +1904,7 @@ class GemmSm100(GemmSm90):
                 consumer_group=ab_pipeline_consumer_group,
                 tx_count=self.num_tma_load_bytes,
                 cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
             )
         else:
             pipeline_ab = PipelineTmaCpAsyncUmma.create(
@@ -1913,6 +1917,7 @@ class GemmSm100(GemmSm90):
                 producer_drop_count=None
                 if not self.use_2cta_instrs
                 else (2 if not is_leader_cta else 0),
+                defer_sync=True,
             )
         return pipeline_ab
 
@@ -1930,6 +1935,7 @@ class GemmSm100(GemmSm90):
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
     def make_sched_pipeline(
@@ -1958,6 +1964,7 @@ class GemmSm100(GemmSm90):
             consumer_group=sched_pipeline_consumer_group,
             # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
             consumer_mask=None if const_expr(cluster_size == 1) else 0,
+            defer_sync=True,
         )
 
     @cute.jit
@@ -1977,6 +1984,7 @@ class GemmSm100(GemmSm90):
             num_stages=self.a_prefetch_stage,
             producer_group=a_prefetch_producer_group,
             consumer_group=a_prefetch_consumer_group,
+            defer_sync=True,
         )
 
     @classmethod
