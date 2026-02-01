@@ -616,25 +616,20 @@ class VarlenMTileScheduler(TileScheduler):
                 if args.raster_order == RasterOrderOption.AlongM
                 else RasterOrder.AlongN  # For Heuristic we also use AlongN
             )
-            ncluster_fast = (
-                problem_shape_ncluster_mn[0]
-                if raster_order == RasterOrder.AlongM
-                else problem_shape_ncluster_mn[1]
-            )
-            ncluster_slow = (
-                problem_shape_ncluster_mn[1]
-                if raster_order == RasterOrder.AlongM
-                else problem_shape_ncluster_mn[0]
-            )
+            ncluster_fast = problem_shape_ncluster_mn[
+                0 if raster_order == RasterOrder.AlongM else 1
+            ]
+            ncluster_slow = problem_shape_ncluster_mn[
+                1 if raster_order == RasterOrder.AlongM else 0
+            ]
             if const_expr(ncluster_fast is not None):
                 group_size = min(args.group_size, ncluster_fast)
                 group_size_tail = ncluster_fast % group_size
             else:
                 group_size, group_size_tail = args.group_size, None
+            num_clusters_in_group = None
             if const_expr(ncluster_slow is not None):
                 num_clusters_in_group = group_size * ncluster_slow
-            else:
-                num_clusters_in_group = None
             return VarlenMTileScheduler.Params(
                 problem_shape_ncluster_mnl,
                 args.total_m,
