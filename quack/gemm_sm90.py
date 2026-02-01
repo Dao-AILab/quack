@@ -323,8 +323,6 @@ class GemmSm90:
             epilogue_args,
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
-            # epi_smem will reuse smem ab if not persistent.
-            overlap_sD_sA=not self.is_persistent,
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -460,9 +458,7 @@ class GemmSm90:
             tile_sched_params, scheduler_args.max_active_clusters
         )
 
-        epi_smem_size = (
-            cute.cosize(self.epi_smem_layout_staged) if self.is_persistent and mD is not None else 0
-        )
+        epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
 
         @cute.struct
@@ -624,11 +620,7 @@ class GemmSm90:
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
         sD = None
         if const_expr(has_D):
-            if const_expr(not self.is_persistent):
-                sD_ptr = cute.recast_ptr(sA.iterator, epi_smem_layout.inner, dtype=self.d_dtype)
-                sD = cute.make_tensor(sD_ptr, epi_smem_layout.outer)
-            else:
-                sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
+            sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
         sC = None
         if const_expr(has_C):
             sC = storage.sC.get_tensor(epi_c_smem_layout.outer, swizzle=epi_c_smem_layout.inner)
@@ -962,11 +954,6 @@ class GemmSm90:
                     )
                 else:
                     tiled_copy_s2r, tSR_sC, tRS_rC, tSR_rC = None, None, None, None
-
-                # Wait for all warp groups in the thread block to finish, because smem for tensor
-                # A in the mainloop is reused in the epilogue if not persistent.
-                if const_expr(not self.is_persistent):
-                    epilogue_barrier.arrive_and_wait()
 
                 self.epi_visit_acc(epilogue_params, acc, tiled_mma, tile_coord_mnkl, tidx)
 
@@ -1687,7 +1674,6 @@ class GemmSm90:
         epilogue_args: EpilogueArguments,
         smem_capacity: int,
         occupancy: int,
-        overlap_sD_sA: bool = False,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1708,16 +1694,11 @@ class GemmSm90:
         """
 
         epi_stage = 4 if epi_tile[1] <= 16 else 2
-        if overlap_sD_sA:
-            epi_bytes = 0
-        else:
-            d_bytes_per_stage = (
-                cute.size(epi_tile) * d_dtype.width // 8 if d_dtype is not None else 0
-            )
-            epi_bytes_per_stage = d_bytes_per_stage + cls.epi_smem_bytes_per_stage(
-                epilogue_args, cta_tile_shape_mnk, epi_tile
-            )
-            epi_bytes = epi_bytes_per_stage * epi_stage
+        d_bytes_per_stage = cute.size(epi_tile) * d_dtype.width // 8 if d_dtype is not None else 0
+        epi_bytes_per_stage = d_bytes_per_stage + cls.epi_smem_bytes_per_stage(
+            epilogue_args, cta_tile_shape_mnk, epi_tile
+        )
+        epi_bytes = epi_bytes_per_stage * epi_stage
         epi_c_stage = 0 if c_dtype is None else (4 if epi_tile[1] <= 16 else 2)
         if c_dtype is not None:
             epi_bytes += cute.size(epi_tile) * c_dtype.width // 8 * epi_c_stage
@@ -1735,7 +1716,7 @@ class GemmSm90:
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
-        if not overlap_sD_sA and epi_bytes_per_stage > 0:
+        if epi_bytes_per_stage > 0:
             epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // epi_bytes_per_stage
         return ab_stage, epi_stage, epi_c_stage
 
