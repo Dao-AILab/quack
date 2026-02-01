@@ -329,7 +329,7 @@ class TileScheduler:
                     # Need this fence since the STAS from the producer is using the async proxy.
                     # Without this, we get race condition / deadlock.
                     if const_expr(cute.size(params.cluster_shape_mn) > 1):
-                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
                         # if tidx % 32 == 0: cute.printf("bidx = {}, bidz = {}, tidx = {}, before empty arrive", bidx, bidz, tidx)
@@ -871,8 +871,11 @@ class VarlenMTileScheduler(TileScheduler):
                 if cute.arch.lane_idx() == 0:
                     # cute.printf("before atomicadd, tidx = {}, bidz = {}, idx = {}", cute.arch.thread_idx()[0], cute.arch.block_idx()[2], current_work_linear_idx)
                     num_persistent_clusters = cute.arch.grid_dim()[2]
-                    current_work_linear_idx = num_persistent_clusters + utils.atomic_add_i32(
-                        1, params.tile_count_semaphore
+                    current_work_linear_idx = num_persistent_clusters + cute.arch.atomic_add(
+                        params.tile_count_semaphore,
+                        1,
+                        sem="relaxed",
+                        scope="gpu",
                     )
                     # cute.printf("after atomicadd, tidx = {}, bidz = {}, idx = {}", cute.arch.thread_idx()[0], cute.arch.block_idx()[2], current_work_linear_idx)
                 # lane 0 already has the right tile_idx, just need to broadcast

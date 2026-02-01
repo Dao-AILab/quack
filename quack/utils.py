@@ -119,25 +119,6 @@ def ceil(a: float | Float32, *, loc=None, ip=None) -> Int32:
     )
 
 
-@dsl_user_op
-def prmt(a: int | Int32, b: int | Int32, c: int | Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Int32(a).ir_value(loc=loc, ip=ip),
-                Int32(b).ir_value(loc=loc, ip=ip),
-                Int32(c).ir_value(loc=loc, ip=ip),
-            ],
-            "prmt.b32 $0, $1, $2, $3;",
-            "=r,r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 @cute.jit
 def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Numeric) -> None:
     """Fill out-of-bounds values in shared memory tensor.
@@ -194,13 +175,6 @@ def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
         if lane >= offset:
             val += partial_sum
     return val
-
-
-@dsl_user_op
-def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(
-        res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-    )
 
 
 @dsl_user_op

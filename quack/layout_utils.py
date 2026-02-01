@@ -6,8 +6,6 @@ import cutlass.cute as cute
 
 from cutlass import Int32, const_expr
 
-from quack.utils import prmt
-
 
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
     """Transpose the first two dimensions of a tensor on smem."""
@@ -55,8 +53,8 @@ def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
         lower0 = lower if lane_03 else upper
         upper0 = cute.arch.shuffle_sync(upper0, offset=upper_idx, mask_and_clamp=mask_and_clamp)
         lower0 = cute.arch.shuffle_sync(lower0, offset=lower_idx, mask_and_clamp=mask_and_clamp)
-        t_u32[i * 2 + 0] = prmt(upper0, lower0, selector_upper)
-        t_u32[i * 2 + 1] = prmt(upper0, lower0, selector_lower)
+        t_u32[i * 2 + 0] = cute.arch.prmt(upper0, lower0, selector_upper)
+        t_u32[i * 2 + 1] = cute.arch.prmt(upper0, lower0, selector_lower)
 
 
 @cute.jit

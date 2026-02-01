@@ -241,7 +241,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
 
         def tma_store_fn(src_idx, dst_idx):
             # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.fence_view_async_shared()
             epilogue_barrier.arrive_and_wait()
             # Copy from shared memory to global memory
             if is_tma_warp:
@@ -266,7 +266,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
                 # Fence to make sure shared memory read is visible to TMA load
-                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.fence_view_async_shared()
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
                     epi_pipeline.consumer_release(epi_read_state)
