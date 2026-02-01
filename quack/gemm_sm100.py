@@ -774,9 +774,7 @@ class GemmSm100(GemmSm90):
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        #
         # Setup cta/thread coordinates
-        #
         # Coords inside cluster
         bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
@@ -785,20 +783,9 @@ class GemmSm100(GemmSm90):
         # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
-        #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
-        #
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
-
-        # Tensor memory dealloc barrier init
-        if use_2cta_instrs:
-            if warp_idx == self.ab_load_warp_id:
-                num_tmem_dealloc_threads = 32
-                cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads)
 
         # Initialize pipelines and states
         ab_pipeline = self.make_ab_pipeline(
@@ -832,6 +819,19 @@ class GemmSm100(GemmSm90):
             a_prefetch_pipeline = self.make_a_prefetch_pipeline(
                 storage.a_prefetch_pipeline_array_ptr.data_ptr(),
             )
+
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierGemm.TmemPtr),
+            num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.epilog_warp_id)),
+        )
+        # Tensor memory dealloc barrier init
+        tmem = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=self.epilog_warp_id[0],
+            is_two_cta=use_2cta_instrs,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+        )
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
@@ -889,10 +889,6 @@ class GemmSm100(GemmSm90):
             TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
         )
 
-        tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierGemm.TmemPtr),
-            num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.epilog_warp_id)),
-        )
         epi_load_barrier = None
         if const_expr(has_C):
             epi_load_barrier = pipeline.NamedBarrier(
@@ -902,9 +898,7 @@ class GemmSm100(GemmSm90):
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        #
         # Specialized AB load warps
-        #
         if warp_idx == self.ab_load_warp_id:
             is_tma_warp = True
             # initialize tensormap for A & B
@@ -954,9 +948,7 @@ class GemmSm100(GemmSm90):
                     self.b_layout,
                     is_tma_warp,
                 )
-                # ///////////////////////////////////////////////////////////////////////////
-                #  Local_tile partition global tensors
-                # ///////////////////////////////////////////////////////////////////////////
+                # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
                     tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),
                     tile_coord_mnkl[1],
@@ -1098,9 +1090,7 @@ class GemmSm100(GemmSm90):
                 while work_tile.is_valid_tile:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
-                    # ///////////////////////////////////////////////////////////////////////////
-                    #  Local_tile partition global tensors
-                    # ///////////////////////////////////////////////////////////////////////////
+                    # Local_tile partition global tensors
                     mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
                     if const_expr(varlen_m):
                         # (M, K)
@@ -1158,9 +1148,7 @@ class GemmSm100(GemmSm90):
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
 
-        #
         # Specialized scheduler warp. Will also prefetch A indices if gatherA
-        #
         if const_expr(tile_sched_params.tile_count_semaphore is not None or self.gather_A):
             if warp_idx == self.scheduler_warp_id:
                 is_scheduler_warp = True
@@ -1245,9 +1233,7 @@ class GemmSm100(GemmSm90):
                 if is_scheduler_warp:
                     tile_scheduler.producer_tail()
 
-        #
         # Specialized TMA epi load warp
-        #
         if const_expr(mC_mnl is not None):
             if warp_idx == self.epi_load_warp_id:
                 epi_producer_state = pipeline.make_pipeline_state(
@@ -1286,15 +1272,11 @@ class GemmSm100(GemmSm90):
                     # End of persistent scheduler loop
                 epi_pipeline.producer_tail(epi_producer_state)
 
-        #
         # Specialized MMA warp
-        #
         if warp_idx == self.mma_warp_id:
-            tmem_alloc_barrier.arrive_and_wait()
             # Retrieving tensor memory ptr and make accumulator tensor
-            acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
-            )
+            tmem.wait_for_alloc()
+            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # Partition shared/tensor memory tensor for TiledMMA_A/B/D
             # (MMA, MMA_M, MMA_K, STAGE)
             tCrA = tiled_mma.make_fragment_A(sA_mma)
@@ -1399,12 +1381,8 @@ class GemmSm100(GemmSm90):
         #
         if warp_idx < self.mma_warp_id:
             # Alloc tensor memory buffer
-            if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.alloc_tmem(
-                    self.num_tmem_alloc_cols, tmem_holding_buf, is_two_cta=use_2cta_instrs
-                )
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            tmem_alloc_barrier.arrive_and_wait()
+            tmem.allocate(self.num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
 
             is_tma_warp = Boolean(warp_idx == self.epilog_warp_id[0])
             varlen_manager.init_tensormap_epi(
@@ -1414,9 +1392,7 @@ class GemmSm100(GemmSm90):
             tma_desc_epi_ptrs = varlen_manager.get_tma_desc_epi_ptrs()
 
             # Retrieving tensor memory ptr and make accumulator tensor
-            acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
-            )
+            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
@@ -1540,21 +1516,13 @@ class GemmSm100(GemmSm90):
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
 
-            # Dealloc the tensor memory buffer
-            if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
-            epilogue_barrier.arrive_and_wait()
-            if warp_idx == self.epilog_warp_id[0]:
-                if const_expr(use_2cta_instrs):
-                    cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
-                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-                cute.arch.dealloc_tmem(
-                    acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
-                )
-
             # Wait for D store complete
             if is_tma_warp:
                 epi_store_pipeline.producer_tail()
+
+            # Dealloc the tensor memory buffer
+            tmem.relinquish_alloc_permit()
+            tmem.free(acc_tmem_ptr)
 
     @cute.jit
     def load_A_gather_A(
@@ -2729,10 +2697,10 @@ def run(
     tflops = flops / (timing * 1e9)  # Convert to TFlops
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
-    # time.sleep(0.5)
-    # timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
-    # tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
-    # print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
+    time.sleep(0.5)
+    timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
+    tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
+    print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
 
 if __name__ == "__main__":

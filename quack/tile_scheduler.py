@@ -285,9 +285,9 @@ class TileScheduler:
         loc=None,
         ip=None,
     ):
-        tidx = cute.arch.thread_idx()[0]
-        bidx = cute.arch.block_idx()[0]
-        bidz = cute.arch.block_idx()[2]
+        # tidx = cute.arch.thread_idx()[0]
+        # bidx = cute.arch.block_idx()[0]
+        # bidz = cute.arch.block_idx()[2]
         params = self.params
         if const_expr(params.is_persistent):
             num_persistent_clusters = cute.arch.grid_dim()[2]
