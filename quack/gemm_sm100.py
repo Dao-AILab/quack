@@ -632,7 +632,7 @@ class GemmSm100(GemmSm90):
             a_prefetch_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.a_prefetch_stage * 2
             ]
-            tile_count: cute.struct.MemRange[Int32, self.sched_stage]
+            scheduler_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: Int32
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
@@ -805,7 +805,7 @@ class GemmSm100(GemmSm90):
             acc_pipeline_mbar_ptr=storage.acc_pipeline_array_ptr.data_ptr(),
         )
         sched_pipeline = None
-        tile_count = None
+        scheduler_data = None
         if const_expr(tile_sched_params.tile_count_semaphore is not None):
             # Dynamic persistent scheduler
             sched_pipeline = self.make_sched_pipeline(
@@ -813,7 +813,7 @@ class GemmSm100(GemmSm90):
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 has_C=has_C,
             )
-            tile_count = storage.tile_count.get_tensor((self.sched_stage,))
+            scheduler_data = storage.scheduler_data.get_tensor((4, self.sched_stage))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
             a_prefetch_pipeline = self.make_a_prefetch_pipeline(
@@ -886,7 +886,7 @@ class GemmSm100(GemmSm90):
         )
 
         TileSchedulerCls = partial(
-            TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
+            TileSchedulerCls.create, tile_sched_params, scheduler_data, sched_pipeline
         )
 
         epi_load_barrier = None

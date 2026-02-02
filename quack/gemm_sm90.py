@@ -27,6 +27,7 @@ from quack.tile_scheduler import (
     TileScheduler,
     VarlenMTileSchedulerArguments,
     VarlenMTileScheduler,
+    PersistenceMode,
 )
 from quack.varlen_utils import VarlenArguments, VarlenManager
 
@@ -466,7 +467,7 @@ class GemmSm90:
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
-            tile_count: cute.struct.MemRange[Int32, self.sched_stage]
+            scheduler_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
@@ -602,7 +603,7 @@ class GemmSm90:
                 epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
             )
         sched_pipeline = None
-        tile_count = None
+        scheduler_data = None
         if const_expr(tile_sched_params.tile_count_semaphore is not None):
             # Dynamic persistent scheduler
             sched_pipeline = self.make_sched_pipeline(
@@ -610,7 +611,7 @@ class GemmSm90:
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 varlen_k=varlen_k,
             )
-            tile_count = storage.tile_count.get_tensor((self.sched_stage,))
+            scheduler_data = storage.scheduler_data.get_tensor((4, self.sched_stage))
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
@@ -642,7 +643,7 @@ class GemmSm90:
         )
 
         TileSchedulerCls = partial(
-            TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
+            TileSchedulerCls.create, tile_sched_params, scheduler_data, sched_pipeline
         )
 
         # Cluster wait for barrier init
@@ -1345,6 +1346,12 @@ class GemmSm90:
         varlen_args,
     ):
         """Create scheduler arguments. Override in subclasses for custom schedulers."""
+        if const_expr(not self.is_persistent):
+            persistence_mode = PersistenceMode.NONE
+        elif const_expr(scheduler_args.tile_count_semaphore is not None):
+            persistence_mode = PersistenceMode.DYNAMIC
+        else:
+            persistence_mode = PersistenceMode.STATIC
         if const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (
                 mD.shape[2]
@@ -1367,7 +1374,7 @@ class GemmSm90:
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 tile_count_semaphore=scheduler_args.tile_count_semaphore,
                 batch_idx_permute=scheduler_args.batch_idx_permute,
-                is_persistent=self.is_persistent,
+                persistence_mode=persistence_mode,
             )
         else:
             assert mD is not None or not self.gather_A
@@ -1385,7 +1392,7 @@ class GemmSm90:
                 tile_shape_mn=self.cta_tile_shape_mnk[:2],
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 tile_count_semaphore=scheduler_args.tile_count_semaphore,
-                is_persistent=self.is_persistent,
+                persistence_mode=persistence_mode,
             )
         return tile_sched_args
 
