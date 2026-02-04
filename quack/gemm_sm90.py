@@ -399,10 +399,12 @@ class GemmSm90:
         assert (varlen_args.mAIdx is not None) == self.gather_A
 
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
-        )
+        def new_stride(t: cute.Tensor):
+            return tuple(
+                cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
+                for s in t.stride
+            )
+
         mA, mD = [
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
             if t is not None
