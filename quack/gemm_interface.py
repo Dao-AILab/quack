@@ -1030,7 +1030,9 @@ def gemm_symmetric(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "gated")],
+    configs=[
+        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "gated")
+    ],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -1071,7 +1073,9 @@ def gemm_gated_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
     gemm_gated_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -1103,7 +1107,9 @@ def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "dgated")],
+    configs=[
+        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "dgated")
+    ],
     key=["activation", "colvec_reduce", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_dgated_configs},
 )
@@ -1159,7 +1165,9 @@ def gemm_dgated_tuned(
         colvec_reduce_partial = torch.empty(colvec_shape, dtype=torch.float32, device=A.device)
     else:
         colvec_reduce_partial = None
-    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
     gemm_dgated_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -1196,7 +1204,9 @@ def gemm_gated(
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
     preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    postact_out: Optional[Tensor] = None,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
+    postact_out: Optional[
+        Tensor
+    ] = None,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,

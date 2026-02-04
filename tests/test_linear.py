@@ -8,8 +8,13 @@ from quack.linear import linear_func, linear_act_func
 from quack.gemm_interface import (
     gemm_add_inplace,
     gemm_dact,
+    gemm_gated,
+    gemm_dgated,
+    gemm_ref,
     gemm_act_ref,
     gemm_dact_ref,
+    gemm_gated_ref,
+    gemm_dgated_ref,
 )
 
 
@@ -154,3 +159,91 @@ def test_gemm_add_inplace_alpha_beta(m, k, n, input_dtype, alpha, beta, alpha_be
     C_ref = alpha_val * torch.mm(A.float(), B.float()) + beta_val * C_og.float()
     C_pt = alpha_val * torch.mm(A, B) + beta_val * C_og
     assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-4
+
+
+@pytest.mark.parametrize("store_preact", [True, False])
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai", "reglu", "geglu", "glu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("out_features", [1504, 2048])
+@pytest.mark.parametrize("in_features", [736, 4096])
+def test_gemm_gated(in_features, out_features, has_bias, input_dtype, activation, store_preact):
+    """Test GEMM with gated activation forward computation."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m = 1920
+    x = torch.randn((m, in_features), device=device, dtype=input_dtype, requires_grad=True)
+    x = x[::2]  # Testing non-contiguous
+    # Weight has 2*out_features columns for gated activation
+    w = (
+        torch.randn((2 * out_features, in_features), device=device, dtype=input_dtype)
+        / math.sqrt(in_features)
+    ).requires_grad_()
+    bias = torch.randn(2 * out_features, device=device) if has_bias else None
+    preact, postact = gemm_gated(
+        x, w.T, bias=bias, activation=activation, store_preact=store_preact, tuned=False
+    )
+    preact_ref, postact_ref = gemm_gated_ref(
+        x.float(), w.float().T, bias=bias, activation=activation, store_preact=store_preact
+    )
+    preact_pt, postact_pt = gemm_gated_ref(
+        x, w.T, bias=bias, activation=activation, store_preact=store_preact
+    )
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
+    if store_preact:
+        assert preact is not None and preact_ref is not None
+        assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "swiglu_oai", "reglu", "geglu", "glu"])
+# @pytest.mark.parametrize("activation", ["swiglu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("colvec_reduce", [False, True])
+# @pytest.mark.parametrize("colvec_reduce", [True])
+@pytest.mark.parametrize("has_colvec_scale", [False, True])
+# @pytest.mark.parametrize("has_colvec_scale", [True])
+@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("n", [1504, 2048])
+# @pytest.mark.parametrize("k", [1024])
+# @pytest.mark.parametrize("n", [2048])
+def test_gemm_dgated(n, k, has_colvec_scale, colvec_reduce, input_dtype, activation):
+    """Test GEMM with gated activation gradient computation."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m = 960
+    dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
+    weight = torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)
+    # PreAct has 2*n columns for gated activation (gate and up projections interleaved)
+    preact = torch.randn((m, 2 * n), device=device, dtype=input_dtype, requires_grad=True)
+    colvec_scale = torch.randn(m, device=device) if has_colvec_scale else None
+    dx, postact, *rest = gemm_dgated(
+        dout_input,
+        weight.T,
+        preact,
+        colvec_scale=colvec_scale,
+        activation=activation,
+        colvec_reduce=colvec_reduce,
+        tuned=False,
+    )
+    if colvec_reduce:
+        colvec_reduce_out = rest[0]
+    dx_ref, postact_ref = gemm_dgated_ref(
+        dout_input.float(), weight.float().T, preact.float(), activation=activation
+    )
+    dx_pt, postact_pt = gemm_dgated_ref(dout_input, weight.T, preact, activation=activation)
+    if colvec_reduce:
+        colvec_reduce_ref = (postact_ref * gemm_ref(dout_input.float(), weight.float().T)).sum(
+            dim=-1
+        )
+        colvec_reduce_pt = (postact_pt * gemm_ref(dout_input, weight.T)).sum(dim=-1)
+    if has_colvec_scale:
+        dx_ref *= colvec_scale.float()[:, None]
+        postact_ref *= colvec_scale.float()[:, None]
+        dx_pt *= colvec_scale[:, None]
+        postact_pt *= colvec_scale[:, None]
+    assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+    if colvec_reduce:
+        assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
+            colvec_reduce_pt - colvec_reduce_ref
+        ).abs().max() + 1e-5
