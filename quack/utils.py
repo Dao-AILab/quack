@@ -77,6 +77,54 @@ def store_shared_remote(
 
 
 @dsl_user_op
+def store_shared_remote_x4(
+    val0: Float32 | Int32,
+    val1: Float32 | Int32,
+    val2: Float32 | Int32,
+    val3: Float32 | Int32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: cute.typing.Int,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    remote_smem_ptr_i32 = set_block_rank(
+        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(
+        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    assert isinstance(val0, (Float32, Int32)), "val must be Float32, or Int32"
+    dtype = Float32 if isinstance(val0, Float32) else Int32
+    suffix = {Float32: "f32", Int32: "s32"}[dtype]
+    constraint = {Float32: "f", Int32: "r"}[dtype]
+    llvm.inline_asm(
+        None,
+        [
+            remote_smem_ptr_i32,
+            remote_mbar_ptr_i32,
+            dtype(val0).ir_value(loc=loc, ip=ip),
+            dtype(val1).ir_value(loc=loc, ip=ip),
+            dtype(val2).ir_value(loc=loc, ip=ip),
+            dtype(val3).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        f".reg .v4 .{suffix} abcd;\n\t"
+        f"mov.{suffix} abcd.x, $2;\n\t"
+        f"mov.{suffix} abcd.y, $3;\n\t"
+        f"mov.{suffix} abcd.z, $4;\n\t"
+        f"mov.{suffix} abcd.w, $5;\n\t"
+        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.{suffix} [$0], abcd, [$1];\n\t"
+        "}\n",
+        f"r,r,{constraint},{constraint},{constraint},{constraint}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
     return Float32(
         nvvm.fmin(
@@ -191,4 +239,21 @@ def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
         # New API: infers result type automatically
         return nvvm.atomicrmw(
             op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )
+
+
+@dsl_user_op
+def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    from cutlass import CUDA_VERSION
+
+    # * NVVM call based on nvvm version
+    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+        # Old API: requires explicit result type as first positional argument
+        return nvvm.atomicrmw(
+            res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )
+    else:
+        # New API: infers result type automatically
+        return nvvm.atomicrmw(
+            op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
         )

@@ -606,8 +606,7 @@ class GemmSm90:
             )
         sched_pipeline = None
         scheduler_data = None
-        if const_expr(tile_sched_params.tile_count_semaphore is not None):
-            # Dynamic persistent scheduler
+        if const_expr(self.is_persistent):
             sched_pipeline = self.make_sched_pipeline(
                 cluster_layout_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
@@ -678,7 +677,7 @@ class GemmSm90:
                 is_scheduler_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
                 if const_expr(cute.size(cluster_layout_mnk) > 1):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
-                tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
+                tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
@@ -795,13 +794,14 @@ class GemmSm90:
                             k_tile_cnt,
                             varlen_m=varlen_m,
                         )
-                    tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
                 if const_expr(self.pingpong and not varlen_k):
                     # Need to write the tile_idx to smem for the next WG in the pingpong mode
-                    tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+                    if is_scheduler_warp:
+                        tile_scheduler.write_work_tile_to_smem(work_tile)
+                    work_tile = tile_scheduler.get_current_work()
                 ab_pipeline.producer_tail(ab_producer_state)
                 if is_scheduler_warp:
                     tile_scheduler.producer_tail()
@@ -860,10 +860,8 @@ class GemmSm90:
                 pipeline.PipelineUserType.Producer, self.epi_c_stage
             )
             tile_scheduler = TileSchedulerCls()
-            work_tile = None
+            work_tile = tile_scheduler.initial_work_tile_info()
             if const_expr(self.pingpong):
-                if const_expr(varlen_k):
-                    work_tile = tile_scheduler.initial_work_tile_info()
                 if warp_idx >= 4:
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
                     epi_read_state.advance_iters(c_tile_cnt)
@@ -874,13 +872,9 @@ class GemmSm90:
                         len_k = varlen_manager.len_k(batch_idx=work_tile.tile_idx[3])
                         k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                         ab_read_state.advance_iters(k_tile_cnt)
+                    # TODO: do we need to check if work_tile is valid?
                     tile_scheduler.advance_to_next_work()
-                    if const_expr(varlen_k):
-                        work_tile = tile_scheduler.get_current_work()
-                if const_expr(not varlen_k):
-                    work_tile = tile_scheduler.initial_work_tile_info()
-            else:
-                work_tile = tile_scheduler.initial_work_tile_info()
+                    work_tile = tile_scheduler.get_current_work()
             if const_expr(varlen_m):
                 # wait tensormap initialization complete before update
                 varlen_manager.fence_tensormap_init()
@@ -1651,13 +1645,13 @@ class GemmSm90:
         # Threads/warps participating in this pipeline
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_layout_mnk)
-        # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+        # Each warp will contribute 1 to the arrive count
         # If pingpong and varlen_k, then all 8 mma warps will participate in the scheduler barrier
         # at each round. If pingpong and not varlen_k, then only 4 mma warp will participate.
         consumer_arrive_cnt = (
             (self.mma_warp_groups if not (self.pingpong and not varlen_k) else 1) * 4
             + self.num_ab_load_warps
-        ) * cluster_size - 1
+        ) * cluster_size
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
