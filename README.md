@@ -5,7 +5,11 @@ Kernels are written in the [CuTe-DSL](https://docs.nvidia.com/cutlass/media/docs
 ## Installation
 
 ``` bash
+# For CUDA 12.9:
 pip install quack-kernels
+
+# For CUDA 13.1:
+pip install quack-kernels[cu13]
 ```
 
 ## Requirements
