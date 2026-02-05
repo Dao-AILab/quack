@@ -1,6 +1,6 @@
 # 🦆 QuACK: A Quirky Assortment of CuTe Kernels 🦆
 
-Kernels are written in the [CuTe-DSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
+Kernels are written in the [CuTe-DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
 
 ## Installation
 
