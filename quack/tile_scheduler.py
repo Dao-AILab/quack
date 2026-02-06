@@ -137,6 +137,8 @@ class TileScheduler:
         self,
         current_work_idx: Int32,
         num_tiles_executed: Int32,
+        current_batch_idx: Int32,
+        num_work_idx_before_cur_batch: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         pipeline_state: PipelineStateWAdvance,
@@ -147,6 +149,8 @@ class TileScheduler:
     ):
         self._current_work_idx = current_work_idx
         self.num_tiles_executed = num_tiles_executed
+        self._current_batch_idx = current_batch_idx
+        self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
@@ -170,8 +174,8 @@ class TileScheduler:
     ) -> "TileScheduler":
         """is_scheduler_warp should only be true for one warp in the whole cluster"""
         if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
-            cidx, _, _ = cute.arch.cluster_idx()
-            current_work_idx = Int32(cidx)
+            cluster_id, _, _ = cute.arch.cluster_idx()
+            current_work_idx = Int32(cluster_id)
         else:
             _, _, bidz = cute.arch.block_idx()
             current_work_idx = Int32(bidz)
@@ -186,6 +190,8 @@ class TileScheduler:
         return TileScheduler(
             current_work_idx,
             Int32(0),  # num_tiles_executed
+            Int32(0),  # current_batch_idx
+            Int32(0),  # num_work_idx_before_cur_batch
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -324,15 +330,17 @@ class TileScheduler:
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, Boolean(is_valid))
 
     # @cute.jit
-    def initial_work_tile_info(self, *, loc=None, ip=None):
-        return self._delinearize_work_idx(self._current_work_idx, loc=loc, ip=ip)
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        work_tile_info = self._delinearize_work_idx(self._current_work_idx, loc=loc, ip=ip)
+        self._current_batch_idx = work_tile_info.tile_idx[3]
+        return work_tile_info
         # if is_scheduler_warp:
         # work_tile_info = self._delinearize_work_idx(block_zero_only=True, loc=loc, ip=ip)
         # self.write_work_tile_to_smem(work_tile_info, loc=loc, ip=ip)
         # self.write_work_tile_to_smem(self._delinearize_work_idx(block_zero_only=True, loc=loc, ip=ip), loc=loc, ip=ip)
 
     @cute.jit
-    def _fetch_next_work_idx(self, *, loc=None, ip=None) -> Int32 | Tuple[Int32, Int32, Int32]:
+    def _fetch_next_work_idx(self, *, loc=None, ip=None) -> Int32 | Tuple[Int32, Int32, Boolean]:
         """should only be called by the scheduler warp"""
         params = self.params
         num_persistent_clusters = Int32(cute.arch.grid_dim()[2])
@@ -428,6 +436,7 @@ class TileScheduler:
                 work_tile_info = self._delinearize_work_idx(
                     self._current_work_idx, block_zero_only=True, loc=loc, ip=ip
                 )
+                self._current_batch_idx = work_tile_info.tile_idx[3]
                 self.write_work_tile_to_smem(work_tile_info, loc=loc, ip=ip)
 
     def producer_tail(self):
@@ -445,6 +454,8 @@ class TileScheduler:
         for obj in [
             self._current_work_idx,
             self.num_tiles_executed,
+            self._current_batch_idx,
+            self._num_work_idx_before_cur_batch,
             self._sched_smem,
             self._scheduler_pipeline,
             self._pipeline_state,
@@ -461,6 +472,8 @@ class TileScheduler:
             [
                 self._current_work_idx,
                 self.num_tiles_executed,
+                self._current_batch_idx,
+                self._num_work_idx_before_cur_batch,
                 self._sched_smem,
                 self._scheduler_pipeline,
                 self._pipeline_state,
@@ -569,6 +582,8 @@ class TriangularTileScheduler(TileScheduler):
         return TriangularTileScheduler(
             current_work_idx,
             Int32(0),  # num_tiles_executed
+            Int32(0),  # current_batch_idx
+            Int32(0),  # num_work_idx_before_cur_batch
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -912,54 +927,44 @@ class VarlenMTileScheduler(TileScheduler):
     def _delinearize_work_idx(
         self,
         work_idx: Int32,
-        bidz: Optional[Int32] = None,
+        _bidz: Optional[Int32] = None,
         is_valid: Optional[Boolean] = None,
         *,
         block_zero_only: bool = False,
         loc=None,
         ip=None,
     ) -> cutlass.utils.WorkTileInfo:
-        assert bidz is None
-        assert is_valid is None
+        assert _bidz is None
         params = self.params
         lane_idx = cute.arch.lane_idx()
         num_batch = self.params.problem_shape_ncluster_mnl[2]
         block_size = params.tile_shape_mn[0] * params.cluster_shape_mn[0]
         batch_idx = self._current_batch_idx
-        num_clusters_m = self._get_num_m_blocks(
-            lane_idx, bidb_start=batch_idx, block_size=block_size
-        )
-        num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
-        num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
-        # Total number of blocks for the next 31 problems, same for all lanes
-        clusters_in_problems = cute.arch.shuffle_sync(
-            num_clusters_cumulative, cute.arch.WARP_SIZE - 1
-        )
-        problems_end_tile = self._num_work_idx_before_cur_batch + clusters_in_problems
-        # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, problems_end_tile = %d, num_clusters_m=%d, num_clusters_cumulative = %d, problems_end_tile = %d", self._tile_idx, problems_end_tile, num_clusters_m, num_clusters_cumulative, problems_end_tile)
         next_tile_idx = work_idx
+
+        problems_end_tile = self._num_work_idx_before_cur_batch
+        num_clusters_m, num_clusters_cumulative, clusters_in_problems = Int32(0), Int32(0), Int32(0)
         while problems_end_tile <= next_tile_idx:
-            batch_idx += cute.arch.WARP_SIZE - 1
+            num_clusters_m = self._get_num_m_blocks(
+                lane_idx, bidb_start=batch_idx, block_size=block_size
+            )
+            num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
+            num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
+            # Total number of blocks for the next 31 problems, same for all lanes
+            clusters_in_problems = cute.arch.shuffle_sync(
+                num_clusters_cumulative, cute.arch.WARP_SIZE - 1
+            )
+            problems_end_tile += clusters_in_problems
+            if problems_end_tile <= next_tile_idx:
+                batch_idx += cute.arch.WARP_SIZE - 1
             if batch_idx >= num_batch:
                 batch_idx = Int32(num_batch)
                 problems_end_tile = next_tile_idx + 1
-            else:
-                num_clusters_m = self._get_num_m_blocks(
-                    lane_idx, bidb_start=batch_idx, block_size=block_size
-                )
-                num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
-                num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
-                clusters_in_problems = cute.arch.shuffle_sync(
-                    num_clusters_cumulative, cute.arch.WARP_SIZE - 1
-                )
-                problems_end_tile += clusters_in_problems
+        is_valid = batch_idx < num_batch
         if const_expr(params.persistence_mode == PersistenceMode.NONE):
-            is_valid = self.num_tiles_executed == 0 and batch_idx < num_batch
-        else:
-            is_valid = batch_idx < num_batch
-        # Just a placeholer value in case batch_idx >= num_batch
-        num_work_idx_before_cur_batch = problems_end_tile - clusters_in_problems
+            is_valid &= self.num_tiles_executed == 0
         cid_m, cid_n = Int32(0), Int32(0)
+        num_work_idx_before_cur_batch = Int32(0)
         if is_valid:
             problems_start_tile = problems_end_tile - clusters_in_problems
             # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, problems_end_tile = %d, num_clusters_m=%d, batch_idx = %d", self._tile_idx, problems_end_tile, num_clusters_m, batch_idx)
@@ -981,7 +986,6 @@ class VarlenMTileScheduler(TileScheduler):
             cluster_id_in_problem = next_tile_idx - num_work_idx_before_cur_batch
             # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, cid_n=%d, cid_m=%d, is_valid = %d", self._tile_idx, batch_idx, cid_n, cid_m, is_valid)
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, num_clusters_m, loc=loc, ip=ip)
-        self._current_batch_idx = batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
 
         pid_m, pid_n = self._cluster_id_to_cta_id(
@@ -990,38 +994,3 @@ class VarlenMTileScheduler(TileScheduler):
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
 
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [
-            self._current_work_idx,
-            self.num_tiles_executed,
-            self._current_batch_idx,
-            self._num_work_idx_before_cur_batch,
-            self._sched_smem,
-            self._scheduler_pipeline,
-            self._pipeline_state,
-            self.params,
-        ]:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        for obj, n_items in zip(
-            [
-                self._current_work_idx,
-                self.num_tiles_executed,
-                self._current_batch_idx,
-                self._num_work_idx_before_cur_batch,
-                self._sched_smem,
-                self._scheduler_pipeline,
-                self._pipeline_state,
-                self.params,
-            ],
-            self._values_pos,
-        ):
-            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return self.__class__(*(tuple(obj_list)), loc=self._loc)
