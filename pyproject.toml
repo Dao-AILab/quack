@@ -27,6 +27,16 @@ include = ["quack*"]
 [tool.setuptools.dynamic]
 version = {attr = "quack.__version__"}
 
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "extra == 'cu13'" },
+]
+
 [tool.ruff]
 line-length = 100
 
