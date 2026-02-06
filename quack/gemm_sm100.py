@@ -634,7 +634,7 @@ class GemmSm100(GemmSm90):
             a_prefetch_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.a_prefetch_stage * 2
             ]
-            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
+            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 12]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: Int32
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
@@ -814,7 +814,7 @@ class GemmSm100(GemmSm90):
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 has_C=has_C,
             )
-            sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
+            sched_data = storage.sched_data.get_tensor((12, self.sched_stage))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
             a_prefetch_pipeline = self.make_a_prefetch_pipeline(
@@ -1166,7 +1166,7 @@ class GemmSm100(GemmSm90):
                         cute.make_identity_tensor(tile_M if varlen_m else tile_K)
                     )
                 # Persistent tile scheduling loop
-                tile_scheduler = TileSchedulerCls()
+                tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
                 work_tile = tile_scheduler.initial_work_tile_info()
                 a_prefetch_producer_state = None
                 if const_expr(self.gather_A):

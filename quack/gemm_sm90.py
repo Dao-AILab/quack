@@ -1344,10 +1344,13 @@ class GemmSm90:
         """Create scheduler arguments. Override in subclasses for custom schedulers."""
         if const_expr(not self.is_persistent):
             persistence_mode = PersistenceMode.NONE
-        elif const_expr(scheduler_args.tile_count_semaphore is not None):
-            persistence_mode = PersistenceMode.DYNAMIC
         else:
-            persistence_mode = PersistenceMode.STATIC
+            if const_expr(self.arch >= 100):
+                persistence_mode = PersistenceMode.CLC
+            elif const_expr(scheduler_args.tile_count_semaphore is not None):
+                persistence_mode = PersistenceMode.DYNAMIC
+            else:
+                persistence_mode = PersistenceMode.STATIC
         if const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (
                 mD.shape[2]

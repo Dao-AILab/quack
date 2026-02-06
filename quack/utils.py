@@ -257,3 +257,31 @@ def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
         return nvvm.atomicrmw(
             op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
         )
+
+
+@dsl_user_op
+def issue_clc_query_nomulticast(
+    mbar_ptr: cute.Pointer,
+    clc_response_ptr: cute.Pointer,
+    loc=None,
+    ip=None,
+) -> None:
+    """
+    The clusterlaunchcontrol.try_cancel instruction requests atomically cancelling the launch
+    of a cluster that has not started running yet. It asynchronously writes an opaque response
+    to shared memory indicating whether the operation succeeded or failed. On success, the
+    opaque response contains the ctaid of the first CTA of the canceled cluster.
+
+    :param mbar_ptr: A pointer to the mbarrier address in SMEM
+    :type mbar_ptr:  Pointer
+    :param clc_response_ptr: A pointer to the cluster launch control response address in SMEM
+    :type clc_response_ptr:  Pointer
+    """
+    mbar_llvm_ptr = mbar_ptr.llvm_ptr
+    clc_response_llvm_ptr = clc_response_ptr.llvm_ptr
+    nvvm.clusterlaunchcontrol_try_cancel(
+        clc_response_llvm_ptr,
+        mbar_llvm_ptr,
+        loc=loc,
+        ip=ip,
+    )
