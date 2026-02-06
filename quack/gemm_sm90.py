@@ -469,7 +469,7 @@ class GemmSm90:
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
-            scheduler_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
+            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
@@ -605,14 +605,14 @@ class GemmSm90:
                 epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
             )
         sched_pipeline = None
-        scheduler_data = None
+        sched_data = None
         if const_expr(self.is_persistent):
             sched_pipeline = self.make_sched_pipeline(
                 cluster_layout_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 varlen_k=varlen_k,
             )
-            scheduler_data = storage.scheduler_data.get_tensor((4, self.sched_stage))
+            sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
@@ -644,7 +644,7 @@ class GemmSm90:
         )
 
         TileSchedulerCls = partial(
-            TileSchedulerCls.create, tile_sched_params, scheduler_data, sched_pipeline
+            TileSchedulerCls.create, tile_sched_params, sched_data, sched_pipeline
         )
 
         # Cluster wait for barrier init
