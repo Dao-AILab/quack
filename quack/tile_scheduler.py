@@ -464,7 +464,6 @@ class TileScheduler:
                 self._sched_smem,
                 self._scheduler_pipeline,
                 self._pipeline_state,
-                self._clc_mbar_ptr,
                 self.params,
             ],
             self._values_pos,
