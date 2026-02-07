@@ -831,16 +831,13 @@ class GemmSm90:
             )
 
             # Make fragments
-            tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
-            tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
-
-            acc_shape = tiled_mma.partition_shape_C(
-                cute.select(self.cta_tile_shape_mnk, mode=[0, 1])
+            acc, tCrA, tCrB = quack_sm90_utils.partition_fragment_ABC(
+                thr_mma, self.cta_tile_shape_mnk, sA, sB
             )
-            acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
             acc_slow = None
             if const_expr(self.fp8_slow_accum):
-                acc_slow = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
+            mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -889,16 +886,8 @@ class GemmSm90:
                 )
                 len_k = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                ab_read_state, tiled_mma = self.mma(
-                    ab_pipeline,
-                    ab_read_state,
-                    tiled_mma,
-                    tCrA,
-                    tCrB,
-                    acc,
-                    acc_slow,
-                    k_tile_cnt,
-                    warp_group_idx,
+                ab_read_state = self.mma(
+                    ab_pipeline, ab_read_state, mma_fn, acc, acc_slow, k_tile_cnt, warp_group_idx
                 )
                 if const_expr(varlen_k):
                     if k_tile_cnt == 0:
@@ -1124,14 +1113,12 @@ class GemmSm90:
         self,
         ab_pipeline: cutlass.pipeline.PipelineAsync,
         ab_read_state: cutlass.pipeline.PipelineState,
-        tiled_mma: cute.TiledMma,
-        tCrA: cute.Tensor,
-        tCrB: cute.Tensor,
+        mma_fn: Callable,
         acc: cute.Tensor,
         acc_slow: Optional[cute.Tensor],
         k_tile_cnt: Int32,
         warp_group_idx: Int32,
-    ) -> Tuple[cutlass.pipeline.PipelineState, cute.TiledMma]:
+    ) -> cutlass.pipeline.PipelineState:
         # Prologue MMAs
         k_pipe_mmas = 1
         ab_release_state = ab_read_state.clone()
@@ -1141,17 +1128,12 @@ class GemmSm90:
         peek_ab_full_status = Boolean(True)
         if 0 < k_tile_cnt:
             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
-        tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-        num_k_blocks = cute.size(tCrA, mode=[2])
+        zero_init = Boolean(True)
         for k_tile in cutlass.range(num_prologue_mma):
             # Wait for A/B buffer to be ready
             ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
-            warpgroup.fence()
-            for k_blk_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                k_blk_coord = (None, None, k_blk_idx, ab_read_state.index)
-                cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
-                tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
-            warpgroup.commit_group()
+            mma_fn(A_idx=ab_read_state.index, B_idx=ab_read_state.index, zero_init=zero_init)
+            zero_init = Boolean(False)
             ab_read_state.advance()
             peek_ab_full_status = Boolean(True)
             if k_tile + 1 < k_tile_cnt:
@@ -1166,14 +1148,10 @@ class GemmSm90:
         for k_tile in cutlass.range(num_prologue_mma, k_tile_cnt, unroll=1):
             # Wait for TMA copies to complete
             ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
-            warpgroup.fence()
             if const_expr(self.fp8_slow_accum):
-                tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-            for k_blk_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                k_blk_coord = (None, None, k_blk_idx, ab_read_state.index)
-                cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
-                tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
-            warpgroup.commit_group()
+                zero_init = Boolean(True)
+            mma_fn(A_idx=ab_read_state.index, B_idx=ab_read_state.index, zero_init=zero_init)
+            zero_init = Boolean(False)
             # Wait on the wgmma barrier for previous k_pipe_mmas wgmmas to complete
             if const_expr(not self.fp8_slow_accum):
                 warpgroup.wait_group(k_pipe_mmas)
@@ -1197,9 +1175,7 @@ class GemmSm90:
             ab_release_state.advance()
         if const_expr(self.fp8_slow_accum):
             acc.store(acc_slow.load())
-        # If we don't return the tiled_mma, we get compiler error
-        # "operand #0 does not dominate this use"
-        return ab_read_state, tiled_mma
+        return ab_read_state
 
     @cute.jit
     def epilogue(
