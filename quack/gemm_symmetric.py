@@ -133,8 +133,11 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
-            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+            if is_tma_warp:
+                epi_store_pipeline.producer_acquire()
+            epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
+            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
                 copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
             cute.copy(
@@ -156,8 +159,6 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
                 if square_tile_m != square_tile_n:  # don't write twice to the same tile
                     copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
                 epi_store_pipeline.producer_commit()
-                epi_store_pipeline.producer_acquire()
-            epilogue_barrier.arrive_and_wait()
 
         self.epi_end(
             params,
