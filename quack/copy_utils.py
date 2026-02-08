@@ -10,6 +10,7 @@ from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
+from cutlass._mlir.dialects import llvm
 
 
 @dsl_user_op
@@ -377,6 +378,63 @@ def get_smem_load_A(
         return load_s2r_retile(tiled_copy, tSR_sA[None, None, None, src_idx], dst, **new_kwargs)
 
     return copy_fn if not with_dst_tensor else copy_fn_w_dst_tensor, thr_copy, tSR_sA
+
+
+@dsl_user_op
+def cpasync_reduce_bulk_add_f32(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: int | Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    # cache_hint = cutlass.Int64(0x14F0000000000000)  # EVICT_LAST
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
+        "l,r,r",
+        # [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value(), cache_hint.ir_value()],
+        # "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32 [$0], [$1], $2, $3;",
+        # "l,r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def cpasync_bulk_get_copy_fn(
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    single_stage: bool = False,
+    **kwargs,
+) -> Callable:
+    group_rank_src = const_expr(cute.rank(src_tensor) - (1 if not single_stage else 0))
+    group_rank_dst = const_expr(cute.rank(dst_tensor) - (1 if not single_stage else 0))
+    # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
+    src = cute.group_modes(src_tensor, 0, group_rank_src)
+    dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
+
+    def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
+        atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
+        with cute.arch.elect_one():
+            cute.copy(
+                atom,
+                src[None, src_idx],
+                dst[None, dst_idx],
+                mbar_ptr=tma_bar_ptr,
+                **new_kwargs,
+                **kwargs,
+            )
+
+    def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
+        atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
+        with cute.arch.elect_one():
+            cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
+
+    return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 
 
 def tma_get_copy_fn(
