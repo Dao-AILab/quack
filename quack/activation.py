@@ -2,14 +2,22 @@
 
 import math
 from typing import Tuple
+from functools import partial
 
 import cutlass.cute as cute
 from cutlass import Float32, Boolean, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
 
 
 F32_or_F32x2 = Float32 | Tuple[Float32, Float32]
+
+
+sub_packed_f32x2 = partial(
+    cute.arch.calc_packed_f32x2_op,
+    src_c=None,
+    calc_func=nvvm.sub_packed_f32x2,
+)
 
 
 @dsl_user_op
@@ -433,7 +441,7 @@ def dglu(
         sigmoid_x_dout = cute.arch.mul_packed_f32x2(sigmoid_x, dout)
         glu_out = cute.arch.mul_packed_f32x2(sigmoid_x, y)
         # dx = (y - glu_out) * sigmoid_x_dout
-        y_minus_glu_out = cute.arch.sub_packed_f32x2(y, glu_out)
+        y_minus_glu_out = sub_packed_f32x2(y, glu_out)
         dx = cute.arch.mul_packed_f32x2(y_minus_glu_out, sigmoid_x_dout)
         dy = sigmoid_x_dout
         return dx, dy, glu_out

@@ -7,13 +7,14 @@ name = "quack-kernels"
 dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
-    "nvidia-cutlass-dsl>=4.4.0.dev0",
+    "nvidia-cutlass-dsl>=4.4.0.dev1",
     "torch",
     "apache-tvm-ffi>=0.1.6,<0.2",
     "torch-c-dlpack-ext",
 ]
 
 [project.optional-dependencies]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.0.dev1"]
 dev = [
     "pre-commit",
     "ruff",
@@ -25,6 +26,16 @@ include = ["quack*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "quack.__version__"}
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "extra == 'cu13'" },
+]
 
 [tool.ruff]
 line-length = 100

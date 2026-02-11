@@ -480,10 +480,12 @@ class GemmSm100(GemmSm90):
         assert (varlen_args.mAIdx is not None) == self.gather_A
 
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
-        )
+        def new_stride(t: cute.Tensor):
+            return tuple(
+                cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
+                for s in t.stride
+            )
+
         mA, mD = [
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
             if t is not None
@@ -632,7 +634,7 @@ class GemmSm100(GemmSm90):
             a_prefetch_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.a_prefetch_stage * 2
             ]
-            tile_count: cute.struct.MemRange[Int32, self.sched_stage]
+            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 12]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: Int32
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
@@ -805,15 +807,14 @@ class GemmSm100(GemmSm90):
             acc_pipeline_mbar_ptr=storage.acc_pipeline_array_ptr.data_ptr(),
         )
         sched_pipeline = None
-        tile_count = None
-        if const_expr(tile_sched_params.tile_count_semaphore is not None):
-            # Dynamic persistent scheduler
+        sched_data = None
+        if const_expr(self.is_persistent):
             sched_pipeline = self.make_sched_pipeline(
                 self.cluster_shape_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 has_C=has_C,
             )
-            tile_count = storage.tile_count.get_tensor((self.sched_stage,))
+            sched_data = storage.sched_data.get_tensor((12, self.sched_stage))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
             a_prefetch_pipeline = self.make_a_prefetch_pipeline(
@@ -886,7 +887,7 @@ class GemmSm100(GemmSm90):
         )
 
         TileSchedulerCls = partial(
-            TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
+            TileSchedulerCls.create, tile_sched_params, sched_data, sched_pipeline
         )
 
         epi_load_barrier = None
@@ -1149,7 +1150,7 @@ class GemmSm100(GemmSm90):
                     work_tile = tile_scheduler.get_current_work()
 
         # Specialized scheduler warp. Will also prefetch A indices if gatherA
-        if const_expr(tile_sched_params.tile_count_semaphore is not None or self.gather_A):
+        if const_expr(self.is_persistent or self.gather_A):
             if warp_idx == self.scheduler_warp_id:
                 is_scheduler_warp = True
                 if const_expr(cute.size(cluster_layout_vmnk) > 1):
@@ -1226,7 +1227,6 @@ class GemmSm100(GemmSm90):
                                 a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
                                 a_prefetch_producer_state.advance()
                     # Advance to next tile
-                    tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
@@ -1915,13 +1915,13 @@ class GemmSm100(GemmSm90):
         # Threads/warps participating in this pipeline
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_layout_mnk)
-        # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+        # Each warp will contribute 1 to the arrive count
         warps_per_cta = self.num_ab_load_warps + len(
             (self.mma_warp_id, *self.epilog_warp_id, self.scheduler_warp_id)
         )
         if has_C:
             warps_per_cta += 1
-        consumer_arrive_cnt = warps_per_cta * cluster_size - 1
+        consumer_arrive_cnt = warps_per_cta * cluster_size
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1940,9 +1940,7 @@ class GemmSm100(GemmSm90):
         self, a_prefetch_pipeline_mbar_ptr: cute.Pointer
     ) -> pipeline.PipelineAsync:
         producer_cnt = 32
-        a_prefetch_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, producer_cnt, alignment=producer_cnt
-        )
+        a_prefetch_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         consumer_arrive_cnt = self.num_ab_load_warps - 1
         a_prefetch_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt

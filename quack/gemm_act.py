@@ -10,7 +10,6 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, Boolean, const_expr
-from cutlass.cutlass_dsl import if_generate
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -240,23 +239,6 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
-        def tma_store_fn(src_idx, dst_idx):
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_view_async_shared()
-            epilogue_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                if const_expr(has_D):
-                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
-                copy_postact(src_idx=src_idx, dst_idx=dst_idx)
-            # Can't use if statement here, epi_store_pipeline object isn't captured somehow
-            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
-            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
-            epilogue_barrier.arrive_and_wait()
-
-        delay_tma_store = True
-
-        src_idx_prev, dst_idx_prev = None, None
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # The global memory coordinate for the current epi tile
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
@@ -280,12 +262,11 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
-            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
-            if const_expr(delay_tma_store):
-                if const_expr(epi_idx > 0):
-                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
-                src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
+            if is_tma_warp:
+                epi_store_pipeline.producer_acquire()
+            epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
+            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
                 copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
             cute.copy(
@@ -293,11 +274,15 @@ class GemmActMixin(GemmDefaultEpiMixin):
                 tiled_copy_postact_r2s.retile(tRS_rPostAct),
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
-            if const_expr(not delay_tma_store):
-                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord)
-
-        if const_expr(delay_tma_store):
-            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
+            # Fence and barrier to make sure shared memory store is visible to TMA store
+            cute.arch.fence_view_async_shared()
+            epilogue_barrier.arrive_and_wait()
+            # Copy from shared memory to global memory
+            if is_tma_warp:
+                if const_expr(has_D):
+                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
+                copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
+                epi_store_pipeline.producer_commit()
 
         self.epi_end(
             params,
@@ -507,17 +492,19 @@ def gemm_act(
 gemm_act.compile_cache = {}
 
 
-
-
 class GemmGatedMixin(GemmActMixin):
-    def epi_to_underlying_arguments(self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None) -> GemmActMixin.EpilogueParams:
+    def epi_to_underlying_arguments(
+        self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
+    ) -> GemmActMixin.EpilogueParams:
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         assert self.postact_dtype.width == 16, "GemmGated only supports 16bit postact for now"
         assert self.d_layout is None or self.d_layout.is_n_major_c()
         assert self.postact_layout.is_n_major_c()
         if self.arch == 90:
-            assert self.cta_tile_shape_mnk[1] % 32 == 0, "GemmGatedSm90 requires tileN to be divisible by 32"
+            assert self.cta_tile_shape_mnk[1] % 32 == 0, (
+                "GemmGatedSm90 requires tileN to be divisible by 32"
+            )
 
         self.cta_tile_shape_postact_mn = (
             self.cta_tile_shape_mnk[0],
@@ -540,10 +527,13 @@ class GemmGatedMixin(GemmActMixin):
         )
         # Assume all strides are divisible by 32 bits except the last stride
         new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s for s in t.stride
+            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
+            for s in t.stride
         )
         mRowVecBroadcast, mColVecBroadcast = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
+            if t is not None
+            else None
             for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
         ]
         return self.EpilogueParams(
@@ -560,11 +550,17 @@ class GemmGatedMixin(GemmActMixin):
 
     @staticmethod
     def epi_smem_bytes_per_stage(
-        args: GemmActMixin.EpilogueArguments, cta_tile_shape_mnk: Tuple[int, int, int], epi_tile: cute.Tile
+        args: GemmActMixin.EpilogueArguments,
+        cta_tile_shape_mnk: Tuple[int, int, int],
+        epi_tile: cute.Tile,
     ) -> int:
         postact_dtype = args.mPostAct.element_type
-        postact_bytes_per_stage = (cute.size(cute.shape(epi_tile)) // 2) * (postact_dtype.width // 8)
-        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(args, cta_tile_shape_mnk, epi_tile)
+        postact_bytes_per_stage = (cute.size(cute.shape(epi_tile)) // 2) * (
+            postact_dtype.width // 8
+        )
+        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(
+            args, cta_tile_shape_mnk, epi_tile
+        )
         return postact_bytes_per_stage + rowvec_colvec_bytes
 
     @cute.jit
@@ -653,7 +649,9 @@ def gemm_gated(
     # PostAct shape validation depends on varlen_m
     if cu_seqlens_m is not None:
         # varlen_m case: PostAct is 2D (total_m, n//2)
-        assert PostAct.dim() == 2 and PostAct.is_cuda, "PostAct must be a 2D CUDA tensor for varlen_m"
+        assert PostAct.dim() == 2 and PostAct.is_cuda, (
+            "PostAct must be a 2D CUDA tensor for varlen_m"
+        )
         assert PostAct.shape == (
             M,
             N // 2,
@@ -716,9 +714,7 @@ def gemm_gated(
         ),
     )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters,
-        tile_count_semaphore,
-        max_swizzle_size=max_swizzle_size,
+        max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
     )
 
     # Create varlen arguments if needed (assumes persistent=True when varlen_m)

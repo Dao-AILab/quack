@@ -108,12 +108,12 @@ def bitonic_topk(
     n = cute.size(arr.shape)
     assert k == 1 << int(math.log2(k)), "k must be a power of 2"
     assert n % k == 0, "n must be divisible by k"
-    topk_vals = cute.make_fragment(k, arr.element_type)
+    topk_vals = cute.make_rmem_tensor(k, arr.element_type)
     for v in cutlass.range(k, unroll_full=True):
         topk_vals[v] = arr[v]
     bitonic_sort(topk_vals, ascending=ascending)
     for i in cutlass.range(1, n // k, unroll_full=True):
-        other_vals = cute.make_fragment(k, arr.element_type)
+        other_vals = cute.make_rmem_tensor(k, arr.element_type)
         for v in cutlass.range(k, unroll_full=True):
             other_vals[v] = arr[i * k + v]
         bitonic_sort(other_vals, ascending=ascending)
@@ -122,7 +122,7 @@ def bitonic_topk(
     # TODO: this is not efficient for large k (e.g. >= 16) since threads in the same warps
     # do duplicate work.
     for i in cutlass.range(int(math.log2(warp_width)), unroll_full=True):
-        other_vals = cute.make_fragment(k, arr.element_type)
+        other_vals = cute.make_rmem_tensor(k, arr.element_type)
         for v in cutlass.range(k, unroll_full=True):
             other_vals[v] = cute.arch.shuffle_sync_bfly(topk_vals[v], offset=1 << i)
         bitonic_topk_merge(topk_vals, other_vals, ascending=ascending)

@@ -1,16 +1,23 @@
 # 🦆 QuACK: A Quirky Assortment of CuTe Kernels 🦆
 
-Kernels are written in the [CuTe-DSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
+Kernels are written in the [CuTe-DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
 
 ## Installation
 
 ``` bash
+# For CUDA 12.9:
 pip install quack-kernels
+
+# For CUDA 13.1:
+pip install 'quack-kernels[cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
+
+# Or using uv (faster):
+uv pip install 'quack-kernels[cu13]'
 ```
 
 ## Requirements
 
-- H100 or B200 GPU
+- H100 or B200/B300 GPU
 - CUDA toolkit 12.9+
 - Python 3.12
 
@@ -54,4 +61,10 @@ To set up the development environment:
 ```bash
 pip install -e '.[dev]'
 pre-commit install
+
+# For CUDA 13.1:
+pip install 'quack-kernels[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
+
+# Or using uv:
+uv pip install 'quack-kernels[dev,cu13]'
 ```

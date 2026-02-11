@@ -9,6 +9,7 @@ from torch.amp import custom_fwd, custom_bwd
 
 
 from quack.gemm_interface import gemm, gemm_add_inplace, gemm_act, gemm_dact
+from quack.gemm_interface import gemm_gated, gemm_dgated
 
 
 def linear_fwd_convert_type(*tensors):
@@ -225,6 +226,42 @@ class DActLinearUntunedFunc(DActLinearFunc):
 
 def act_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
     fn_cls = DActLinearFunc if tuned else DActLinearUntunedFunc
+    return fn_cls.apply(preact, weight, x, activation, fuse_grad_accum)
+
+
+class LinearGatedFunc(LinearActFunc):
+    matmul_fwd_fn = gemm_gated
+
+
+class LinearGatedUntunedFunc(LinearActFunc):
+    # Passing in tuned=False to disable tuning at runtime
+    matmul_fwd_fn = partial(gemm_gated, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+
+
+def linear_gated_func(
+    x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True
+):
+    fn_cls = LinearGatedFunc if tuned else LinearGatedUntunedFunc
+    return fn_cls.apply(x, weight, activation, bias, store_preact, fuse_grad_accum)
+
+
+class DGatedLinearFunc(DActLinearFunc):
+    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True)
+
+
+class DGatedLinearUntunedFunc(DActLinearFunc):
+    # Passing in tuned=False to disable tuning at runtime
+    matmul_fwd_fn = partial(gemm, tuned=False)
+    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+
+
+def gated_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
+    fn_cls = DGatedLinearFunc if tuned else DGatedLinearUntunedFunc
     return fn_cls.apply(preact, weight, x, activation, fuse_grad_accum)
 
 
