@@ -297,8 +297,9 @@ def get_smem_store_C(
     else:
         tRS_sC = partition_D_position_independent(thr_copy, sC)
 
-    def copy_fn(src: cute.Tensor, dst_idx: Int32, **new_kwargs):
-        cvt_copy(tiled_copy, src, tRS_sC[None, None, None, dst_idx], retile=True, **new_kwargs)
+    def copy_fn(src: cute.Tensor, dst_idx: Optional[Int32] = None, **new_kwargs):
+        dst_tensor = tRS_sC if const_expr(dst_idx is None) else tRS_sC[None, None, None, dst_idx]
+        cvt_copy(tiled_copy, src, dst_tensor, retile=True, **new_kwargs)
 
     return copy_fn, thr_copy, tRS_sC
 
@@ -323,10 +324,9 @@ def get_smem_load_C(
     thr_copy_RS = cute.make_tiled_copy_C(copy_atom_RS, tiled_mma).get_slice(tidx)
     tRS_shape = thr_copy_RS.partition_S(cute.make_identity_tensor(sC.shape[:2])).shape
 
-    def copy_fn(src_idx: Int32, **new_kwargs):
-        return load_s2r_retile(
-            tiled_copy, tSR_sC[None, None, None, src_idx], dst_shape=tRS_shape, **new_kwargs
-        )
+    def copy_fn(src_idx: Optional[Int32] = None, **new_kwargs):
+        src_tensor = tSR_sC if const_expr(src_idx is None) else tSR_sC[None, None, None, src_idx]
+        return load_s2r_retile(tiled_copy, src_tensor, dst_shape=tRS_shape, **new_kwargs)
 
     return copy_fn, thr_copy, tSR_sC
 
