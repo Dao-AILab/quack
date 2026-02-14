@@ -930,8 +930,8 @@ class GemmSm90:
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                     tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
                 )
-                # (R2S, R2S_M, R2S_N)
-                tRS_rAcc = tiled_copy_r2s.retile(acc)
+                # (R2S, R2S_M, R2S_N, num_epi)
+                tRS_rAcc = cute.flat_divide(acc, tRS_rD.layout)
                 load_acc_subtile = partial(self.epi_load_acc_subtile, tRS_rAcc)
                 if const_expr(has_C):
                     tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
@@ -1356,8 +1356,7 @@ class GemmSm90:
 
     @cute.jit
     def epi_load_acc_subtile(self, tRS_rAcc: cute.Tensor, tRS_rD: cute.Tensor, epi_idx: int):
-        for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
-            tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
+        cute.autovec_copy(tRS_rAcc[None, None, None, epi_idx], tRS_rD)
 
     @cute.jit
     def epi_begin(
