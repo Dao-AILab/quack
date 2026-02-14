@@ -331,6 +331,48 @@ def get_smem_load_C(
     return copy_fn, thr_copy, tSR_sC
 
 
+def epilog_smem_copy_atom(
+    tiled_mma: cute.TiledMma, epi_tile: cute.Shape, transpose: bool = False
+) -> cute.TiledCopy:
+    copy_atom_C = cute.make_copy_atom(
+        warp.StMatrix8x8x16bOp(transpose, num_matrices=4 if epi_tile[1] % 16 == 0 else 2),
+        cutlass.Float16,  # this is just to get the right source layout
+    )
+    tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+    return tiled_copy_C_atom
+
+
+def get_smem_store_epi(
+    tiled_mma: cute.TiledMma,
+    epi_tile: cute.Shape,
+    sC: Optional[cute.Tensor],
+    tidx: Int32,
+    arch: int,
+    transpose: bool = False,
+    position_independent=False,
+) -> Tuple[Callable, cute.TiledCopy, cute.Tensor, cute.Tensor]:
+    dtype = sC.element_type if const_expr(sC is not None) else cutlass.Float16
+    tiled_copy_C_atom = epilog_smem_copy_atom(tiled_mma, epi_tile)
+    copy_atom = get_smem_store_atom(arch, dtype, transpose)
+    tiled_copy = cute.make_tiled_copy_S(copy_atom, tiled_copy_C_atom)
+    thr_copy = tiled_copy.get_slice(tidx)
+    tRS_sC = None
+    if const_expr(sC is not None):
+        if const_expr(not position_independent):
+            tRS_sC = thr_copy.partition_D(sC)
+        else:
+            tRS_sC = partition_D_position_independent(thr_copy, sC)
+    sC_shape = sC.shape[:2] if sC is not None else epi_tile
+    # (R2S, R2S_M, R2S_N, PIPE_C)
+    tRS_rC_shape = thr_copy.partition_S(cute.make_identity_tensor(sC_shape)).shape
+    tRS_rC = cute.make_rmem_tensor(tRS_rC_shape, tiled_mma.op.acc_dtype)
+
+    def copy_fn(src: cute.Tensor, dst_idx: Int32, **new_kwargs):
+        cvt_copy(tiled_copy, src, tRS_sC[None, None, None, dst_idx], **new_kwargs)
+
+    return copy_fn if const_expr(sC is not None) else None, thr_copy, tRS_sC, tRS_rC
+
+
 def get_smem_store_A(
     tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, arch: int, position_independent=False
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
