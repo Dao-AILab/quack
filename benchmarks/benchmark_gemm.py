@@ -15,6 +15,8 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
 from quack.gemm_sm90 import GemmSm90, TileSchedulerOptions
+from quack.gemm_sm100 import GemmSm100
+from quack.cute_dsl_utils import get_device_capacity
 from quack.varlen_utils import VarlenArguments
 
 """
@@ -212,7 +214,12 @@ def run(
     if dynamic_persistent:
         persistent = True
 
-    print("Running Hopper Dense GEMM with:")
+    device_capacity = get_device_capacity(torch.device("cuda"))
+    is_sm100 = device_capacity[0] >= 10
+    if is_sm100:
+        persistent = True  # SM100 always uses persistent scheduling
+
+    print("Running Dense GEMM with:")
     print(f"mnkl: {mnkl}")
     print(
         f"A dtype: {a_dtype}, B dtype: {b_dtype}, D dtype: {d_dtype}, C_dtype: {c_dtype}, Acc dtype: {acc_dtype}"
@@ -227,9 +234,10 @@ def run(
     # Unpack parameters
     m, n, k, l = mnkl
     cluster_shape_mnk = (*cluster_shape_mn, 1)
+    GemmCls = GemmSm100 if is_sm100 else GemmSm90
 
     # Skip unsupported types
-    if not GemmSm90.is_valid_dtypes(
+    if not GemmCls.is_valid_dtypes(
         a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major
     ):
         raise TypeError(
@@ -386,16 +394,25 @@ def run(
     else:
         tensormaps_tensor = None
 
-    gemm = GemmSm90(
-        acc_dtype,
-        a_dtype,
-        tile_shape_mn,
-        cluster_shape_mnk,
-        pingpong=pingpong,
-        is_persistent=persistent,
-        fp8_fast_accum=fp8_fast_accum,
-        gather_A=gather_A,
-    )
+    if is_sm100:
+        gemm = GemmCls(
+            acc_dtype,
+            a_dtype,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            gather_A=gather_A,
+        )
+    else:
+        gemm = GemmCls(
+            acc_dtype,
+            a_dtype,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            pingpong=pingpong,
+            is_persistent=persistent,
+            fp8_fast_accum=fp8_fast_accum,
+            gather_A=gather_A,
+        )
 
     # Compute max active clusters on current device
     if persistent:
