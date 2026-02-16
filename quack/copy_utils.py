@@ -11,6 +11,8 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
 from cutlass._mlir.dialects import llvm
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
 
 @dsl_user_op
@@ -445,6 +447,27 @@ def cpasync_reduce_bulk_add_f32(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@dsl_user_op
+def get_tma_desc_addr(tma_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.Pointer:
+    """
+    Gets the address of the TMA descriptor embedded in a TMA Copy Atom.
+
+    Extracts the constant memory address of the TMA descriptor for use with
+    custom PTX instructions.
+
+    :param tma_atom: TMA Copy Atom from make_tiled_tma_atom
+    :return: Pointer to TMA descriptor in constant memory
+
+    Example:
+        >>> desc_ptr = get_tma_descriptor_address(tma_atom)
+    """
+    exec_atom = _cute_nvgpu_ir.atom_make_exec_tma(tma_atom._trait.value, loc=loc, ip=ip)
+    tma_desc_ptr_type = ir.Type.parse(
+        "!cute.ptr<!cute_nvgpu.tma_descriptor_tiled, generic, align<128>>"
+    )
+    return _cute_nvgpu_ir.get_tma_desc_addr(tma_desc_ptr_type, exec_atom, loc=loc, ip=ip)
 
 
 def cpasync_bulk_get_copy_fn(
