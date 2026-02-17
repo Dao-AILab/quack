@@ -1,18 +1,23 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import re
-from typing import Optional, Type, Tuple, Callable
+from typing import Optional, Type, Tuple, Callable, Sequence
+from functools import partial
 
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Int16, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.pipeline
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+
+
+Sm100MmaPeerBitMask = 0xFEFFFFFF
 
 
 @dsl_user_op
@@ -452,7 +457,7 @@ def cpasync_reduce_bulk_add_f32(
 @dsl_user_op
 def get_tma_desc_addr(tma_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.Pointer:
     """
-    Gets the address of the TMA descriptor embedded in a TMA Copy Atom.
+    Get the address of the TMA descriptor embedded in a TMA Copy Atom.
 
     Extracts the constant memory address of the TMA descriptor for use with
     custom PTX instructions.
@@ -468,6 +473,118 @@ def get_tma_desc_addr(tma_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.Poi
         "!cute.ptr<!cute_nvgpu.tma_descriptor_tiled, generic, align<128>>"
     )
     return _cute_nvgpu_ir.get_tma_desc_addr(tma_desc_ptr_type, exec_atom, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def tma_gather4_load(
+    tma_desc_ptr: cute.Pointer,
+    dst_smem_ptr: cute.Pointer,
+    mbarrier_ptr: cute.Pointer,
+    col_idx: Int32,
+    row_indices: Sequence[Int32],
+    *,
+    num_cta: int = 1,
+    multicast_mask=None,
+    loc=None,
+    ip=None,
+) -> None:
+    """
+    Perform TMA gather4 load from global memory to shared memory.
+
+    Issues PTX instruction:
+    cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes
+        [dstMem], [tensorMap, {col_idx, row0, row1, row2, row3}], [smem_bar];
+
+    This loads 4 rows (specified by row_indices) from a 2D tensor at the given
+    column index into shared memory, using the TMA descriptor.
+
+    :param tma_desc_ptr: Pointer to TMA descriptor in constant memory (128-byte aligned)
+    :type tma_desc_ptr:  Pointer
+    :param dst_smem_ptr: Destination address in shared memory
+    :type dst_smem_ptr:  Pointer
+    :param mbarrier_ptr: Pointer to mbarrier in shared memory for completion tracking
+    :type mbarrier_ptr:  Pointer
+    :param col_idx:      Column index
+    :type col_idx:       Int32
+    :param row_indices:  Sequence of exactly 4 row indices
+    :type row_indices:   Sequence[Int32]
+    :param num_cta:      Number of CTAs participating (default: 1)
+    :type num_cta:       int
+    :param multicast_mask: Optional multicast mask
+    :type multicast_mask: Int16
+
+    Requirements:
+        - row_indices must contain exactly 4 elements
+        - Compute capability >= SM_100 (Blackwell)
+        - TMA descriptor must be properly initialized for 2D tensor
+
+    Example:
+        >>> from cutlass.cute.nvgpu import cpasync
+        >>> from cutlass.cute import core
+        >>>
+        >>> # Create TMA descriptor
+        >>> tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(...)
+        >>> tma_desc_ptr = get_tma_descriptor_address(tma_atom)
+        >>>
+        >>> # Compute indices (typically from kernel logic)
+        >>> col_idx = core.get(...) or 5  # Int32 value
+        >>> row_indices = [core.get(...) for _ in range(4)]  # 4 Int32 values
+        >>>
+        >>> # Gather 4 rows at computed column
+        >>> tma_gather4_load(
+        ...     tma_desc_ptr=tma_desc_ptr,
+        ...     dst_smem_ptr=smem_ptr,
+        ...     mbarrier_ptr=barrier_ptr,
+        ...     col_idx=col_idx,
+        ...     row_indices=row_indices
+        ... )
+    """
+    if len(row_indices) != 4:
+        raise ValueError(f"gather4 requires exactly 4 row indices, got {len(row_indices)}")
+    col_val = Int32(col_idx).ir_value()
+    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]
+    # Convert pointers to integer addresses
+    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip).ir_value()
+    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    mbar_addr = mbarrier_ptr.toint(loc=loc, ip=ip)
+    if num_cta > 1:
+        # Executed by both CTAs. Set peer bit to 0 so that the
+        # transaction bytes will update CTA0's barrier.
+        mbar_addr = mbar_addr & Sm100MmaPeerBitMask
+    mbar_addr = mbar_addr.ir_value()
+    # Handle multicast_mask - may already be ir.Value or Python int
+    multicast_mask_val = None
+    if multicast_mask is not None:
+        multicast_mask_val = Int16(multicast_mask).ir_value()
+    assert multicast_mask_val is None, "multicast is not supported yet"
+    # Emit inline PTX for TMA gather4
+    # PTX: cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes
+    #      [dstMem], [tensorMap, {col, row0, row1, row2, row3}], [smem_bar];
+    ptx = (
+        f"cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{num_cta} "
+        "[$0], [$1, {$2, $3, $4, $5, $6}], [$7];"
+    )
+
+    llvm.inline_asm(
+        None,
+        [
+            dst_addr,
+            desc_addr,
+            col_val,
+            row_vals[0],
+            row_vals[1],
+            row_vals[2],
+            row_vals[3],
+            mbar_addr,
+        ],
+        ptx,
+        "r,l,r,r,r,r,r,r",  # constraints: register, long, 6x register
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 def cpasync_bulk_get_copy_fn(
@@ -557,7 +674,7 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
 def gather_m_get_copy_fn(
     thr_copy_A: cute.ThrCopy,
     mA: cute.Tensor,  # (whatever, K)
-    sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
+    sA: cute.Tensor,  # (tile_M, tile_K, STAGE)
     gsAIdx: cute.Tensor,  # (tile_M), either gmem or smem
     limit_m: Int32,
     limit_k: Int32,
@@ -625,7 +742,7 @@ def gather_m_get_copy_fn(
 def gather_k_get_copy_fn(
     thr_copy_A: cute.ThrCopy,
     mA: cute.Tensor,  # (tile_M, whatever)
-    sA: cute.Tensor,  # (tile_M, tile_N, STAGE)
+    sA: cute.Tensor,  # (tile_M, tile_K, STAGE)
     gsAIdx: cute.Tensor,  # (tile_K, RestK), either gmem or smem
     limit_m: Int32,
     limit_k: Int32,
@@ -731,3 +848,43 @@ def gather_k_get_copy_fn(
     return copy_fn, prefetch_from_gmem_fn if const_expr(
         gAIdx is not None
     ) else prefetch_from_smem_fn
+
+
+@cute.jit
+def gather_m_get_tma_copy_fn(
+    tma_atom: cute.CopyAtom,
+    mA: cute.Tensor,  # (whatever, K)
+    sA: cute.Tensor,  # ((4, 32), (64, 1), STAGE)
+    sAIdx: cute.Tensor,  # (tile_M),
+    warp_idx: Int32,
+    num_warps: int,
+    num_cta: int = 1,
+) -> Callable:
+    tile_M = cute.size(sAIdx, mode=[0])
+    tile_K = cute.size(sA[None, None, 0]) // tile_M
+    assert tile_M % 4 == 0
+    # cta_group = 1 if tma_atom.op.cta_group == CtaGroup.ONE else 2
+    cta_group = num_cta  # Somehow all tma_atom has CtaGroup.ONE inside the kernel
+
+    copy_AIdx_s2r = cute.make_tiled_copy_tv(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=128),
+        cute.make_layout(num_warps),  # thr_layout
+        cute.make_layout(4),  # val_layout
+    )
+    warp_copy_AIdx_s2r = copy_AIdx_s2r.get_slice(warp_idx)
+    tSR_sAIdx = warp_copy_AIdx_s2r.partition_S(sAIdx)
+    # ((4, 1), 8, (64, 1), STAGE)
+    tSR_sA = warp_copy_AIdx_s2r.partition_S(sA)
+    tSR_rAIdx = load_s2r(tSR_sAIdx)
+    tma_desc_ptr = get_tma_desc_addr(tma_atom)
+    tma_gather4_load_fn = partial(tma_gather4_load, tma_desc_ptr, num_cta=cta_group)
+
+    def copy_fn(src_idx, dst_idx, tma_bar_ptr: cute.Pointer):
+        col_idx = tile_K * src_idx
+        for m in cutlass.range(cute.size(tSR_rAIdx, mode=[1]), unroll_full=True):
+            row_indices = [tSR_rAIdx[v, m] for v in range(4)]
+            smem_ptr = tSR_sA[None, m, None, dst_idx].iterator
+            with cute.arch.elect_one():
+                tma_gather4_load_fn(smem_ptr, tma_bar_ptr, col_idx, row_indices)
+
+    return copy_fn
