@@ -25,7 +25,7 @@ def get_all_configs(
 ) -> List[GemmConfig]:
     assert device_capacity in [9, 10]
     if device_capacity == 9:
-        tile_n_vals = [128, 144, 160, 176, 192, 208]
+        tile_n_vals = [128, 160, 192, 208]
         tile_mn_coop_vals = [(256, tile_n) for tile_n in tile_n_vals] + [
             (128, 224),
             (128, 256),
@@ -48,11 +48,7 @@ def get_all_configs(
         swap_ab_vals = [False, True]
         if epilogue in ["lse", "gated"]:
             swap_ab_vals = [False]
-        # raster_swizzle = (
-        #     [(0, 1)]
-        #     if not tune_raster_order
-        #     else [(1, 1), (1, 2), (1, 4), (1, 8), (2, 1), (2, 2), (2, 4), (2, 8)]
-        # )
+
         return [
             GemmConfig(
                 tile_m=tile_m,
@@ -61,35 +57,29 @@ def get_all_configs(
                 cluster_m=cluster_m,
                 cluster_n=cluster_n,
                 swap_ab=swap_ab,
-                # raster_order=raster_order,
-                # max_swizzle_size=max_swizzle_size,
             )
             for (tile_m, tile_n, pingpong), (cluster_m, cluster_n), swap_ab in itertools.product(
                 tile_mn_vals,
                 cluster,
                 swap_ab_vals,
-                # raster_swizzle,
             )
         ]
     elif device_capacity == 10:
         tile_n_vals = [128, 160, 192, 224, 256]
-        tile_n_64_vals = [128, 192, 256]
         tile_mn_cluster_vals = (
             [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]
-            # + [(128, tile_n, (2, 1)) for tile_n in tile_n_64_vals]
             + [(128, tile_n, (2, 1)) for tile_n in tile_n_vals]
             + [(256, tile_n, (2, 1)) for tile_n in tile_n_vals]
         )
         swap_ab_vals = [False, True]
         if epilogue in ["lse", "gated"]:
             swap_ab_vals = [False]
-        max_swizzle_size_vals = [4, 8, 16]
         GemmConfigCls = partial(GemmConfig, pingpong=False)  # There's no pingpong on Sm100
         return [
             GemmConfigCls(
-                tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=ms
+                tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=8
             )
-            for (m, n, (cm, cn)), sab, ms in itertools.product(
-                tile_mn_cluster_vals, swap_ab_vals, max_swizzle_size_vals
+            for (m, n, (cm, cn)), sab in itertools.product(
+                tile_mn_cluster_vals, swap_ab_vals
             )
         ]
