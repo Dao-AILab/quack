@@ -7,14 +7,14 @@ name = "quack-kernels"
 dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
-    "nvidia-cutlass-dsl>=4.4.0.dev1",
+    "nvidia-cutlass-dsl>=4.4.0",
     "torch",
     "apache-tvm-ffi>=0.1.6,<0.2",
     "torch-c-dlpack-ext",
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.0.dev1"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.0"]
 dev = [
     "pre-commit",
     "ruff",
