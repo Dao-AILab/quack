@@ -140,6 +140,9 @@ def online_softmax_reduce(
         cute.arch.fmax,
         threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
     )
+    if max_x == -Float32.inf:
+        max_x = Float32.zero
+
     log2_e = math.log2(math.e)
     exp_x = cute.math.exp2(x * log2_e - (max_x * log2_e), fastmath=True)
     sum_exp_x = cute.arch.warp_reduction(
