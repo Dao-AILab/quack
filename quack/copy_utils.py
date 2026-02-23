@@ -1,6 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-import re
 from typing import Optional, Type, Tuple, Callable, Sequence
 from functools import partial
 
@@ -34,7 +33,7 @@ def cvt_copy(
 ) -> None:
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src_cvt = cute.make_fragment_like(src, dst.element_type)
+        src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
         src_cvt.store(src.load().to(dst.element_type))
         src = src_cvt
     if const_expr(retile):
@@ -44,7 +43,7 @@ def cvt_copy(
 
 @dsl_user_op
 def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
-    dst = cute.make_fragment_like(src, src.element_type, loc=loc, ip=ip)
+    dst = cute.make_rmem_tensor_like(src, src.element_type, loc=loc, ip=ip)
     cute.autovec_copy(src, dst, loc=loc, ip=ip)
     return dst
 
@@ -64,6 +63,16 @@ def load_s2r_retile(
     else:
         dst = dst_shape
     cute.copy(tiled_copy, src, tiled_copy.retile(dst), loc=loc, ip=ip)
+    return dst
+
+
+@dsl_user_op
+def load_t2r(
+    thr_copy: cute.ThrCopy, shape: cute.Shape, src: cute.Tensor, *, loc=None, ip=None
+) -> cute.Tensor:
+    cDst = cute.make_identity_tensor(shape)
+    dst = cute.make_rmem_tensor(thr_copy.partition_D(cDst).shape, src.element_type, loc=loc, ip=ip)
+    cute.copy(thr_copy, src, dst, loc=loc, ip=ip)
     return dst
 
 
@@ -155,30 +164,6 @@ def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
 #     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 
-def parse_swizzle_from_pointer(ptr: cute.Pointer) -> Tuple[int, int, int]:
-    """Extract swizzle parameters from a pointer's swizzle_type.
-
-    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
-    b, m, s are the swizzle parameters (bits, base, shift).
-
-    Returns:
-        A cute.Swizzle object constructed from the extracted parameters
-
-    Raises:
-        ValueError: If the swizzle_type string cannot be parsed
-    """
-    # Ideally there should be a better API to get swizzle parameters, but we'll just parse
-    # the string here.
-    swizzle_str = str(ptr.type.swizzle_type)
-    # Extract the inner part "S<b,m,s>"
-    match = re.search(r"S<(\d+),(\d+),(\d+)>", swizzle_str)
-    if match:
-        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
-        return b, m, s
-    else:
-        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
-
-
 def swizzle_int(ptr_int: Int32, b: int, m: int, s: int) -> Int32:
     bit_msk = (1 << b) - 1
     yyy_msk = bit_msk << (m + s)
@@ -186,15 +171,15 @@ def swizzle_int(ptr_int: Int32, b: int, m: int, s: int) -> Int32:
 
 
 def swizzle_ptr(ptr: cute.Pointer):
-    b, m, s = parse_swizzle_from_pointer(ptr)
-    ptr_int = swizzle_int(ptr.toint(), b, m, s)
+    swz = ptr.type.swizzle_type
+    ptr_int = swizzle_int(ptr.toint(), swz.num_bits, swz.num_base, swz.num_shift)
     return cute.make_ptr(ptr.dtype, ptr_int, ptr.memspace, assumed_align=ptr.alignment)
 
 
 def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
     outer = tensor.layout
     width = tensor.element_type.width
-    inner = cute.make_swizzle(*parse_swizzle_from_pointer(tensor.iterator))
+    inner = tensor.iterator.type.swizzle_type
     # Need to recast the swizzle from byte (e.g. <3, 4, 3> to element units (e.g. <3, 3, 3> for
     # for 16 bits and <3, 2, 3> for 32 bits)
     new_layout = cute.recast_layout(
