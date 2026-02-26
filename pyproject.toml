@@ -18,6 +18,7 @@ cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.0"]
 dev = [
     "pre-commit",
     "ruff",
+    "pytest",
 ]
 
 [tool.setuptools.packages.find]
