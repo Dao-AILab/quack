@@ -454,7 +454,7 @@ class GemmSm90:
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
         TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_args.mCuSeqlensM is not None)
-        tile_sched_args = self.get_scheduler_arguments(mA, mB, mD, scheduler_args, varlen_args)
+        tile_sched_args = self.get_scheduler_arguments(mA, mB, mD, scheduler_args, varlen_args, epilogue_args)
         tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
         grid = TileSchedulerCls.get_grid_shape(
             tile_sched_params, scheduler_args.max_active_clusters
@@ -1299,6 +1299,7 @@ class GemmSm90:
         mD: Optional[cute.Tensor],
         scheduler_args,
         varlen_args,
+        epilogue_args
     ):
         """Create scheduler arguments. Override in subclasses for custom schedulers."""
         if const_expr(not self.is_persistent):
@@ -1335,7 +1336,7 @@ class GemmSm90:
                 persistence_mode=persistence_mode,
             )
         else:
-            assert mD is not None or not self.gather_A
+            assert (mD is not None) or (epilogue_args.mPostAct is not None) or (not self.gather_A)
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(mB.shape[0], self.cta_tile_shape_mnk[1]),

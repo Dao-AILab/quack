@@ -599,7 +599,7 @@ class GemmSm100(GemmSm90):
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
         TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_args.mCuSeqlensM is not None)
-        tile_sched_args = self.get_scheduler_arguments(mA, mB, mD, scheduler_args, varlen_args)
+        tile_sched_args = self.get_scheduler_arguments(mA, mB, mD, scheduler_args, varlen_args, epilogue_args)
         tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
         grid = TileSchedulerCls.get_grid_shape(
             tile_sched_params, scheduler_args.max_active_clusters
