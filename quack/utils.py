@@ -126,8 +126,18 @@ def store_shared_remote_x4(
 
 @dsl_user_op
 def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
+    if cutlass.const_expr(cutlass.CUDA_VERSION.major) == 12:
+        return Float32(
+            nvvm.fmin(
+                T.f32(),
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
+        )
     return Float32(
-        nvvm.fmin(
+            nvvm.fmin(
             Float32(a).ir_value(loc=loc, ip=ip),
             Float32(b).ir_value(loc=loc, ip=ip),
             loc=loc,
