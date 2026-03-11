@@ -14,6 +14,7 @@ from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
 from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
+from quack.rounding import RoundingMode
 
 
 # Dictionary mapping activation names to PyTorch functions
@@ -95,6 +96,8 @@ def gemm_tuned(
     add_to_output: bool = False,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int = 0,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -151,6 +154,8 @@ def gemm_tuned(
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed,
     )
 
 
@@ -296,6 +301,8 @@ def gemm(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int = 0,
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     if out is None:
@@ -329,6 +336,8 @@ def gemm(
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed,
     )
     return out
 
@@ -337,9 +346,6 @@ def gemm(
     "quack::gemm_out",
     mutates_args=("out",),
     device_types="cuda",
-    # We have to split out alpha and alpha_tensor since torch.library requires
-    # each argument to have a fixed type
-    # schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? bias, float alpha=1.0, Tensor? alpha_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_out(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
@@ -355,6 +361,8 @@ def gemm_out(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int = 0,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
@@ -371,6 +379,8 @@ def gemm_out(
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed,
     )
 
 

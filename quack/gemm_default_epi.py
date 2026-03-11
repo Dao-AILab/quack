@@ -6,11 +6,12 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass import Int32, Uint32, Float32, Boolean, const_expr
 
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.rounding import RoundingMode
 from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
@@ -25,6 +26,8 @@ class GemmDefaultEpiMixin:
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -32,10 +35,12 @@ class GemmDefaultEpiMixin:
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        sr_seed: Optional[Int32] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         # Assume all strides are divisible by 32 bits except the last stride
         new_stride = lambda t: tuple(
             cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
@@ -52,6 +57,7 @@ class GemmDefaultEpiMixin:
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
+            sr_seed=args.sr_seed,
         )
 
     @cute.jit

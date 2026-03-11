@@ -29,6 +29,7 @@ from quack.gemm_tvm_ffi_utils import (
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.varlen_utils import VarlenManager
 import quack.copy_utils as copy_utils
+from quack.rounding import RoundingMode
 
 
 class GemmSymmetricMixin(GemmActMixin):
@@ -147,7 +148,21 @@ class GemmSymmetricMixin(GemmActMixin):
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                if const_expr(self.rounding_mode == RoundingMode.RS):
+                    tile_seed = (
+                        tile_coord_mnkl[0] * 65537
+                        + tile_coord_mnkl[1] * 257
+                        + tile_coord_mnkl[3] * 17
+                        + (num_prev_subtiles + epi_idx) * 7
+                    )
+                    copy_utils.sr_cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer],
+                        params.sr_seed, tidx, tile_seed,
+                    )
+                else:
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                    )
             cute.copy(
                 tiled_copy_postact_r2s,
                 tiled_copy_postact_r2s.retile(tRS_rPostAct),
@@ -368,6 +383,8 @@ def gemm_symmetric(
         None,  # act_fn is Constexpr, baked in at compile time
         alpha=scalar_arg(alpha, alpha_mode),
         beta=scalar_arg(beta, beta_mode),
+        rounding_mode=None,
+        sr_seed=None,
     )
     scheduler_args = make_scheduler_args(
         max_active_clusters,

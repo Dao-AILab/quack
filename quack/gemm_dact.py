@@ -40,6 +40,7 @@ from quack.gemm_tvm_ffi_utils import (
 )
 from quack.varlen_utils import VarlenManager
 from quack import copy_utils
+from quack.rounding import RoundingMode
 import quack.layout_utils as layout_utils
 from quack.activation import dact_fn_map, dgate_fn_map
 
@@ -106,6 +107,8 @@ class GemmDGatedMixin(GemmActMixin):
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -120,10 +123,12 @@ class GemmDGatedMixin(GemmActMixin):
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
+        sr_seed: Optional[Int32] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         # C and D are implicitly 2 16-bit elements packed into 32 bits, simply for the purpose
@@ -169,6 +174,7 @@ class GemmDGatedMixin(GemmActMixin):
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
             mColVecReduce=mColVecReduce,
+            sr_seed=args.sr_seed,
         )
 
     @cute.jit
@@ -664,9 +670,13 @@ def gemm_dact(
             None,  # act_bwd_fn is Constexpr
             mColVecBroadcast=colvec_scale,
             mColVecReduce=colvec_reduce,
+            rounding_mode=None,
+            sr_seed=None,
         )
     else:
-        epi_args = GemmDActMixin.EpilogueArguments(PostAct_p, None)  # act_fn is Constexpr
+        epi_args = GemmDActMixin.EpilogueArguments(
+            PostAct_p, None, rounding_mode=None, sr_seed=None,
+        )
     scheduler_args = make_scheduler_args(
         max_active_clusters,
         max_swizzle_size,

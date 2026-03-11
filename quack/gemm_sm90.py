@@ -34,6 +34,7 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
 import quack.copy_utils as copy_utils
 import quack.sm90_utils as quack_sm90_utils
+from quack.rounding import RoundingMode
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -1235,7 +1236,21 @@ class GemmSm90:
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                if const_expr(self.rounding_mode == RoundingMode.RS):
+                    tile_seed = (
+                        tile_coord_mnkl[0] * 65537
+                        + tile_coord_mnkl[1] * 257
+                        + tile_coord_mnkl[3] * 17
+                        + (num_prev_subtiles + epi_idx) * 7
+                    )
+                    copy_utils.sr_cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer],
+                        params.sr_seed, tidx, tile_seed,
+                    )
+                else:
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                    )
             # Fence and barrier to make sure shared memory store is visible to TMA store
             cute.arch.fence_view_async_shared()
             epilogue_barrier.arrive_and_wait()

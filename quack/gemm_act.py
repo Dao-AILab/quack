@@ -39,6 +39,7 @@ from quack.layout_utils import permute_gated_Cregs_b16
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
 from quack.activation import act_fn_map, gate_fn_map
+from quack.rounding import RoundingMode
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
@@ -50,6 +51,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -62,10 +65,12 @@ class GemmActMixin(GemmDefaultEpiMixin):
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        sr_seed: Optional[Int32] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
 
@@ -104,6 +109,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
+            sr_seed=args.sr_seed,
         )
 
     def epi_get_tma_atoms(
@@ -267,7 +273,21 @@ class GemmActMixin(GemmDefaultEpiMixin):
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                if const_expr(self.rounding_mode == RoundingMode.RS):
+                    tile_seed = (
+                        tile_coord_mnkl[0] * 65537
+                        + tile_coord_mnkl[1] * 257
+                        + tile_coord_mnkl[3] * 17
+                        + (num_prev_subtiles + epi_idx) * 7
+                    )
+                    copy_utils.sr_cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer],
+                        params.sr_seed, tidx, tile_seed,
+                    )
+                else:
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                    )
             cute.copy(
                 tiled_copy_postact_r2s,
                 tiled_copy_postact_r2s.retile(tRS_rPostAct),
@@ -337,6 +357,7 @@ class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         assert self.postact_dtype.width == 16, "GemmGated only supports 16bit postact for now"
@@ -389,6 +410,7 @@ class GemmGatedMixin(GemmActMixin):
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
+            sr_seed=args.sr_seed,
         )
 
     @staticmethod
@@ -655,6 +677,8 @@ def gemm_act(
         None,  # act_fn is Constexpr, pass None at call time
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
+        rounding_mode=None,  # Constexpr, pass None at call time
+        sr_seed=None,
     )
     scheduler_args = make_scheduler_args(
         max_active_clusters,
