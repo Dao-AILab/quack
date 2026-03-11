@@ -876,7 +876,10 @@ class VarlenMTileScheduler(TileScheduler):
     def _cluster_idx_to_work_idx_batch(
         params: Params, cluster_idx: Tuple[Int32, Int32, Int32], *, loc=None, ip=None
     ) -> Tuple[Int32, Optional[Int32]]:
-        current_work_idx = Int32(cluster_idx[2])
+        if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
+            current_work_idx = Int32(cluster_idx[0])
+        else:
+            current_work_idx = Int32(cluster_idx[2])
         batch_idx = None
         return current_work_idx, batch_idx
 
@@ -932,7 +935,7 @@ class VarlenMTileScheduler(TileScheduler):
         total_clusters_m_max = (params.total_m + num_batch * (block_size - 1)) // block_size
         total_clusters_max = total_clusters_m_max * params.problem_shape_ncluster_mnl[1]
         if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
-            return (*params.cluster_shape_mn, total_clusters_max)
+            return (params.cluster_shape_mn[0] * total_clusters_max, params.cluster_shape_mn[1], 1)
         else:
             num_persistent_clusters = cutlass.min(max_active_clusters, total_clusters_max)
             return (*params.cluster_shape_mn, num_persistent_clusters)
