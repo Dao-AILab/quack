@@ -1275,7 +1275,7 @@ class GemmSm90:
         if const_expr(not self.is_persistent):
             persistence_mode = PersistenceMode.NONE
         else:
-            if const_expr(self.arch >= 100):
+            if const_expr(self.arch >= 100 and scheduler_args.use_clc_persistence):
                 persistence_mode = PersistenceMode.CLC
             elif const_expr(scheduler_args.tile_count_semaphore is not None):
                 persistence_mode = PersistenceMode.DYNAMIC

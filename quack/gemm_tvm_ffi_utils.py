@@ -5,7 +5,7 @@ from functools import partial
 
 
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, Boolean
 from cutlass.cute.runtime import make_ptr
 
 from quack.cache_utils import compile_and_cache
@@ -60,7 +60,7 @@ def get_dtypes(A, B, D, C):
 
 
 def make_scheduler_args(
-    max_active_clusters, max_swizzle_size, tile_count_semaphore, batch_idx_permute=None
+    max_active_clusters, max_swizzle_size, tile_count_semaphore, batch_idx_permute=None, clc_persistence=False
 ):
     return TileSchedulerOptions(
         max_active_clusters=max_active_clusters,
@@ -70,10 +70,11 @@ def make_scheduler_args(
             tile_count_semaphore.data_ptr() if tile_count_semaphore is not None else None
         ),
         batch_idx_permute=batch_idx_permute,
+        use_clc_persistence=clc_persistence,
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
+def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, clc_persistence):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
         max_swizzle_size=Int32(8),
@@ -85,6 +86,7 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
             if has_batch_idx_permute
             else None
         ),
+        use_clc_persistence=Boolean(clc_persistence)
     )
 
 

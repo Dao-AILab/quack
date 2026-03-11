@@ -466,6 +466,7 @@ def _compile_gemm_act(
     colvec_ndim,
     varlen_m,
     gather_A,
+    use_clc_persistence,
     device_capacity,
     gemm_cls_name,
 ):
@@ -508,7 +509,7 @@ def _compile_gemm_act(
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l, use_clc_persistence)
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     key = (
         "gemm_act",
@@ -534,6 +535,7 @@ def _compile_gemm_act(
         colvec_ndim,
         varlen_m,
         gather_A,
+        use_clc_persistence,
         device_capacity,
     )
     return cached_compile(
@@ -577,6 +579,7 @@ def gemm_act(
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    use_clc_persistence: bool = False
 ) -> None:
     if activation in gate_fn_map:
         gemm_cls_name = "gated"
@@ -640,6 +643,7 @@ def gemm_act(
         colvec_ndim,
         varlen_m,
         gather_A,
+        use_clc_persistence,
         device_capacity,
         gemm_cls_name,
     )
@@ -660,6 +664,7 @@ def gemm_act(
         max_active_clusters,
         max_swizzle_size,
         tile_count_semaphore,
+        use_clc_persistence
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
