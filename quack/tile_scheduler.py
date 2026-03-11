@@ -58,7 +58,6 @@ class TileSchedulerOptions(NamedTuple):
     max_swizzle_size: Int32 = Int32(8)
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
-    use_clc_persistence: bool = False
 
 
 @dataclass

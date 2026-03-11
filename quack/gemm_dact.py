@@ -497,7 +497,7 @@ def _compile_gemm_dact(
         epi_args = GemmCls.EpilogueArguments(mPostAct, act_fn)
         post_init = None
 
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l, use_clc_persistence)
+    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     key = (
         "gemm_dact",
@@ -538,6 +538,7 @@ def _compile_gemm_dact(
             pingpong,
             persistent,
             gather_A,
+            use_clc_persistence,
             device_capacity,
             mA,
             mB,
@@ -571,7 +572,7 @@ def gemm_dact(
     colvec_reduce: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
-    use_clc_persistence: bool = False
+    use_clc_persistence: bool = False,
 ) -> None:
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
@@ -675,7 +676,6 @@ def gemm_dact(
         max_active_clusters,
         max_swizzle_size,
         tile_count_semaphore,
-        use_clc_persistence,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 

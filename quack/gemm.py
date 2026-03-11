@@ -93,7 +93,7 @@ def _compile_gemm(
         mColVecBroadcast=mColVec,
         add_to_output=add_to_output,
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l, use_clc_persistence)
+    scheduler_args = make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l)
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
     key = ("gemm",) + (
@@ -133,6 +133,7 @@ def _compile_gemm(
             pingpong,
             persistent,
             gather_A,
+            use_clc_persistence,
             device_capacity,
             mA,
             mB,
@@ -167,7 +168,7 @@ def gemm(
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
-    use_clc_persistence: bool = True,
+    use_clc_persistence: bool = False,
     add_to_output: bool = False,
 ) -> None:
     varlen_m = cu_seqlens_m is not None

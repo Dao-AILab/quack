@@ -80,7 +80,15 @@ def get_all_configs(
         use_clc_vals = [True, False]
         return [
             GemmConfigCls(
-                tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=8, clc=clc,
+                tile_m=m,
+                tile_n=n,
+                cluster_m=cm,
+                cluster_n=cn,
+                swap_ab=sab,
+                max_swizzle_size=8,
+                clc=clc,
             )
-            for (m, n, (cm, cn)), sab, clc in itertools.product(tile_mn_cluster_vals, swap_ab_vals, use_clc_vals)
+            for (m, n, (cm, cn)), sab, clc in itertools.product(
+                tile_mn_cluster_vals, swap_ab_vals, use_clc_vals
+            )
         ]

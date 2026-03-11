@@ -5,7 +5,7 @@ from functools import partial
 
 
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Boolean
+from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
 from quack.cache_utils import compile_and_cache
@@ -60,7 +60,7 @@ def get_dtypes(A, B, D, C):
 
 
 def make_scheduler_args(
-    max_active_clusters, max_swizzle_size, tile_count_semaphore, batch_idx_permute=None, clc_persistence=False
+    max_active_clusters, max_swizzle_size, tile_count_semaphore, batch_idx_permute=None
 ):
     return TileSchedulerOptions(
         max_active_clusters=max_active_clusters,
@@ -70,11 +70,10 @@ def make_scheduler_args(
             tile_count_semaphore.data_ptr() if tile_count_semaphore is not None else None
         ),
         batch_idx_permute=batch_idx_permute,
-        use_clc_persistence=clc_persistence,
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, clc_persistence):
+def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
         max_swizzle_size=Int32(8),
@@ -86,7 +85,6 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, clc_pe
             if has_batch_idx_permute
             else None
         ),
-        use_clc_persistence=Boolean(clc_persistence)
     )
 
 
@@ -181,6 +179,7 @@ def compile_gemm_kernel(
     pingpong,
     persistent,
     gather_A,
+    use_clc_persistence,
     device_capacity,
     mA,
     mB,
@@ -196,7 +195,14 @@ def compile_gemm_kernel(
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] == 9:
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-    gemm_obj = GemmCls(Float32, a_dtype, tile_shape_mn, cluster_shape_mnk, gather_A=gather_A)
+    gemm_obj = GemmCls(
+        Float32,
+        a_dtype,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        gather_A=gather_A,
+        use_clc_persistence=use_clc_persistence,
+    )
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

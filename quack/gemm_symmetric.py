@@ -248,7 +248,7 @@ def _compile_gemm_symmetric(
         alpha=fake_scalar(alpha_mode),
         beta=fake_scalar(beta_mode),
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l, use_clc_persistence)
+    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
     varlen_args = None
     key = (
         "gemm_symmetric",
@@ -281,6 +281,7 @@ def _compile_gemm_symmetric(
             pingpong,
             persistent,
             False,
+            use_clc_persistence,
             device_capacity,
             mA,
             mB,
@@ -308,7 +309,7 @@ def gemm_symmetric(
     max_swizzle_size: int = 8,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
-    use_clc_persistence: bool = False
+    use_clc_persistence: bool = False,
 ) -> None:
     # Transpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
@@ -376,7 +377,6 @@ def gemm_symmetric(
         max_active_clusters,
         max_swizzle_size,
         tile_count_semaphore,
-        use_clc_persistence
     )
     varlen_args = None
 

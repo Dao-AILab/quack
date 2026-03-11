@@ -55,9 +55,13 @@ default_device_capacity = get_device_capacity(torch.device("cuda"))
 
 def default_config(device):
     if get_device_capacity(device)[0] != 10:
-        return GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True, clc=False)
+        return GemmConfig(
+            tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True, clc=False
+        )
     else:
-        return GemmConfig(tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False, clc=True)
+        return GemmConfig(
+            tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False, clc=True
+        )
 
 
 def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
@@ -220,7 +224,7 @@ def gemm_act_tuned(
         colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        use_clc_persistence=config.clc
+        use_clc_persistence=config.clc,
     )
 
 
@@ -282,7 +286,7 @@ def gemm_dact_tuned(
         max_swizzle_size=config.max_swizzle_size,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        use_clc_persistence=config.clc
+        use_clc_persistence=config.clc,
     )
 
 
@@ -1198,7 +1202,7 @@ def gemm_dgated_tuned(
         colvec_reduce=colvec_reduce_partial,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        use_clc_persistence=config.clc
+        use_clc_persistence=config.clc,
     )
     if colvec_reduce:
         colvec_reduce_final = colvec_reduce_partial.sum(dim=-1)
