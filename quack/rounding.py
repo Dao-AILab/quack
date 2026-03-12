@@ -37,7 +37,7 @@ PHILOX_KEY_B = 0xBB67AE85
 
 @dsl_user_op
 def mul_wide_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> tuple:
-    """Unsigned 32x32 -> 64 wide multiply via PTX `mul.wide.u32`.
+    """Unsigned 32b x 32b -> 64 wide multiply via PTX `mul.wide.u32`.
 
     Returns (hi, lo) as a pair of Uint32 values.
     """
@@ -64,6 +64,36 @@ def mul_wide_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> tuple:
     hi = cutlass.Uint32(llvm.extractvalue(i32_ty, result, [0], loc=loc, ip=ip))
     lo = cutlass.Uint32(llvm.extractvalue(i32_ty, result, [1], loc=loc, ip=ip))
     return hi, lo
+
+
+@dsl_user_op
+def cvt_f32x2_bf16x2_rs(
+    a: Float32,
+    b: Float32,
+    rand_bits: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Int32:
+    """Convert 2 FP32 values to packed BF16x2 using stochastic rounding.
+
+    Uses Blackwell PTX instruction: cvt.rs.satfinite.bf16x2.f32 dst, src_hi, src_lo, rand
+    """
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                Uint32(rand_bits).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rs.satfinite.bf16x2.f32 $0, $2, $1, $3;",
+            "=r,f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
 @dsl_user_op
@@ -104,36 +134,6 @@ def philox(
         k1 = k1 + key_b
 
     return c0, c1, c2, c3
-
-
-@dsl_user_op
-def cvt_rs_f32x2_bf16x2(
-    a: Float32,
-    b: Float32,
-    rand_bits: Uint32,
-    *,
-    loc=None,
-    ip=None,
-) -> cutlass.Int32:
-    """Convert 2 FP32 values to packed BF16x2 using stochastic rounding.
-
-    Uses Blackwell PTX instruction: cvt.rs.satfinite.bf16x2.f32 dst, src_hi, src_lo, rand
-    """
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                Uint32(rand_bits).ir_value(loc=loc, ip=ip),
-            ],
-            "cvt.rs.satfinite.bf16x2.f32 $0, $2, $1, $3;",
-            "=r,f,f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
 
 
 @dsl_user_op
@@ -188,7 +188,7 @@ def convert_f32_to_bf16_sr(
             rand_batch = philox(counter, cutlass.Uint32(seed))
 
         entropy = rand_batch[intra_idx]
-        packed_i32 = cvt_rs_f32x2_bf16x2(Float32(src_lo), Float32(src_hi), entropy, loc=loc, ip=ip)
+        packed_i32 = cvt_f32x2_bf16x2_rs(Float32(src_lo), Float32(src_hi), entropy, loc=loc, ip=ip)
 
         packed_i32_val = cutlass.Int32(packed_i32).ir_value(loc=loc, ip=ip)
         i32_vec = vector.insertelement(

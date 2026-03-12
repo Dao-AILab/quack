@@ -346,6 +346,9 @@ def gemm(
     "quack::gemm_out",
     mutates_args=("out",),
     device_types="cuda",
+    # We have to split out alpha and alpha_tensor since torch.library requires
+    # each argument to have a fixed type
+    # schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? bias, float alpha=1.0, Tensor? alpha_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_out(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k

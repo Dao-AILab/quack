@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Uint32, Float32, Boolean, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 from quack.gemm_sm90 import GemmSm90
