@@ -1236,16 +1236,23 @@ class GemmSm90:
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                if const_expr(self.rounding_mode == RoundingMode.RS):
-                    tile_seed = (
+                if const_expr(
+                    self.rounding_mode == RoundingMode.RS
+                    and self.acc_dtype == cutlass.Float32
+                    and self.d_dtype == cutlass.BFloat16
+                ):
+                    seed = params.sr_seed + (
                         tile_coord_mnkl[0] * 65537
                         + tile_coord_mnkl[1] * 257
                         + tile_coord_mnkl[3] * 17
                         + (num_prev_subtiles + epi_idx) * 7
                     )
                     copy_utils.sr_cvt_copy(
-                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer],
-                        params.sr_seed, tidx, tile_seed,
+                        tiled_copy_r2s,
+                        tRS_rD,
+                        tRS_sD[None, None, None, epi_buffer],
+                        seed,
+                        tidx,
                     )
                 else:
                     copy_utils.cvt_copy(

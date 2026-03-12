@@ -267,22 +267,33 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            # Convert postact from acc_dtype to postact_dtype
+            tRS_rPostAct_out = self.epi_convert_postact(
+                tRS_rPostAct, params, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+            )
             if is_tma_warp:
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                if const_expr(self.rounding_mode == RoundingMode.RS):
-                    tile_seed = (
+                if const_expr(
+                    self.rounding_mode == RoundingMode.RS
+                    and self.acc_dtype == cutlass.Float32
+                    and self.d_dtype == cutlass.BFloat16
+                ):
+                    seed = params.sr_seed + (
                         tile_coord_mnkl[0] * 65537
                         + tile_coord_mnkl[1] * 257
                         + tile_coord_mnkl[3] * 17
                         + (num_prev_subtiles + epi_idx) * 7
                     )
                     copy_utils.sr_cvt_copy(
-                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer],
-                        params.sr_seed, tidx, tile_seed,
+                        tiled_copy_r2s,
+                        tRS_rD,
+                        tRS_sD[None, None, None, epi_buffer],
+                        seed,
+                        tidx,
                     )
                 else:
                     copy_utils.cvt_copy(
@@ -290,7 +301,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     )
             cute.copy(
                 tiled_copy_postact_r2s,
-                tiled_copy_postact_r2s.retile(tRS_rPostAct),
+                tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
             # Fence and barrier to make sure shared memory store is visible to TMA store
@@ -317,6 +328,39 @@ class GemmActMixin(GemmDefaultEpiMixin):
         return epi_read_state, epi_producer_state
 
     @cute.jit
+    def epi_convert_postact(
+        self, tRS_rPostAct, params, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        """Convert postact from acc_dtype to postact_dtype. Override for custom postprocessing."""
+        if const_expr(
+            self.rounding_mode == RoundingMode.RS
+            and self.acc_dtype == cutlass.Float32
+            and self.postact_dtype == cutlass.BFloat16
+        ):
+            from quack.rounding import convert_f32_to_bf16_sr
+            from cutlass.cute.tensor import TensorSSA
+
+            # Salt with 0x9E3779B1 to avoid sharing entropy with the D output seed
+            seed = (
+                params.sr_seed
+                + 0x9E3779B1
+                + (
+                    tile_coord_mnkl[0] * 65537
+                    + tile_coord_mnkl[1] * 257
+                    + tile_coord_mnkl[3] * 17
+                    + (num_prev_subtiles + epi_idx) * 7
+                )
+            )
+            tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
+            src_vec = tRS_rPostAct.load()
+            raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
+            tRS_rPostAct_out.store(TensorSSA(raw_vec, src_vec.shape, self.postact_dtype))
+        else:
+            tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
+            tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        return tRS_rPostAct_out
+
+    @cute.jit
     def epi_visit_subtile(
         self,
         params: EpilogueParams,
@@ -339,10 +383,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     )
         else:
             tRS_rPostAct = tRS_rD
-        # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
-        return tRS_rPostAct_out
+        return tRS_rPostAct
 
 
 class GemmActSm90(GemmActMixin, GemmSm90):
@@ -448,9 +489,15 @@ class GemmGatedMixin(GemmActMixin):
                 tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
                 )
-        # Type conversion
-        tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        return tRS_rPostAct
+
+    @cute.jit
+    def epi_convert_postact(
+        self, tRS_rPostAct, params, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        tRS_rPostAct_out = GemmActMixin.epi_convert_postact(
+            self, tRS_rPostAct, params, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
         if const_expr(self.arch == 90):
             # Only need this if we're using STSM
             permute_gated_Cregs_b16(tRS_rPostAct_out)

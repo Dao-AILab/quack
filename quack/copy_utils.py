@@ -46,9 +46,8 @@ def sr_cvt_copy(
     tiled_copy: cute.TiledCopy,
     src: cute.Tensor,
     dst: cute.Tensor,
-    sr_seed: Int32,
+    seed: Int32,
     tidx: Int32,
-    tile_seed: Int32,
     *,
     loc=None,
     ip=None,
@@ -58,9 +57,8 @@ def sr_cvt_copy(
     from quack.rounding import convert_f32_to_bf16_sr
     from cutlass.cute.tensor import TensorSSA
     src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
-    combined_seed = sr_seed + tile_seed
     src_vec = src.load()
-    raw_vec = convert_f32_to_bf16_sr(src_vec, combined_seed, tidx, loc=loc, ip=ip)
+    raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx, loc=loc, ip=ip)
     src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
     src = src_cvt
     cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)

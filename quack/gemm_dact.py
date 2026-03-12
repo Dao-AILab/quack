@@ -81,10 +81,7 @@ class GemmDActMixin(GemmActMixin):
                     )
         else:
             tRS_rPostAct = tRS_rC_acc
-        # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
-        return tRS_rPostAct_out
+        return tRS_rPostAct
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
@@ -337,9 +334,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
-        tRS_rOut_cvt = cute.make_fragment_like(tRS_rOut, self.postact_dtype)
-        tRS_rOut_cvt.store(tRS_rOut.load().to(self.postact_dtype))
-        return tRS_rOut_cvt
+        return tRS_rOut
 
     @cute.jit
     def epi_end(
