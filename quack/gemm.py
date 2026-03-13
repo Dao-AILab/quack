@@ -7,12 +7,13 @@ from functools import lru_cache
 from torch import Tensor
 
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_default_epi import GemmDefaultEpiMixin, GemmDefaultSm90, GemmDefaultSm100
+from quack.rounding import RoundingMode
 from quack.gemm_tvm_ffi_utils import (
     get_majors,
     get_dtypes,
@@ -53,6 +54,8 @@ def _compile_gemm(
     gather_A,
     has_batch_idx_permute,
     device_capacity,
+    rounding_mode,
+    sr_seed_mode,
 ):
     GemmCls = GemmDefaultSm100 if device_capacity[0] > 9 else GemmDefaultSm90
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
@@ -69,13 +72,13 @@ def _compile_gemm(
         gather_A=gather_A,
     )
 
-    def fake_scalar(mode):
+    def fake_scalar(mode, dtype=Float32):
         if mode == 0:
             return None
         elif mode == 1:
-            return Float32(1.0)
+            return dtype(1.0 if dtype == Float32 else 0)
         else:
-            return make_ptr(Float32, 0, cute.AddressSpace.gmem, assumed_align=4)
+            return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -91,6 +94,8 @@ def _compile_gemm(
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
         add_to_output=add_to_output,
+        rounding_mode=rounding_mode,
+        sr_seed=fake_scalar(sr_seed_mode, dtype=Int32),
     )
     scheduler_args = make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l)
     aidx_len = m if varlen_m else (k if varlen_k else None)
@@ -120,6 +125,8 @@ def _compile_gemm(
         gather_A,
         has_batch_idx_permute,
         device_capacity,
+        rounding_mode,
+        sr_seed_mode,
     )
     return cached_compile(
         key,
@@ -166,6 +173,8 @@ def gemm(
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int | Tensor = 0,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -186,17 +195,24 @@ def gemm(
         assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
+    device_capacity = get_device_capacity(A.device)
+    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    if rounding_mode == RoundingMode.RS:
+        assert device_capacity[0] >= 10, (
+            "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
+        )
+
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
-
-    device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
 
     alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
     beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
+    sr_seed_mode = (
+        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
+    )
     compiled_fn = _compile_gemm(
         a_dtype,
         b_dtype,
@@ -222,6 +238,8 @@ def gemm(
         gather_A,
         batch_idx_permute is not None,
         device_capacity,
+        rounding_mode,
+        sr_seed_mode,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -229,11 +247,11 @@ def gemm(
     if COMPILE_ONLY:
         return
 
-    def scalar_arg(scalar, mode):
+    def scalar_arg(scalar, mode, dtype=Float32):
         if mode == 0:
             return None
         elif mode == 1:
-            return Float32(scalar)
+            return dtype(scalar)
         else:
             return scalar.data_ptr()
 
@@ -245,6 +263,8 @@ def gemm(
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
         add_to_output=None,
+        rounding_mode=None,
+        sr_seed=scalar_arg(sr_seed, sr_seed_mode, dtype=Int32),
     )
     scheduler_args = make_scheduler_args(
         max_active_clusters,

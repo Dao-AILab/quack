@@ -11,6 +11,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.rounding import RoundingMode
 from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
@@ -25,6 +26,8 @@ class GemmDefaultEpiMixin:
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -32,10 +35,12 @@ class GemmDefaultEpiMixin:
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         # Assume all strides are divisible by 32 bits except the last stride
         new_stride = lambda t: tuple(
             cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
@@ -52,6 +57,7 @@ class GemmDefaultEpiMixin:
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
+            sr_seed=args.sr_seed,
         )
 
     @cute.jit
@@ -67,11 +73,13 @@ class GemmDefaultEpiMixin:
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
     ):
-        alpha, beta = None, None
+        alpha, beta, sr_seed = None, None, None
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
             alpha = utils.load_scalar_or_pointer(params.alpha)
         if const_expr(hasattr(params, "beta") and params.beta is not None):
             beta = utils.load_scalar_or_pointer(params.beta)
+        if const_expr(hasattr(params, "sr_seed") and params.sr_seed is not None):
+            sr_seed = utils.load_int_scalar_or_pointer(params.sr_seed)
         sRowVec, sColVec, *rest = epi_smem_tensors
         tile_M, tile_N = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
         batch_idx = tile_coord_mnkl[3]
@@ -146,10 +154,10 @@ class GemmDefaultEpiMixin:
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             epilogue_barrier.arrive_and_wait()
-        return alpha, beta, tDsRowVec, tDsColVec
+        return alpha, beta, sr_seed, tDsRowVec, tDsColVec
 
     def epi_begin_loop(self, params: EpilogueParams, epi_tensors, epi_coord: cute.Coord):
-        alpha, beta, tDsRowVec, tDsColVec = epi_tensors
+        alpha, beta, sr_seed, tDsRowVec, tDsColVec = epi_tensors
         tDrRowVec_cvt = None
         if const_expr(tDsRowVec is not None):
             tDsRowVec_cur = cute.group_modes(tDsRowVec, 3, cute.rank(tDsRowVec))[
@@ -171,7 +179,7 @@ class GemmDefaultEpiMixin:
             cute.autovec_copy(cute.filter_zeros(tDsColVec_cur), cute.filter_zeros(tDrColVec))
             tDrColVec_cvt = cute.make_fragment_like(tDrColVec, self.acc_dtype)
             tDrColVec_cvt.store(tDrColVec.load().to(self.acc_dtype))
-        return alpha, beta, tDrRowVec_cvt, tDrColVec_cvt
+        return alpha, beta, sr_seed, tDrRowVec_cvt, tDrColVec_cvt
 
     @cute.jit
     def epi_visit_subtile(
@@ -181,7 +189,7 @@ class GemmDefaultEpiMixin:
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        alpha, beta, tDrRowVec, tDrColVec = epi_loop_tensors
+        alpha, beta, sr_seed, tDrRowVec, tDrColVec = epi_loop_tensors
         rD = tRS_rD.load()
         # Apply alpha scaling to accumulator if alpha is provided (not None)
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):

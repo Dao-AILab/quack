@@ -10,6 +10,7 @@ import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
@@ -38,7 +39,9 @@ from quack.gemm_tvm_ffi_utils import (
 from quack.layout_utils import permute_gated_Cregs_b16
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
+import quack.utils as utils
 from quack.activation import act_fn_map, gate_fn_map
+from quack.rounding import RoundingMode
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
@@ -50,6 +53,8 @@ class GemmActMixin(GemmDefaultEpiMixin):
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -62,10 +67,12 @@ class GemmActMixin(GemmDefaultEpiMixin):
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
 
@@ -104,6 +111,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
+            sr_seed=args.sr_seed,
         )
 
     def epi_get_tma_atoms(
@@ -261,16 +269,41 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            # Convert postact from acc_dtype to postact_dtype
+            tRS_rPostAct_out = self.epi_convert_postact(
+                tRS_rPostAct, epi_loop_tensors[2], tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+            )
             if is_tma_warp:
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                if const_expr(
+                    self.rounding_mode == RoundingMode.RS
+                    and self.acc_dtype == cutlass.Float32
+                    and self.d_dtype == cutlass.BFloat16
+                ):
+                    seed = epi_loop_tensors[2] + (
+                        tile_coord_mnkl[0] * 65537
+                        + tile_coord_mnkl[1] * 257
+                        + tile_coord_mnkl[3] * 17
+                        + (num_prev_subtiles + epi_idx) * 7
+                    )
+                    copy_utils.sr_cvt_copy(
+                        tiled_copy_r2s,
+                        tRS_rD,
+                        tRS_sD[None, None, None, epi_buffer],
+                        seed,
+                        tidx,
+                    )
+                else:
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                    )
             cute.copy(
                 tiled_copy_postact_r2s,
-                tiled_copy_postact_r2s.retile(tRS_rPostAct),
+                tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
             # Fence and barrier to make sure shared memory store is visible to TMA store
@@ -297,6 +330,39 @@ class GemmActMixin(GemmDefaultEpiMixin):
         return epi_read_state, epi_producer_state
 
     @cute.jit
+    def epi_convert_postact(
+        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        """Convert postact from acc_dtype to postact_dtype. Override for custom postprocessing."""
+        if const_expr(
+            self.rounding_mode == RoundingMode.RS
+            and self.acc_dtype == cutlass.Float32
+            and self.postact_dtype == cutlass.BFloat16
+        ):
+            from quack.rounding import convert_f32_to_bf16_sr
+            from cutlass.cute.tensor import TensorSSA
+
+            # Salt with 0x9E3779B1 to avoid sharing entropy with the D output seed
+            seed = (
+                sr_seed
+                + 0x9E3779B1
+                + (
+                    tile_coord_mnkl[0] * 65537
+                    + tile_coord_mnkl[1] * 257
+                    + tile_coord_mnkl[3] * 17
+                    + (num_prev_subtiles + epi_idx) * 7
+                )
+            )
+            tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
+            src_vec = tRS_rPostAct.load()
+            raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
+            tRS_rPostAct_out.store(TensorSSA(raw_vec, src_vec.shape, self.postact_dtype))
+        else:
+            tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
+            tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        return tRS_rPostAct_out
+
+    @cute.jit
     def epi_visit_subtile(
         self,
         params: EpilogueParams,
@@ -319,10 +385,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     )
         else:
             tRS_rPostAct = tRS_rD
-        # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
-        return tRS_rPostAct_out
+        return tRS_rPostAct
 
 
 class GemmActSm90(GemmActMixin, GemmSm90):
@@ -337,6 +400,7 @@ class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         assert self.postact_dtype.width == 16, "GemmGated only supports 16bit postact for now"
@@ -389,6 +453,7 @@ class GemmGatedMixin(GemmActMixin):
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
+            sr_seed=args.sr_seed,
         )
 
     @staticmethod
@@ -426,9 +491,15 @@ class GemmGatedMixin(GemmActMixin):
                 tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
                 )
-        # Type conversion
-        tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        return tRS_rPostAct
+
+    @cute.jit
+    def epi_convert_postact(
+        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        tRS_rPostAct_out = GemmActMixin.epi_convert_postact(
+            self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
         if const_expr(self.arch == 90):
             # Only need this if we're using STSM
             permute_gated_Cregs_b16(tRS_rPostAct_out)
@@ -468,6 +539,8 @@ def _compile_gemm_act(
     gather_A,
     device_capacity,
     gemm_cls_name,
+    rounding_mode=RoundingMode.RN,
+    sr_seed_mode=0,
 ):
     GemmCls = (
         {"act": GemmActSm100, "gated": GemmGatedSm100}[gemm_cls_name]
@@ -502,11 +575,22 @@ def _compile_gemm_act(
         mColVec = None
 
     act_fn = act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
+
+    def fake_scalar(mode, dtype=Int32):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return dtype(0)
+        else:
+            return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
+
     epi_args = GemmCls.EpilogueArguments(
         mPostAct,
         act_fn,
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
+        rounding_mode=rounding_mode,
+        sr_seed=fake_scalar(sr_seed_mode),
     )
     scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
@@ -535,6 +619,8 @@ def _compile_gemm_act(
         varlen_m,
         gather_A,
         device_capacity,
+        rounding_mode,
+        sr_seed_mode,
     )
     return cached_compile(
         key,
@@ -577,6 +663,8 @@ def gemm_act(
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int | Tensor = 0,
 ) -> None:
     if activation in gate_fn_map:
         gemm_cls_name = "gated"
@@ -617,7 +705,14 @@ def gemm_act(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    if rounding_mode == RoundingMode.RS:
+        assert device_capacity[0] >= 10, (
+            "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
+        )
 
+    sr_seed_mode = (
+        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
+    )
     compiled_fn = _compile_gemm_act(
         a_dtype,
         b_dtype,
@@ -642,6 +737,8 @@ def gemm_act(
         gather_A,
         device_capacity,
         gemm_cls_name,
+        rounding_mode=rounding_mode,
+        sr_seed_mode=sr_seed_mode,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -650,11 +747,22 @@ def gemm_act(
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+
+    def scalar_arg(scalar, mode, dtype=Int32):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return dtype(scalar)
+        else:
+            return scalar.data_ptr()
+
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
         None,  # act_fn is Constexpr, pass None at call time
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
+        rounding_mode=None,  # Constexpr, pass None at call time
+        sr_seed=scalar_arg(sr_seed, sr_seed_mode),
     )
     scheduler_args = make_scheduler_args(
         max_active_clusters,

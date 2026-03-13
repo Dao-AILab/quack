@@ -40,6 +40,7 @@ from quack.gemm_tvm_ffi_utils import (
 )
 from quack.varlen_utils import VarlenManager
 from quack import copy_utils
+from quack.rounding import RoundingMode
 import quack.layout_utils as layout_utils
 from quack.activation import dact_fn_map, dgate_fn_map
 
@@ -80,10 +81,7 @@ class GemmDActMixin(GemmActMixin):
                     )
         else:
             tRS_rPostAct = tRS_rC_acc
-        # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
-        return tRS_rPostAct_out
+        return tRS_rPostAct
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
@@ -106,6 +104,8 @@ class GemmDGatedMixin(GemmActMixin):
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -120,10 +120,12 @@ class GemmDGatedMixin(GemmActMixin):
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         # C and D are implicitly 2 16-bit elements packed into 32 bits, simply for the purpose
@@ -169,6 +171,7 @@ class GemmDGatedMixin(GemmActMixin):
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
             mColVecReduce=mColVecReduce,
+            sr_seed=args.sr_seed,
         )
 
     @cute.jit
@@ -231,7 +234,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        alpha, beta, tDrRowVec, tDrColVec, tDrColVecReduce = epi_loop_tensors
+        alpha, beta, sr_seed, tDrRowVec, tDrColVec, tDrColVecReduce = epi_loop_tensors
         assert alpha is None and beta is None and tDrRowVec is None  # We don't use these for now
         assert tRS_rC is not None
         implicit_dtype = params.implicit_dtype
@@ -331,9 +334,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
-        tRS_rOut_cvt = cute.make_fragment_like(tRS_rOut, self.postact_dtype)
-        tRS_rOut_cvt.store(tRS_rOut.load().to(self.postact_dtype))
-        return tRS_rOut_cvt
+        return tRS_rOut
 
     @cute.jit
     def epi_end(
@@ -664,9 +665,16 @@ def gemm_dact(
             None,  # act_bwd_fn is Constexpr
             mColVecBroadcast=colvec_scale,
             mColVecReduce=colvec_reduce,
+            rounding_mode=None,
+            sr_seed=None,
         )
     else:
-        epi_args = GemmDActMixin.EpilogueArguments(PostAct_p, None)  # act_fn is Constexpr
+        epi_args = GemmDActMixin.EpilogueArguments(
+            PostAct_p,
+            None,
+            rounding_mode=None,
+            sr_seed=None,
+        )
     scheduler_args = make_scheduler_args(
         max_active_clusters,
         max_swizzle_size,

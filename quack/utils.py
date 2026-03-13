@@ -25,6 +25,15 @@ def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
         return x
 
 
+@cute.jit
+def load_int_scalar_or_pointer(x: Int32 | cute.Pointer) -> Int32:
+    if const_expr(isinstance(x, cute.Pointer)):
+        return Int32(cute.make_tensor(x, cute.make_layout(1))[0])
+    else:
+        assert isinstance(x, Int32)
+        return x
+
+
 @dsl_user_op
 def set_block_rank(
     smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None

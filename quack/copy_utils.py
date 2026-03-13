@@ -42,6 +42,30 @@ def cvt_copy(
 
 
 @dsl_user_op
+def sr_cvt_copy(
+    tiled_copy: cute.TiledCopy,
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    seed: Int32,
+    tidx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    from quack.rounding import convert_f32_to_bf16_sr
+    from cutlass.cute.tensor import TensorSSA
+
+    src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
+    src_vec = src.load()
+    raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx, loc=loc, ip=ip)
+    src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
+    src = src_cvt
+    cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     dst = cute.make_rmem_tensor_like(src, src.element_type, loc=loc, ip=ip)
     cute.autovec_copy(src, dst, loc=loc, ip=ip)

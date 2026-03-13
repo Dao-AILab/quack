@@ -8,6 +8,7 @@ from quack.linear import linear_func, linear_act_func, act_linear_func, gated_li
 from quack.linear import linear_gated_func
 from quack.mlp import mlp_func
 from quack.gemm_interface import (
+    gemm,
     gemm_add_inplace,
     gemm_dact,
     gemm_gated,
@@ -18,6 +19,7 @@ from quack.gemm_interface import (
     gemm_gated_ref,
     gemm_dgated_ref,
 )
+from quack.rounding import RoundingMode
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -433,3 +435,69 @@ def test_autocast_compile(fn_name):
     out.sum().backward()
     assert x.grad is not None
     assert w.grad is not None
+
+
+# =============================================================================
+# Stochastic Rounding Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("sr_seed", [0, 42])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [512, 1024])
+@pytest.mark.parametrize("k", [256, 768])
+@pytest.mark.parametrize("m", [480, 960])
+def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
+    """Test GEMM with stochastic rounding on SM100+.
+
+    Validates that SR produces results close to RNE (within BF16 tolerance)
+    and that the output has correct shape and dtype.
+    """
+    device = "cuda"
+    cap = torch.cuda.get_device_capability()
+    if cap[0] < 10:
+        pytest.skip("Stochastic rounding requires SM100+ (Blackwell)")
+    torch.random.manual_seed(0)
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    out_sr = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=sr_seed)
+    out_rn = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RN)
+    out_ref = torch.mm(A.float(), B.float())
+    assert out_sr.shape == out_rn.shape
+    assert out_sr.dtype == input_dtype
+    # SR should be close to reference; may differ by up to 1 ULP more than RNE
+    # so use a looser multiplier and atol
+    assert (out_sr - out_ref).abs().max() < 3 * (out_rn - out_ref).abs().max() + 5e-2
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_sr_requires_sm100(input_dtype):
+    """Assert that SR raises on SM90."""
+    device = "cuda"
+    cap = torch.cuda.get_device_capability()
+    if cap[0] >= 10:
+        pytest.skip("This test is for SM90 hardware")
+    torch.random.manual_seed(0)
+    A = torch.randn((128, 256), device=device, dtype=input_dtype)
+    B = torch.randn((256, 128), device=device, dtype=input_dtype)
+    with pytest.raises(AssertionError, match="SM100"):
+        gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [512])
+@pytest.mark.parametrize("k", [256])
+@pytest.mark.parametrize("m", [480])
+def test_gemm_sr_different_seeds(m, k, n, input_dtype):
+    """Different SR seeds should produce different results (non-deterministic rounding)."""
+    device = "cuda"
+    cap = torch.cuda.get_device_capability()
+    if cap[0] < 10:
+        pytest.skip("Stochastic rounding requires SM100+ (Blackwell)")
+    torch.random.manual_seed(0)
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    out1 = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=1)
+    out2 = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=2)
+    # Different seeds should give different outputs (with high probability)
+    assert not torch.equal(out1, out2)

@@ -29,6 +29,7 @@ from quack.gemm_tvm_ffi_utils import (
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.varlen_utils import VarlenManager
 import quack.copy_utils as copy_utils
+from quack.rounding import RoundingMode
 
 
 class GemmSymmetricMixin(GemmActMixin):
@@ -141,16 +142,40 @@ class GemmSymmetricMixin(GemmActMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            tRS_rPostAct_out = self.epi_convert_postact(
+                tRS_rPostAct, epi_loop_tensors[2], tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+            )
             if is_tma_warp:
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                if const_expr(
+                    self.rounding_mode == RoundingMode.RS
+                    and self.acc_dtype == cutlass.Float32
+                    and self.d_dtype == cutlass.BFloat16
+                ):
+                    seed = epi_loop_tensors[2] + (
+                        tile_coord_mnkl[0] * 65537
+                        + tile_coord_mnkl[1] * 257
+                        + tile_coord_mnkl[3] * 17
+                        + (num_prev_subtiles + epi_idx) * 7
+                    )
+                    copy_utils.sr_cvt_copy(
+                        tiled_copy_r2s,
+                        tRS_rD,
+                        tRS_sD[None, None, None, epi_buffer],
+                        seed,
+                        tidx,
+                    )
+                else:
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                    )
             cute.copy(
                 tiled_copy_postact_r2s,
-                tiled_copy_postact_r2s.retile(tRS_rPostAct),
+                tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
             pid_m = tile_coord_mnkl[0]
@@ -368,6 +393,8 @@ def gemm_symmetric(
         None,  # act_fn is Constexpr, baked in at compile time
         alpha=scalar_arg(alpha, alpha_mode),
         beta=scalar_arg(beta, beta_mode),
+        rounding_mode=None,
+        sr_seed=None,
     )
     scheduler_args = make_scheduler_args(
         max_active_clusters,
