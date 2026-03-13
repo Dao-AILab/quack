@@ -97,7 +97,7 @@ def gemm_tuned(
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
     rounding_mode: int = RoundingMode.RN,
-    sr_seed: int = 0,
+    sr_seed: int | Tensor = 0,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -302,7 +302,7 @@ def gemm(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     rounding_mode: int = RoundingMode.RN,
-    sr_seed: int = 0,
+    sr_seed: int | Tensor = 0,
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     if out is None:
@@ -323,6 +323,8 @@ def gemm(
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
+    sr_seed_tensor = sr_seed if isinstance(sr_seed, Tensor) else None
+    sr_seed_int = sr_seed if isinstance(sr_seed, int) else 0
     gemm_out(
         A,
         B,
@@ -337,7 +339,8 @@ def gemm(
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
         rounding_mode=rounding_mode,
-        sr_seed=sr_seed,
+        sr_seed=sr_seed_int,
+        sr_seed_tensor=sr_seed_tensor,
     )
     return out
 
@@ -366,10 +369,12 @@ def gemm_out(
     tuned: bool = True,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int = 0,
+    sr_seed_tensor: Optional[Tensor] = None,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = alpha_tensor if alpha_tensor is not None else alpha
+    sr_seed_arg = sr_seed_tensor if sr_seed_tensor is not None else sr_seed
     fn(
         A,
         B,
@@ -383,7 +388,7 @@ def gemm_out(
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
         rounding_mode=rounding_mode,
-        sr_seed=sr_seed,
+        sr_seed=sr_seed_arg,
     )
 
 

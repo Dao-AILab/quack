@@ -55,6 +55,7 @@ def _compile_gemm(
     has_batch_idx_permute,
     device_capacity,
     rounding_mode,
+    sr_seed_mode,
 ):
     GemmCls = GemmDefaultSm100 if device_capacity[0] > 9 else GemmDefaultSm90
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
@@ -71,13 +72,13 @@ def _compile_gemm(
         gather_A=gather_A,
     )
 
-    def fake_scalar(mode):
+    def fake_scalar(mode, dtype=Float32):
         if mode == 0:
             return None
         elif mode == 1:
-            return Float32(1.0)
+            return dtype(1.0 if dtype == Float32 else 0)
         else:
-            return make_ptr(Float32, 0, cute.AddressSpace.gmem, assumed_align=4)
+            return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -87,7 +88,6 @@ def _compile_gemm(
     else:
         mColVec = None
 
-    sr_seed = Int32(0) if rounding_mode == RoundingMode.RS else None
     epi_args = GemmCls.EpilogueArguments(
         alpha=fake_scalar(alpha_mode),
         beta=fake_scalar(beta_mode),
@@ -95,7 +95,7 @@ def _compile_gemm(
         mColVecBroadcast=mColVec,
         add_to_output=add_to_output,
         rounding_mode=rounding_mode,
-        sr_seed=sr_seed,
+        sr_seed=fake_scalar(sr_seed_mode, dtype=Int32),
     )
     scheduler_args = make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l)
     aidx_len = m if varlen_m else (k if varlen_k else None)
@@ -126,6 +126,7 @@ def _compile_gemm(
         has_batch_idx_permute,
         device_capacity,
         rounding_mode,
+        sr_seed_mode,
     )
     return cached_compile(
         key,
@@ -173,7 +174,7 @@ def gemm(
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
-    sr_seed: int = 0,
+    sr_seed: int | Tensor = 0,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -209,6 +210,9 @@ def gemm(
     beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
+    sr_seed_mode = (
+        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
+    )
     compiled_fn = _compile_gemm(
         a_dtype,
         b_dtype,
@@ -235,6 +239,7 @@ def gemm(
         batch_idx_permute is not None,
         device_capacity,
         rounding_mode,
+        sr_seed_mode,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -242,11 +247,11 @@ def gemm(
     if COMPILE_ONLY:
         return
 
-    def scalar_arg(scalar, mode):
+    def scalar_arg(scalar, mode, dtype=Float32):
         if mode == 0:
             return None
         elif mode == 1:
-            return Float32(scalar)
+            return dtype(scalar)
         else:
             return scalar.data_ptr()
 
@@ -259,7 +264,7 @@ def gemm(
         mColVecBroadcast=colvec_bias,
         add_to_output=None,
         rounding_mode=None,
-        sr_seed=Int32(sr_seed) if rounding_mode == RoundingMode.RS else None,
+        sr_seed=scalar_arg(sr_seed, sr_seed_mode, dtype=Int32),
     )
     scheduler_args = make_scheduler_args(
         max_active_clusters,

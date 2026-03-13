@@ -1241,7 +1241,7 @@ class GemmSm90:
                     and self.acc_dtype == cutlass.Float32
                     and self.d_dtype == cutlass.BFloat16
                 ):
-                    seed = params.sr_seed + (
+                    seed = epi_loop_tensors[2] + (
                         tile_coord_mnkl[0] * 65537
                         + tile_coord_mnkl[1] * 257
                         + tile_coord_mnkl[3] * 17

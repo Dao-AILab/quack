@@ -48,13 +48,7 @@ def mul_wide_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> tuple:
             Uint32(a).ir_value(loc=loc, ip=ip),
             Uint32(b).ir_value(loc=loc, ip=ip),
         ],
-        "{\n"
-        "  .reg .u64 prod;\n"
-        "  mul.wide.u32 prod, $2, $3;\n"
-        "  cvt.u32.u64 $1, prod;\n"
-        "  shr.u64 prod, prod, 32;\n"
-        "  cvt.u32.u64 $0, prod;\n"
-        "}",
+        "{\n  .reg .u64 prod;\n  mul.wide.u32 prod, $2, $3;\n  mov.b64 {$1, $0}, prod;\n}",
         "=r,=r,r,r",
         has_side_effects=False,
         is_align_stack=False,

@@ -105,7 +105,7 @@ class GemmDGatedMixin(GemmActMixin):
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
-        sr_seed: Optional[Int32] = None
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -120,7 +120,7 @@ class GemmDGatedMixin(GemmActMixin):
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
-        sr_seed: Optional[Int32] = None
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
@@ -234,7 +234,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        alpha, beta, tDrRowVec, tDrColVec, tDrColVecReduce = epi_loop_tensors
+        alpha, beta, sr_seed, tDrRowVec, tDrColVec, tDrColVecReduce = epi_loop_tensors
         assert alpha is None and beta is None and tDrRowVec is None  # We don't use these for now
         assert tRS_rC is not None
         implicit_dtype = params.implicit_dtype
@@ -670,7 +670,10 @@ def gemm_dact(
         )
     else:
         epi_args = GemmDActMixin.EpilogueArguments(
-            PostAct_p, None, rounding_mode=None, sr_seed=None,
+            PostAct_p,
+            None,
+            rounding_mode=None,
+            sr_seed=None,
         )
     scheduler_args = make_scheduler_args(
         max_active_clusters,

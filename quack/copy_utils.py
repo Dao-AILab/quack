@@ -56,6 +56,7 @@ def sr_cvt_copy(
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     from quack.rounding import convert_f32_to_bf16_sr
     from cutlass.cute.tensor import TensorSSA
+
     src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
     src_vec = src.load()
     raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx, loc=loc, ip=ip)
