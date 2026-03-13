@@ -179,6 +179,7 @@ def compile_gemm_kernel(
     pingpong,
     persistent,
     gather_A,
+    use_clc_persistence,
     device_capacity,
     mA,
     mB,
@@ -194,7 +195,14 @@ def compile_gemm_kernel(
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] == 9:
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-    gemm_obj = GemmCls(Float32, a_dtype, tile_shape_mn, cluster_shape_mnk, gather_A=gather_A)
+    gemm_obj = GemmCls(
+        Float32,
+        a_dtype,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        gather_A=gather_A,
+        use_clc_persistence=use_clc_persistence,
+    )
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

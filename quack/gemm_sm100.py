@@ -162,6 +162,7 @@ class GemmSm100(GemmSm90):
         cluster_shape_mnk: Tuple[int, int, int],
         sf_vec_size: Optional[int] = None,
         gather_A: bool = False,
+        use_clc_persistence: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -194,6 +195,7 @@ class GemmSm100(GemmSm90):
         self.blockscaled = sf_vec_size is not None
         self.is_persistent = True
         self.pingpong = False  # for compatibility with GemmSm90
+        self.use_clc_persistence = use_clc_persistence
         self.gather_A = gather_A
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "

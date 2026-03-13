@@ -137,6 +137,7 @@ class GemmSm90:
         is_persistent: bool = True,
         fp8_fast_accum: bool = False,
         gather_A: bool = False,
+        use_clc_persistence: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -155,6 +156,9 @@ class GemmSm90:
         self.acc_dtype = acc_dtype
         self.pingpong = pingpong
         self.is_persistent = is_persistent
+        self.use_clc_persistence = use_clc_persistence
+        if self.use_clc_persistence:
+            assert self.arch == 100
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
@@ -1275,7 +1279,7 @@ class GemmSm90:
         if const_expr(not self.is_persistent):
             persistence_mode = PersistenceMode.NONE
         else:
-            if const_expr(self.arch >= 100):
+            if const_expr(self.arch >= 100 and self.use_clc_persistence):
                 persistence_mode = PersistenceMode.CLC
             elif const_expr(scheduler_args.tile_count_semaphore is not None):
                 persistence_mode = PersistenceMode.DYNAMIC

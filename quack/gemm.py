@@ -52,6 +52,7 @@ def _compile_gemm(
     varlen_k,
     gather_A,
     has_batch_idx_permute,
+    use_clc_persistence,
     device_capacity,
 ):
     GemmCls = GemmDefaultSm100 if device_capacity[0] > 9 else GemmDefaultSm90
@@ -119,6 +120,7 @@ def _compile_gemm(
         varlen_k,
         gather_A,
         has_batch_idx_permute,
+        use_clc_persistence,
         device_capacity,
     )
     return cached_compile(
@@ -131,6 +133,7 @@ def _compile_gemm(
             pingpong,
             persistent,
             gather_A,
+            use_clc_persistence,
             device_capacity,
             mA,
             mB,
@@ -165,6 +168,7 @@ def gemm(
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
+    use_clc_persistence: bool = False,
     add_to_output: bool = False,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
@@ -221,6 +225,7 @@ def gemm(
         varlen_k,
         gather_A,
         batch_idx_permute is not None,
+        use_clc_persistence,
         device_capacity,
     )
 

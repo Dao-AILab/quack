@@ -10,6 +10,7 @@ class GemmConfig:
     tile_m: int = 128
     tile_n: int = 192
     pingpong: bool = True
+    clc: bool = True
     cluster_m: int = 2
     cluster_n: int = 1
     swap_ab: bool = False
@@ -54,6 +55,7 @@ def get_all_configs(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 pingpong=pingpong,
+                clc=False,
                 cluster_m=cluster_m,
                 cluster_n=cluster_n,
                 swap_ab=swap_ab,
@@ -75,9 +77,18 @@ def get_all_configs(
         if epilogue in ["lse", "gated"]:
             swap_ab_vals = [False]
         GemmConfigCls = partial(GemmConfig, pingpong=False)  # There's no pingpong on Sm100
+        use_clc_vals = [True, False]
         return [
             GemmConfigCls(
-                tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=8
+                tile_m=m,
+                tile_n=n,
+                cluster_m=cm,
+                cluster_n=cn,
+                swap_ab=sab,
+                max_swizzle_size=8,
+                clc=clc,
             )
-            for (m, n, (cm, cn)), sab in itertools.product(tile_mn_cluster_vals, swap_ab_vals)
+            for (m, n, (cm, cn)), sab, clc in itertools.product(
+                tile_mn_cluster_vals, swap_ab_vals, use_clc_vals
+            )
         ]

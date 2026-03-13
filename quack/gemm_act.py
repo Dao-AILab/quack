@@ -466,6 +466,7 @@ def _compile_gemm_act(
     colvec_ndim,
     varlen_m,
     gather_A,
+    use_clc_persistence,
     device_capacity,
     gemm_cls_name,
 ):
@@ -534,6 +535,7 @@ def _compile_gemm_act(
         colvec_ndim,
         varlen_m,
         gather_A,
+        use_clc_persistence,
         device_capacity,
     )
     return cached_compile(
@@ -546,6 +548,7 @@ def _compile_gemm_act(
             pingpong,
             persistent,
             gather_A,
+            use_clc_persistence,
             device_capacity,
             mA,
             mB,
@@ -577,6 +580,7 @@ def gemm_act(
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    use_clc_persistence: bool = False,
 ) -> None:
     if activation in gate_fn_map:
         gemm_cls_name = "gated"
@@ -640,6 +644,7 @@ def gemm_act(
         colvec_ndim,
         varlen_m,
         gather_A,
+        use_clc_persistence,
         device_capacity,
         gemm_cls_name,
     )

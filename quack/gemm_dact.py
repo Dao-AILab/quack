@@ -431,6 +431,7 @@ def _compile_gemm_dact(
     colvec_reduce_ndim,
     varlen_m,
     gather_A,
+    use_clc_persistence,
     device_capacity,
     gemm_cls_name,
 ):
@@ -524,6 +525,7 @@ def _compile_gemm_dact(
         colvec_reduce_ndim,
         varlen_m,
         gather_A,
+        use_clc_persistence,
         device_capacity,
     )
     return cached_compile(
@@ -536,6 +538,7 @@ def _compile_gemm_dact(
             pingpong,
             persistent,
             gather_A,
+            use_clc_persistence,
             device_capacity,
             mA,
             mB,
@@ -569,6 +572,7 @@ def gemm_dact(
     colvec_reduce: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    use_clc_persistence: bool = False,
 ) -> None:
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
@@ -648,6 +652,7 @@ def gemm_dact(
         colvec_reduce.ndim if colvec_reduce is not None else 0,
         varlen_m,
         gather_A,
+        use_clc_persistence,
         device_capacity,
         gemm_cls_name,
     )
