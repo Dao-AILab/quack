@@ -20,6 +20,7 @@ dev = [
     "pytest",
     "pytest-xdist",
     "ruff",
+    "pytest",
 ]
 
 [tool.setuptools.packages.find]
