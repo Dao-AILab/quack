@@ -39,7 +39,6 @@ from quack.gemm_tvm_ffi_utils import (
 from quack.layout_utils import permute_gated_Cregs_b16
 import quack.sm90_utils as sm90_utils
 import quack.copy_utils as copy_utils
-import quack.utils as utils
 from quack.activation import act_fn_map, gate_fn_map
 from quack.rounding import RoundingMode
 
@@ -336,7 +335,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
         """Convert postact from acc_dtype to postact_dtype. Override for custom postprocessing."""
         if const_expr(
             self.rounding_mode == RoundingMode.RS
-            and self.acc_dtype == cutlass.Float32
+            and tRS_rPostAct.element_type == cutlass.Float32
             and self.postact_dtype == cutlass.BFloat16
         ):
             from quack.rounding import convert_f32_to_bf16_sr
