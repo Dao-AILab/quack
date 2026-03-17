@@ -51,8 +51,6 @@ Activation = Literal[
     "glu",
 ]
 
-default_device_capacity = get_device_capacity(torch.device("cuda"))
-
 
 def default_config(device):
     if get_device_capacity(device)[0] != 10:
@@ -63,20 +61,22 @@ def default_config(device):
 
 def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
+    device_capacity = get_device_capacity(kwargs["A"].device)[0]
+    configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
     if varlen_m or gather_A:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
-        if get_device_capacity(kwargs["A"].device)[0] == 9:
+        if device_capacity == 9:
             # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
     return configs
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -160,7 +160,7 @@ def gemm_tuned(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -227,7 +227,7 @@ def gemm_act_tuned(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -1056,7 +1056,7 @@ def gemm_symmetric(
 
 @autotune(
     configs=[
-        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "gated")
+        AutotuneConfig(config=c) for c in get_all_configs("gated")
     ],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
@@ -1133,7 +1133,7 @@ def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
 
 @autotune(
     configs=[
-        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "dgated")
+        AutotuneConfig(config=c) for c in get_all_configs("dgated")
     ],
     key=["activation", "colvec_reduce", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_dgated_configs},
