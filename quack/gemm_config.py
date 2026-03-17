@@ -79,7 +79,9 @@ def _get_sm100_configs(
     swap_ab_vals = [False, True]
     if epilogue in ["lse", "gated"]:
         swap_ab_vals = [False]
-    GemmConfigCls = partial(GemmConfig, pingpong=False, device_capacity=10)  # There's no pingpong on Sm100
+    GemmConfigCls = partial(
+        GemmConfig, pingpong=False, device_capacity=10
+    )  # There's no pingpong on Sm100
     return [
         GemmConfigCls(
             tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=8

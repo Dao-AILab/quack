@@ -1055,9 +1055,7 @@ def gemm_symmetric(
 
 
 @autotune(
-    configs=[
-        AutotuneConfig(config=c) for c in get_all_configs("gated")
-    ],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs("gated")],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -1132,9 +1130,7 @@ def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
 
 
 @autotune(
-    configs=[
-        AutotuneConfig(config=c) for c in get_all_configs("dgated")
-    ],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs("dgated")],
     key=["activation", "colvec_reduce", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_dgated_configs},
 )
