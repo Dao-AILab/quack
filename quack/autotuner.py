@@ -451,11 +451,11 @@ class AutotuneConfig:
         return ", ".join(res)
 
     def __hash__(self):
-        return hash(tuple(*self.all_kwargs().items()))
+        return hash(tuple(self.all_kwargs().items()))
 
     def __eq__(self, other):
-        self_tuple = tuple(*self.all_kwargs().items())
-        other_tuple = tuple(*other.all_kwargs().items())
+        self_tuple = tuple(self.all_kwargs().items())
+        other_tuple = tuple(other.all_kwargs().items())
         return self_tuple == other_tuple
 
 
