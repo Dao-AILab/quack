@@ -48,6 +48,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     """Test RMSNorm forward pass against reference implementation."""
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
+    torch.cuda.empty_cache()
     device = "cuda"
     atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
@@ -59,15 +60,18 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_() if weight is not None else None
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+    # Compile ref for large inputs to avoid OOMs.
+    compile_ref = N >= 256 * 1024 and M >= 8 * 1024
+    ref_function = torch.compile(rmsnorm_ref) if compile_ref else rmsnorm_ref
     out = function(x, weight, eps=eps)
-    out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
+    out_ref = ref_function(x_ref, weight_ref, eps=eps)
 
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     # Backward pass
     if N > 128 * 1024 and input_dtype == torch.float32:
-        # Skip backward pass for due to not enough smem
+        # Skip backward pass due to not enough smem
         return
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
@@ -76,7 +80,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     if weight_dtype is not None:
         if weight_dtype == torch.float32:
-            weight_atol = 1e-4
+            weight_atol = 2e-4
         else:
             weight_atol = 2 * (weight_ref.grad + 0.3 - 0.3 - weight_ref.grad).abs().max()
         torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)

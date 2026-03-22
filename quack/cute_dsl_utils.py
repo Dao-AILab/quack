@@ -4,6 +4,9 @@ from typing import Tuple, get_origin
 from functools import lru_cache
 from dataclasses import dataclass, fields
 
+import os
+import re
+
 import torch
 
 try:
@@ -14,7 +17,6 @@ except ImportError:
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float16, BFloat16, Float32
-from cutlass.base_dsl.typing import JitArgument
 from cutlass.base_dsl.tvm_ffi_builder import spec
 from cutlass.cutlass_dsl import NumericMeta
 
@@ -65,8 +67,25 @@ def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
 
 
+def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
+    """Parse arch string (e.g. 'sm_90', 'sm90', '90', 'sm_100a') to (major, minor) tuple."""
+    match = re.match(r"^(?:sm_?)?(\d+)(\d)([af]?)$", arch_str.strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Invalid QUACK_ARCH format: {arch_str!r} (expected e.g. '90', 'sm_90')")
+    major, minor, _ = match.groups()
+    return int(major), int(minor)
+
+
 @lru_cache
 def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
+    """Return (major, minor) device capability.
+
+    Override with QUACK_ARCH (e.g. 'sm_90' or '90') for CPU-only compilation
+    without a GPU present.
+    """
+    arch_override = os.environ.get("QUACK_ARCH")
+    if arch_override is not None:
+        return _parse_arch_str(arch_override)
     return torch.cuda.get_device_capability(device)
 
 
@@ -136,30 +155,5 @@ class ParamsBase:
             values += obj_values
             self._values_pos.append(len(obj_values))
         return values
-
-    __new_from_mlir_values__ = _new_from_mlir_values
-
-
-@dataclass
-class ArgumentsBase(JitArgument):
-    def __c_pointers__(self):
-        _, non_constexpr_fields = _partition_fields(self)
-        c_ptrs = []
-        for obj in non_constexpr_fields.values():
-            if hasattr(obj, "__c_pointers__"):
-                c_ptrs.extend(obj.__c_pointers__())
-        return c_ptrs
-
-    def __get_mlir_types__(self):
-        _, non_constexpr_fields = _partition_fields(self)
-        types, self._values_pos = [], []
-        for obj in non_constexpr_fields.values():
-            if hasattr(obj, "__get_mlir_types__"):
-                obj_types = obj.__get_mlir_types__()
-                types.extend(obj_types)
-                self._values_pos.append(len(obj_types))
-            else:
-                self._values_pos.append(0)
-        return types
 
     __new_from_mlir_values__ = _new_from_mlir_values

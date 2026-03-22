@@ -6,8 +6,8 @@ CuTe DSL kernels compiled with `--enable-tvm-ffi` use a two-phase approach:
 1. **Compile time**: Build MLIR from fake (symbolic) tensors, lower to PTX
 2. **Call time**: Pass real tensors; TVM-FFI extracts pointers and validates shapes
 
-The compiled function is cached (filesystem + `lru_cache`) so recompilation only
-happens for new dtype/major/tile/activation combinations.
+The compiled function is cached via `@jit_cache` (in-memory dict + filesystem `.o` cache)
+so recompilation only happens for new dtype/major/tile/activation combinations.
 
 ## Symbolic Shapes and `sym_int`
 
@@ -138,20 +138,19 @@ class ParamsBase:
 gemm_act(A, B, D, ...)          # user-facing API
   │
   ├─ Extract dtypes, majors from real tensors
-  ├─ _compile_gemm_act(...)     # @lru_cache — in-memory cache
+  ├─ _compile_gemm_act(...)     # @jit_cache — in-memory + disk cache
   │    ├─ make_fake_gemm_tensors(...)  # symbolic tensors with shared sym_ints
   │    ├─ Build fake epilogue args, scheduler args, varlen args
-  │    └─ cached_compile(key, lambda: compile_gemm_kernel(...))
-  │         └─ compile_and_cache(key, fn)  # filesystem cache
-  │              └─ cute.compile(gemm_obj, *fake_args, options="--enable-tvm-ffi")
+  │    └─ compile_gemm_kernel(...)
+  │         └─ cute.compile(gemm_obj, *fake_args, options="--enable-tvm-ffi")
   │
   ├─ Build runtime epilogue args (real tensors, None for Constexpr fields)
   ├─ Build runtime scheduler/varlen args
   └─ compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
 ```
 
-The cache key includes all parameters that affect codegen: dtypes, majors, tile
-sizes, cluster dims, activation, etc. Same key → same compiled kernel.
+The `@jit_cache` key is derived from the function's args (dtypes, majors, tile sizes,
+cluster dims, activation, etc.). Same args → same compiled kernel.
 
 ## Key Files
 
@@ -160,4 +159,4 @@ sizes, cluster dims, activation, etc. Same key → same compiled kernel.
 | `compile_utils.py` | `make_fake_tensor` — creates symbolic tensors |
 | `gemm_tvm_ffi_utils.py` | `make_fake_gemm_tensors`, `compile_gemm_kernel`, varlen/scheduler helpers |
 | `cute_dsl_utils.py` | `@mlir_namedtuple`, `ParamsBase`, Constexpr converter patch |
-| `cache_utils.py` | Filesystem caching of compiled kernels |
+| `cache_utils.py` | `@jit_cache` decorator — in-memory + filesystem `.o` caching |

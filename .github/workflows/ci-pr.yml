@@ -1,8 +1,14 @@
-name: CI
+name: CI (PR)
 
 on:
-  push:
+  pull_request:
     branches: [main]
+  pull_request_target:
+    branches: [main]
+
+concurrency:
+  group: ci-pr-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -17,6 +23,10 @@ jobs:
         run: ruff format --check quack/ tests/
 
   test:
+    if: >
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'pull_request_target'
+    environment: gpu-ci
     strategy:
       fail-fast: false
       matrix:
@@ -26,4 +36,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/gpu-test

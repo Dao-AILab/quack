@@ -11,7 +11,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 import quack.utils as utils
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase, mlir_namedtuple
+from quack.cute_dsl_utils import mlir_namedtuple
 
 
 class RasterOrderOption(IntEnum):
@@ -61,7 +61,7 @@ class TileSchedulerOptions(NamedTuple):
 
 
 @dataclass
-class TileSchedulerArguments(ArgumentsBase):
+class TileSchedulerArguments:
     problem_shape_ntile_mnl: cute.Shape
     raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
@@ -73,7 +73,7 @@ class TileSchedulerArguments(ArgumentsBase):
 
 class TileScheduler:
     @dataclass
-    class Params(ParamsBase):
+    class Params:
         problem_shape_ncluster_mnl: cute.Shape
         raster_order: RasterOrder
         num_clusters_per_problem_fdd: FastDivmod
@@ -557,7 +557,7 @@ class TriangularTileScheduler(TileScheduler):
     """We assume the tile size per cluster is square (e.g., 128 x 256 per CTA, with cluster 2 x 1)"""
 
     @dataclass
-    class Params(ParamsBase):
+    class Params:
         problem_shape_ncluster_mnl: cute.Shape
         num_clusters_per_problem_fdd: FastDivmod
         group_size_inv_f32: Float32
@@ -757,7 +757,7 @@ class TriangularTileScheduler(TileScheduler):
 
 
 @dataclass
-class VarlenMTileSchedulerArguments(ParamsBase):
+class VarlenMTileSchedulerArguments:
     problem_shape_ntile_mnl: cute.Shape
     total_m: Int32
     cu_seqlens_m: cute.Tensor
@@ -771,7 +771,7 @@ class VarlenMTileSchedulerArguments(ParamsBase):
 
 class VarlenMTileScheduler(TileScheduler):
     @dataclass
-    class Params(ParamsBase):
+    class Params:
         problem_shape_ncluster_mnl: cute.Shape
         total_m: Int32
         cu_seqlens_m: cute.Tensor

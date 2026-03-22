@@ -27,7 +27,6 @@ from cutlass.utils import LayoutEnum
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from quack.pipeline import PipelineTmaCpAsyncUmma
-from quack.cute_dsl_utils import ParamsBase
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
@@ -743,7 +742,7 @@ class GemmSm100(GemmSm90):
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
-        epilogue_params: ParamsBase,
+        epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: Optional[cute.Layout],
@@ -755,7 +754,7 @@ class GemmSm100(GemmSm90):
         epi_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
         epi_c_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
-        tile_sched_params: ParamsBase,
+        tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
         """

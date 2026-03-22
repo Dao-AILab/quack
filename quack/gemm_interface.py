@@ -14,6 +14,10 @@ from quack.gemm import gemm as gemm_sm90_sm100
 from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
 from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
 from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
+from quack.gemm_sq_reduce import gemm_sq_reduce as gemm_sq_reduce_sm90_sm100
+from quack.gemm_norm_act import gemm_norm_act_fn as gemm_norm_act_sm90_sm100
+from quack.rms_final_reduce import rms_final_reduce
+from quack.rounding import RoundingMode
 
 
 # Dictionary mapping activation names to PyTorch functions
@@ -50,8 +54,6 @@ Activation = Literal[
     "glu",
 ]
 
-default_device_capacity = get_device_capacity(torch.device("cuda"))
-
 
 def default_config(device):
     if get_device_capacity(device)[0] != 10:
@@ -64,15 +66,30 @@ def default_config(device):
         )
 
 
+def nvmmh_config(A, B, device_capacity):
+    """Use nvMatmulHeuristics to pick a config for pure GEMM (no varlen/gather/epilogue).
+
+    Returns None if unavailable, caller should fall back to default_config.
+    """
+    try:
+        from quack.nvmmh_heuristic import nvmmh_default_config
+
+        return nvmmh_default_config(A, B, device_capacity)
+    except Exception:
+        return None
+
+
 def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
+    device_capacity = get_device_capacity(kwargs["A"].device)[0]
+    configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
     if varlen_m or gather_A:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
-        if get_device_capacity(kwargs["A"].device)[0] == 9:
+        if device_capacity == 9:
             # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
             configs = [conf for conf in configs if not conf.kwargs["config"].clc]
@@ -80,7 +97,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -100,9 +117,24 @@ def gemm_tuned(
     add_to_output: bool = False,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int | Tensor = 0,
 ) -> None:
     if config is None:
-        config = default_config(A.device)
+        # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue)
+        is_pure_gemm = (
+            cu_seqlens_m is None
+            and cu_seqlens_k is None
+            and A_idx is None
+            and C is None
+            and bias is None
+            and not add_to_output
+        )
+        if is_pure_gemm:
+            device_capacity = get_device_capacity(A.device)[0]
+            config = nvmmh_config(A, B, device_capacity)
+        if config is None:
+            config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
@@ -157,11 +189,13 @@ def gemm_tuned(
         batch_idx_permute=batch_idx_permute,
         use_clc_persistence=config.clc,
         add_to_output=add_to_output,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed,
     )
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -229,7 +263,7 @@ def gemm_act_tuned(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0])],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -304,6 +338,8 @@ def gemm(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int | Tensor = 0,
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     if out is None:
@@ -324,6 +360,8 @@ def gemm(
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
+    sr_seed_tensor = sr_seed if isinstance(sr_seed, Tensor) else None
+    sr_seed_int = sr_seed if isinstance(sr_seed, int) else 0
     gemm_out(
         A,
         B,
@@ -337,6 +375,9 @@ def gemm(
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed_int,
+        sr_seed_tensor=sr_seed_tensor,
     )
     return out
 
@@ -363,10 +404,14 @@ def gemm_out(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int = 0,
+    sr_seed_tensor: Optional[Tensor] = None,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = alpha_tensor if alpha_tensor is not None else alpha
+    sr_seed_arg = sr_seed_tensor if sr_seed_tensor is not None else sr_seed
     fn(
         A,
         B,
@@ -379,6 +424,8 @@ def gemm_out(
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed_arg,
     )
 
 
@@ -1045,9 +1092,7 @@ def gemm_symmetric(
 
 
 @autotune(
-    configs=[
-        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "gated")
-    ],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs("gated")],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -1122,9 +1167,7 @@ def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
 
 
 @autotune(
-    configs=[
-        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "dgated")
-    ],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs("dgated")],
     key=["activation", "colvec_reduce", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_dgated_configs},
 )
@@ -1323,7 +1366,7 @@ def _precompile_default_config(autotuned_fn, *args, **kwargs):
     """Compile the default config in COMPILE_ONLY mode.
 
     Checks COMPILE_ONLY flag and SymInt guard, then calls the unwrapped function with
-    config=None (which selects the default config), triggering compilation (exports .so)
+    config=None (which selects the default config), triggering compilation (exports .o)
     without benchmarking or kernel launch.
     Tests use tuned=False which also selects the default config, so this is sufficient.
     """
@@ -1456,6 +1499,475 @@ def gemm_symmetric_out_fake(
         )
     except Exception:
         pass
+
+
+## ── gemm_rms ────────────────────────────────────────────────────────────────
+
+
+def _prune_gemm_rms_configs(configs, named_args: dict, **kwargs):
+    """ColVecReduce requires no swap_ab."""
+    configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
+    return prune_invalid_gemm_configs(configs, named_args | kwargs)
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    key=["dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": _prune_gemm_rms_configs},
+)
+def _gemm_rms_tuned(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    out: Tensor,  # (M, N) or (L, M, N)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    config: Optional[GemmConfig] = None,
+) -> Tensor:
+    if config is None:
+        config = default_config(A.device)
+    og_ndim_2 = A.ndim == 2
+    N = B.shape[-1]
+    if A.ndim == 2:
+        A = A.unsqueeze(0)
+    B = B.mT
+    if B.ndim == 2:
+        B = B.unsqueeze(0)
+    if out.ndim == 2:
+        out = out.unsqueeze(0)
+    if C is not None and C.ndim == 2:
+        C = C.unsqueeze(0)
+    if norm_weight is not None and norm_weight.ndim == 1:
+        norm_weight = norm_weight.unsqueeze(0)  # (L, N)
+    # Allocate partial reduction buffer
+    tile_n = config.tile_n
+    n_tiles = (N + tile_n - 1) // tile_n
+    colvec_reduce = torch.empty(
+        (A.shape[0], A.shape[1], n_tiles), dtype=torch.float32, device=A.device
+    )
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
+    gemm_sq_reduce_sm90_sm100(
+        A,
+        B,
+        out,
+        C,
+        colvec_reduce,
+        tile_count_semaphore,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+        persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
+        rowvec=norm_weight,
+    )
+    # Final reduction: rstd = rsqrt(sum(partials) / N + eps)
+    scale = 1.0 / N
+    flat_reduce = colvec_reduce.reshape(-1, n_tiles)
+    rstd_flat = rms_final_reduce(flat_reduce, scale=scale, eps=eps)
+    rstd = rstd_flat.reshape(A.shape[:-1])
+    if og_ndim_2:
+        rstd = rstd.squeeze(0)
+    return rstd
+
+
+@torch.library.custom_op(
+    "quack::gemm_rms_out",
+    mutates_args=("out",),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, Tensor? norm_weight=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
+)
+def _gemm_rms_out(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor] = None,
+    norm_weight: Optional[Tensor] = None,
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tensor:
+    """GEMM + RMS + optional rowvec scaling.
+
+    D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    """
+    fn = _gemm_rms_tuned if tuned else partial(_gemm_rms_tuned.fn, config=None)
+    return fn(
+        A,
+        B,
+        out,
+        C=C,
+        norm_weight=norm_weight,
+        eps=eps,
+        dynamic_scheduler=dynamic_scheduler,
+    )
+
+
+@torch.library.register_fake("quack::gemm_rms_out")
+def _gemm_rms_out_fake(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    C: Optional[Tensor] = None,
+    norm_weight: Optional[Tensor] = None,
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tensor:
+    _precompile_default_config(
+        _gemm_rms_tuned,
+        A,
+        B,
+        out,
+        C=C,
+        norm_weight=norm_weight,
+        eps=eps,
+        dynamic_scheduler=dynamic_scheduler,
+    )
+    rstd_shape = A.shape[:-1]
+    return torch.empty(rstd_shape, dtype=torch.float32, device=A.device)
+
+
+def gemm_rms_ref(
+    A: Tensor,
+    B: Tensor,
+    C: Optional[Tensor] = None,
+    norm_weight: Optional[Tensor] = None,
+    eps: float = 1e-6,
+) -> Tuple[Tensor, Tensor]:
+    """Reference: D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D = D_raw * norm_weight."""
+    fn = torch.bmm if A.ndim == 3 else torch.mm
+    D = fn(A, B)
+    if C is not None:
+        D = D + C
+    rstd = torch.rsqrt(D.float().square().mean(dim=-1) + eps)
+    if norm_weight is not None:
+        D = D * norm_weight
+    return D, rstd
+
+
+def gemm_rms(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
+    out: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    out_dtype: Optional[torch.dtype] = None,
+    eps: float = 1e-6,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tuple[Tensor, Tensor]:
+    """GEMM + RMS statistics + optional rowvec scaling.
+
+    D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    Returns (D_out, rstd).
+    """
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    N = B.shape[-1]
+    if out is None:
+        out_shape = (*A.shape[:-1], N)
+        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    rstd = _gemm_rms_out(
+        A,
+        B,
+        out,
+        C=C,
+        norm_weight=norm_weight,
+        eps=eps,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
+    )
+    return out, rstd
+
+
+## ── gemm_norm_act ─────────────────────────────────────────────────────────────
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    key=["activation", "dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
+)
+def gemm_norm_act_tuned(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    preact_out: Optional[Tensor],  # (M, N) or (L, M, N) — None if not storing preact
+    postact_out: Tensor,  # (M, N) or (L, M, N)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    rstd: Optional[Tensor] = None,  # (M,) or (L, M)
+    activation: ActActivation = None,
+    dynamic_scheduler: bool = False,
+    config: Optional[GemmConfig] = None,
+) -> None:
+    if config is None:
+        config = default_config(A.device)
+    if A.ndim == 2:
+        A = A.unsqueeze(0)
+    B = B.mT
+    if B.ndim == 2:
+        B = B.unsqueeze(0)
+    if C is not None and C.ndim == 2:
+        C = C.unsqueeze(0)
+    if preact_out is not None and preact_out.ndim == 2:
+        D = preact_out.unsqueeze(0)
+    else:
+        D = preact_out
+    if postact_out.ndim == 2:
+        PostAct = postact_out.unsqueeze(0)
+    else:
+        PostAct = postact_out
+    if rstd is not None and rstd.ndim == 1:
+        rstd = rstd.unsqueeze(0)  # (L, M)
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
+    gemm_norm_act_sm90_sm100(
+        A if not config.swap_ab else B,
+        B if not config.swap_ab else A,
+        (D if not config.swap_ab else D.mT) if D is not None else None,
+        (C if not config.swap_ab else C.mT) if C is not None else None,
+        PostAct if not config.swap_ab else PostAct.mT,
+        tile_count_semaphore,
+        activation,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+        persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
+        colvec=rstd if not config.swap_ab else None,
+        rowvec=rstd if config.swap_ab else None,
+    )
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_configs("gated")],
+    key=["activation", "dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
+)
+def gemm_norm_gated_tuned(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    preact_out: Optional[Tensor],  # (M, N) or (L, M, N)
+    postact_out: Tensor,  # (M, N//2) or (L, M, N//2)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
+    rstd: Optional[Tensor] = None,  # (M,) or (L, M)
+    activation: GatedActivation = "swiglu",
+    dynamic_scheduler: bool = False,
+    config: Optional[GemmConfig] = None,
+) -> None:
+    if config is None:
+        config = default_config(A.device)
+    if A.ndim == 2:
+        A = A.unsqueeze(0)
+    B = B.mT
+    if B.ndim == 2:
+        B = B.unsqueeze(0)
+    if C is not None and C.ndim == 2:
+        C = C.unsqueeze(0)
+    if preact_out is not None and preact_out.ndim == 2:
+        D = preact_out.unsqueeze(0)
+    else:
+        D = preact_out
+    if postact_out.ndim == 2:
+        PostAct = postact_out.unsqueeze(0)
+    else:
+        PostAct = postact_out
+    if rstd is not None and rstd.ndim == 1:
+        rstd = rstd.unsqueeze(0)  # (L, M)
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
+    gemm_norm_act_sm90_sm100(
+        A if not config.swap_ab else B,
+        B if not config.swap_ab else A,
+        (D if not config.swap_ab else D.mT) if D is not None else None,
+        (C if not config.swap_ab else C.mT) if C is not None else None,
+        PostAct if not config.swap_ab else PostAct.mT,
+        tile_count_semaphore,
+        activation,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+        persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
+        colvec=rstd if not config.swap_ab else None,
+        rowvec=rstd if config.swap_ab else None,
+    )
+
+
+@torch.library.custom_op(
+    "quack::gemm_norm_act_out",
+    mutates_args=("preact_out", "postact_out"),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str? activation=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+)
+def gemm_norm_act_out(
+    A: Tensor,
+    B: Tensor,
+    preact_out: Optional[Tensor],
+    postact_out: Tensor,
+    C: Optional[Tensor] = None,
+    rstd: Optional[Tensor] = None,
+    activation: ActActivation = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> None:
+    fn = gemm_norm_act_tuned if tuned else partial(gemm_norm_act_tuned.fn, config=None)
+    fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
+
+
+@torch.library.register_fake("quack::gemm_norm_act_out")
+def _gemm_norm_act_out_fake(
+    A,
+    B,
+    preact_out,
+    postact_out,
+    C=None,
+    rstd=None,
+    activation=None,
+    dynamic_scheduler=False,
+    tuned=True,
+) -> None:
+    pass
+
+
+@torch.library.custom_op(
+    "quack::gemm_norm_gated_out",
+    mutates_args=("preact_out", "postact_out"),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str activation='swiglu', bool dynamic_scheduler=False, bool tuned=True) -> ()",
+)
+def gemm_norm_gated_out(
+    A: Tensor,
+    B: Tensor,
+    preact_out: Optional[Tensor],
+    postact_out: Tensor,
+    C: Optional[Tensor] = None,
+    rstd: Optional[Tensor] = None,
+    activation: GatedActivation = "swiglu",
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> None:
+    fn = gemm_norm_gated_tuned if tuned else partial(gemm_norm_gated_tuned.fn, config=None)
+    fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
+
+
+@torch.library.register_fake("quack::gemm_norm_gated_out")
+def _gemm_norm_gated_out_fake(
+    A,
+    B,
+    preact_out,
+    postact_out,
+    C=None,
+    rstd=None,
+    activation="swiglu",
+    dynamic_scheduler=False,
+    tuned=True,
+) -> None:
+    pass
+
+
+def gemm_norm_act(
+    A: Tensor,  # (M, K) or (L, M, K)
+    B: Tensor,  # (K, N) or (L, K, N)
+    rstd: Optional[Tensor] = None,  # (M,) or (L, M)
+    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) — residual
+    activation: Activation = None,
+    preact_out: Optional[Tensor] = None,
+    postact_out: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+    store_preact: bool = False,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """GEMM + normalize + activation: PostAct = act((A @ B + C) * rstd).
+
+    rstd is a column vector (M,).
+    Returns (preact, postact) where preact is the normalized value before activation.
+    """
+    is_gated = activation in gated_to_pytorch_fn_map
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
+    if A.ndim == 2:
+        out_shape = (A.shape[0], B.shape[-1])
+    else:
+        out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
+    postact_shape = (*out_shape[:-1], out_shape[-1] // 2) if is_gated else out_shape
+    if preact_out is None and store_preact:
+        preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    if postact_out is None:
+        postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
+    if is_gated:
+        gemm_norm_gated_out(
+            A,
+            B,
+            preact_out,
+            postact_out,
+            C,
+            rstd,
+            activation,
+            dynamic_scheduler,
+            tuned,
+        )
+    else:
+        gemm_norm_act_out(
+            A,
+            B,
+            preact_out,
+            postact_out,
+            C,
+            rstd,
+            activation,
+            dynamic_scheduler,
+            tuned,
+        )
+    return preact_out, postact_out
+
+
+gemm_norm_gated = gemm_norm_act
+
+
+def gemm_norm_act_ref(
+    A: Tensor,
+    B: Tensor,
+    rstd: Optional[Tensor] = None,  # (M,) or (L, M)
+    C: Optional[Tensor] = None,
+    activation: Activation = None,
+    store_preact: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """Reference: preact = (A @ B + C) * rstd, postact = act(preact)."""
+    is_gated = activation in gated_to_pytorch_fn_map
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
+    fn = torch.bmm if A.ndim == 3 else torch.mm
+    D = fn(A, B)
+    if C is not None:
+        D = D + C
+    if rstd is not None:
+        D = D * rstd.unsqueeze(-1)
+    preact = D.to(out_dtype) if store_preact else None
+    _act_map = {**act_to_pytorch_fn_map, "silu": F.silu}
+    if is_gated:
+        gate = D[..., ::2]
+        up = D[..., 1::2]
+        postact = gated_to_pytorch_fn_map[activation](gate, up).to(postact_dtype)
+    else:
+        postact = _act_map[activation](D).to(postact_dtype)
+    return preact, postact
+
+
+gemm_norm_gated_ref = gemm_norm_act_ref
 
 
 # TODO: this is not quite right, do we need to register gemm_add not gemm_add_out?

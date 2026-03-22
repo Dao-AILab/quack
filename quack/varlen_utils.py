@@ -8,7 +8,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr
 
 from quack import copy_utils
-from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
+from quack.cute_dsl_utils import mlir_namedtuple
 
 
 # Grouping arguments together that should be passed to __call__
@@ -21,7 +21,7 @@ class VarlenArguments(NamedTuple):
 
 class VarlenManager:
     @dataclass
-    class Params(ParamsBase):
+    class Params:
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None

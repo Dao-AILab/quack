@@ -19,7 +19,9 @@ from cutlass import Int32, Float32, Float16, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 
-from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
+from dataclasses import dataclass
+
+from quack.cute_dsl_utils import ParamsBase
 from quack.tile_scheduler import (
     TileSchedulerOptions,
     TileSchedulerArguments,
@@ -34,6 +36,7 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
 import quack.copy_utils as copy_utils
 import quack.sm90_utils as quack_sm90_utils
+from quack.rounding import RoundingMode
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -124,7 +127,10 @@ class GemmSm90:
 
     arch = 90
 
-    EpilogueArguments = ArgumentsBase
+    @dataclass
+    class EpilogueArguments:
+        pass
+
     EpilogueParams = ParamsBase
 
     def __init__(
@@ -550,14 +556,14 @@ class GemmSm90:
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
-        epilogue_params: ParamsBase,
+        epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_mnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
-        tile_sched_params: ParamsBase,
+        tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
         """
@@ -1181,6 +1187,18 @@ class GemmSm90:
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
         has_D = const_expr(copy_D is not None)
+
+        # Setup postact output (returns None for default epilogue, context tuple for Act)
+        postact_ctx = self.epi_setup_postact(
+            params,
+            epi_smem_tensors,
+            tiled_copy_r2s,
+            tiled_copy_t2r,
+            tile_coord_mnkl,
+            varlen_manager,
+            tidx,
+        )
+
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
@@ -1232,14 +1250,53 @@ class GemmSm90:
                     copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
-            tRS_rEpi = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            # Convert and store postact if this epilogue produces one
+            if const_expr(postact_ctx is not None):
+                tRS_rPostAct_out = self.epi_convert_postact(
+                    tRS_rPostAct,
+                    epi_loop_tensors["sr_seed"],
+                    tidx,
+                    tile_coord_mnkl,
+                    num_prev_subtiles,
+                    epi_idx,
+                )
             if is_tma_warp:
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                if const_expr(
+                    self.rounding_mode == RoundingMode.RS
+                    and self.acc_dtype == cutlass.Float32
+                    and self.d_dtype == cutlass.BFloat16
+                ):
+                    seed = epi_loop_tensors["sr_seed"] + (
+                        tile_coord_mnkl[0] * 65537
+                        + tile_coord_mnkl[1] * 257
+                        + tile_coord_mnkl[3] * 17
+                        + (num_prev_subtiles + epi_idx) * 7
+                    )
+                    copy_utils.sr_cvt_copy(
+                        tiled_copy_r2s,
+                        tRS_rD,
+                        tRS_sD[None, None, None, epi_buffer],
+                        seed,
+                        tidx,
+                    )
+                else:
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                    )
+            # Copy postact from registers to shared memory
+            if const_expr(postact_ctx is not None):
+                tiled_copy_postact_r2s, tRS_sPostAct, copy_postact = postact_ctx
+                cute.copy(
+                    tiled_copy_postact_r2s,
+                    tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
+                    tRS_sPostAct[None, None, None, epi_buffer],
+                )
             # Fence and barrier to make sure shared memory store is visible to TMA store
             cute.arch.fence_view_async_shared()
             epilogue_barrier.arrive_and_wait()
@@ -1247,6 +1304,8 @@ class GemmSm90:
             if is_tma_warp:
                 if const_expr(has_D):
                     copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
+                if const_expr(postact_ctx is not None):
+                    copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
                 epi_store_pipeline.producer_commit()
 
         self.epi_end(

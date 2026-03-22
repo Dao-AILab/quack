@@ -13,6 +13,9 @@ pip install 'quack-kernels[cu13]' --extra-index-url https://download.pytorch.org
 
 # Or using uv (faster):
 uv pip install 'quack-kernels[cu13]'
+
+# Optional: install NVIDIA matmul heuristics for better untuned GEMM configs
+pip install 'quack-kernels[heuristics]'
 ```
 
 ## Requirements

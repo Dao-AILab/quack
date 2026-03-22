@@ -1,0 +1,19 @@
+name: GPU Test
+description: Compile and run tests inside apptainer
+
+runs:
+  using: composite
+  steps:
+    - name: Compile and run tests
+      shell: bash
+      run: |
+        apptainer exec --nv --writable-tmpfs ~/attention_26.03.07.sif bash -c "
+          export PYTHONPATH=\$PWD:\$PYTHONPATH &&
+          export QUACK_CACHE_DIR=\$HOME/.quack_cache &&
+          pytest tests/ --compile-only -n 24 &&
+          FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 40000 {print \$1}' | paste -sd,) &&
+          if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 40GB free memory'; exit 1; fi &&
+          echo \"Running tests on GPUs: \$FREE_GPUS\" &&
+          NUM_GPUS=\$(echo \"\$FREE_GPUS\" | tr ',' '\n' | wc -l) &&
+          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS
+        "

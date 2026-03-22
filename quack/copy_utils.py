@@ -42,6 +42,30 @@ def cvt_copy(
 
 
 @dsl_user_op
+def sr_cvt_copy(
+    tiled_copy: cute.TiledCopy,
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    seed: Int32,
+    tidx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    from quack.rounding import convert_f32_to_bf16_sr
+    from cutlass.cute.tensor import TensorSSA
+
+    src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
+    src_vec = src.load()
+    raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx, loc=loc, ip=ip)
+    src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
+    src = src_cvt
+    cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     dst = cute.make_rmem_tensor_like(src, src.element_type, loc=loc, ip=ip)
     cute.autovec_copy(src, dst, loc=loc, ip=ip)
@@ -346,7 +370,10 @@ def sm90_get_smem_load_op(
 
 
 def get_smem_store_atom(
-    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+    arch: cutlass.Constexpr[int],
+    element_type: Type[cute.Numeric],
+    transpose: bool = False,
+    major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
     if const_expr(arch < 90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -355,14 +382,22 @@ def get_smem_store_atom(
             num_bits_per_copy=(2 if not transpose else 1) * element_type.width,
         )
     else:
+        num_matrices = (
+            4
+            if major_mode_size is None or major_mode_size % 16 == 0
+            else (2 if major_mode_size % 8 == 0 else 1)
+        )
         return cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+            warp.StMatrix8x8x16bOp(transpose=transpose, num_matrices=num_matrices),
             element_type,
         )
 
 
 def get_smem_load_atom(
-    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+    arch: cutlass.Constexpr[int],
+    element_type: Type[cute.Numeric],
+    transpose: bool = False,
+    major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
     if const_expr(arch < 90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -371,8 +406,13 @@ def get_smem_load_atom(
             num_bits_per_copy=(2 if not transpose else 1) * element_type.width,
         )
     else:
+        num_matrices = (
+            4
+            if major_mode_size is None or major_mode_size % 16 == 0
+            else (2 if major_mode_size % 8 == 0 else 1)
+        )
         return cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=transpose, num_matrices=4),
+            warp.LdMatrix8x8x16bOp(transpose=transpose, num_matrices=num_matrices),
             element_type,
         )
 
@@ -384,9 +424,10 @@ def get_smem_store_C(
     arch: int,
     transpose: bool = False,
     position_independent=False,
+    major_mode_size: Optional[int] = None,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
-    copy_atom = get_smem_store_atom(arch, dtype, transpose)
+    copy_atom = get_smem_store_atom(arch, dtype, transpose, major_mode_size=major_mode_size)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):

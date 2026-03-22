@@ -1,5 +1,4 @@
 from typing import Tuple, Optional, Callable
-from functools import lru_cache, partial
 
 from torch import Tensor
 
@@ -7,8 +6,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.cute.runtime import make_ptr
-import cutlass.utils.hopper_helpers as sm90_utils_og
-import cutlass.utils.blackwell_helpers as sm100_utils
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
@@ -23,12 +20,13 @@ from quack.gemm_tvm_ffi_utils import (
     get_dtypes,
     make_scheduler_args,
     make_fake_scheduler_args,
-    cached_compile,
     compile_gemm_kernel,
 )
+from quack.cache_utils import jit_cache
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.varlen_utils import VarlenManager
 import quack.copy_utils as copy_utils
+from quack.rounding import RoundingMode
 
 
 class GemmSymmetricMixin(GemmActMixin):
@@ -66,27 +64,14 @@ class GemmSymmetricMixin(GemmActMixin):
         has_C = const_expr(tRS_rC is not None)
         has_D = const_expr(copy_D is not None)
 
-        tma_atom_postact = params.tma_atom_postact
-        mPostAct_mnl = params.mPostAct_mnl
-        sRowVec, sColVec, sPostAct = epi_smem_tensors
-        get_smem_store_op = (
-            partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
-            if self.arch == 100
-            else sm90_utils_og.sm90_get_smem_store_op
-        )
-        copy_atom_postact_r2s = get_smem_store_op(
-            self.postact_layout, self.postact_dtype, self.acc_dtype
-        )
-        tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
-        tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
-        batch_idx = tile_coord_mnkl[3]
-        copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
-            tma_atom_postact,
-            varlen_manager.offset_batch_epi(mPostAct_mnl, batch_idx),
-            self.cta_tile_shape_postact_mn,
-            params.epi_tile_postact,
-            sPostAct,
+        tiled_copy_postact_r2s, tRS_sPostAct, copy_postact = self.epi_setup_postact(
+            params,
+            epi_smem_tensors,
+            tiled_copy_r2s,
+            tiled_copy_t2r,
             tile_coord_mnkl,
+            varlen_manager,
+            tidx,
         )
 
         # We iterate over epi tiles in the N dimension first before the M dimension
@@ -141,16 +126,45 @@ class GemmSymmetricMixin(GemmActMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            tRS_rPostAct_out = self.epi_convert_postact(
+                tRS_rPostAct,
+                epi_loop_tensors["sr_seed"],
+                tidx,
+                tile_coord_mnkl,
+                num_prev_subtiles,
+                epi_idx,
+            )
             if is_tma_warp:
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                if const_expr(
+                    self.rounding_mode == RoundingMode.RS
+                    and self.acc_dtype == cutlass.Float32
+                    and self.d_dtype == cutlass.BFloat16
+                ):
+                    seed = epi_loop_tensors["sr_seed"] + (
+                        tile_coord_mnkl[0] * 65537
+                        + tile_coord_mnkl[1] * 257
+                        + tile_coord_mnkl[3] * 17
+                        + (num_prev_subtiles + epi_idx) * 7
+                    )
+                    copy_utils.sr_cvt_copy(
+                        tiled_copy_r2s,
+                        tRS_rD,
+                        tRS_sD[None, None, None, epi_buffer],
+                        seed,
+                        tidx,
+                    )
+                else:
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
+                    )
             cute.copy(
                 tiled_copy_postact_r2s,
-                tiled_copy_postact_r2s.retile(tRS_rPostAct),
+                tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
                 tRS_sPostAct[None, None, None, epi_buffer],
             )
             pid_m = tile_coord_mnkl[0]
@@ -190,7 +204,7 @@ class GemmSymmetricSm100(GemmSymmetricMixin, GemmSm100):
     pass
 
 
-@lru_cache(maxsize=None)
+@jit_cache
 def _compile_gemm_symmetric(
     a_dtype,
     b_dtype,
@@ -250,47 +264,22 @@ def _compile_gemm_symmetric(
     )
     scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
     varlen_args = None
-    key = (
-        "gemm_symmetric",
+    return compile_gemm_kernel(
+        GemmCls,
         a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        c_major,
-        postact_dtype,
-        a_major,
-        b_major,
-        d_major,
-        postact_major,
         tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
-        has_semaphore,
-        alpha_mode,
-        beta_mode,
+        False,
         device_capacity,
-    )
-    return cached_compile(
-        key,
-        lambda: compile_gemm_kernel(
-            GemmCls,
-            a_dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            pingpong,
-            persistent,
-            False,
-            use_clc_persistence,
-            device_capacity,
-            mA,
-            mB,
-            mD,
-            mC,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-        ),
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
     )
 
 
@@ -372,6 +361,8 @@ def gemm_symmetric(
         None,  # act_fn is Constexpr, baked in at compile time
         alpha=scalar_arg(alpha, alpha_mode),
         beta=scalar_arg(beta, beta_mode),
+        rounding_mode=None,
+        sr_seed=None,
     )
     scheduler_args = make_scheduler_args(
         max_active_clusters,

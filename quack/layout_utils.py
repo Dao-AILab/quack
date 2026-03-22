@@ -196,10 +196,12 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
     # For back to back gemm, convert layout of acc0 to gemm 1 accept layout.
     # For Sm80, as the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
     # For Sm90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
+    # If N / 8 is odd, we'll convert to ((2, 2, 1), MMA_M, N / 8, MMA_N).
     # TODO: Sm90 FP8
     if const_expr(cute.rank(acc_layout.shape[0]) == 3):  # Sm90
+        div = 2 if const_expr(acc_layout.shape[0][2] % 2 == 0) else 1
         l = cute.logical_divide(
-            acc_layout, ((None, None, 2), None, None)
+            acc_layout, ((None, None, div), None, None)
         )  # ((2, 2, (2, N / 16)), MMA_M, MMA_N)
         rA_mma_view = cute.make_layout(
             (

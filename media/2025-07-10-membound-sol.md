@@ -135,7 +135,7 @@ tXgX = thr_copy_X_async.partition_S(blkX)
 tXsX = thr_copy_X_async.partition_S(sX)
 
 # allocate registers
-tXrX = cute.make_fragment_like(tXgX)
+tXrX = cute.make_rmem_tensor_like(tXgX)
 
 # asynchronously copy inputs from gmem to smem
 cute.copy(copy_atom_load_X_async, tXgX, tXsX)

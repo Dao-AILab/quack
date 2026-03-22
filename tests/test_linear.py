@@ -8,6 +8,7 @@ from quack.linear import linear_func, linear_act_func, act_linear_func, gated_li
 from quack.linear import linear_gated_func
 from quack.mlp import mlp_func
 from quack.gemm_interface import (
+    gemm,
     gemm_add_inplace,
     gemm_dact,
     gemm_gated,
@@ -17,7 +18,17 @@ from quack.gemm_interface import (
     gemm_dact_ref,
     gemm_gated_ref,
     gemm_dgated_ref,
+    gemm_rms,
+    gemm_rms_ref,
+    gemm_norm_act,
+    gemm_norm_act_ref,
 )
+from quack.gemm_config import GemmConfig
+from quack.rounding import RoundingMode
+from quack.rms_final_reduce import rms_final_reduce
+
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -433,3 +444,282 @@ def test_autocast_compile(fn_name):
     out.sum().backward()
     assert x.grad is not None
     assert w.grad is not None
+
+
+# =============================================================================
+# Stochastic Rounding Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("sr_seed", [0, 42])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [512, 1024])
+@pytest.mark.parametrize("k", [256, 768])
+@pytest.mark.parametrize("m", [480, 960])
+def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
+    """Test GEMM with stochastic rounding on SM100+.
+
+    Validates that SR produces results close to RNE (within BF16 tolerance)
+    and that the output has correct shape and dtype.
+    """
+    device = "cuda"
+    cap = torch.cuda.get_device_capability()
+    if cap[0] < 10:
+        pytest.skip("Stochastic rounding requires SM100+ (Blackwell)")
+    torch.random.manual_seed(0)
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype) / math.sqrt(k)
+    out_sr = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=sr_seed)
+    out_rn = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RN)
+    out_ref = torch.mm(A.float(), B.float())
+    assert out_sr.shape == out_rn.shape
+    assert out_sr.dtype == input_dtype
+    # SR should be close to reference; may differ by up to 1 ULP more than RNE
+    # so use a looser multiplier and atol
+    assert (out_sr - out_ref).abs().max() < 3 * (out_rn - out_ref).abs().max() + 5e-3
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_sr_requires_sm100(input_dtype):
+    """Assert that SR raises on SM90."""
+    device = "cuda"
+    cap = torch.cuda.get_device_capability()
+    if cap[0] >= 10:
+        pytest.skip("This test is for SM90 hardware")
+    torch.random.manual_seed(0)
+    A = torch.randn((128, 256), device=device, dtype=input_dtype)
+    B = torch.randn((256, 128), device=device, dtype=input_dtype)
+    with pytest.raises(AssertionError, match="SM100"):
+        gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [512])
+@pytest.mark.parametrize("k", [256])
+@pytest.mark.parametrize("m", [480])
+def test_gemm_sr_different_seeds(m, k, n, input_dtype):
+    """Different SR seeds should produce different results (non-deterministic rounding)."""
+    device = "cuda"
+    cap = torch.cuda.get_device_capability()
+    if cap[0] < 10:
+        pytest.skip("Stochastic rounding requires SM100+ (Blackwell)")
+    torch.random.manual_seed(0)
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    out1 = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=1)
+    out2 = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=2)
+    # Different seeds should give different outputs (with high probability)
+    assert not torch.equal(out1, out2)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("N", [1, 4, 8, 16, 64, 128])
+@pytest.mark.parametrize("M", [1, 37, 960, 1920])
+def test_rms_final_reduce(M, N, input_dtype):
+    """Test rms_final_reduce: rstd[m] = rsqrt(sum_n(x[m,n]) * scale + eps)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    total_cols = 4096  # pretend the GEMM had this many columns
+    scale = 1.0 / total_cols
+    eps = 1e-6
+    x = torch.randn((M, N), device=device, dtype=input_dtype).abs()  # partial sums are non-negative
+    rstd = rms_final_reduce(x, scale=scale, eps=eps)
+    rstd_ref = torch.rsqrt(x.float().sum(dim=-1) * scale + eps)
+    assert (rstd - rstd_ref).abs().max() < 1e-5
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("has_norm_weight", [False, True])
+@pytest.mark.parametrize("has_C", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1504, 2048])
+@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("m", [960, 1920])
+def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, use_compile):
+    """Test GEMM + RMS + optional rowvec scaling.
+
+    D_raw = A @ B (+ C), rstd = rsqrt(mean(D_raw^2) + eps), D_out = D_raw * norm_weight.
+    """
+    device = "cuda"
+    torch.random.manual_seed(0)
+    eps = 1e-6
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    C = torch.randn((m, n), device=device, dtype=input_dtype) if has_C else None
+    norm_weight = torch.randn(n, device=device, dtype=input_dtype) if has_norm_weight else None
+    fn = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
+    D, rstd = fn(A, B, C=C, norm_weight=norm_weight, eps=eps, tuned=False)
+    D_ref, rstd_ref = gemm_rms_ref(
+        A.float(),
+        B.float(),
+        C=C.float() if C is not None else None,
+        norm_weight=norm_weight,
+        eps=eps,
+    )
+    D_pt, rstd_pt = gemm_rms_ref(A, B, C=C, norm_weight=norm_weight, eps=eps)
+    assert (D - D_ref).abs().max() < 2 * (D_pt - D_ref).abs().max() + 1e-5
+    assert (rstd - rstd_ref).abs().max() < 2 * (rstd_pt - rstd_ref).abs().max() + 1e-3
+
+
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("activation", [None, "silu", "relu", "gelu_tanh_approx"])
+@pytest.mark.parametrize("has_C", [False, True])
+@pytest.mark.parametrize("n", [2048])
+@pytest.mark.parametrize("k", [4096])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_ab):
+    from quack.gemm_interface import gemm_norm_act_tuned
+
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m = 1024
+    A = torch.randn(m, k, device=device, dtype=input_dtype)
+    B = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
+    C = torch.randn(m, n, device=device, dtype=input_dtype) if has_C else None
+    rstd = torch.randn(m, device=device, dtype=torch.float32)
+    if not swap_ab:
+        fn = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
+        preact, postact = fn(
+            A,
+            B,
+            rstd=rstd,
+            C=C,
+            activation=activation,
+            store_preact=True,
+            tuned=False,
+        )
+    else:
+        preact = torch.empty(m, n, device=device, dtype=input_dtype)
+        postact = torch.empty(m, n, device=device, dtype=input_dtype)
+        gemm_norm_act_tuned.fn(
+            A,
+            B,
+            preact,
+            postact,
+            C,
+            rstd,
+            activation,
+            False,
+            config=GemmConfig(swap_ab=True),
+        )
+    preact_ref, postact_ref = gemm_norm_act_ref(
+        A.float(),
+        B.float(),
+        rstd=rstd,
+        C=C.float() if C is not None else None,
+        activation=activation,
+        store_preact=True,
+    )
+    preact_pt, postact_pt = gemm_norm_act_ref(
+        A,
+        B,
+        rstd=rstd,
+        C=C,
+        activation=activation,
+        store_preact=True,
+    )
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("activation", ["swiglu", "reglu", "geglu"])
+@pytest.mark.parametrize("n", [2048])
+@pytest.mark.parametrize("k", [4096])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_norm_gated(input_dtype, k, n, activation, use_compile):
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m = 1024
+    A = torch.randn(m, k, device=device, dtype=input_dtype)
+    B = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
+    rstd = torch.randn(m, device=device, dtype=torch.float32)
+    fn = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
+    preact, postact = fn(
+        A,
+        B,
+        rstd=rstd,
+        activation=activation,
+        store_preact=True,
+        tuned=False,
+    )
+    preact_ref, postact_ref = gemm_norm_act_ref(
+        A.float(),
+        B.float(),
+        rstd=rstd,
+        activation=activation,
+        store_preact=True,
+    )
+    preact_pt, postact_pt = gemm_norm_act_ref(
+        A,
+        B,
+        rstd=rstd,
+        activation=activation,
+        store_preact=True,
+    )
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("activation", [None, "silu", "gelu_tanh_approx"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_rms_then_norm_act(input_dtype, activation, use_compile):
+    """End-to-end: gemm_rms + gemm_norm_act vs PyTorch activation(rmsnorm(x @ W2 + res) @ W1).
+
+    Transformer pattern:
+      D = x @ W2 + residual                       ← gemm_rms step 1
+      rstd = rsqrt(mean(D^2) + eps)               ← gemm_rms step 2
+      rmsnorm(D) = D * rstd * w                   ← element-wise
+      postact = activation(rmsnorm(D) @ W1)        ← GEMM + activation
+
+    Since rmsnorm(D) @ W1 = (D * rstd * w) @ W1 = (D @ diag(w) @ W1) * rstd,
+    we pre-fuse w into W1 and use only rstd as the colvec:
+      W1_fused = diag(w) @ W1
+      postact = gemm_norm_act(D, W1_fused, rstd=rstd, activation=act)
+    """
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, k, n = 1024, 4096, 2048
+    eps = 1e-6
+
+    x = torch.randn(m, k, device=device, dtype=input_dtype)
+    W2 = torch.randn(k, k, device=device, dtype=input_dtype) / math.sqrt(k)
+    residual = torch.randn(m, k, device=device, dtype=input_dtype)
+    W1 = torch.randn(k, n, device=device, dtype=input_dtype) / math.sqrt(k)
+    w = torch.randn(k, device=device, dtype=input_dtype)
+
+    # Step 1: fused gemm_rms with norm_weight → D_normed = (x @ W2 + residual) * w, rstd
+    fn_rms = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
+    D_normed, rstd = fn_rms(x, W2, C=residual, norm_weight=w, eps=eps, tuned=False)
+
+    # Step 2: fused gemm_norm_act → postact = activation((D_normed @ W1) * rstd)
+    fn_norm_act = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
+    _, postact = fn_norm_act(D_normed, W1, rstd=rstd, activation=activation, tuned=False)
+
+    # Reference: PyTorch fp32
+    D_ref = x.float() @ W2.float() + residual.float()
+    rstd_ref = torch.rsqrt(D_ref.square().mean(dim=-1) + eps)
+    normed = D_ref * rstd_ref.unsqueeze(-1) * w.float()
+    preact = normed @ W1.float()
+    act_map = {
+        None: lambda x: x,
+        "silu": F.silu,
+        "gelu_tanh_approx": lambda x: F.gelu(x, approximate="tanh"),
+    }
+    postact_ref = act_map[activation](preact).to(input_dtype)
+
+    # PyTorch bf16 baseline (for error comparison)
+    D_pt = x @ W2 + residual
+    rstd_pt = torch.rsqrt(D_pt.float().square().mean(dim=-1) + eps)
+    normed_pt = D_pt.float() * rstd_pt.unsqueeze(-1) * w.float()
+    preact_pt = normed_pt @ W1.float()
+    postact_pt = act_map[activation](preact_pt.float()).to(input_dtype)
+
+    err = (postact - postact_ref).abs().max().item()
+    err_pt = (postact_pt - postact_ref).abs().max().item()
+    print(
+        f"act={activation}: err={err:.4f}, err_pt={err_pt:.4f}, ratio={err / (err_pt + 1e-10):.2f}"
+    )
+    assert err < 2 * err_pt + 1e-4

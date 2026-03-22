@@ -141,14 +141,14 @@ class Autotuner:
         return self._do_bench
 
     def _precompile(self, *args, configs, **kwargs):
-        """Pre-compile all configs in parallel subprocesses to populate .so cache.
+        """Pre-compile all configs in parallel subprocesses to populate .o cache.
 
         cute.compile() is not thread-safe (MLIR thread-local state) and fork after
         CUDA init causes segfaults. So we spawn persistent subprocess workers: each
         has its own CUDA context, creates FakeTensors matching the parent's tensor
         metadata, and compiles with COMPILE_ONLY=True. Workers stay alive to amortize
         import overhead across multiple configs. The parent then loads instantly from
-        the .so cache during benchmarking.
+        the .o cache during benchmarking.
         """
         from quack.cache_utils import CACHE_ENABLED
 
@@ -159,7 +159,7 @@ class Autotuner:
         if max_workers <= 1:
             return
 
-        # Quick check: compile first config in-process. If it loads from .so cache
+        # Quick check: compile first config in-process. If it loads from .o cache
         # (<0.5s), the rest are likely cached too — skip spawning workers.
         t_check = time.time()
         try:
@@ -451,11 +451,11 @@ class AutotuneConfig:
         return ", ".join(res)
 
     def __hash__(self):
-        return hash(tuple(*self.all_kwargs().items()))
+        return hash(tuple(self.all_kwargs().items()))
 
     def __eq__(self, other):
-        self_tuple = tuple(*self.all_kwargs().items())
-        other_tuple = tuple(*other.all_kwargs().items())
+        self_tuple = tuple(self.all_kwargs().items())
+        other_tuple = tuple(other.all_kwargs().items())
         return self_tuple == other_tuple
 
 

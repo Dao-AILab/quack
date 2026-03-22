@@ -17,12 +17,14 @@ def make_smem_layout(
     layout: LayoutEnum,
     tile: cute.Tile,
     stage: Optional[int] = None,
+    major_mode_size: Optional[int] = None,
     *,
     loc=None,
     ip=None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
     shape = cute.product_each(cute.shape(tile, loc=loc, ip=ip), loc=loc, ip=ip)
-    major_mode_size = shape[1] if layout.is_n_major_c() else shape[0]
+    if const_expr(major_mode_size is None):
+        major_mode_size = shape[1] if layout.is_n_major_c() else shape[0]
     smem_layout_atom = warpgroup.make_smem_layout_atom(
         sm90_utils_og.get_smem_layout_atom(layout, dtype, major_mode_size),
         dtype,

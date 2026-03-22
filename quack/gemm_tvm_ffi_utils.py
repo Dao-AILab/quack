@@ -8,7 +8,6 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
-from quack.cache_utils import compile_and_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import TileSchedulerOptions
@@ -164,11 +163,6 @@ def make_fake_gemm_tensors(
         mD = fake_tensor(d_dtype, (m, n, l), leading_dim=d_leading, divisibility=div_d)
         mC = fake_tensor(c_dtype, (m, n, l), leading_dim=c_leading, divisibility=div_c)
     return mA, mB, mD, mC, m, n, k, l
-
-
-def cached_compile(key, compile_fn):
-    """Filesystem caching via compile_and_cache. Use @lru_cache on caller for in-memory cache."""
-    return compile_and_cache(key, compile_fn)
 
 
 def compile_gemm_kernel(

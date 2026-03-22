@@ -17,11 +17,10 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 
 
 @cute.jit
-def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
+def load_scalar_or_pointer(x, dtype=Float32):
     if const_expr(isinstance(x, cute.Pointer)):
-        return Float32(cute.make_tensor(x, cute.make_layout(1))[0])
+        return dtype(cute.make_tensor(x, cute.make_layout(1))[0])
     else:
-        assert isinstance(x, Float32)
         return x
 
 
@@ -185,7 +184,7 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
         tXpX: Predicate tensor indicating valid elements
         fill_value: Value to fill OOB locations with
     """
-    tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), None, 0])
+    tXrX_fill = cute.make_rmem_tensor_like(tXsX[(None, 0), None, 0])
     tXrX_fill.fill(fill_value)
     for rest_v in cutlass.range_constexpr(tXsX.shape[0][1]):
         for rest_k in cutlass.range_constexpr(tXsX.shape[2]):

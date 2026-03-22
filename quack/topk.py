@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Tri Dao.
 
 import math
-from functools import lru_cache, partial
+from functools import partial
 from typing import Type, Optional
 
 import torch
@@ -17,7 +17,7 @@ import quack.copy_utils as copy_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduction_base import ReductionBase
 from quack.reduce import row_reduce
-from quack.cache_utils import compile_and_cache
+from quack.cache_utils import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.sort.bitonic_sort import bitonic_topk
 
@@ -96,7 +96,7 @@ class TopK:
 
         tXgX = thr_copy.partition_S(gX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
-        tXrX = cute.make_fragment_like(tXgX)
+        tXrX = cute.make_rmem_tensor_like(tXgX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
         tXpX = (
@@ -186,7 +186,7 @@ class TopK:
             topk_vals_split.store(exp_x * cute.arch.rcp_approx(denom))
 
         # Convert cleaned values to output type
-        topk_vals_out = cute.make_fragment_like(topk_vals_split, mValues.element_type)
+        topk_vals_out = cute.make_rmem_tensor_like(topk_vals_split, mValues.element_type)
         topk_vals_out.store(topk_vals_split.load().to(mValues.element_type))
 
         row = tXcX[0][0]
@@ -253,27 +253,22 @@ def _topk_fwd_fake(
         _compile_topk_bwd(dtype, dtype, dx_dtype, N, k, softmax)
 
 
-@lru_cache(maxsize=None)
+@jit_cache
 def _compile_topk_fwd(dtype, N, k, softmax):
-    key = ("topk_fwd", dtype, N, k, softmax)
-
-    def _compile():
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        x_cute = fake_tensor(dtype, (batch_sym, N), div)
-        values_cute = fake_tensor(dtype, (batch_sym, k), div)
-        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
-        topk_op = TopK(dtype, N, k, softmax=softmax)
-        return cute.compile(
-            topk_op,
-            x_cute,
-            values_cute,
-            indices_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-
-    return compile_and_cache(key, _compile)
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    x_cute = fake_tensor(dtype, (batch_sym, N), div)
+    values_cute = fake_tensor(dtype, (batch_sym, k), div)
+    indices_cute = fake_tensor(Int32, (batch_sym, k), div)
+    topk_op = TopK(dtype, N, k, softmax=softmax)
+    return cute.compile(
+        topk_op,
+        x_cute,
+        values_cute,
+        indices_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def topk_fwd(x: torch.Tensor, k: int, softmax: bool = False):
@@ -394,9 +389,9 @@ class TopKBackward(ReductionBase):
         tXgdV = thr_copy.partition_S(gdVals)
         tXgV = thr_copy.partition_S(gVals) if const_expr(gVals is not None) else None
         tXgI = thr_copy.partition_S(gIdx)
-        tXrdV = cute.make_fragment_like(tXgdV)
-        tXrV = cute.make_fragment_like(tXgV) if const_expr(tXgV is not None) else None
-        tXrI = cute.make_fragment_like(tXgI)
+        tXrdV = cute.make_rmem_tensor_like(tXgdV)
+        tXrV = cute.make_rmem_tensor_like(tXgV) if const_expr(tXgV is not None) else None
+        tXrI = cute.make_rmem_tensor_like(tXgI)
         tXrdV.fill(tXrdV.element_type.zero)
         if const_expr(mValues is not None):
             tXrV.fill(tXrV.element_type.zero)
@@ -405,7 +400,7 @@ class TopKBackward(ReductionBase):
         tXsdX = thr_copy.partition_D(sdX)
         tXgdX = thr_copy.partition_D(gdX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
-        tXrdX = cute.make_fragment_like(tXgdX)
+        tXrdX = cute.make_rmem_tensor_like(tXgdX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
         tXpV = copy_utils.predicate_k(thr_copy.partition_S(cTopK), limit=mdValues.shape[1])
@@ -513,29 +508,24 @@ def _topk_bwd_fake(
         _compile_topk_bwd(dtype, val_dtype, dx_dtype, N, k, softmax)
 
 
-@lru_cache(maxsize=None)
+@jit_cache
 def _compile_topk_bwd(dtype, val_dtype, dx_dtype, N, k, softmax):
-    key = ("topk_bwd", dtype, val_dtype, dx_dtype, N, k, softmax)
-
-    def _compile():
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        dvalues_cute = fake_tensor(dtype, (batch_sym, k), div)
-        values_cute = fake_tensor(val_dtype, (batch_sym, k), div) if val_dtype is not None else None
-        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
-        dx_cute = fake_tensor(dx_dtype, (batch_sym, N), div)
-        topk_bwd_op = TopKBackward(dtype, N, k, softmax=softmax)
-        return cute.compile(
-            topk_bwd_op,
-            dvalues_cute,
-            values_cute,
-            indices_cute,
-            dx_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-
-    return compile_and_cache(key, _compile)
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    dvalues_cute = fake_tensor(dtype, (batch_sym, k), div)
+    values_cute = fake_tensor(val_dtype, (batch_sym, k), div) if val_dtype is not None else None
+    indices_cute = fake_tensor(Int32, (batch_sym, k), div)
+    dx_cute = fake_tensor(dx_dtype, (batch_sym, N), div)
+    topk_bwd_op = TopKBackward(dtype, N, k, softmax=softmax)
+    return cute.compile(
+        topk_bwd_op,
+        dvalues_cute,
+        values_cute,
+        indices_cute,
+        dx_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def topk_bwd(
