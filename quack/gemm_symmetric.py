@@ -220,10 +220,9 @@ def _compile_gemm_symmetric(
     cluster_shape_mnk,
     pingpong,
     persistent,
-    has_semaphore,
+    is_dynamic_persistent,
     alpha_mode,
     beta_mode,
-    use_clc_persistence,
     device_capacity,
 ):
     GemmCls = GemmSymmetricSm90 if device_capacity[0] == 9 else GemmSymmetricSm100
@@ -262,7 +261,11 @@ def _compile_gemm_symmetric(
         alpha=fake_scalar(alpha_mode),
         beta=fake_scalar(beta_mode),
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9), 
+        False, 
+        l
+    )
     varlen_args = None
     return compile_gemm_kernel(
         GemmCls,
@@ -272,6 +275,7 @@ def _compile_gemm_symmetric(
         pingpong,
         persistent,
         False,
+        is_dynamic_persistent,
         device_capacity,
         mA,
         mB,
@@ -295,10 +299,10 @@ def gemm_symmetric(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
-    use_clc_persistence: bool = False,
 ) -> None:
     # Transpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
@@ -313,6 +317,9 @@ def gemm_symmetric(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+
+    if is_dynamic_persistent and device_capacity[0] == 9:
+        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
 
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
@@ -334,10 +341,9 @@ def gemm_symmetric(
         cluster_shape_mnk,
         pingpong,
         persistent,
-        tile_count_semaphore is not None,
+        is_dynamic_persistent,
         alpha_mode,
         beta_mode,
-        use_clc_persistence,
         device_capacity,
     )
 

@@ -160,7 +160,7 @@ def _compile_gemm_norm_act(
     cluster_shape_mnk,
     pingpong,
     persistent,
-    has_semaphore,
+    is_dynamic_persistent,
     activation,
     rowvec_dtype,
     colvec_dtype,
@@ -222,7 +222,11 @@ def _compile_gemm_norm_act(
         rounding_mode=rounding_mode,
         sr_seed=fake_scalar(sr_seed_mode),
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9), 
+        False, 
+        l
+    )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     return compile_gemm_kernel(
         GemmCls,
@@ -232,6 +236,7 @@ def _compile_gemm_norm_act(
         pingpong,
         persistent,
         gather_A,
+        is_dynamic_persistent,
         device_capacity,
         mA,
         mB,
@@ -257,6 +262,7 @@ def gemm_norm_act_fn(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
     rowvec: Optional[Tensor] = None,  # (l, n) — norm_weight
     colvec: Optional[Tensor] = None,  # (l, m) or (total_m,) — rstd
@@ -307,6 +313,9 @@ def gemm_norm_act_fn(
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] >= 10, "Stochastic rounding requires SM100+"
 
+    if is_dynamic_persistent and device_capacity[0] == 9:
+        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
@@ -325,7 +334,7 @@ def gemm_norm_act_fn(
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
-        tile_count_semaphore is not None,
+        is_dynamic_persistent,
         activation,
         torch2cute_dtype_map[rowvec.dtype] if rowvec is not None else None,
         torch2cute_dtype_map[colvec.dtype] if colvec is not None else None,

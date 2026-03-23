@@ -161,7 +161,7 @@ class GemmSm100(GemmSm90):
         cluster_shape_mnk: Tuple[int, int, int],
         sf_vec_size: Optional[int] = None,
         gather_A: bool = False,
-        use_clc_persistence: bool = False,
+        use_clc_persistence: bool = True,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 

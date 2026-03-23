@@ -41,7 +41,7 @@ def _compile_gemm(
     cluster_shape_mnk,
     pingpong,
     persistent,
-    has_semaphore,
+    is_dynamic_persistent,
     rowvec_dtype,
     colvec_dtype,
     colvec_ndim,
@@ -52,7 +52,6 @@ def _compile_gemm(
     varlen_k,
     gather_A,
     has_batch_idx_permute,
-    use_clc_persistence,
     device_capacity,
     rounding_mode,
     sr_seed_mode,
@@ -97,7 +96,11 @@ def _compile_gemm(
         rounding_mode=rounding_mode,
         sr_seed=fake_scalar(sr_seed_mode, dtype=Int32),
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l)
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9), 
+        has_batch_idx_permute, 
+        l
+    )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
     return compile_gemm_kernel(
@@ -108,6 +111,7 @@ def _compile_gemm(
         pingpong,
         persistent,
         gather_A,
+        is_dynamic_persistent,
         device_capacity,
         mA,
         mB,
@@ -132,6 +136,7 @@ def gemm(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
     rowvec_bias: Optional[Tensor] = None,  # (l, n)
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
@@ -141,7 +146,6 @@ def gemm(
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
-    use_clc_persistence: bool = False,
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
@@ -171,6 +175,8 @@ def gemm(
         assert device_capacity[0] >= 10, (
             "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
         )
+    if is_dynamic_persistent and device_capacity[0] == 9:
+        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
@@ -196,7 +202,7 @@ def gemm(
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
-        tile_count_semaphore is not None,
+        is_dynamic_persistent,
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
         torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
         colvec_ndim,
@@ -207,7 +213,6 @@ def gemm(
         varlen_k,
         gather_A,
         batch_idx_permute is not None,
-        use_clc_persistence,
         device_capacity,
         rounding_mode,
         sr_seed_mode,

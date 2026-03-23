@@ -240,7 +240,7 @@ def _compile_gemm_dact(
     cluster_shape_mnk,
     pingpong,
     persistent,
-    has_semaphore,
+    is_dynamic_persistent,
     activation,
     colvec_scale_dtype,
     colvec_scale_ndim,
@@ -248,7 +248,6 @@ def _compile_gemm_dact(
     colvec_reduce_ndim,
     varlen_m,
     gather_A,
-    use_clc_persistence,
     device_capacity,
     gemm_cls_name,
 ):
@@ -314,7 +313,11 @@ def _compile_gemm_dact(
         epi_args = GemmCls.EpilogueArguments(mPostAct, act_fn)
         post_init = None
 
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9), 
+        False, 
+        l
+    )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     return compile_gemm_kernel(
         GemmCls,
@@ -324,7 +327,7 @@ def _compile_gemm_dact(
         pingpong,
         persistent,
         gather_A,
-        use_clc_persistence,
+        is_dynamic_persistent,
         device_capacity,
         mA,
         mB,
@@ -351,6 +354,7 @@ def gemm_dact(
     cluster_N: int,
     pingpong: bool = True,
     persistent: bool = True,
+    is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
     colvec_scale: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m (dgated only)
     # (l, m, ceildiv(n, tile_n)), or (total_m, ceildiv(n, tile_n)) if varlen_m (dgated only)
@@ -413,6 +417,9 @@ def gemm_dact(
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
 
+    if is_dynamic_persistent and device_capacity[0] == 9:
+        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+
     compiled_fn = _compile_gemm_dact(
         a_dtype,
         b_dtype,
@@ -429,7 +436,7 @@ def gemm_dact(
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
-        tile_count_semaphore is not None,
+        is_dynamic_persistent,
         activation,
         torch2cute_dtype_map[colvec_scale.dtype] if colvec_scale is not None else None,
         colvec_scale.ndim if colvec_scale is not None else 0,
@@ -437,7 +444,6 @@ def gemm_dact(
         colvec_reduce.ndim if colvec_reduce is not None else 0,
         varlen_m,
         gather_A,
-        use_clc_persistence,
         device_capacity,
         gemm_cls_name,
     )

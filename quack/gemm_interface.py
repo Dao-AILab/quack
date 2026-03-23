@@ -58,11 +58,11 @@ Activation = Literal[
 def default_config(device):
     if get_device_capacity(device)[0] != 10:
         return GemmConfig(
-            tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True, clc=False
+            tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True, is_dynamic_persistent=False
         )
     else:
         return GemmConfig(
-            tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False, clc=True
+            tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False, is_dynamic_persistent=True
         )
 
 
@@ -90,7 +90,6 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
         if device_capacity == 9:
-            # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
             configs = [conf for conf in configs if not conf.kwargs["config"].clc]
     return configs
@@ -164,7 +163,7 @@ def gemm_tuned(
         out_shape = (batch_size, A.shape[-2], B.shape[-2])
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_sm90_sm100(
         A if not config.swap_ab else B,
@@ -178,6 +177,7 @@ def gemm_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
@@ -187,7 +187,6 @@ def gemm_tuned(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
-        use_clc_persistence=config.clc,
         add_to_output=add_to_output,
         rounding_mode=rounding_mode,
         sr_seed=sr_seed,
@@ -237,7 +236,7 @@ def gemm_act_tuned(
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_act_sm90_sm100(
         A if not config.swap_ab else B,
@@ -253,12 +252,12 @@ def gemm_act_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        use_clc_persistence=config.clc,
     )
 
 
@@ -301,7 +300,7 @@ def gemm_dact_tuned(
     else:
         PostAct = postact_out
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_dact_sm90_sm100(
         A if not config.swap_ab else B,
@@ -317,10 +316,10 @@ def gemm_dact_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        use_clc_persistence=config.clc,
     )
 
 
@@ -1134,7 +1133,7 @@ def gemm_gated_tuned(
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_act_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1150,6 +1149,7 @@ def gemm_gated_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
@@ -1224,7 +1224,7 @@ def gemm_dgated_tuned(
     else:
         colvec_reduce_partial = None
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_dact_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1240,12 +1240,12 @@ def gemm_dgated_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         colvec_scale=colvec_scale,
         colvec_reduce=colvec_reduce_partial,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        use_clc_persistence=config.clc,
     )
     if colvec_reduce:
         colvec_reduce_final = colvec_reduce_partial.sum(dim=-1)
@@ -1547,7 +1547,7 @@ def _gemm_rms_tuned(
         (A.shape[0], A.shape[1], n_tiles), dtype=torch.float32, device=A.device
     )
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_sq_reduce_sm90_sm100(
         A,
@@ -1562,6 +1562,7 @@ def _gemm_rms_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         rowvec=norm_weight,
     )
@@ -1723,7 +1724,7 @@ def gemm_norm_act_tuned(
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_norm_act_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1739,6 +1740,7 @@ def gemm_norm_act_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         colvec=rstd if not config.swap_ab else None,
         rowvec=rstd if config.swap_ab else None,
@@ -1781,7 +1783,7 @@ def gemm_norm_gated_tuned(
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
     )
     gemm_norm_act_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1797,6 +1799,7 @@ def gemm_norm_gated_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
+        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
         max_swizzle_size=config.max_swizzle_size,
         colvec=rstd if not config.swap_ab else None,
         rowvec=rstd if config.swap_ab else None,

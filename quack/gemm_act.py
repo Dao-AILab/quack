@@ -266,14 +266,13 @@ def _compile_gemm_act(
     cluster_shape_mnk,
     pingpong,
     persistent,
-    has_semaphore,
+    is_dynamic_persistent,
     activation,
     rowvec_dtype,
     colvec_dtype,
     colvec_ndim,
     varlen_m,
     gather_A,
-    use_clc_persistence,
     device_capacity,
     gemm_cls_name,
     rounding_mode=RoundingMode.RN,
@@ -329,7 +328,11 @@ def _compile_gemm_act(
         rounding_mode=rounding_mode,
         sr_seed=fake_scalar(sr_seed_mode),
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9), 
+        False, 
+        l
+    )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     return compile_gemm_kernel(
         GemmCls,
@@ -339,7 +342,7 @@ def _compile_gemm_act(
         pingpong,
         persistent,
         gather_A,
-        use_clc_persistence,
+        is_dynamic_persistent,
         device_capacity,
         mA,
         mB,
@@ -365,6 +368,7 @@ def gemm_act(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
     rowvec_bias: Optional[Tensor] = None,  # (l, n)
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
@@ -417,6 +421,9 @@ def gemm_act(
             "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
         )
 
+    if is_dynamic_persistent and device_capacity[0] == 9:
+        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
@@ -435,14 +442,13 @@ def gemm_act(
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
-        tile_count_semaphore is not None,
+        is_dynamic_persistent,
         activation,
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
         torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
         colvec_ndim,
         varlen_m,
         gather_A,
-        use_clc_persistence,
         device_capacity,
         gemm_cls_name,
         rounding_mode=rounding_mode,

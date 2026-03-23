@@ -109,7 +109,7 @@ def _compile_gemm_sq_reduce(
     cluster_shape_mnk,
     pingpong,
     persistent,
-    has_semaphore,
+    is_dynamic_persistent,
     colvec_reduce_dtype,
     colvec_reduce_ndim,
     rowvec_dtype,
@@ -146,7 +146,11 @@ def _compile_gemm_sq_reduce(
         mRowVecBroadcast=mRowVec,
         mColVecReduce=mColVecReduce,
     )
-    scheduler_args = make_fake_scheduler_args(has_semaphore, False, l)
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9), 
+        False, 
+        l
+    )
     varlen_args = make_fake_varlen_args(False, False, False, None)
     return compile_gemm_kernel(
         GemmCls,
@@ -156,6 +160,7 @@ def _compile_gemm_sq_reduce(
         pingpong,
         persistent,
         False,
+        is_dynamic_persistent,
         device_capacity,
         mA,
         mB,
@@ -180,6 +185,7 @@ def gemm_sq_reduce(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
     rowvec: Optional[Tensor] = None,  # (l, n) — norm_weight
 ) -> None:
@@ -194,6 +200,9 @@ def gemm_sq_reduce(
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
 
+    if is_dynamic_persistent and device_capacity[0] == 9:
+        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+
     compiled_fn = _compile_gemm_sq_reduce(
         a_dtype,
         b_dtype,
@@ -207,7 +216,7 @@ def gemm_sq_reduce(
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
-        tile_count_semaphore is not None,
+        is_dynamic_persistent,
         torch2cute_dtype_map[colvec_reduce.dtype],
         colvec_reduce.ndim,
         torch2cute_dtype_map[rowvec.dtype] if rowvec is not None else None,
