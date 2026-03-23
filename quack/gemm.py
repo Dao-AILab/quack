@@ -97,9 +97,7 @@ def _compile_gemm(
         sr_seed=fake_scalar(sr_seed_mode, dtype=Int32),
     )
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), 
-        has_batch_idx_permute, 
-        l
+        (is_dynamic_persistent and device_capacity[0] == 9), has_batch_idx_permute, l
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
@@ -176,7 +174,9 @@ def gemm(
             "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
         )
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        assert tile_count_semaphore is not None, (
+            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        )
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)

@@ -71,6 +71,7 @@ def make_scheduler_args(
         batch_idx_permute=batch_idx_permute,
     )
 
+
 def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),

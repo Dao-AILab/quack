@@ -147,9 +147,7 @@ def _compile_gemm_sq_reduce(
         mColVecReduce=mColVecReduce,
     )
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), 
-        False, 
-        l
+        (is_dynamic_persistent and device_capacity[0] == 9), False, l
     )
     varlen_args = make_fake_varlen_args(False, False, False, None)
     return compile_gemm_kernel(
@@ -201,7 +199,9 @@ def gemm_sq_reduce(
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
 
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        assert tile_count_semaphore is not None, (
+            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        )
 
     compiled_fn = _compile_gemm_sq_reduce(
         a_dtype,

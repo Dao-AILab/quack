@@ -56,7 +56,7 @@ def _get_sm90_configs(
             cluster_n=cluster_n,
             swap_ab=swap_ab,
             device_capacity=9,
-            is_dynamic_persistent=False, # default to not use dynamic persistent
+            is_dynamic_persistent=False,  # default to not use dynamic persistent
         )
         for (tile_m, tile_n, pingpong), (cluster_m, cluster_n), swap_ab in itertools.product(
             tile_mn_vals,
@@ -87,9 +87,17 @@ def _get_sm100_configs(
     use_clc_vals = [True, False]
     return [
         GemmConfigCls(
-            tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=8, is_dynamic_persistent=use_clc
+            tile_m=m,
+            tile_n=n,
+            cluster_m=cm,
+            cluster_n=cn,
+            swap_ab=sab,
+            max_swizzle_size=8,
+            is_dynamic_persistent=use_clc,
         )
-        for (m, n, (cm, cn)), sab, use_clc in itertools.product(tile_mn_cluster_vals, swap_ab_vals, use_clc_vals)
+        for (m, n, (cm, cn)), sab, use_clc in itertools.product(
+            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals
+        )
     ]
 
 

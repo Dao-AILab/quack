@@ -58,11 +58,21 @@ Activation = Literal[
 def default_config(device):
     if get_device_capacity(device)[0] != 10:
         return GemmConfig(
-            tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True, is_dynamic_persistent=False
+            tile_m=128,
+            tile_n=192,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=True,
+            is_dynamic_persistent=False,
         )
     else:
         return GemmConfig(
-            tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False, is_dynamic_persistent=True
+            tile_m=256,
+            tile_n=256,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=True,
         )
 
 
@@ -163,7 +173,9 @@ def gemm_tuned(
         out_shape = (batch_size, A.shape[-2], B.shape[-2])
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_sm90_sm100(
         A if not config.swap_ab else B,
@@ -236,7 +248,9 @@ def gemm_act_tuned(
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_act_sm90_sm100(
         A if not config.swap_ab else B,
@@ -300,7 +314,9 @@ def gemm_dact_tuned(
     else:
         PostAct = postact_out
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_dact_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1133,7 +1149,9 @@ def gemm_gated_tuned(
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_act_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1224,7 +1242,9 @@ def gemm_dgated_tuned(
     else:
         colvec_reduce_partial = None
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_dact_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1547,7 +1567,9 @@ def _gemm_rms_tuned(
         (A.shape[0], A.shape[1], n_tiles), dtype=torch.float32, device=A.device
     )
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_sq_reduce_sm90_sm100(
         A,
@@ -1724,7 +1746,9 @@ def gemm_norm_act_tuned(
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_norm_act_sm90_sm100(
         A if not config.swap_ab else B,
@@ -1783,7 +1807,9 @@ def gemm_norm_gated_tuned(
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler and get_device_capacity(A)[0] == 9 else None
+        torch.zeros(1, dtype=torch.int32, device=A.device)
+        if dynamic_scheduler and get_device_capacity(A)[0] == 9
+        else None
     )
     gemm_norm_act_sm90_sm100(
         A if not config.swap_ab else B,

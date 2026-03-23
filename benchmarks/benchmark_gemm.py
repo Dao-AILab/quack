@@ -14,8 +14,9 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
-from quack.gemm_sm90 import GemmSm90, TileSchedulerOptions
-from quack.gemm_sm100 import GemmSm100
+from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm100
+from quack.gemm_sm90 import TileSchedulerOptions
+
 from quack.cute_dsl_utils import get_device_capacity
 from quack.varlen_utils import VarlenArguments
 
@@ -234,7 +235,7 @@ def run(
     # Unpack parameters
     m, n, k, l = mnkl
     cluster_shape_mnk = (*cluster_shape_mn, 1)
-    GemmCls = GemmSm100 if is_sm100 else GemmSm90
+    GemmCls = GemmDefaultSm100 if is_sm100 else GemmDefaultSm90
 
     # Skip unsupported types
     if not GemmCls.is_valid_dtypes(
@@ -374,6 +375,7 @@ def run(
             tile_shape_mn,
             cluster_shape_mnk,
             gather_A=gather_A,
+            use_clc_persistence=dynamic_persistent,
         )
     else:
         gemm = GemmCls(
@@ -392,7 +394,7 @@ def run(
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
             cluster_shape_mn[0] * cluster_shape_mn[1]
         )
-        if dynamic_persistent:
+        if dynamic_persistent and (not is_sm100):
             tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device="cuda")
         else:
             tile_count_semaphore = None

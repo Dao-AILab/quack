@@ -329,9 +329,7 @@ def _compile_gemm_act(
         sr_seed=fake_scalar(sr_seed_mode),
     )
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), 
-        False, 
-        l
+        (is_dynamic_persistent and device_capacity[0] == 9), False, l
     )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     return compile_gemm_kernel(
@@ -422,7 +420,9 @@ def gemm_act(
         )
 
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        assert tile_count_semaphore is not None, (
+            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        )
 
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)

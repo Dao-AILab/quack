@@ -314,9 +314,7 @@ def _compile_gemm_dact(
         post_init = None
 
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), 
-        False, 
-        l
+        (is_dynamic_persistent and device_capacity[0] == 9), False, l
     )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     return compile_gemm_kernel(
@@ -418,7 +416,9 @@ def gemm_dact(
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert tile_count_semaphore is not None, "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        assert tile_count_semaphore is not None, (
+            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        )
 
     compiled_fn = _compile_gemm_dact(
         a_dtype,
