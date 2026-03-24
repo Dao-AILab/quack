@@ -187,15 +187,15 @@ class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
-        assert args.mPostAct.element_type.width == 16, (
-            "GemmGated only supports 16bit postact for now"
-        )
+        assert (
+            args.mPostAct.element_type.width == 16
+        ), "GemmGated only supports 16bit postact for now"
         assert self.d_layout is None or self.d_layout.is_n_major_c()
         assert cutlass.utils.LayoutEnum.from_tensor(args.mPostAct).is_n_major_c()
         if self.arch == 90:
-            assert self.cta_tile_shape_mnk[1] % 32 == 0, (
-                "GemmGatedSm90 requires tileN to be divisible by 32"
-            )
+            assert (
+                self.cta_tile_shape_mnk[1] % 32 == 0
+            ), "GemmGatedSm90 requires tileN to be divisible by 32"
         self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
@@ -415,14 +415,14 @@ def gemm_act(
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
     if rounding_mode == RoundingMode.RS:
-        assert device_capacity[0] >= 10, (
-            "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
-        )
+        assert (
+            device_capacity[0] >= 10
+        ), "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert tile_count_semaphore is not None, (
-            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
-        )
+        assert (
+            tile_count_semaphore is not None
+        ), "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
 
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)

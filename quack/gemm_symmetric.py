@@ -317,9 +317,9 @@ def gemm_symmetric(
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert tile_count_semaphore is not None, (
-            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
-        )
+        assert (
+            tile_count_semaphore is not None
+        ), "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
 
     tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)

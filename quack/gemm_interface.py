@@ -172,6 +172,7 @@ def gemm_tuned(
     else:
         out_shape = (batch_size, A.shape[-2], B.shape[-2])
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -189,7 +190,7 @@ def gemm_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
@@ -247,6 +248,7 @@ def gemm_act_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -266,7 +268,7 @@ def gemm_act_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
@@ -313,6 +315,7 @@ def gemm_dact_tuned(
         PostAct = postact_out.unsqueeze(0)
     else:
         PostAct = postact_out
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -332,7 +335,7 @@ def gemm_dact_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
@@ -1148,6 +1151,7 @@ def gemm_gated_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -1167,7 +1171,7 @@ def gemm_gated_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
@@ -1241,6 +1245,7 @@ def gemm_dgated_tuned(
         colvec_reduce_partial = torch.empty(colvec_shape, dtype=torch.float32, device=A.device)
     else:
         colvec_reduce_partial = None
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -1260,7 +1265,7 @@ def gemm_dgated_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         colvec_scale=colvec_scale,
         colvec_reduce=colvec_reduce_partial,
@@ -1566,6 +1571,7 @@ def _gemm_rms_tuned(
     colvec_reduce = torch.empty(
         (A.shape[0], A.shape[1], n_tiles), dtype=torch.float32, device=A.device
     )
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -1584,7 +1590,7 @@ def _gemm_rms_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         rowvec=norm_weight,
     )
@@ -1745,6 +1751,7 @@ def gemm_norm_act_tuned(
         PostAct = postact_out
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -1764,7 +1771,7 @@ def gemm_norm_act_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         colvec=rstd if not config.swap_ab else None,
         rowvec=rstd if config.swap_ab else None,
@@ -1806,6 +1813,7 @@ def gemm_norm_gated_tuned(
         PostAct = postact_out
     if rstd is not None and rstd.ndim == 1:
         rstd = rstd.unsqueeze(0)  # (L, M)
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
         if dynamic_scheduler and get_device_capacity(A)[0] == 9
@@ -1825,7 +1833,7 @@ def gemm_norm_gated_tuned(
         config.cluster_n,
         config.pingpong,
         persistent=True,
-        is_dynamic_persistent=dynamic_scheduler or config.is_dynamic_persistent,
+        is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
         colvec=rstd if not config.swap_ab else None,
         rowvec=rstd if config.swap_ab else None,
