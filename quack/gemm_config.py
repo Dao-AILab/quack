@@ -24,7 +24,7 @@ def _get_sm90_configs(
     epilogue: Optional[str] = None,
     tune_coop: bool = True,
 ) -> List[GemmConfig]:
-    tile_n_vals = [128, 160, 192, 208]
+    tile_n_vals = [128, 160, 192]
     tile_mn_coop_vals = [(256, tile_n) for tile_n in tile_n_vals] + [
         (128, 224),
         (128, 256),
@@ -70,7 +70,7 @@ def _get_sm90_configs(
 def _get_sm100_configs(
     epilogue: Optional[str] = None,
 ) -> List[GemmConfig]:
-    tile_n_vals = [64, 128, 160, 192, 224, 256]
+    tile_n_vals = [64, 128, 192, 256]
     tile_mn_cluster_vals = (
         [(128, tile_n, (1, 1)) for tile_n in tile_n_vals]
         + [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]

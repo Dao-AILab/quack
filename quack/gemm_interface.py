@@ -89,19 +89,48 @@ def nvmmh_config(A, B, device_capacity):
         return None
 
 
+# Given a problem shape, we can prune most configs that have clearly suboptimal tile sizes
+#   e.g. tile_N = 64 is clearly not needed for most (M, N, K, L) shapes if min(M, N) >= 1024
+def prune_suboptimal_gemm_config(configs, named_args: dict, **kwargs):
+    A_shape = named_args['A'].shape
+    B_shape = named_args['B'].shape
+    
+    M, N, K, L = None, None, None, 1
+    assert len(A_shape) in [2, 3]
+    assert len(B_shape) in [2, 3]
+    if len(A_shape) == 2:
+        M, K = A_shape
+    else:
+        L, M, K = A_shape
+
+
+    if len(B_shape) == 2:
+        K, N = B_shape
+    else:
+        L, K, N = B_shape
+        
+    if min(M, N) >= 1024:
+        configs = [conf for conf in configs if conf.kwargs["config"].tile_n >= 128]
+        configs = [conf for conf in configs if conf.kwargs["config"].tile_m >= 128]
+    
+    return configs    
+
 def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
     device_capacity = get_device_capacity(kwargs["A"].device)[0]
     configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
+    
+    configs = prune_suboptimal_gemm_config(configs, named_args, **kwargs)
     if varlen_m or gather_A:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
         if device_capacity == 9:
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
-            configs = [conf for conf in configs if not conf.kwargs["config"].clc]
+            # dynamic persistent in SM90 
+            configs = [conf for conf in configs if not conf.kwargs["config"].is_dynamic_persistent]
     return configs
 
 
