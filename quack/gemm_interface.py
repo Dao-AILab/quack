@@ -101,7 +101,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
         if device_capacity == 9:
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
-            configs = [conf for conf in configs if not conf.kwargs["config"].clc]
+            configs = [conf for conf in configs if not conf.kwargs["config"].is_dynamic_persistent]
     return configs
 
 
