@@ -42,6 +42,7 @@ torch = [
 
 [tool.ruff]
 line-length = 100
+exclude = [".#*"]
 
 [tool.ruff.lint]
 ignore = [

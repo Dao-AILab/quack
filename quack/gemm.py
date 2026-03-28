@@ -170,13 +170,13 @@ def gemm(
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
     if rounding_mode == RoundingMode.RS:
-        assert (
-            device_capacity[0] >= 10
-        ), "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
+        assert device_capacity[0] >= 10, (
+            "Stochastic rounding (RoundingMode.RS) requires SM100+ (Blackwell)"
+        )
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert (
-            tile_count_semaphore is not None
-        ), "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        assert tile_count_semaphore is not None, (
+            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        )
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)

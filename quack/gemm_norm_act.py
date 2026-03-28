@@ -312,9 +312,9 @@ def gemm_norm_act_fn(
         assert device_capacity[0] >= 10, "Stochastic rounding requires SM100+"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
-        assert (
-            tile_count_semaphore is not None
-        ), "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        assert tile_count_semaphore is not None, (
+            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
+        )
 
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)

@@ -295,3 +295,37 @@ def mma_partition_A_vec(
     sVec_mma = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
     tC_sVec = make_acc_tensor_mn_view(thr_mma.partition_A(sVec_mma))
     return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
+
+
+def copy_partition_S_vec(
+    sVec: cute.Tensor, thr_copy: cute.core.ThrCopy, expand_shape: int, is_colvec: bool
+) -> cute.Tensor:
+    assert cute.rank(sVec) == 2
+    assert sVec.stride[0] == 1
+    stage = sVec.shape[1]
+    shape = (
+        (sVec.shape[0], expand_shape, stage)
+        if const_expr(is_colvec)
+        else (expand_shape, sVec.shape[0], stage)
+    )
+    stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
+    sVec_thr = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
+    tC_sVec = reshape_acc_to_mn(thr_copy.partition_S(sVec_thr))
+    return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
+
+
+def copy_partition_D_vec(
+    sVec: cute.Tensor, thr_copy: cute.core.ThrCopy, expand_shape: int, is_colvec: bool
+) -> cute.Tensor:
+    assert cute.rank(sVec) == 2
+    assert sVec.stride[0] == 1
+    stage = sVec.shape[1]
+    shape = (
+        (sVec.shape[0], expand_shape, stage)
+        if const_expr(is_colvec)
+        else (expand_shape, sVec.shape[0], stage)
+    )
+    stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
+    sVec_thr = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
+    tC_sVec = reshape_acc_to_mn(thr_copy.partition_D(sVec_thr))
+    return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
