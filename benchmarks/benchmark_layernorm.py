@@ -8,7 +8,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from quack.layernorm import layernorm, layernorm_ref, rstd_ref, mean_ref
+from quack.rmsnorm import layernorm_fwd as layernorm, layernorm_ref
 import cutlass.cute as cute
 
 try:
