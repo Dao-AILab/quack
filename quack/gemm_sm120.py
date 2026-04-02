@@ -216,6 +216,7 @@ class GemmSm120(GemmSm90):
         epi_c_smem_layout: cute.ComposedLayout,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        _trace_ptr: Optional[cutlass.Int64] = None, # TODO: unused
     ):
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)

@@ -218,7 +218,7 @@ def run(
         persistent = True
 
     device_capacity = get_device_capacity(torch.device("cuda"))
-    is_sm100 = device_capacity[0] >= 10
+    is_sm100 = device_capacity[0] == 10
     if is_sm100:
         persistent = True  # SM100 always uses persistent scheduling
 
