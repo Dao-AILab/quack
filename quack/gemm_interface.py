@@ -1074,7 +1074,11 @@ def gemm_symmetric_out(
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    tile_m = 256 if get_device_capacity(A.device)[0] == 10 else 128
+    sm = get_device_capacity(A.device)[0]
+    tile_m = 256 if sm == 10 else 128
+    # SM120: cluster>1 hangs, use tile 128x128 cluster 1x1 for square cluster tiles
+    tile_n = 128 if sm == 12 else 256
+    cluster_m = 1 if sm == 12 else 2
     gemm_symmetric_sm90_sm100(
         A,
         B,
@@ -1082,8 +1086,8 @@ def gemm_symmetric_out(
         C if C is not None else None,
         tile_count_semaphore,
         tile_M=tile_m,
-        tile_N=256,
-        cluster_M=2,
+        tile_N=tile_n,
+        cluster_M=cluster_m,
         cluster_N=1,
         pingpong=False,
         persistent=True,
@@ -1518,7 +1522,10 @@ def gemm_symmetric_out_fake(
     if not COMPILE_ONLY or isinstance(A.shape[0], torch.SymInt):
         return
     # gemm_symmetric is not autotuned, compile the single fixed config directly
-    tile_m = 256 if get_device_capacity(A.device)[0] == 10 else 128
+    sm = get_device_capacity(A.device)[0]
+    tile_m = 256 if sm == 10 else 128
+    tile_n = 128 if sm == 12 else 256
+    cluster_m = 1 if sm == 12 else 2
     try:
         gemm_symmetric_sm90_sm100(
             A.unsqueeze(0) if A.ndim == 2 else A,
@@ -1527,8 +1534,8 @@ def gemm_symmetric_out_fake(
             (C.unsqueeze(0) if C.ndim == 2 else C) if C is not None else None,
             torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None,
             tile_M=tile_m,
-            tile_N=256,
-            cluster_M=2,
+            tile_N=tile_n,
+            cluster_M=cluster_m,
             cluster_N=1,
             pingpong=False,
             persistent=True,
