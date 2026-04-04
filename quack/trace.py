@@ -250,7 +250,7 @@ def _is_warp_leader():
     falls back to lane_idx() == 0 on older architectures.
     """
     if cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90:
-        return cutlass.Boolean(nvvm.elect_sync())
+        return cutlass.Boolean(nvvm.elect_sync(T.bool()))
     return cute.arch.lane_idx() == 0
 
 
