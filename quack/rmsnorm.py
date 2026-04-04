@@ -20,9 +20,9 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache_utils import jit_cache
-from quack.cute_dsl_utils import torch2cute_dtype_map, get_device_capacity
+from quack.cute_dsl_utils import torch2cute_dtype_map
+from cutlass.base_dsl import Arch
 
-_device_capacity = get_device_capacity()
 
 def _ensure_contiguous(t):
     """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
@@ -48,23 +48,23 @@ class RMSNorm(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
-        N = self.N
-        # Set cluster to 1 for Consumer Blackwell (SM120)
-        if _device_capacity == (12, 0):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) and SM12x (consumer Blackwell) lack cluster support
+        if arch < Arch.sm_90 or arch.major == 12:
             self.cluster_n = 1
             return
+        N = self.N
+        # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
+        # Similarly cluster_n = 8 is faster for N=128k
+        if const_expr(self.dtype.width == 16):
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
-            # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
-            # Similarly cluster_n = 8 is faster for N=128k
-            if const_expr(self.dtype.width == 16):
-                thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
-            else:
-                thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
-            for limit, cluster in thresholds:
-                if N <= limit:
-                    self.cluster_n = cluster
-                    return
-            self.cluster_n = 16
+            thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
+        for limit, cluster in thresholds:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
 
     @cute.jit
     def __call__(
@@ -526,16 +526,17 @@ class RMSNormBackward(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
-        N = self.N
-        if _device_capacity == (12, 0):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) and SM12x (consumer Blackwell) lack cluster support
+        if arch < Arch.sm_90 or arch.major == 12:
             self.cluster_n = 1
             return
-        else:
-            for limit, cluster in [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]:
-                if N <= limit:
-                    self.cluster_n = cluster
-                    return
-            self.cluster_n = 16
+        N = self.N
+        for limit, cluster in [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
 
     @cute.jit
     def __call__(
