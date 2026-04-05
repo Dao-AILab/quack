@@ -87,7 +87,6 @@ class TensorMapManagerSm90(TensorMapManager):
                         "r,r",
                         has_side_effects=True,
                         is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT,
                     )
             # wait until it's safe to update tensormap in global memory
             with cute.arch.elect_one():
@@ -109,7 +108,6 @@ class TensorMapManagerSm90(TensorMapManager):
                         "l,r",
                         has_side_effects=True,
                         is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT,
                     )
                 cute.arch.sync_warp()
                 cute.nvgpu.cpasync.fence_tma_desc_release()

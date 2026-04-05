@@ -52,7 +52,6 @@ def mul_wide_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> tuple:
         "=r,=r,r,r",
         has_side_effects=False,
         is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
     i32_ty = T.i32()
     hi = cutlass.Uint32(llvm.extractvalue(i32_ty, result, [0], loc=loc, ip=ip))
@@ -85,7 +84,6 @@ def cvt_f32x2_bf16x2_rs(
             "=r,f,f,r",
             has_side_effects=False,
             is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 

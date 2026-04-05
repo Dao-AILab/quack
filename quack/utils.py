@@ -39,7 +39,6 @@ def set_block_rank(
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 
@@ -72,7 +71,6 @@ def store_shared_remote(
         f"r,{constraint},r",
         has_side_effects=True,
         is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -120,7 +118,6 @@ def store_shared_remote_x4(
         f"r,r,{constraint},{constraint},{constraint},{constraint}",
         has_side_effects=True,
         is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -156,7 +153,6 @@ def sqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
             "=f,f",
             has_side_effects=False,
             is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 
@@ -171,7 +167,6 @@ def ceil(a: float | Float32, *, loc=None, ip=None) -> Int32:
             "=r,f",
             has_side_effects=False,
             is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 

@@ -584,7 +584,6 @@ def cpasync_reduce_bulk_add_f32(
         # "l,r,r,l",
         has_side_effects=True,
         is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -715,7 +714,6 @@ def tma_gather4_load(
         "r,l,r,r,r,r,r,r",  # constraints: register, long, 6x register
         has_side_effects=True,
         is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
