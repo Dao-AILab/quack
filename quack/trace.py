@@ -250,7 +250,12 @@ def _is_warp_leader():
     falls back to lane_idx() == 0 on older architectures.
     """
     if cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90:
-        return cutlass.Boolean(nvvm.elect_sync(T.bool()))
+        if cutlass.const_expr(cutlass.CUDA_VERSION.major) == 12:
+            return cutlass.Boolean(nvvm.elect_sync(T.bool()))
+        elif cutlass.const_expr(cutlass.CUDA_VERSION.major) == 13:
+            return cutlass.Boolean(nvvm.elect_sync())
+        else:
+            raise ValueError(f"CUDA_VERSION.major must be >= 12, got {cutlass.CUDA_VERSION.major}")
     return cute.arch.lane_idx() == 0
 
 
