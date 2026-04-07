@@ -240,7 +240,6 @@ class GemmSm100(GemmSm90):
         # Multiple of 4 warps to increase/decrease number of registers
         assert self.threads_per_cta % 128 == 0
 
-
     def _setup_attributes(self, epilogue_args: EpilogueArguments, varlen_args: VarlenArguments):
         """Set up configurations that are dependent on GEMM inputs
 
