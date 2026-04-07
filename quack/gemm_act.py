@@ -286,7 +286,7 @@ def _compile_gemm_act(
     gemm_cls_name,
     rounding_mode=RoundingMode.RN,
     sr_seed_mode=0,
-    use_tma_gather=False, 
+    use_tma_gather=False,
 ):
     sm_to_cls = {
         "act": {9: GemmActSm90, 10: GemmActSm100, 11: GemmActSm100, 12: GemmActSm120},
@@ -361,7 +361,7 @@ def _compile_gemm_act(
         epi_args,
         scheduler_args,
         varlen_args,
-        use_tma_gather=use_tma_gather
+        use_tma_gather=use_tma_gather,
     )
 
 
