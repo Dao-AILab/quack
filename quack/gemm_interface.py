@@ -114,6 +114,9 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         if device_capacity == 9:
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
             configs = [conf for conf in configs if not conf.kwargs["config"].is_dynamic_persistent]
+    # use_tma_gather only valid when gather_A is active on SM100/SM110
+    if not gather_A or device_capacity not in [10, 11]:
+        configs = [conf for conf in configs if not conf.kwargs["config"].use_tma_gather]
     return configs
 
 
@@ -215,6 +218,7 @@ def gemm_tuned(
         add_to_output=add_to_output,
         rounding_mode=rounding_mode,
         sr_seed=sr_seed,
+        use_tma_gather=config.use_tma_gather,
     )
 
 
@@ -286,6 +290,7 @@ def gemm_act_tuned(
         colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        use_tma_gather=config.use_tma_gather,
     )
 
 
@@ -351,6 +356,7 @@ def gemm_dact_tuned(
         max_swizzle_size=config.max_swizzle_size,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        use_tma_gather=config.use_tma_gather,
     )
 
 
@@ -580,9 +586,6 @@ def gemm_add(
     "quack::gemm_add_out",
     mutates_args=("out",),
     device_types="cuda",
-    # We have to split out alpha and alpha_tensor since torch.library requires
-    # each argument to have a fixed type
-    # schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_out(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
@@ -740,9 +743,6 @@ def gemm_add_inplace(
     "quack::gemm_add_inplace",
     mutates_args=("out",),
     device_types="cuda",
-    # We have to split out alpha and alpha_tensor since torch.library requires
-    # each argument to have a fixed type
-    # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_inplace_op(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
@@ -1198,6 +1198,7 @@ def gemm_gated_tuned(
         colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        use_tma_gather=config.use_tma_gather,
     )
 
 
@@ -1292,6 +1293,7 @@ def gemm_dgated_tuned(
         colvec_reduce=colvec_reduce_partial,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        use_tma_gather=config.use_tma_gather,
     )
     if colvec_reduce:
         colvec_reduce_final = colvec_reduce_partial.sum(dim=-1)

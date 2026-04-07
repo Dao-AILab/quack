@@ -259,6 +259,7 @@ def _compile_gemm_dact(
     gather_A,
     device_capacity,
     gemm_cls_name,
+    use_tma_gather=False,
 ):
     is_dgated = gemm_cls_name == "dgated"
     sm_to_cls = {
@@ -352,6 +353,7 @@ def _compile_gemm_dact(
         scheduler_args,
         varlen_args,
         post_init=post_init,
+        use_tma_gather=use_tma_gather,
     )
 
 
@@ -376,7 +378,7 @@ def gemm_dact(
     colvec_reduce: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
-    use_clc_persistence: bool = False,
+    use_tma_gather: bool = False,
 ) -> None:
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
@@ -463,6 +465,7 @@ def gemm_dact(
         gather_A,
         device_capacity,
         gemm_cls_name,
+        use_tma_gather=use_tma_gather,
     )
 
     from quack.cache_utils import COMPILE_ONLY

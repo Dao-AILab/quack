@@ -18,6 +18,8 @@ class GemmConfig:
     # raster_order: int = 1
     max_swizzle_size: int = 8
     device_capacity: int = 9
+    # whether to use TMA gather (vs normal cp.async) for gather_A on SM100
+    use_tma_gather: bool = False
 
 
 def _get_sm90_configs(
@@ -58,6 +60,7 @@ def _get_sm90_configs(
             swap_ab=swap_ab,
             device_capacity=9,
             is_dynamic_persistent=False,  # default to not use dynamic persistent on SM90
+            use_tma_gather=False,  # TMA gather not supported on SM90
         )
         for (tile_m, tile_n, pingpong), (cluster_m, cluster_n), swap_ab in itertools.product(
             tile_mn_vals,
@@ -87,6 +90,7 @@ def _get_sm100_configs(
         GemmConfig, pingpong=False, device_capacity=10
     )  # There's no pingpong on Sm100
     use_clc_vals = [True, False]
+    use_tma_gather_vals = [True, False]
     return [
         GemmConfigCls(
             tile_m=m,
@@ -96,9 +100,10 @@ def _get_sm100_configs(
             swap_ab=sab,
             max_swizzle_size=8,
             is_dynamic_persistent=use_clc,
+            use_tma_gather=use_tma_gather,
         )
-        for (m, n, (cm, cn)), sab, use_clc in itertools.product(
-            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals
+        for (m, n, (cm, cn)), sab, use_clc, use_tma_gather in itertools.product(
+            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals, use_tma_gather_vals
         )
     ]
 
@@ -126,6 +131,7 @@ def _get_sm120_configs(
             swap_ab=swap_ab,
             device_capacity=12,
             is_dynamic_persistent=True,
+            use_tma_gather=False,  # TMA gather not supported on SM120
         )
         for (tile_m, tile_n, pingpong), swap_ab in itertools.product(tile_mn_vals, swap_ab_vals)
     ]

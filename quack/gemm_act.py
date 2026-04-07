@@ -286,6 +286,7 @@ def _compile_gemm_act(
     gemm_cls_name,
     rounding_mode=RoundingMode.RN,
     sr_seed_mode=0,
+    use_tma_gather=False, 
 ):
     sm_to_cls = {
         "act": {9: GemmActSm90, 10: GemmActSm100, 11: GemmActSm100, 12: GemmActSm120},
@@ -360,6 +361,7 @@ def _compile_gemm_act(
         epi_args,
         scheduler_args,
         varlen_args,
+        use_tma_gather=use_tma_gather
     )
 
 
@@ -385,6 +387,7 @@ def gemm_act(
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    use_tma_gather: bool = False,
 ) -> None:
     if activation in gate_fn_map:
         gemm_cls_name = "gated"
@@ -462,6 +465,7 @@ def gemm_act(
         gemm_cls_name,
         rounding_mode=rounding_mode,
         sr_seed_mode=sr_seed_mode,
+        use_tma_gather=use_tma_gather,
     )
 
     from quack.cache_utils import COMPILE_ONLY
