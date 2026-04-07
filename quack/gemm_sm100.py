@@ -302,7 +302,7 @@ class GemmSm100(GemmSm90):
             )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = self.mma_tiler[2] // self.mma_inst_shape_mnk[2] if self.mma_tiler[2] > 1 else 4
+        mma_inst_tile_k = cute.size(cute.shape_div(self.mma_tiler[2], self.mma_inst_shape_mnk[2]))
         self.mma_tiler = (
             self.mma_tiler[0],
             self.mma_tiler[1],
