@@ -240,6 +240,7 @@ class GemmSm100(GemmSm90):
         # Multiple of 4 warps to increase/decrease number of registers
         assert self.threads_per_cta % 128 == 0
 
+
     def _setup_attributes(self, epilogue_args: EpilogueArguments, varlen_args: VarlenArguments):
         """Set up configurations that are dependent on GEMM inputs
 
@@ -302,7 +303,7 @@ class GemmSm100(GemmSm90):
             )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        mma_inst_tile_k = self.mma_tiler[2] // self.mma_inst_shape_mnk[2] if self.mma_tiler[2] > 1 else 4
         self.mma_tiler = (
             self.mma_tiler[0],
             self.mma_tiler[1],
