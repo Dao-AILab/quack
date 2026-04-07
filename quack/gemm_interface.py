@@ -586,6 +586,9 @@ def gemm_add(
     "quack::gemm_add_out",
     mutates_args=("out",),
     device_types="cuda",
+    # We have to split out alpha and alpha_tensor since torch.library requires
+    # each argument to have a fixed type
+    # schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_out(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
@@ -743,6 +746,9 @@ def gemm_add_inplace(
     "quack::gemm_add_inplace",
     mutates_args=("out",),
     device_types="cuda",
+    # We have to split out alpha and alpha_tensor since torch.library requires
+    # each argument to have a fixed type
+    # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, Tensor? cu_seqlens_m=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_inplace_op(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
