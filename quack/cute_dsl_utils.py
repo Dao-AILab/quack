@@ -77,7 +77,7 @@ def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
 
 
 @lru_cache
-def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
+def _get_device_capacity_cached(device: torch.device = None) -> Tuple[int, int]:
     """Return (major, minor) device capability.
 
     Override with QUACK_ARCH (e.g. 'sm_90' or '90') for CPU-only compilation
@@ -87,6 +87,23 @@ def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     if arch_override is not None:
         return _parse_arch_str(arch_override)
     return torch.cuda.get_device_capability(device)
+
+
+def get_device_capacity(
+    device: torch.device | torch.Tensor | None = None,
+) -> Tuple[int, int]:
+    """Return (major, minor) device capability.
+
+    Override with QUACK_ARCH (e.g. 'sm_90' or '90') for CPU-only compilation
+    without a GPU present.
+
+    Accepts either a ``torch.device`` or a tensor and canonicalizes to the
+    underlying device before consulting the cached helper. This avoids leaking
+    tensors through the LRU cache key.
+    """
+    if isinstance(device, torch.Tensor):
+        device = device.device
+    return _get_device_capacity_cached(device)
 
 
 def _partition_fields(obj):
