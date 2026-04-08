@@ -9,6 +9,7 @@ from quack.linear import linear_gated_func
 from quack.mlp import mlp_func
 from quack.gemm_interface import (
     gemm,
+    gemm_add,
     gemm_add_inplace,
     gemm_dact,
     gemm_gated,
@@ -145,6 +146,27 @@ def test_gemm_add_inplace(m, k, n, input_dtype):
     gemm_add_inplace(A, B, C, tuned=False)
     C_ref = C_og.float() + torch.mm(A.float(), B.float())
     C_pt = C_og + torch.mm(A, B)
+    assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1504, 2048])
+@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("m", [960, 1920])
+def test_gemm_add_out_reuses_c_storage(m, k, n, input_dtype):
+    """Regression test for gemm_add(..., out=C) dispatching to the in-place path."""
+    device = "cuda"
+    torch.random.manual_seed(123)
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    C = torch.randn((m, n), device=device, dtype=input_dtype)
+    alpha = torch.tensor(0.5, device=device, dtype=torch.float32)
+    C_og = C.clone()
+    out = gemm_add(A, B, C, out=C, alpha=alpha, beta=1.0, tuned=False)
+    alpha_val = alpha.item()
+    C_ref = alpha_val * torch.mm(A.float(), B.float()) + C_og.float()
+    C_pt = alpha_val * torch.mm(A, B) + C_og
+    assert out is C
     assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-5
 
 

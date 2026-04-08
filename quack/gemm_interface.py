@@ -562,23 +562,40 @@ def gemm_add(
     alpha = alpha if isinstance(alpha, float) else 1.0
     beta_tensor = beta if not isinstance(beta, float) else None
     beta = beta if isinstance(beta, float) else 1.0
-    gemm_add_out(
-        A,
-        B,
-        C if not add_to_output else None,
-        out,
-        alpha,
-        beta,
-        alpha_tensor,
-        beta_tensor,
-        cu_seqlens_m=cu_seqlens_m,
-        cu_seqlens_k=cu_seqlens_k,
-        A_idx=A_idx,
-        batch_idx_permute=batch_idx_permute,
-        add_to_output=add_to_output,
-        dynamic_scheduler=dynamic_scheduler,
-        tuned=tuned,
-    )
+    alpha_arg = alpha_tensor if alpha_tensor is not None else alpha
+    beta_arg = beta_tensor if beta_tensor is not None else beta
+    if add_to_output:
+        gemm_add_inplace(
+            A,
+            B,
+            out,
+            alpha=alpha_arg,
+            beta=beta_arg,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            batch_idx_permute=batch_idx_permute,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+        )
+    else:
+        gemm_add_out(
+            A,
+            B,
+            C,
+            out,
+            alpha,
+            beta,
+            alpha_tensor,
+            beta_tensor,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            batch_idx_permute=batch_idx_permute,
+            add_to_output=add_to_output,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+        )
     return out
 
 
