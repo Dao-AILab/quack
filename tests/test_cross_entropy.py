@@ -40,6 +40,13 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_cross_entropy(M, N, input_dtype, use_compile):
     """Test Cross Entropy forward pass against reference implementation."""
+    # SM12x (consumer Blackwell) has 99 KB SMEM — skip dims that exceed capacity
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        if input_dtype == torch.float32 and N > 4096:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp32")
+        if input_dtype != torch.float32 and N > 8192:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp16/bf16")
     device = "cuda"
     atol, rtol = 5e-5, 1e-5
     torch.random.manual_seed(0)

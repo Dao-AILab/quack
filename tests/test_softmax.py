@@ -30,6 +30,13 @@ TOLERANCES = {
 # @pytest.mark.parametrize("M", [1])
 def test_softmax(M, N, input_dtype, use_compile):
     """Test Softmax forward and backward passes against reference implementation."""
+    # SM12x (consumer Blackwell) has 99 KB SMEM — skip dims that exceed capacity
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        if input_dtype == torch.float32 and N > 4096:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp32")
+        if input_dtype != torch.float32 and N > 8192:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp16/bf16")
     device = "cuda"
     atol, rtol = TOLERANCES[input_dtype]
     function = torch.compile(softmax, fullgraph=True) if use_compile else softmax

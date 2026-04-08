@@ -19,6 +19,7 @@ from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache_utils import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
+from cutlass.base_dsl import Arch
 
 
 class Softmax(ReductionBase):
@@ -40,6 +41,11 @@ class Softmax(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) and SM12x (consumer Blackwell) lack cluster support
+        if arch < Arch.sm_90 or arch.major == 12:
+            self.cluster_n = 1
+            return
         N = self.N
         if const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
@@ -231,6 +237,11 @@ class SoftmaxBackward(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) and SM12x (consumer Blackwell) lack cluster support
+        if arch < Arch.sm_90 or arch.major == 12:
+            self.cluster_n = 1
+            return
         N = self.N
         if const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
