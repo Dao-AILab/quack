@@ -25,6 +25,29 @@ PACKAGE_NAME = "quack"
 VERSION = __version__
 
 
+def _get_current_cuda_device() -> str | None:
+    """Return the physical CUDA device identifier for the current process.
+
+    Maps the logical ``torch.cuda.current_device()`` index through
+    ``CUDA_VISIBLE_DEVICES`` (if set) so the result is valid as a
+    standalone ``CUDA_VISIBLE_DEVICES`` value (handles integer IDs,
+    GPU UUIDs, and MIG IDs).
+
+    Returns ``None`` if CUDA is not initialized or the device cannot
+    be determined.
+    """
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return None
+    logical_device = torch.cuda.current_device()
+    parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if parent_visible is not None:
+        visible_devices = [d.strip() for d in parent_visible.split(",")]
+        if logical_device < len(visible_devices):
+            return visible_devices[logical_device]
+        return None
+    return str(logical_device)
+
+
 def get_home_dir():
     return os.getenv(f"{PACKAGE_NAME.upper()}_HOME", Path.home())
 
@@ -214,17 +237,9 @@ class Autotuner:
         # Without this, all workers default to cuda:0 and their CUDA context
         # initialization can OOM when many ranks share a node.
         worker_env = os.environ.copy()
-        if torch.cuda.is_available() and torch.cuda.is_initialized():
-            logical_device = torch.cuda.current_device()
-            parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if parent_visible is not None:
-                # Map logical index back to the physical device token (handles
-                # integer IDs, GPU UUIDs, and MIG IDs).
-                visible_devices = [d.strip() for d in parent_visible.split(",")]
-                if logical_device < len(visible_devices):
-                    worker_env["CUDA_VISIBLE_DEVICES"] = visible_devices[logical_device]
-            else:
-                worker_env["CUDA_VISIBLE_DEVICES"] = str(logical_device)
+        current_device = _get_current_cuda_device()
+        if current_device is not None:
+            worker_env["CUDA_VISIBLE_DEVICES"] = current_device
 
         # Launch persistent worker pool
         workers = []
