@@ -85,6 +85,12 @@ def test_cross_entropy(M, N, input_dtype, use_compile):
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_cross_entropy_lse_partial(M, N, input_dtype, use_compile):
     """Test Cross Entropy forward pass against reference implementation."""
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        if input_dtype == torch.float32 and N > 4096:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp32")
+        if input_dtype != torch.float32 and N > 8192:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp16/bf16")
     assert N % 128 == 0, "N must be multiple of 128 for lse_partial"
     device = "cuda"
     atol, rtol = 5e-5, 1e-5
@@ -197,6 +203,12 @@ def test_cross_entropy_edge_targets(use_compile):
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_cross_entropy_ignore_index(M, N, input_dtype, use_compile):
     """Test Cross Entropy with ignore_index functionality."""
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        if input_dtype == torch.float32 and N > 4096:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp32")
+        if input_dtype != torch.float32 and N > 8192:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp16/bf16")
     device = "cuda"
     atol, rtol = 5e-5, 1e-5
     torch.random.manual_seed(0)
@@ -265,6 +277,12 @@ def test_cross_entropy_ignore_index_edge_cases(use_compile):
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_compile):
     """Test Cross Entropy forward pass with gradient computation."""
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        if input_dtype == torch.float32 and N > 4096:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp32")
+        if input_dtype != torch.float32 and N > 8192:
+            pytest.skip("SM12x: 99 KB SMEM limit exceeded for fp16/bf16")
     device = "cuda"
     atol, rtol = 1e-4, 1e-4
     torch.random.manual_seed(0)
