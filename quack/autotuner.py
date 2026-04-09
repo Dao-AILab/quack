@@ -210,6 +210,22 @@ class Autotuner:
         fn_module = self.fn.__module__
         fn_qualname = self.fn.__qualname__
 
+        # Restrict worker subprocesses to the parent's current CUDA device.
+        # Without this, all workers default to cuda:0 and their CUDA context
+        # initialization can OOM when many ranks share a node.
+        worker_env = os.environ.copy()
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            logical_device = torch.cuda.current_device()
+            parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if parent_visible is not None:
+                # Map logical index back to the physical device token (handles
+                # integer IDs, GPU UUIDs, and MIG IDs).
+                visible_devices = [d.strip() for d in parent_visible.split(",")]
+                if logical_device < len(visible_devices):
+                    worker_env["CUDA_VISIBLE_DEVICES"] = visible_devices[logical_device]
+            else:
+                worker_env["CUDA_VISIBLE_DEVICES"] = str(logical_device)
+
         # Launch persistent worker pool
         workers = []
         for _ in range(max_workers):
@@ -218,6 +234,7 @@ class Autotuner:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL if not verbose else None,
+                env=worker_env,
             )
             ready = _recv(p.stdout)
             if ready != "READY":
