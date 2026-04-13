@@ -157,6 +157,9 @@ def test_rmsnorm_strided_tensor(use_compile):
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_large_tensor(M, N, input_dtype, eps, use_compile):
     """Test RMSNorm forward pass against reference implementation."""
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        pytest.skip("SM12x: large tensors exceed 16 GB VRAM on consumer cards")
     device = "cuda"
     atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
