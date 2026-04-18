@@ -3,14 +3,14 @@
 
 from functools import partial
 
-import cutlass.cute as cute
+
 from cutlass import Float32, Int32, Int64
 from cutlass.cute.runtime import make_ptr
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
-
+import cutlass.cute as cute
 
 def div_for_dtype(dtype):
     """16-byte alignment: divisibility in elements = 128 // dtype_width_bits."""

@@ -2,10 +2,10 @@
 
 from typing import NamedTuple, Optional
 
+import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean
-
-from quack.cute_dsl_utils import mlir_namedtuple
+from cutlass import Boolean, Int32
+from quack.cute_dsl_utils import mlir_namedtuple, StaticTypes
 
 
 @mlir_namedtuple
@@ -18,6 +18,14 @@ class WorkDesc(NamedTuple):
     split_k_parts: Int32 = Int32(1)
     is_final_split: Boolean = Boolean(True)
     is_valid_tile: Boolean = Boolean(False)
+
+    def __extract_mlir_values__(self):
+        values = []
+        for field_val in self:
+            if field_val is None or isinstance(field_val, StaticTypes):
+                continue
+            values.extend(cutlass.extract_mlir_values(field_val))
+        return values
 
     @property
     def tile_idx(self):

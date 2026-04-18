@@ -3,22 +3,16 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/hopper/dense_gemm.py
 
 import enum
-import math
-from dataclasses import dataclass
+from typing import Tuple, Type, Callable, Optional, Union, Literal
 from functools import partial
-from typing import Callable, Literal, Optional, Tuple, Type, Union
+import math
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
-import cutlass.utils.hopper_helpers as sm90_utils
-import quack.copy_utils as copy_utils
-import quack.sm90_utils as quack_sm90_utils
+
 from cutlass import Boolean, const_expr, Float16, Float32, Int32
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum
+from dataclasses import dataclass
 from quack import layout_utils
 from quack.cute_dsl_utils import ParamsBase
 from quack.gemm_epilogue_plan import (
@@ -36,10 +30,7 @@ from quack.gemm_problem_adapter import (
     ProblemArguments as DefaultProblemArguments,
     ProblemParams as DefaultProblemParams,
 )
-
-# return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
-from quack.rounding import RoundingMode
 from quack.tile_scheduler import (
     PersistenceMode,
     TileScheduler,
@@ -49,7 +40,14 @@ from quack.tile_scheduler import (
     VarlenMTileSchedulerArguments,
 )
 from quack.varlen_utils import VarlenArguments, VarlenManager
-
+from typing import Callable, Literal, Optional, Tuple, Type, Union
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+import cutlass.utils.hopper_helpers as sm90_utils
+import quack.copy_utils as copy_utils
+import quack.sm90_utils as quack_sm90_utils
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
 using CUTE DSL.

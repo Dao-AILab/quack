@@ -254,6 +254,6 @@ def gemm_sq_reduce(
     varlen_args = make_varlen_args(None, None, None)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)

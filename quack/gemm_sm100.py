@@ -2,37 +2,47 @@
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
 
-import math
+from typing import Optional, Type, Tuple, Union, Callable, Literal
 from functools import partial
-from typing import Callable, Literal, Optional, Tuple, Type, Union
+import math
 
 import cuda.bindings.driver as cuda
+
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass.cute.nvgpu.warp import (
+    LdMatrix8x8x16bOp,
+    LdMatrix16x16x8bOp,
+    StMatrix8x8x16bOp,
+    StMatrix16x8x8bOp,
+)
+from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass.utils import LayoutEnum
+
+from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
+from quack.tile_scheduler import TileSchedulerOptions
+from quack.varlen_utils import VarlenArguments, VarlenManager
+from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
+from quack import layout_utils
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
 from quack.layout_utils import tile_atom_to_shape_SF_strided
+
+# return PipelineStateWAdvance instead of PipelineState
 from cutlass import Boolean, const_expr, Float32, Int32
-from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.warp import (
     LdMatrix16x16x8bOp,
     LdMatrix8x8x16bOp,
     StMatrix16x8x8bOp,
     StMatrix8x8x16bOp,
 )
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.utils import LayoutEnum
-from quack import layout_utils
-from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 from quack.pipeline import PipelineTmaCpAsyncUmma, PipelineTmaUmma
-from quack.tile_scheduler import TileSchedulerOptions
-from quack.varlen_utils import VarlenArguments, VarlenManager
-
-# return PipelineStateWAdvance instead of PipelineState
-
+from typing import Callable, Literal, Optional, Tuple, Type, Union
 """
 A high-performance persistent batched dense GEMM example for the NVIDIA Blackwell SM100 architecture
 using CUTE DSL.

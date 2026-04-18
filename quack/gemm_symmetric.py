@@ -1,3 +1,4 @@
+
 from typing import Tuple, Optional, Callable
 
 from torch import Tensor
@@ -27,9 +28,10 @@ from quack.cache_utils import jit_cache
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.varlen_utils import VarlenManager
 import quack.copy_utils as copy_utils
-from quack.gemm_epilogue_plan import symmetric_epi_commit
 from quack.rounding import RoundingMode
 
+
+from quack.gemm_epilogue_plan import symmetric_epi_commit
 
 class GemmSymmetricMixin(GemmActMixin):
     def get_scheduler_class(self, varlen_m: bool = False):
@@ -252,6 +254,6 @@ def gemm_symmetric(
     varlen_args = None
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
