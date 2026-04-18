@@ -10,6 +10,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 
 import quack.utils as utils
 from quack.fast_math import FastDivmod
+from quack.gemm_work import WorkDesc, make_work_desc
 from quack.pipeline import PipelineStateWAdvance
 from quack.cute_dsl_utils import mlir_namedtuple
 
@@ -308,7 +309,7 @@ class TileScheduler:
         block_zero_only: bool = False,
         loc=None,
         ip=None,
-    ) -> cutlass.utils.WorkTileInfo:
+    ) -> WorkDesc:
         params = self.params
         if const_expr(is_valid is None):
             if const_expr(params.persistence_mode == PersistenceMode.NONE):
@@ -336,10 +337,10 @@ class TileScheduler:
                 else params.batch_idx_permute[bidz_]
             )
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
-        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
+        return make_work_desc(tile_coord_mnkl, is_valid)
 
     @cute.jit
-    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+    def get_current_work(self, *, loc=None, ip=None) -> WorkDesc:
         params = self.params
         pid_m, pid_n, batch_idx, is_valid = Int32(0), Int32(0), Int32(0), Boolean(False)
         if const_expr(params.persistence_mode == PersistenceMode.NONE):
@@ -361,10 +362,10 @@ class TileScheduler:
             self._pipeline_state.advance()
             is_valid = Boolean(is_valid_i32)
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
-        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, Boolean(is_valid))
+        return make_work_desc(tile_coord_mnkl, Boolean(is_valid))
 
     # @cute.jit
-    def initial_work_tile_info(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkDesc:
         return self._delinearize_work_idx(self._current_work_idx, loc=loc, ip=ip)
         # if is_scheduler_warp:
         # work_tile_info = self._delinearize_work_idx(block_zero_only=True, loc=loc, ip=ip)
@@ -428,7 +429,7 @@ class TileScheduler:
 
     @cute.jit
     def write_work_tile_to_smem(
-        self, work_tile_info: cutlass.utils.WorkTileInfo, *, loc=None, ip=None
+        self, work_tile_info: WorkDesc, *, loc=None, ip=None
     ):
         params = self.params
         if const_expr(self._sched_smem is not None):
@@ -733,7 +734,7 @@ class TriangularTileScheduler(TileScheduler):
         block_zero_only: bool = False,
         loc=None,
         ip=None,
-    ) -> cutlass.utils.WorkTileInfo:
+    ) -> WorkDesc:
         params = self.params
         if const_expr(is_valid is None):
             if const_expr(params.persistence_mode == PersistenceMode.NONE):
@@ -764,7 +765,7 @@ class TriangularTileScheduler(TileScheduler):
         # if tidx == 0:
         #     cute.printf("bidx = {}, bidy = {}, group_id = {}, id_in_group = {}, group_size_actual = {}, group_col = {}, group_remainder = {}, cid_n_in_group = {}, cid_m_in_group = {}, cid_m = {}, cid_n = {}, is_valid = {}",
         #                 bidx, bidy, group_id, id_in_group, group_size_actual, group_col, group_remainder, cid_n_in_group, cid_m_in_group, cid_m, cid_n, is_valid)
-        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
+        return make_work_desc(tile_coord_mnkl, is_valid)
 
 
 @dataclass
@@ -1025,7 +1026,7 @@ class VarlenMTileScheduler(TileScheduler):
         block_zero_only: bool = False,
         loc=None,
         ip=None,
-    ) -> cutlass.utils.WorkTileInfo:
+    ) -> WorkDesc:
         assert bidz is None
         params = self.params
         lane_idx = cute.arch.lane_idx()
@@ -1091,4 +1092,4 @@ class VarlenMTileScheduler(TileScheduler):
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         self._current_batch_idx = batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
-        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
+        return make_work_desc(tile_coord_mnkl, is_valid)

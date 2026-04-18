@@ -3,33 +3,39 @@
 
 from typing import Optional
 
-from torch import Tensor
-
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Float32, Int32
 from cutlass.cute.runtime import make_ptr
-
 from quack.cache_utils import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
+from quack.cute_dsl_utils import (
+    get_device_capacity,
+    get_max_active_clusters,
+    torch2cute_dtype_map,
+)
 from quack.gemm_default_epi import (
     GemmDefaultEpiMixin,
-    GemmDefaultSm90,
     GemmDefaultSm100,
     GemmDefaultSm120,
+    GemmDefaultSm90,
 )
-from quack.rounding import RoundingMode
+from quack.gemm_problem_adapter import (
+    GroupedProblemAdapterMixin,
+    GroupedProblemArguments,
+)
 from quack.gemm_tvm_ffi_utils import (
-    get_majors,
+    compile_gemm_kernel,
     get_dtypes,
-    perm3d,
-    make_scheduler_args,
-    make_varlen_args,
+    get_majors,
+    make_fake_gemm_tensors,
     make_fake_scheduler_args,
     make_fake_varlen_args,
-    make_fake_gemm_tensors,
-    compile_gemm_kernel,
+    make_scheduler_args,
+    make_varlen_args,
+    perm3d,
 )
+from quack.rounding import RoundingMode
+from torch import Tensor
 
 
 @jit_cache
@@ -63,6 +69,7 @@ def _compile_gemm(
     rounding_mode,
     sr_seed_mode,
     has_trace_ptr,
+    grouped,
 ):
     sm_to_cls = {
         9: GemmDefaultSm90,
@@ -71,6 +78,10 @@ def _compile_gemm(
         12: GemmDefaultSm120,
     }
     GemmCls = sm_to_cls[device_capacity[0]]
+    if grouped:
+        GemmCls = type(
+            f"Grouped{GemmCls.__name__}", (GroupedProblemAdapterMixin, GemmCls), {}
+        )
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
         a_dtype,
         b_dtype,
@@ -115,6 +126,14 @@ def _compile_gemm(
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    problem_args = (
+        GroupedProblemArguments(
+            mProblemIndex=fake_tensor(Int32, (l,), leading_dim=0, divisibility=4),
+            mProblemK=fake_tensor(Int32, (l,), leading_dim=0, divisibility=4),
+        )
+        if grouped
+        else None
+    )
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -135,6 +154,7 @@ def _compile_gemm(
         has_trace_ptr=has_trace_ptr,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
+        problem_args=problem_args,
     )
 
 
@@ -157,21 +177,48 @@ def gemm(
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
-    cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
-    cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
-    A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
-    batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
+    cu_seqlens_m: Optional[
+        Tensor
+    ] = None,  # (l+1,) cumulative sum of m values for variable length
+    cu_seqlens_k: Optional[
+        Tensor
+    ] = None,  # (l+1,) cumulative sum of k values for variable length
+    A_idx: Optional[
+        Tensor
+    ] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
+    batch_idx_permute: Optional[
+        Tensor
+    ] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
+    grouped: bool = False,
+    grouped_problem_index: Optional[Tensor] = None,
+    grouped_problem_k: Optional[Tensor] = None,
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
+    if grouped:
+        assert A.ndim == 3 and B.ndim == 3 and D.ndim == 3, (
+            "grouped GEMM expects dense packed batched tensors"
+        )
+        assert not varlen and not gather_A, (
+            "grouped GEMM does not combine with varlen/gather"
+        )
+        batch_size = A.shape[0]
+        if grouped_problem_index is not None:
+            assert grouped_problem_index.numel() == batch_size, (
+                "grouped_problem_index must have one entry per problem"
+            )
+        if grouped_problem_k is not None:
+            assert grouped_problem_k.numel() == batch_size, (
+                "grouped_problem_k must have one entry per problem"
+            )
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
     if gather_A:
         assert varlen, "gather_A requires varlen"
@@ -188,11 +235,17 @@ def gemm(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    assert device_capacity[0] in [9, 10, 11, 12], (
+        "Only SM90, SM100, SM110, and SM120 are supported"
+    )
     if use_tma_gather:
-        assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
+        assert device_capacity[0] in [10, 11], (
+            "TMA gather currently requires SM100/SM110"
+        )
     if rounding_mode == RoundingMode.RS:
-        assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
+        assert device_capacity[0] == 10, (
+            "Stochastic rounding (RoundingMode.RS) requires SM100"
+        )
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (
             "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
@@ -208,7 +261,9 @@ def gemm(
     concat_layout = tuple(sorted(concat_layout)) if concat_layout else ()
 
     sr_seed_mode = (
-        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
+        2
+        if isinstance(sr_seed, Tensor)
+        else (1 if rounding_mode == RoundingMode.RS else 0)
     )
     compiled_fn = _compile_gemm(
         a_dtype,
@@ -240,6 +295,7 @@ def gemm(
         rounding_mode,
         sr_seed_mode,
         trace_ptr is not None,
+        grouped,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -255,7 +311,9 @@ def gemm(
         else:
             return scalar.data_ptr()
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    max_active_clusters = (
+        get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    )
 
     epi_args = GemmDefaultEpiMixin.EpilogueArguments(
         alpha=scalar_arg(alpha, alpha_mode),
@@ -273,10 +331,38 @@ def gemm(
         batch_idx_permute,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+    problem_args = (
+        GroupedProblemArguments(
+            mProblemIndex=grouped_problem_index,
+            mProblemK=grouped_problem_k,
+        )
+        if grouped
+        else None
+    )
 
     if device_capacity[0] in [10, 11]:
         compiled_fn(
-            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, trace_ptr
+            A_p,
+            B_p,
+            D_p,
+            C_p,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            None,
+            None,
+            trace_ptr,
+            problem_args,
         )
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, trace_ptr)
+        compiled_fn(
+            A_p,
+            B_p,
+            D_p,
+            C_p,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            trace_ptr,
+            problem_args,
+        )
