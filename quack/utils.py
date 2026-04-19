@@ -275,6 +275,18 @@ def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
 
 
 @dsl_user_op
+def threadfence(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "membar.gl;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+@dsl_user_op
 def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
     from cutlass import CUDA_VERSION
 
