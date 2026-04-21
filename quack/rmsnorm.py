@@ -1246,7 +1246,7 @@ def rmsnorm_bwd(
     # In-kernel cross-CTA dw reduction via two-level tree. Only supported for
     # cluster_n == 1 (N <= 8192) and non-per-head. For larger N or per-head the
     # kernel ignores dw/semaphore and we fall back to host-side dw_partial.sum().
-    use_in_kernel_dw_reduction = N <= 8192 and weight is not None and not per_head
+    use_in_kernel_dw_reduction = N <= 2048 and weight is not None and not per_head
     if weight is not None:
         # Always store partial gradients in fp32 for numerical accuracy
         dw_shape = (sm_count, H, N) if per_head else (sm_count, N)
