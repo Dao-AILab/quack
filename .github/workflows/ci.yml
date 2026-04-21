@@ -8,7 +8,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install ruff
         run: pip install ruff
       - name: Ruff check
@@ -25,5 +25,5 @@ jobs:
     name: test (${{ matrix.gpu }})
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/gpu-test
