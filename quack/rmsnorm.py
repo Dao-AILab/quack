@@ -1033,7 +1033,17 @@ def _rmsnorm_bwd(
     semaphore: Optional[Tensor] = None,
     group_size: Optional[int] = None,
 ) -> None:
-    """RMSNorm backward pass (mutates dx, dw_partial, dw in-place)."""
+    """RMSNorm backward pass.
+    Args:
+        x: Input tensor of shape (M, N) or (M, H, N) for per-head
+        weight: Optional weight tensor of shape (N,) or (H, N) for per-head
+        dout: Upstream gradients tensor of shape (M, N) or (M, H, N)
+        rstd: Reciprocal standard deviation tensor of shape (M,) or (M, H)
+    Returns:
+        Tuple of (dx, dw) where:
+        - dx: Input gradients tensor of same shape as x
+        - dw: Weight gradients tensor of same shape as weight (or None if weight is None)
+    """
     assert x.dim() in (2, 3), "Input must be 2D or 3D"
     assert x.is_cuda, "Input tensor must be on CUDA device"
     supported_types = {torch.float16, torch.bfloat16, torch.float32}
