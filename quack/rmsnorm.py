@@ -608,8 +608,21 @@ class RMSNormBackward(ReductionBase):
         num_blocks = sm_count
         num_heads = mX.shape[1] if const_expr(cute.rank(mX) == 3) else 1
         self.kernel(
-            mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdW_final, mdB, mdRes, mSemaphore,
-            group_size, tiler_mn, tiled_copy, threads_per_row,
+            mX,
+            mW,
+            mdO,
+            mdResO,
+            mRstd,
+            mdX,
+            mdW,
+            mdW_final,
+            mdB,
+            mdRes,
+            mSemaphore,
+            group_size,
+            tiler_mn,
+            tiled_copy,
+            threads_per_row,
         ).launch(
             grid=[num_blocks, self.cluster_n, num_heads],
             block=[num_threads, 1, 1],
@@ -925,7 +938,8 @@ class RMSNormBackward(ReductionBase):
             gdW_all = cute.local_tile(mdW, (1, tiler_mn[1]), (None, cluster_y))
             tXgdW_all = thr_copy_X.partition_S(gdW_all)
             tXrdW_accum = cute.make_fragment_like(
-                tXgdW_all[None, None, None, 0], Float32,
+                tXgdW_all[None, None, None, 0],
+                Float32,
             )
             tXrdW_row = cute.make_fragment_like(tXgdW_all[None, None, None, 0])
 
@@ -945,7 +959,9 @@ class RMSNormBackward(ReductionBase):
                     copy(tXgdW_all[None, None, None, i], tXrdW_row)
                     tXrdW_accum.store(tXrdW_accum.load() + tXrdW_row.load())
                 gdW_leader = cute.local_tile(
-                    mdW, (1, tiler_mn[1]), (group_base, cluster_y),
+                    mdW,
+                    (1, tiler_mn[1]),
+                    (group_base, cluster_y),
                 )
                 tXgdW_leader = thr_copy_X.partition_D(gdW_leader)
                 copy(tXrdW_accum, tXgdW_leader)
@@ -955,7 +971,8 @@ class RMSNormBackward(ReductionBase):
                 if tidx == 0:
                     is_last_group = Int32(0)
                     old = utils.atomic_add_i32(
-                        Int32(1), mSemaphore.iterator + num_groups,
+                        Int32(1),
+                        mSemaphore.iterator + num_groups,
                     )
                     if old == num_groups - Int32(1):
                         is_last_group = Int32(1)
@@ -970,7 +987,9 @@ class RMSNormBackward(ReductionBase):
                         copy(tXgdW_all[None, None, None, leader_row], tXrdW_row)
                         tXrdW_accum.store(tXrdW_accum.load() + tXrdW_row.load())
                     gdW_final = cute.local_tile(
-                        mdW_final, (1, tiler_mn[1]), (0, cluster_y),
+                        mdW_final,
+                        (1, tiler_mn[1]),
+                        (0, cluster_y),
                     )
                     tXgdW_final = thr_copy_X.partition_D(gdW_final)
                     tXrdW_out = cute.make_fragment_like(tXgdW_final)
@@ -1086,8 +1105,18 @@ def _rmsnorm_bwd(
         per_head,
         dw_dtype,
     )(
-        x, weight, dout, dresidual_out, rstd, dx, dw_partial, dw,
-        dresidual, db_partial, semaphore, sm_count,
+        x,
+        weight,
+        dout,
+        dresidual_out,
+        rstd,
+        dx,
+        dw_partial,
+        dw,
+        dresidual,
+        db_partial,
+        semaphore,
+        sm_count,
         group_size if group_size is not None else 0,
     )
 
@@ -1232,8 +1261,19 @@ def rmsnorm_bwd(
     db_partial = torch.empty(db_shape, device=device, dtype=torch.float32) if has_bias else None
 
     _rmsnorm_bwd(
-        x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual,
-        sm_count, dw, semaphore, group_size,
+        x,
+        weight,
+        dout,
+        rstd,
+        dx,
+        dw_partial,
+        db_partial,
+        dresidual_out,
+        dresidual,
+        sm_count,
+        dw,
+        semaphore,
+        group_size,
     )
 
     if weight is not None and not use_in_kernel_dw_reduction:
