@@ -4,15 +4,13 @@
 from functools import partial
 
 
-import cutlass.cute as cute
-from cutlass import Int32, Int64, Float32
+from cutlass import Float32, Int32, Int64
 from cutlass.cute.runtime import make_ptr
-
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
-
+import cutlass.cute as cute
 
 def div_for_dtype(dtype):
     """16-byte alignment: divisibility in elements = 128 // dtype_width_bits."""
@@ -66,7 +64,9 @@ def make_scheduler_args(
         raster_order=None,
         max_swizzle_size=max_swizzle_size,
         tile_count_semaphore=(
-            tile_count_semaphore.data_ptr() if tile_count_semaphore is not None else None
+            tile_count_semaphore.data_ptr()
+            if tile_count_semaphore is not None
+            else None
         ),
         batch_idx_permute=batch_idx_permute,
     )
@@ -77,7 +77,9 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
         max_active_clusters=Int32(1),
         max_swizzle_size=Int32(8),
         tile_count_semaphore=(
-            make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_semaphore else None
+            make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
+            if has_semaphore
+            else None
         ),
         batch_idx_permute=(
             fake_tensor(Int32, (l_sym,), leading_dim=0, divisibility=4)
@@ -103,13 +105,19 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
     num_seqlens = cute.sym_int()
     return VarlenArguments(
         mCuSeqlensM=(
-            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_m else None
+            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
+            if varlen_m
+            else None
         ),
         mCuSeqlensK=(
-            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_k else None
+            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
+            if varlen_k
+            else None
         ),
         mAIdx=(
-            fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4) if gather_A else None
+            fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4)
+            if gather_A
+            else None
         ),
     )
 
@@ -188,6 +196,7 @@ def compile_gemm_kernel(
     has_trace_ptr=False,
     use_tma_gather=False,
     concat_layout=None,
+    problem_args=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] in [9, 12]:
@@ -225,5 +234,6 @@ def compile_gemm_kernel(
         stream,
         *sf_args,
         trace_ptr,
+        problem_args,
         options="--enable-tvm-ffi",
     )

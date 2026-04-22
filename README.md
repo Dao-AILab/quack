@@ -45,6 +45,7 @@ from quack import rmsnorm, softmax, cross_entropy
 [blogpost](media/2025-07-10-membound-sol.md) on how to get memory-bound kernels
 to speed-of-light, right in the comfort of Python thanks to the [CuTe-DSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
 
+
 ## Performance
 
 <div align="center">

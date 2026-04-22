@@ -453,6 +453,96 @@ def gemm(
     return out
 
 
+def gemm_grouped(
+    A_list: list[Tensor],
+    B_list: list[Tensor],
+    out_list: Optional[list[Tensor]] = None,
+    alpha: float | Tensor = 1.0,
+    out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int | Tensor = 0,
+):
+    """Grouped GEMM for heterogeneous `(M_i, K_i) x (K_i, N_i)` problems.
+
+    This host wrapper packs problems into padded batched tensors, dispatches through
+    the grouped-capable core GEMM path, and slices outputs back to per-problem shapes.
+    """
+    assert len(A_list) == len(B_list) and len(A_list) > 0, "A_list/B_list must be same non-zero length"
+    device = A_list[0].device
+    dtype = A_list[0].dtype
+    out_dtype = dtype if out_dtype is None else out_dtype
+    problem_count = len(A_list)
+    ms = [a.shape[0] for a in A_list]
+    ks = [a.shape[1] for a in A_list]
+    ns = [b.shape[1] for b in B_list]
+    assert all(a.ndim == 2 for a in A_list), "Each A must be rank-2"
+    assert all(b.ndim == 2 for b in B_list), "Each B must be rank-2"
+    assert all(a.device == device and b.device == device for a, b in zip(A_list, B_list)), (
+        "All grouped tensors must be on the same device"
+    )
+    assert all(a.dtype == dtype and b.dtype == dtype for a, b in zip(A_list, B_list)), (
+        "All grouped tensors must have the same dtype"
+    )
+    assert all(a.shape[1] == b.shape[0] for a, b in zip(A_list, B_list)), "Incompatible K dims"
+
+    max_m = max(ms)
+    max_k = max(ks)
+    max_n = max(ns)
+
+    A_packed = torch.zeros((problem_count, max_m, max_k), dtype=dtype, device=device)
+    B_packed = torch.zeros((problem_count, max_k, max_n), dtype=dtype, device=device)
+    D_packed = torch.empty((problem_count, max_m, max_n), dtype=out_dtype, device=device)
+
+    for idx, (A_i, B_i) in enumerate(zip(A_list, B_list)):
+        m_i, k_i = A_i.shape
+        _, n_i = B_i.shape
+        A_packed[idx, :m_i, :k_i].copy_(A_i)
+        B_packed[idx, :k_i, :n_i].copy_(B_i)
+
+    grouped_problem_index = torch.arange(problem_count, device=device, dtype=torch.int32)
+    grouped_problem_k = torch.tensor(ks, device=device, dtype=torch.int32)
+
+    config = default_config(device)
+    dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=device)
+        if dynamic_scheduler and get_device_capacity(device)[0] == 9
+        else None
+    )
+
+    gemm_dispatch(
+        A_packed,
+        B_packed,
+        D_packed,
+        None,
+        tile_count_semaphore,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+        persistent=True,
+        is_dynamic_persistent=dynamic_scheduler,
+        max_swizzle_size=config.max_swizzle_size,
+        alpha=alpha,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed,
+        grouped=True,
+        grouped_problem_index=grouped_problem_index,
+        grouped_problem_k=grouped_problem_k,
+    )
+
+    if out_list is None:
+        out_list = [
+            torch.empty((m_i, n_i), dtype=out_dtype, device=device) for m_i, n_i in zip(ms, ns)
+        ]
+    for out_i, m_i, n_i, packed_i in zip(out_list, ms, ns, D_packed):
+        out_i.copy_(packed_i[:m_i, :n_i])
+    return out_list
+
+
 @torch.library.custom_op(
     "quack::gemm_out",
     mutates_args=("out",),

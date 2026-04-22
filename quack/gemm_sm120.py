@@ -163,6 +163,7 @@ class GemmSm120(GemmSm90):
         epi_c_smem_layout: cute.ComposedLayout,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        problem_params,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
         from quack.trace import TraceContext
@@ -269,12 +270,12 @@ class GemmSm120(GemmSm90):
                 )
                 while work_tile.is_valid_tile:
                     tctx.b("tma_load")
-                    tile_coord_mnkl = work_tile.tile_idx
-                    batch_idx = tile_coord_mnkl[3]
+                    tile_coord_mnkl = work_tile.tile_coord_mnkl
+                    batch_idx = self.problem_get_problem_idx(problem_params, work_tile)
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None
                     if const_expr(not self.gather_A):
-                        mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
+                        mA_mk = self.problem_get_batch_A(problem_params, mA_mkl, varlen_manager, work_tile)
                         # (bM, bK, RestK)
                         gA_mk = cute.local_tile(
                             mA_mk,
@@ -298,7 +299,7 @@ class GemmSm120(GemmSm90):
                         )
                     # (bN, bK, RestK)
                     gB_nk = cute.local_tile(
-                        varlen_manager.offset_batch_B(mB_nkl, batch_idx),
+                        self.problem_get_batch_B(problem_params, mB_nkl, varlen_manager, work_tile),
                         cute.select(self.cta_tile_shape_mnk, [1, 2]),
                         (tile_coord_mnkl[1], None),
                     )
@@ -313,7 +314,7 @@ class GemmSm120(GemmSm90):
                         dst_tensor=sB,
                         mcast_mask=b_mcast_mask,
                     )
-                    len_k = varlen_manager.len_k(batch_idx)
+                    len_k = self.problem_get_len_k(problem_params, varlen_manager, work_tile)
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
                         ab_producer_state = self.load_AB(
@@ -409,15 +410,15 @@ class GemmSm120(GemmSm90):
                     if const_expr(not varlen_k):
                         ab_read_state.advance_iters(k_tile_cnt_static)
                     else:
-                        len_k = varlen_manager.len_k(batch_idx=work_tile.tile_idx[3])
+                        len_k = self.problem_get_len_k(problem_params, varlen_manager, work_tile)
                         k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                         ab_read_state.advance_iters(k_tile_cnt)
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
             while work_tile.is_valid_tile:
-                tile_coord_mnkl = work_tile.tile_idx
-                batch_idx = tile_coord_mnkl[3]
-                len_k = varlen_manager.len_k(batch_idx)
+                tile_coord_mnkl = work_tile.tile_coord_mnkl
+                batch_idx = self.problem_get_problem_idx(problem_params, work_tile)
+                len_k = self.problem_get_len_k(problem_params, varlen_manager, work_tile)
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                 acc.fill(0.0)
                 if const_expr(self.pingpong):
@@ -452,7 +453,7 @@ class GemmSm120(GemmSm90):
                 if const_expr(has_D):
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
-                        varlen_manager.offset_batch_epi(mD_mnl, tile_coord_mnkl[3]),
+                        self.problem_get_batch_epi(problem_params, mD_mnl, varlen_manager, work_tile),
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sD,
@@ -462,7 +463,7 @@ class GemmSm120(GemmSm90):
                 if const_expr(has_C):
                     copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
-                        varlen_manager.offset_batch_epi(mC_mnl, tile_coord_mnkl[3]),
+                        self.problem_get_batch_epi(problem_params, mC_mnl, varlen_manager, work_tile),
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sC,
@@ -537,7 +538,7 @@ class GemmSm120(GemmSm90):
                         tile_scheduler.advance_to_next_work()
                         work_tile = tile_scheduler.get_current_work()
                         if work_tile.is_valid_tile:
-                            len_k = varlen_manager.len_k(batch_idx=work_tile.tile_idx[3])
+                            len_k = self.problem_get_len_k(problem_params, varlen_manager, work_tile)
                             k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                             ab_read_state.advance_iters(k_tile_cnt)
                             tile_scheduler.advance_to_next_work()
