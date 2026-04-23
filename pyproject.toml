@@ -11,6 +11,7 @@ dependencies = [
     "torch",
     "apache-tvm-ffi>=0.1.6,<0.2",
     "torch-c-dlpack-ext",
+    "einops",
 ]
 
 [project.optional-dependencies]
