@@ -20,7 +20,7 @@ pip install 'quack-kernels[heuristics]'
 
 ## Requirements
 
-- H100 or B200/B300 GPU
+- H100, B200/B300, or RTX 50 GPU
 - CUDA toolkit 12.9+
 - Python 3.12
 
@@ -32,6 +32,7 @@ pip install 'quack-kernels[heuristics]'
 - 🦆 Layernorm forward
 - 🦆 Hopper gemm + epilogue
 - 🦆 Blackwell gemm + epilogue
+- 🦆 Blackwell GeForce gemm + epilogue
 
 ## Usage
 
