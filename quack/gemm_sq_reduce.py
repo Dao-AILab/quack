@@ -204,8 +204,6 @@ def gemm_sq_reduce(
     """
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
-    if device_capacity[0] == 12:
-        raise NotImplementedError("SM120 GEMM sq reduce epilogue is not yet supported")
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
