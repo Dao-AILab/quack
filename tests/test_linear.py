@@ -196,8 +196,6 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
 def test_gemm_dact(n, k, input_dtype, activation):
     """Test GEMM with activation gradient computation."""
     device = "cuda"
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("SM120 non-gated dactivation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 960
     dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
