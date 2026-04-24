@@ -164,8 +164,6 @@ def test_gemm_concat_layout(
 # @pytest.mark.parametrize("in_features", [4096])
 def test_linear_act(in_features, out_features, has_bias, input_dtype, activation, store_preact):
     device = "cuda"
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("SM120 non-gated activation GEMM epilogue is not yet supported")
     torch.random.manual_seed(0)
     m = 1920
     x = torch.randn((m, in_features), device=device, dtype=input_dtype)

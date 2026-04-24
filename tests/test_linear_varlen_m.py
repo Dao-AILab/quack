@@ -404,8 +404,6 @@ def test_gemm_act_varlen_m(
 ):
     """Test GEMM with activation and variable length M dimension."""
     device = "cuda"
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("SM120 non-gated activation GEMM epilogue is not yet supported")
     torch.random.manual_seed(42)
     seq_lens = torch.randint(100, 500, (num_groups,), device=device)
     total_m = seq_lens.sum().item()

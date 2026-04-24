@@ -300,8 +300,6 @@ def _compile_gemm_act(
         "act": {9: GemmActSm90, 10: GemmActSm100, 11: GemmActSm100, 12: GemmActSm120},
         "gated": {9: GemmGatedSm90, 10: GemmGatedSm100, 11: GemmGatedSm100, 12: GemmGatedSm120},
     }
-    if device_capacity[0] == 12 and gemm_cls_name == "act":
-        raise NotImplementedError("SM120 non-gated activation GEMM epilogue is not yet supported")
     GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
     pa_leading = 1 if postact_major == "n" else 0
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
