@@ -24,7 +24,7 @@ def run_cross_entropy(
     return_dx=False,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+        raise RuntimeError("Ampere GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input Data type: {dtype}")
@@ -50,7 +50,8 @@ def run_cross_entropy(
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
     fn_ref = lambda: compiled_func_ref(x, target)
-    for _ in range(5): fn_ref()  # warm up
+    for _ in range(5):
+        fn_ref()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
     mem_bytes = M * N * db + M * 8 + M * 4
@@ -75,7 +76,7 @@ def run_cross_entropy_backward(
     iterations=1000,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+        raise RuntimeError("Ampere GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input Data type: {dtype}")
@@ -87,7 +88,7 @@ def run_cross_entropy_backward(
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
     x_ref = x.detach().clone().requires_grad_()
 
-    print(f"Input tensor shapes:")
+    print("Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     print(f"target: {target.shape}, dtype: {target.dtype}")
 
@@ -99,7 +100,8 @@ def run_cross_entropy_backward(
     loss_ref = F.cross_entropy(x_ref, target, reduction='none')
     compiled_func_ref = torch.compile(lambda: torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss, retain_graph=True))
 
-    for _ in range(5): compiled_func_ref()  # warm up
+    for _ in range(5):
+        compiled_func_ref()  # warm up
     time.sleep(0.5)
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
     mem_bw_ref = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() +

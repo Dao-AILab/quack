@@ -27,7 +27,7 @@ def run_topk(
     iterations=1000,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"CUDA GPU is required to run this example!")
+        raise RuntimeError("CUDA GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}], k={k}")
     print(f"Input and Output Data type: {dtype}")
@@ -37,7 +37,7 @@ def run_topk(
     device = "cuda"
     x = torch.randn(M, N, device=device, dtype=torch_dtype, requires_grad=True)
 
-    print(f"Input tensor shapes:")
+    print("Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     out, idx = topk(x, k, softmax=softmax)
     print(f"Output shape: {out.shape}")
@@ -81,7 +81,8 @@ def run_topk(
         print(f"Speedup: {speedup:.2f}x")
     else:
         fn_ref = lambda: torch.topk(x, k, dim=-1, largest=True, sorted=True)[0]
-        for _ in range(5): fn_ref()  # warm up
+        for _ in range(5):
+            fn_ref()  # warm up
         time.sleep(0.5)
         avg_time_ref = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
         mem_bw_ref = round(mem_accessed / (avg_time_ref / 1000) / 1e9, 2)
@@ -93,7 +94,8 @@ def run_topk(
 
     if rtopk is not None:
         fn_rtopk = lambda: rtopk.ops.rtopk(x, k, max_iter=512)
-        for _ in range(5): fn_rtopk()  # warm up
+        for _ in range(5):
+            fn_rtopk()  # warm up
         time.sleep(0.5)
         avg_time_ref = do_bench(fn_rtopk, warmup=warmup_iterations, rep=iterations)
         mem_bw_ref = round(mem_accessed / (avg_time_ref / 1000) / 1e9, 2)

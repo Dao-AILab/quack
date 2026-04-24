@@ -28,7 +28,7 @@ def run_softmax(
     iterations=1000,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+        raise RuntimeError("Ampere GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
@@ -38,7 +38,7 @@ def run_softmax(
     device = "cuda"
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype)
 
-    print(f"Input tensor shapes:")
+    print("Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     out = softmax(x)
     # compiled_func_ref = torch.compile(lambda x: F.softmax(x, dim=-1))
@@ -51,7 +51,8 @@ def run_softmax(
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
     fn = lambda: compiled_func_ref(x)
-    for _ in range(5): fn()  # warm up
+    for _ in range(5):
+        fn()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
@@ -60,7 +61,8 @@ def run_softmax(
 
     if liger_softmax is not None:
         fn = lambda: liger_softmax(x)
-        for _ in range(5): fn()  # warm up
+        for _ in range(5):
+            fn()  # warm up
         time.sleep(0.5)
         avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
         mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
@@ -78,7 +80,7 @@ def run_softmax_backward(
     iterations=1000,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+        raise RuntimeError("Ampere GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
@@ -89,7 +91,7 @@ def run_softmax_backward(
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_()
 
-    print(f"Input tensor shapes:")
+    print("Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
 
     y = softmax(x)
@@ -107,7 +109,8 @@ def run_softmax_backward(
     y_ref = F.softmax(x_ref, dim=-1)
     compiled_func_ref = torch.compile(lambda: torch.autograd.grad(y_ref, x_ref, grad_outputs=dy, retain_graph=True))
 
-    for _ in range(5): compiled_func_ref()  # warm up
+    for _ in range(5):
+        compiled_func_ref()  # warm up
     time.sleep(0.5)
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
     mem_bw_ref = round(3 * x.numel() * dtype.width // 8 / (avg_time_ref / 1000) / 1e9)

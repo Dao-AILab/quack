@@ -7,9 +7,7 @@ from triton.testing import do_bench
 
 import cutlass
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
 from quack.rmsnorm import layernorm_fwd as layernorm, layernorm_ref
-import cutlass.cute as cute
 
 try:
     import cudnn
@@ -25,7 +23,7 @@ def run_layernorm(
     iterations=200,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+        raise RuntimeError("Ampere GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
@@ -36,7 +34,7 @@ def run_layernorm(
     x = torch.randn(M, N, device=device, dtype=torch_dtype)
     w = torch.randn(N, device=device, dtype=torch.float32)
 
-    print(f"Input tensor shapes:")
+    print("Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     print(f"w: {w.shape}, dtype: {w.dtype}")
 

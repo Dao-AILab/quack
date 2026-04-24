@@ -1,6 +1,5 @@
 import argparse
 import time
-from typing import Tuple, Type, Optional
 
 import torch
 from triton.testing import do_bench

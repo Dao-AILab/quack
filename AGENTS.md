@@ -15,8 +15,8 @@ pre-commit install
 pip install -e '.[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
 
 # Lint & format
-ruff check --fix quack/ tests/
-ruff format quack/ tests/
+ruff check --fix quack/ tests/ benchmarks/
+ruff format quack/ tests/ benchmarks/
 
 # Run all tests
 pytest tests/

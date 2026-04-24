@@ -1,7 +1,7 @@
 import argparse
 import os
 import time
-from typing import Type, Optional
+from typing import Optional
 
 os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
 
@@ -9,10 +9,7 @@ import torch
 from triton.testing import do_bench
 
 import cutlass
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
 from quack.rmsnorm import rmsnorm_fwd, rmsnorm_ref, rmsnorm, rmsnorm_bwd
-import cutlass.cute as cute
 
 try:
     import cudnn
@@ -29,7 +26,7 @@ def run_rmsnorm(
     iterations=100,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+        raise RuntimeError("Ampere GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
@@ -42,7 +39,7 @@ def run_rmsnorm(
         residual = None
     w = torch.randn(N, device=device, dtype=torch.float32)
 
-    print(f"Input tensor shapes:")
+    print("Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     print(f"w: {w.shape}, dtype: {w.dtype}")
 
@@ -64,7 +61,8 @@ def run_rmsnorm(
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
     fn = lambda: compiled_func_ref(x, w, residual=residual, eps=eps)
-    for _ in range(5): fn()  # warm up
+    for _ in range(5):
+        fn()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     mem_bytes_ref = mem_bytes
@@ -137,7 +135,7 @@ def run_rmsnorm_bwd(
     iterations=100,
 ):
     if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+        raise RuntimeError("Ampere GPU is required to run this example!")
 
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
@@ -155,7 +153,7 @@ def run_rmsnorm_bwd(
     else:
         residual, residual_ref = None, None
 
-    print(f"Input tensor shapes:")
+    print("Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     print(f"w: {w.shape}, dtype: {w.dtype}")
 
@@ -202,7 +200,8 @@ def run_rmsnorm_bwd(
     #     rmsnorm_ref(x_ref, w_ref, eps=eps).backward(dy)
     # compiled_func_ref = torch.compile(f)
 
-    for _ in range(5): compiled_func_ref()  # warm up
+    for _ in range(5):
+        compiled_func_ref()  # warm up
     time.sleep(0.5)
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
     mem_bytes_ref = (3 * x.numel() * dtype.itemsize + w.numel() * 4 + x.shape[0] * 4 + sm_count * w.numel() * 4)
