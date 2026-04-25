@@ -97,7 +97,7 @@ class GemmSqReduceSm100(GemmSqReduceMixin, GemmSm100):
 
 
 class GemmSqReduceSm120(GemmSqReduceMixin, GemmSm120):
-    pass
+    _epi_ops = (*GemmDefaultEpiMixin._epi_ops, ColVecReduce("mColVecReduce", max_warps_in_n=2))
 
 
 @jit_cache

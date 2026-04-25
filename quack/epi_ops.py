@@ -545,7 +545,9 @@ class ColVecReduce(EpiOp):
     and final reduction + gmem write (end).
     """
 
-    max_warps_in_n = 8
+    def __init__(self, name, max_warps_in_n=1):
+        super().__init__(name)
+        self.max_warps_in_n = max_warps_in_n
 
     def param_fields(self):
         return [(self.name, object, None)]
@@ -554,17 +556,19 @@ class ColVecReduce(EpiOp):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
-        if arg_tensor is None:
+        if arg_tensor is None or self.max_warps_in_n <= 1:
             return 0
         return cta_tile_shape_mnk[0] * self.max_warps_in_n * (Float32.width // 8)
 
     def smem_struct_field(self, gemm, params):
         tensor = getattr(params, self.name, None)
-        size = gemm.cta_tile_shape_mnk[0] * self.max_warps_in_n if tensor is not None else 0
+        if tensor is None or self.max_warps_in_n <= 1:
+            return None
+        size = gemm.cta_tile_shape_mnk[0] * self.max_warps_in_n
         return (f"s_{self.name}", cute.struct.Align[cute.struct.MemRange[Float32, size], 16])
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        if getattr(params, self.name, None) is None:
+        if getattr(params, self.name, None) is None or self.max_warps_in_n == 1:
             return None
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
             cute.make_layout((gemm.cta_tile_shape_mnk[0], self.max_warps_in_n))
@@ -634,7 +638,10 @@ class ColVecReduce(EpiOp):
             warp_N = warp_layout_MN[1]
             warps_in_N = const_expr(cute.size(warp_N))
             max_warps_in_n = const_expr(self.max_warps_in_n)
-            assert warps_in_N <= max_warps_in_n, "ColVecReduce warp_N exceeds smem staging"
+            if const_expr(max_warps_in_n <= 1):
+                assert warps_in_N == 1, "ColVecReduce has no inter-warp-N smem staging"
+            else:
+                assert warps_in_N <= max_warps_in_n, "ColVecReduce warp_N exceeds smem staging"
 
             partition_for_epilogue_fn = partial(
                 partition_for_epilogue,
