@@ -192,6 +192,7 @@ def gemm_sq_reduce(
     tile_N: int,
     cluster_M: int,
     cluster_N: int,
+    tile_K: int | None = None,
     pingpong: bool = False,
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
@@ -204,6 +205,8 @@ def gemm_sq_reduce(
     """
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    if tile_K is not None:
+        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C)
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
@@ -223,7 +226,7 @@ def gemm_sq_reduce(
         b_major,
         d_major,
         c_major,
-        (tile_M, tile_N),
+        (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N),
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,

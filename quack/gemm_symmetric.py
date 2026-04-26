@@ -306,6 +306,7 @@ def gemm_symmetric(
     tile_N: int,
     cluster_M: int,
     cluster_N: int,
+    tile_K: int | None = None,
     pingpong: bool = False,
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
@@ -326,13 +327,15 @@ def gemm_symmetric(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    if tile_K is not None:
+        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (
             "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
         )
 
-    tile_shape_mn = (tile_M, tile_N)
+    tile_shape_mn = (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
     beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)

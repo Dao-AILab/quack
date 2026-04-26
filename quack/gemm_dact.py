@@ -367,6 +367,7 @@ def gemm_dact(
     tile_N: int,
     cluster_M: int,
     cluster_N: int,
+    tile_K: int | None = None,
     pingpong: bool = True,
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
@@ -431,6 +432,8 @@ def gemm_dact(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    if tile_K is not None:
+        assert device_capacity[0] in [10, 11], "tile_K currently requires SM100/SM110"
 
     if is_dynamic_persistent and device_capacity[0] == 9:
         assert tile_count_semaphore is not None, (
@@ -449,7 +452,7 @@ def gemm_dact(
         d_major,
         c_major,
         postact_major,
-        (tile_M, tile_N),
+        (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N),
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,

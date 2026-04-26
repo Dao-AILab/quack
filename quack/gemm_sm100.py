@@ -188,7 +188,10 @@ class GemmSm100(GemmSm90):
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
-        self.use_2cta_instrs = mma_tiler_mn[0] in (256,)
+        self.use_2cta_instrs = cluster_shape_mnk[0] == 2 and mma_tiler_mn[0] in (
+            128,
+            256,
+        )
         self.cluster_shape_mnk = cluster_shape_mnk
         assert cluster_shape_mnk[2] == 1, "Cluster shape K must be 1"
         # K dimension: if user provides 3 values, use their K; otherwise default in _setup_attributes
