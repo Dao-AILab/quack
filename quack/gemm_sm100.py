@@ -191,7 +191,7 @@ class GemmSm100(GemmSm90):
         self.sf_vec_size = sf_vec_size
         self.blockscaled = sf_vec_size is not None
         valid_2cta_m = (128, 256) if not self.blockscaled else (256,)
-        self.use_2cta_instrs = cluster_shape_mnk[0] == 2 and mma_tiler_mn[0] in valid_2cta_m
+        self.use_2cta_instrs = cluster_shape_mnk[0] % 2 == 0 and mma_tiler_mn[0] in valid_2cta_m
         self.cluster_shape_mnk = cluster_shape_mnk
         assert cluster_shape_mnk[2] == 1, "Cluster shape K must be 1"
         # K dimension: if user provides 3 values, use their K; otherwise default in _setup_attributes
