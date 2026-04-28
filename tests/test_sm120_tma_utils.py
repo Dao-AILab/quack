@@ -14,6 +14,7 @@ from quack.sm120_tma_utils import (
     get_sm120_direct_tma_desc_addr,
     has_sm120_direct_tma_2d,
     make_sm120_direct_tma_load_2d_atom,
+    make_sm120_direct_tma_smem_layout_2d,
     make_sm120_tma_basis_tensor_2d,
     sm120_direct_tma_load_2d,
 )
@@ -38,10 +39,19 @@ def _sm120_direct_tma_copy_kernel(
     dtype: cutlass.Constexpr,
     d_tile: cutlass.Constexpr[int],
     seq_tile: cutlass.Constexpr[int],
+    use_swizzle: cutlass.Constexpr[bool],
 ):
     smem = cutlass.utils.SmemAllocator()
-    smem_layout = cute.make_layout((d_tile, seq_tile), stride=(1, d_tile))
-    s_tile = smem.allocate_tensor(dtype, smem_layout, byte_alignment=128)
+    smem_layout = make_sm120_direct_tma_smem_layout_2d(d_tile, seq_tile)
+    if cutlass.const_expr(use_swizzle):
+        s_tile = smem.allocate_tensor(
+            dtype,
+            smem_layout,
+            byte_alignment=128,
+            swizzle=cute.make_swizzle(3, 4, 3),
+        )
+    else:
+        s_tile = smem.allocate_tensor(dtype, smem_layout, byte_alignment=128)
     s_mbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout(2), byte_alignment=8)
 
     tidx, _, _ = cute.arch.thread_idx()
@@ -92,9 +102,14 @@ def _launch_sm120_direct_tma_copy(
     seq_total: cutlass.Constexpr[int],
     d_tile: cutlass.Constexpr[int],
     seq_tile: cutlass.Constexpr[int],
+    use_swizzle: cutlass.Constexpr[bool],
 ):
     gmem_tma = make_sm120_tma_basis_tensor_2d(src, d_total, seq_total)
-    smem_layout = cute.make_layout((d_tile, seq_tile), stride=(1, d_tile))
+    smem_layout = make_sm120_direct_tma_smem_layout_2d(
+        d_tile,
+        seq_tile,
+        swizzle=use_swizzle,
+    )
     tma_atom, _, _ = make_sm120_direct_tma_load_2d_atom(
         gmem_tma,
         smem_layout,
@@ -109,6 +124,7 @@ def _launch_sm120_direct_tma_copy(
         dtype,
         d_tile,
         seq_tile,
+        use_swizzle,
     ).launch(grid=[1, 1, 1], block=[64, 1, 1], smem=smem_bytes)
 
 
@@ -118,7 +134,7 @@ def _make_source(seq_total: int, d_total: int, dtype: torch.dtype) -> torch.Tens
     return (seq * 100.0 + d).to(dtype)
 
 
-def _run_copy_case(torch_dtype, cute_dtype, d_tile, seq_tile, coord0, coord1):
+def _run_copy_case(torch_dtype, cute_dtype, d_tile, seq_tile, coord0, coord1, use_swizzle=False):
     _require_sm120_direct_tma()
     d_total = 160
     seq_total = 224
@@ -138,6 +154,7 @@ def _run_copy_case(torch_dtype, cute_dtype, d_tile, seq_tile, coord0, coord1):
         seq_total,
         d_tile,
         seq_tile,
+        use_swizzle,
     )
     cute.compile(_launch_sm120_direct_tma_copy, *compile_args)(*runtime_args)
     torch.cuda.synchronize()
@@ -162,3 +179,19 @@ def test_sm120_direct_tma_2d_copy(torch_dtype, cute_dtype, d_tile, seq_tile, coo
 @pytest.mark.parametrize("coord0,coord1", [(0, 0), (16, 32)])
 def test_sm120_direct_tma_2d_copy_bf16(d_tile, seq_tile, coord0, coord1):
     _run_copy_case(torch.bfloat16, cutlass.BFloat16, d_tile, seq_tile, coord0, coord1)
+
+
+@pytest.mark.parametrize(
+    "torch_dtype,cute_dtype",
+    [(torch.float16, cutlass.Float16), (torch.bfloat16, cutlass.BFloat16)],
+)
+def test_sm120_direct_tma_2d_copy_sw128(torch_dtype, cute_dtype):
+    _run_copy_case(
+        torch_dtype,
+        cute_dtype,
+        d_tile=64,
+        seq_tile=64,
+        coord0=16,
+        coord1=32,
+        use_swizzle=True,
+    )

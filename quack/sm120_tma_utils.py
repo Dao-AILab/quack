@@ -84,6 +84,33 @@ def make_sm120_tma_basis_tensor_2d(
 
 
 @dsl_user_op
+def make_sm120_direct_tma_smem_layout_2d(
+    d_tile: cutlass.Constexpr[int],
+    seq_tile: cutlass.Constexpr[int],
+    *,
+    swizzle: cutlass.Constexpr[bool] = False,
+    loc=None,
+    ip=None,
+) -> cute.Layout | cute.ComposedLayout:
+    """Create the SMEM layout used by the SM120 direct rank-2 TMA path.
+
+    The base layout is the explicit TMA basis ``(d, seq)`` with stride
+    ``(1, d_tile)``.  When ``swizzle`` is true, the returned layout is the
+    conservative SW128-style composed layout validated by the local CuTe DSL
+    direct-TMA smoke test.  The TMA atom layout and destination SMEM pointer
+    must use the same swizzle.
+    """
+    smem_layout = cute.make_layout((d_tile, seq_tile), stride=(1, d_tile))
+    if const_expr(swizzle):
+        return cute.make_composed_layout(
+            cute.make_swizzle(3, 4, 3),
+            0,
+            smem_layout,
+        )
+    return smem_layout
+
+
+@dsl_user_op
 def make_sm120_direct_tma_load_2d_atom(
     gmem_tma_tensor: cute.Tensor,
     smem_layout: cute.Layout | cute.ComposedLayout,
