@@ -30,6 +30,7 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
         65536,
         128256,
         131072,
+        150000,
         256128,
         262144,
     ],
