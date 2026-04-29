@@ -17,6 +17,10 @@ from quack.rmsnorm import rmsnorm  # noqa: E402
 from quack.softmax import softmax  # noqa: E402
 from quack.cross_entropy import cross_entropy  # noqa: E402
 from quack.rounding import RoundingMode  # noqa: E402
+from quack.sm120_tma_utils import (  # noqa: E402
+    assert_sm120_direct_tma_2d,
+    has_sm120_direct_tma_2d,
+)
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -31,4 +35,6 @@ __all__ = [
     "softmax",
     "cross_entropy",
     "RoundingMode",
+    "assert_sm120_direct_tma_2d",
+    "has_sm120_direct_tma_2d",
 ]
