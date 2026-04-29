@@ -252,6 +252,8 @@ class CrossEntropy(ReductionBase):
             if not should_ignore:
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                     tXrdX_f32[i] = tXrdX_f32[i] if tXcFull[i][1] != target else tXrdX_f32[i] - 1.0
+            if const_expr(mWeight is not None):
+                tXrdX_f32.store(tXrdX_f32.load() * target_weight)
             tXrdX.store(tXrdX_f32.load().to(tXrdX.element_type))
             if row < shape[0]:
                 copy(tXrdX, tXgdX)
@@ -710,6 +712,7 @@ class CrossEntropyFunction(torch.autograd.Function):
     def backward(ctx, dloss):
         x, target, lse = ctx.saved_tensors
         weight = ctx.weight
+        dloss = dloss.contiguous()
         dx = cross_entropy_bwd(
             x, target, dloss, lse, weight=weight, ignore_index=ctx.ignore_index,
             inplace_backward=ctx.inplace_backward,
@@ -752,7 +755,7 @@ def cross_entropy(
     if reduction == "mean":
         if weight is not None:
             valid = target != ignore_index
-            denom = (weight[target.clamp(min=0) * valid]).sum()
+            denom = (weight[target.clamp(min=0)] * valid).sum()
             return loss.sum() / denom
         return loss.sum() / (target != ignore_index).sum().float()
     elif reduction == "sum":
@@ -762,4 +765,4 @@ def cross_entropy(
     else:
         raise ValueError(
             f"Invalid reduction mode: {reduction}. Expected one of 'none', 'mean', or 'sum'"
-        )()
+        )
