@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.cross_entropy import cross_entropy_fwd, cross_entropy_bwd, cross_entropy
+from quack.cross_entropy import cross_entropy_fwd, cross_entropy
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
