@@ -85,6 +85,33 @@ Use these shapes first:
 These are the right first comparisons because SM120 timing already showed that
 RMS is sensitive to tile shape and pingpong choice.
 
+## Local RTX 5060 timing pass
+
+The local timing pass below was measured on a Blackwell GeForce RTX 5060
+workstation on 2026-04-29. Because this machine is noisy, each config was run
+three separate times, and each run reported `--stat second-min` over seven CUDA
+event samples. The table records the best and second-best reported runtimes
+across those three benchmark invocations.
+
+All runs used:
+
+- `--kernel rms --dtype bfloat16 --m 4096 --n 4096 --k 4096`
+- `--preheat-ms 500 --stat second-min --repeats 7 --warmup 2`
+- `cluster_m=1`, `cluster_n=1`, dynamic persistence enabled
+
+| tile_m | tile_n | pingpong | best runtime | second-best runtime |
+|---:|---:|:---:|---:|---:|
+| 128 | 64 | false | 3.441 ms | 3.444 ms |
+| 64 | 128 | false | 3.461 ms | 3.469 ms |
+| 128 | 64 | true | 3.338 ms | 3.339 ms |
+| 64 | 128 | true | 3.348 ms | 3.348 ms |
+
+In this small square RMS case, pingpong won by about 2.5-3.8% over the matching
+non-pingpong tile shapes. Treat this as first-pass RTX 5060 evidence only: it
+does not justify changing SM120 defaults without the corresponding `ncu` stall,
+occupancy, register, and SMEM analysis, and it should be revalidated on larger
+RTX 50 GPUs.
+
 ## Example timing commands
 
 ```bash
