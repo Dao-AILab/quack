@@ -2,7 +2,7 @@ This file provides guidance to coding agents (Claude Code, Codex) when working w
 
 ## Project Overview
 
-QuACK (Quirky Assortment of CuTe Kernels) — high-performance CUDA kernels written in [CuTe-DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html), targeting H100 (SM90) and B200/B300 (SM100) GPUs. Package name: `quack-kernels`.
+QuACK (Quirky Assortment of CuTe Kernels) — high-performance CUDA kernels written in [CuTe-DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html), targeting H100 (SM90), B200/B300 (SM100), and GeForce RTX 50 (SM120) GPUs. Package name: `quack-kernels`.
 
 ## Build & Development
 
