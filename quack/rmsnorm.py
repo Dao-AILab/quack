@@ -21,7 +21,7 @@ from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache_utils import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from cutlass.base_dsl import Arch
+from cutlass.base_dsl.arch import Arch
 
 
 def _ensure_contiguous(t):
