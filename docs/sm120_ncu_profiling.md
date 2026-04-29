@@ -28,11 +28,13 @@ This harness makes the following inputs explicit from the command line:
 - `swap_ab`
 - dynamic persistence mode
 - optional GPU preheat duration
+- optional JSON / CSV output for comparing repeated profiling sessions
 
 That makes it suitable for both:
 
 - quick timing with repeated CUDA-event samples
 - reproducible `ncu` runs
+- machine-readable result capture for tuning notes and PR evidence
 
 All timings recorded during this SM120 tuning pass were taken on a desktop
 Blackwell RTX 5060 8GB. Because the local machine is noisy, comparisons should
@@ -42,6 +44,29 @@ minimum.
 These findings should be revalidated on other RTX 50 models, especially the RTX
 5090. Its larger memory capacity and different performance envelope may change
 the winning defaults or the performance expectations.
+
+## Capturing timing records
+
+Use `--output-json` for one-off profiling notes and `--output-csv` when sweeping
+several configs:
+
+### Epilogues
+
+```bash
+python benchmarks/benchmark_gemm_epilogues.py \
+  --kernel rms --dtype bfloat16 --m 4096 --n 4096 --k 4096 \
+  --preheat-ms 500 \
+  --stat second-min \
+  --tile-m 128 --tile-n 64 \
+  --output-json sm120_rms_128x64.json
+
+python benchmarks/benchmark_gemm_epilogues.py \
+  --kernel rms --dtype bfloat16 --m 4096 --n 4096 --k 4096 \
+  --preheat-ms 500 \
+  --stat second-min \
+  --tile-m 64 --tile-n 128 \
+  --output-csv sm120_rms_sweep.csv
+```
 
 ## First comparison matrix
 
