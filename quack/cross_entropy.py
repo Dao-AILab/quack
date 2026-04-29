@@ -261,7 +261,14 @@ class CrossEntropy(ReductionBase):
 
 @jit_cache
 def _compile_cross_entropy_fwd(
-    dtype, target_dtype, target_logit_dtype, N, has_lse, has_dx, has_weights, target_logit_ndim,
+    dtype,
+    target_dtype,
+    target_logit_dtype,
+    N,
+    has_lse,
+    has_dx,
+    has_weights,
+    target_logit_ndim,
 ):
     batch_sym = cute.sym_int()
     div = math.gcd(128 // dtype.width, N)
@@ -674,13 +681,23 @@ def cross_entropy_bwd(
     if inplace_backward and not torch.compiler.is_compiling():
         dx = x
         _cross_entropy_backward(
-            x=x, target=target, dloss=dloss, lse=lse, dx=x, weight=weight,
+            x=x,
+            target=target,
+            dloss=dloss,
+            lse=lse,
+            dx=x,
+            weight=weight,
             ignore_index=ignore_index,
         )
     else:
         dx = torch.empty_like(x)
         cross_entropy_bwd_out(
-            x=x, target=target, dloss=dloss, lse=lse, dx=dx, weight=weight,
+            x=x,
+            target=target,
+            dloss=dloss,
+            lse=lse,
+            dx=dx,
+            weight=weight,
             ignore_index=ignore_index,
         )
     return dx
@@ -689,17 +706,31 @@ def cross_entropy_bwd(
 class CrossEntropyFunction(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, x, target, lse_partial=None, weight=None, ignore_index=-100, inplace_backward=False,
+        ctx,
+        x,
+        target,
+        lse_partial=None,
+        weight=None,
+        ignore_index=-100,
+        inplace_backward=False,
     ):
         if lse_partial is None:
             loss, lse = cross_entropy_fwd(
-                x, target, weight=weight, ignore_index=ignore_index, return_lse=True,
+                x,
+                target,
+                weight=weight,
+                ignore_index=ignore_index,
+                return_lse=True,
             )
         else:
             # if we already compute partial lse, then to compute the final lse we treat
             # @lse_partial as @x and @x as @target_logit
             loss, lse = cross_entropy_fwd(
-                lse_partial, target, target_logit=x, weight=weight, ignore_index=ignore_index,
+                lse_partial,
+                target,
+                target_logit=x,
+                weight=weight,
+                ignore_index=ignore_index,
                 return_lse=True,
             )
         ctx.save_for_backward(x, target, lse)
@@ -714,7 +745,12 @@ class CrossEntropyFunction(torch.autograd.Function):
         weight = ctx.weight
         dloss = dloss.contiguous()
         dx = cross_entropy_bwd(
-            x, target, dloss, lse, weight=weight, ignore_index=ctx.ignore_index,
+            x,
+            target,
+            dloss,
+            lse,
+            weight=weight,
+            ignore_index=ctx.ignore_index,
             inplace_backward=ctx.inplace_backward,
         )
         return dx, None, None, None, None, None
@@ -750,7 +786,12 @@ def cross_entropy(
             - If reduction='sum': scalar tensor with sum of losses
     """
     loss = CrossEntropyFunction.apply(
-        x, target, lse_partial, weight, ignore_index, inplace_backward,
+        x,
+        target,
+        lse_partial,
+        weight,
+        ignore_index,
+        inplace_backward,
     )
     if reduction == "mean":
         if weight is not None:

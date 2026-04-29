@@ -168,12 +168,20 @@ def test_cross_entropy_fwd_with_grad_weight(M, N, input_dtype, inplace_backward)
     if inplace_backward:
         x_copy = x.detach().clone()
         loss, dx = cross_entropy_fwd(
-            x_copy, target, weight=weight, return_dx=True, inplace_backward=True,
+            x_copy,
+            target,
+            weight=weight,
+            return_dx=True,
+            inplace_backward=True,
         )
         assert dx is x_copy
     else:
         loss, dx = cross_entropy_fwd(
-            x, target, weight=weight, return_dx=True, inplace_backward=False,
+            x,
+            target,
+            weight=weight,
+            return_dx=True,
+            inplace_backward=False,
         )
         assert dx is not x
 
