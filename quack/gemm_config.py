@@ -1,4 +1,4 @@
-# Copyright (C) 2025, Fri Dao.
+# Copyright (C) 2025, Tri Dao.
 import itertools
 from typing import Optional, List
 from functools import partial
