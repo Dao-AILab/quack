@@ -12,8 +12,12 @@ Examples:
 """
 
 import argparse
+import csv
+import json
 import math
 import time
+from dataclasses import asdict
+from pathlib import Path
 
 import torch
 
@@ -88,6 +92,75 @@ def profile_once(fn, warmup_launches: int) -> None:
         torch.cuda.synchronize()
     finally:
         cudart.cudaProfilerStop()
+
+
+def _config_dict(config: GemmConfig | None) -> dict | None:
+    return None if config is None else asdict(config)
+
+
+def _result_record(args, config: GemmConfig | None, result: dict) -> dict:
+    device = torch.cuda.get_device_properties(0)
+    samples = result.get("samples")
+    return {
+        "kernel": args.kernel,
+        "m": args.m,
+        "n": args.n,
+        "k": args.k,
+        "dtype": str(args.dtype).removeprefix("torch."),
+        "activation": args.activation,
+        "profile": args.profile,
+        "stat": args.stat,
+        "runtime_ms": result.get("ms"),
+        "samples_ms": samples,
+        "warmup": args.warmup,
+        "repeats": args.repeats,
+        "preheat_ms": args.preheat_ms,
+        "use_selected_config": args.use_selected_config,
+        "tuned": args.tuned,
+        "dynamic_scheduler": args.dynamic_scheduler,
+        "no_residual": args.no_residual,
+        "no_norm_weight": args.no_norm_weight,
+        "with_aux": args.with_aux,
+        "config": _config_dict(config),
+        "device": {
+            "name": device.name,
+            "capability": f"{device.major}.{device.minor}",
+            "total_memory_gb": device.total_memory / 2**30,
+        },
+    }
+
+
+def _write_json(path: str, record: dict) -> None:
+    Path(path).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def _write_csv(path: str, record: dict) -> None:
+    flat = {
+        "kernel": record["kernel"],
+        "m": record["m"],
+        "n": record["n"],
+        "k": record["k"],
+        "dtype": record["dtype"],
+        "activation": record["activation"],
+        "runtime_ms": record["runtime_ms"],
+        "stat": record["stat"],
+        "samples_ms": json.dumps(record["samples_ms"]),
+        "profile": record["profile"],
+        "use_selected_config": record["use_selected_config"],
+        "tuned": record["tuned"],
+        "dynamic_scheduler": record["dynamic_scheduler"],
+        "preheat_ms": record["preheat_ms"],
+        "device_name": record["device"]["name"],
+        "device_capability": record["device"]["capability"],
+        "config": json.dumps(record["config"], sort_keys=True),
+    }
+    path_obj = Path(path)
+    write_header = not path_obj.exists() or path_obj.stat().st_size == 0
+    with path_obj.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(flat))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(flat)
 
 
 def run_rms(args, config: GemmConfig):
@@ -321,6 +394,14 @@ def main():
         default=0,
         help="Optional GPU preheat duration before timing/profile to reduce thermal skew",
     )
+    parser.add_argument(
+        "--output-json",
+        help="Write one machine-readable benchmark result record to this JSON file",
+    )
+    parser.add_argument(
+        "--output-csv",
+        help="Append one machine-readable benchmark result row to this CSV file",
+    )
     args = parser.parse_args()
 
     args.dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
@@ -353,6 +434,14 @@ def main():
         print(f"  stat={args.stat}")
         print(f"  samples_ms={[round(x, 3) for x in result['samples']]}")
         print(f"  runtime={result['ms']:.3f}ms")
+    if args.output_json or args.output_csv:
+        record = _result_record(args, config, result)
+        if args.output_json:
+            _write_json(args.output_json, record)
+            print(f"  output_json={args.output_json}")
+        if args.output_csv:
+            _write_csv(args.output_csv, record)
+            print(f"  output_csv={args.output_csv}")
 
 
 if __name__ == "__main__":
