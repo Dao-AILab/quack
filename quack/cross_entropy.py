@@ -267,7 +267,7 @@ def _compile_cross_entropy_fwd(
     N,
     has_lse,
     has_dx,
-    has_weights,
+    weight_dtype,
     target_logit_ndim,
 ):
     batch_sym = cute.sym_int()
@@ -284,7 +284,7 @@ def _compile_cross_entropy_fwd(
         target_logit_cute = None
     loss_cute = fake_tensor(Float32, (batch_sym,))
     lse_cute = fake_tensor(Float32, (batch_sym,)) if has_lse else None
-    weight_cute = fake_tensor(Float32, (N,)) if has_weights else None
+    weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
     # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
     cross_entropy_op = CrossEntropy(dtype, N, online_softmax=not has_dx)
     return cute.compile(
@@ -341,6 +341,7 @@ def cross_entropy_fwd_out(
         assert dx.is_cuda, "dx must be on CUDA device"
     if weight is not None:
         assert weight.is_cuda, "weight must be on CUDA device"
+        assert weight.is_floating_point(), "weight must be a floating-point tensor"
     if x.size(0) == 0:
         return
     N = x.size(1)
@@ -350,6 +351,7 @@ def cross_entropy_fwd_out(
         torch2cute_dtype_map[target_logit.dtype] if target_logit is not None else None
     )
     target_logit_ndim = target_logit.ndim if target_logit is not None else None
+    weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
     _compile_cross_entropy_fwd(
         dtype,
         target_dtype,
@@ -357,7 +359,7 @@ def cross_entropy_fwd_out(
         N,
         lse is not None,
         dx is not None,
-        weight is not None,
+        weight_dtype,
         target_logit_ndim,
     )(x, target, target_logit, loss, lse, dx, weight, Int32(ignore_index))
 
@@ -384,6 +386,7 @@ def _cross_entropy_fwd_out_fake(
             torch2cute_dtype_map[target_logit.dtype] if target_logit is not None else None
         )
         target_logit_ndim = target_logit.ndim if target_logit is not None else None
+        weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
         _compile_cross_entropy_fwd(
             dtype,
             target_dtype,
@@ -391,10 +394,10 @@ def _cross_entropy_fwd_out_fake(
             N,
             lse is not None,
             dx is not None,
-            weight is not None,
+            weight_dtype,
             target_logit_ndim,
         )
-        _compile_cross_entropy_backward(dtype, target_dtype, N, weight is not None)
+        _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)
 
 
 def cross_entropy_fwd(
@@ -574,13 +577,14 @@ class CrossEntropyBackward:
 
 
 @jit_cache
-def _compile_cross_entropy_backward(dtype, target_dtype, N, has_weights):
+def _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype):
     batch_sym = cute.sym_int()
     div = math.gcd(128 // dtype.width, N)
     x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
     target_cute = fake_tensor(target_dtype, (batch_sym,))
-    dloss_cute, lse_cute = [fake_tensor(Float32, (batch_sym,))] * 2
-    weight_cute = fake_tensor(Float32, (N,)) if has_weights else None
+    dloss_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int64(),))
+    lse_cute = fake_tensor(Float32, (batch_sym,))
+    weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
     cross_entropy_backward_op = CrossEntropyBackward(dtype, N)
     return cute.compile(
         cross_entropy_backward_op,
@@ -631,12 +635,14 @@ def _cross_entropy_backward(
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
     if weight is not None:
         assert weight.is_cuda, "weight must be on CUDA device"
+        assert weight.is_floating_point(), "weight must be a floating-point tensor"
     if x.size(0) == 0:
         return
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     target_dtype = torch2cute_dtype_map[target.dtype]
-    _compile_cross_entropy_backward(dtype, target_dtype, N, weight is not None)(
+    weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
+    _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)(
         x, target, dloss, dx, lse, weight, Int32(ignore_index)
     )
 
@@ -671,7 +677,8 @@ def _cross_entropy_bwd_out_fake(
         N = x.size(1)
         dtype = torch2cute_dtype_map[x.dtype]
         target_dtype = torch2cute_dtype_map[target.dtype]
-        _compile_cross_entropy_backward(dtype, target_dtype, N, weight is not None)
+        weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
+        _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)
 
 
 def cross_entropy_bwd(
@@ -748,7 +755,6 @@ class CrossEntropyFunction(torch.autograd.Function):
     def backward(ctx, dloss):
         x, target, lse = ctx.saved_tensors
         weight = ctx.weight
-        dloss = dloss.contiguous()
         dx = cross_entropy_bwd(
             x,
             target,
