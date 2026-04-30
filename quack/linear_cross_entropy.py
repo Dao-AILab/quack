@@ -92,6 +92,7 @@ def chunked_linear_cross_entropy_fwd(
             loss=loss_chunk,
             lse=None,  # we don't need lse here
             dx=dlogits_chunk,
+            weight=None,
             ignore_index=ignore_index,
         )
         # Compute dx for this chunk: dlogits @ weight

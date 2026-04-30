@@ -37,8 +37,9 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
 )
 @pytest.mark.parametrize("M", [1, 77, 289])
 # @pytest.mark.parametrize("M", [1])
+@pytest.mark.parametrize("has_weight", [False, True])
 @pytest.mark.parametrize("use_compile", [False, True])
-def test_cross_entropy(M, N, input_dtype, use_compile):
+def test_cross_entropy(M, N, input_dtype, has_weight, use_compile):
     """Test Cross Entropy forward pass against reference implementation."""
     major, _ = torch.cuda.get_device_capability()
     if major == 12 and input_dtype == torch.float32 and N > 131072:
@@ -49,12 +50,13 @@ def test_cross_entropy(M, N, input_dtype, use_compile):
     # Create input tensors (scale down to avoid overflow)
     x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
-    x_ref = x.detach().clone().requires_grad_()
+    weight = (torch.rand(N, device=device, dtype=torch.float32) + 0.1) if has_weight else None
+    x_ref = x.detach().clone().float().requires_grad_()
     target_ref = target.detach().clone()
     # Forward pass
     function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
-    loss = function(x, target, reduction="none")
-    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction="none")
+    loss = function(x, target, weight=weight, reduction="none")
+    loss_ref = F.cross_entropy(x_ref, target_ref, weight=weight, reduction="none")
     # Check output shape and dtype
     assert loss.shape == (M,)
     assert loss.dtype == torch.float32
@@ -190,23 +192,25 @@ def test_cross_entropy_edge_targets(use_compile):
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("N", [192, 1024, 32768])
 @pytest.mark.parametrize("M", [1, 77, 289])
+@pytest.mark.parametrize("has_weight", [False, True])
 @pytest.mark.parametrize("use_compile", [False, True])
-def test_cross_entropy_ignore_index(M, N, input_dtype, use_compile):
+def test_cross_entropy_ignore_index(M, N, input_dtype, has_weight, use_compile):
     """Test Cross Entropy with ignore_index functionality."""
     device = "cuda"
     atol, rtol = 5e-5, 1e-5
     torch.random.manual_seed(0)
     x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
+    weight = (torch.rand(N, device=device, dtype=torch.float32) + 0.1) if has_weight else None
     ignore_index = N - 1  # Use last class as ignore index
     ignore_mask = torch.rand(M, device=device) < 0.3  # Randomly ignore ~30% of samples
     target[ignore_mask] = ignore_index
-    x_ref = x.detach().clone().requires_grad_()
+    x_ref = x.detach().clone().float().requires_grad_()
     target_ref = target.detach().clone()
     function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
-    loss = function(x, target, reduction="none", ignore_index=ignore_index)
+    loss = function(x, target, weight=weight, reduction="none", ignore_index=ignore_index)
     loss_ref = F.cross_entropy(
-        x_ref.float(), target_ref, reduction="none", ignore_index=ignore_index
+        x_ref, target_ref, weight=weight, reduction="none", ignore_index=ignore_index
     )
     # Check that losses are zero for ignored indices
     assert (loss[ignore_mask] == 0).all(), "Loss should be 0 for ignored indices"
@@ -257,16 +261,18 @@ def test_cross_entropy_ignore_index_edge_cases(use_compile):
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("N", [192, 1024, 32768, 128256])
 @pytest.mark.parametrize("M", [1, 77, 289])
+@pytest.mark.parametrize("has_weight", [False, True])
 @pytest.mark.parametrize("inplace_backward", [False, True])
 @pytest.mark.parametrize("use_compile", [False, True])
-def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_compile):
+def test_cross_entropy_fwd_with_grad(M, N, input_dtype, has_weight, inplace_backward, use_compile):
     """Test Cross Entropy forward pass with gradient computation."""
     device = "cuda"
     atol, rtol = 1e-4, 1e-4
     torch.random.manual_seed(0)
     x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
-    x_ref = x.detach().clone().requires_grad_()
+    weight = (torch.rand(N, device=device, dtype=torch.float32) + 0.1) if has_weight else None
+    x_ref = x.detach().clone().float().requires_grad_()
     target_ref = target.detach().clone()
     # Test forward with gradient computation
     function = (
@@ -275,18 +281,20 @@ def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_co
     if inplace_backward:
         x_copy = x.detach().clone()
         loss, lse, dx = function(
-            x_copy, target, return_lse=True, return_dx=True, inplace_backward=True
+            x_copy, target, weight=weight, return_lse=True, return_dx=True, inplace_backward=True
         )
         # Check that dx is the same tensor as x_copy (inplace)
         assert dx is x_copy, "inplace_backward should modify x in-place"
     else:
-        loss, lse, dx = function(x, target, return_lse=True, return_dx=True, inplace_backward=False)
+        loss, lse, dx = function(
+            x, target, weight=weight, return_lse=True, return_dx=True, inplace_backward=False
+        )
         # Check that dx is a different tensor from x
         assert dx is not x, "non-inplace should create new tensor"
 
     # Reference implementation
-    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction="none")
-    lse_ref = torch.logsumexp(x_ref.float(), dim=-1)
+    loss_ref = F.cross_entropy(x_ref, target_ref, weight=weight, reduction="none")
+    lse_ref = torch.logsumexp(x_ref, dim=-1)
     dloss = torch.ones_like(loss_ref)  # Need dloss to be 1.0
     (dx_ref,) = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
 
@@ -304,6 +312,7 @@ def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_co
         loss_ig, lse_ig, dx_ig = function(
             x_copy,
             target,
+            weight=weight,
             ignore_index=ignore_index,
             return_lse=True,
             return_dx=True,
@@ -314,6 +323,7 @@ def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_co
         loss_ig, lse_ig, dx_ig = function(
             x,
             target,
+            weight=weight,
             ignore_index=ignore_index,
             return_lse=True,
             return_dx=True,
@@ -321,9 +331,9 @@ def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_co
         )
         assert dx_ig is not x
     # Reference with ignore_index
-    x_ref2 = x.detach().clone().requires_grad_()
+    x_ref2 = x.detach().clone().float().requires_grad_()
     loss_ref_ig = F.cross_entropy(
-        x_ref2.float(), target, reduction="none", ignore_index=ignore_index
+        x_ref2, target, weight=weight, reduction="none", ignore_index=ignore_index
     )
     (dx_ref_ig,) = torch.autograd.grad(loss_ref_ig, x_ref2, grad_outputs=dloss)
     # Check that losses are zero for ignored indices
@@ -354,3 +364,36 @@ def test_cross_entropy_bwd_empty():
     lse = torch.empty(0, device="cuda", dtype=torch.float32)
     dx = cross_entropy_bwd(x, target, dloss, lse)
     assert dx.shape == x.shape and dx.numel() == 0
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("N", [1024, 32768, 128256])
+@pytest.mark.parametrize("M", [77, 289])
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_cross_entropy_weight_reduction(M, N, input_dtype, reduction, use_compile):
+    """Test weighted cross entropy with different reduction modes."""
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12 and input_dtype == torch.float32 and N > 131072:
+        pytest.skip("SM12x: fp32 exceeds 99 KB SMEM")
+    device = "cuda"
+    atol, rtol = 1e-4, 1e-4
+    torch.random.manual_seed(0)
+
+    x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
+    target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
+    weight = torch.rand(N, device=device, dtype=torch.float32) + 0.1
+
+    x_ref = x.detach().clone().float().requires_grad_()
+    target_ref = target.detach().clone()
+
+    function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
+    loss = function(x, target, weight=weight, reduction=reduction)
+    loss_ref = F.cross_entropy(x_ref, target_ref, weight=weight, reduction=reduction)
+
+    torch.testing.assert_close(loss, loss_ref, atol=atol, rtol=rtol)
+
+    if reduction in ("mean", "sum"):
+        loss.backward()
+        loss_ref.backward()
+        torch.testing.assert_close(x.grad, x_ref.grad.to(input_dtype), atol=atol, rtol=rtol)

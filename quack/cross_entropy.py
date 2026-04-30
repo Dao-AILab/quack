@@ -341,6 +341,8 @@ def cross_entropy_fwd_out(
         assert dx.is_cuda, "dx must be on CUDA device"
     if weight is not None:
         assert weight.is_cuda, "weight must be on CUDA device"
+    if x.size(0) == 0:
+        return
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     target_dtype = torch2cute_dtype_map[target.dtype]
@@ -552,6 +554,7 @@ class CrossEntropyBackward:
         lse = Float32.zero
         if row < shape[0]:
             should_ignore = Boolean(target == ignore_index)
+            # dloss is set to 0 if this index should be ignored
             if not should_ignore:
                 dloss = Float32(mDLoss[row])
             lse = Float32(mLSE[row])
@@ -628,6 +631,8 @@ def _cross_entropy_backward(
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
     if weight is not None:
         assert weight.is_cuda, "weight must be on CUDA device"
+    if x.size(0) == 0:
+        return
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     target_dtype = torch2cute_dtype_map[target.dtype]
