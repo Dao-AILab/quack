@@ -6,13 +6,14 @@ smem allocation, begin (one-time per-tile setup), begin_loop (per-subtile extrac
 end (cleanup).
 
 The ops are composed via ComposableEpiMixin which iterates over a static _epi_ops tuple
-to generate epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors,
-epi_begin, and epi_begin_loop automatically.
+to generate epi_smem_bytes, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
+and epi_begin_loop automatically.
 """
 
 import math
 import operator
 from functools import partial
+from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -26,7 +27,12 @@ import quack.layout_utils as layout_utils
 
 
 class EpiContext:
-    """Shared context passed to EpiOp.begin methods. Bundles common arguments."""
+    """Shared context passed to EpiOp.begin methods. Bundles common arguments.
+
+    `tRS_rD_layout` is only populated by callers that need TileLoad — it's the
+    register layout of the matmul output tile, which TileLoad uses to shape its
+    own register tile so it lines up element-wise with tRS_rD in epi_visit_subtile.
+    """
 
     __slots__ = (
         "epi_tile",
@@ -36,6 +42,7 @@ class EpiContext:
         "varlen_manager",
         "epilogue_barrier",
         "tidx",
+        "tRS_rD_layout",
         "partition_for_epilogue_fn",
         "num_epi_threads",
         "batch_idx",
@@ -53,6 +60,7 @@ class EpiContext:
         varlen_manager,
         epilogue_barrier,
         tidx,
+        tRS_rD_layout=None,
     ):
         self.epi_tile = epi_tile
         self.tiled_copy_t2r = tiled_copy_t2r
@@ -61,6 +69,7 @@ class EpiContext:
         self.varlen_manager = varlen_manager
         self.epilogue_barrier = epilogue_barrier
         self.tidx = tidx
+        self.tRS_rD_layout = tRS_rD_layout
         self.tile_M = gemm.cta_tile_shape_mnk[0]
         self.tile_N = gemm.cta_tile_shape_mnk[1]
         self.batch_idx = tile_coord_mnkl[3]
@@ -120,6 +129,31 @@ def _get_lane_warp_layouts(tiled_copy, reference_src=True):
     return lane_layout_MN, warp_layout_MN
 
 
+class EpiSmemBytes(NamedTuple):
+    """Shared-memory accounting for one epilogue op.
+
+    unstaged: allocated once per CTA tile.
+    d_stage: allocated per D/store epilogue stage.
+    c_stage: allocated per C/load epilogue stage.
+    """
+
+    unstaged: int = 0
+    d_stage: int = 0
+    c_stage: int = 0
+
+    def __add__(self, other):
+        return EpiSmemBytes(
+            self.unstaged + other.unstaged,
+            self.d_stage + other.d_stage,
+            self.c_stage + other.c_stage,
+        )
+
+    def __radd__(self, other):
+        if other == 0:
+            return self
+        return self.__add__(other)
+
+
 class EpiOp:
     """Base class for composable epilogue operations."""
 
@@ -143,8 +177,8 @@ class EpiOp:
 
     # --- Host-side: smem allocation ---
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
-        """Bytes of smem needed per stage. arg_tensor is the EpilogueArguments field."""
-        return 0
+        """Bytes of smem needed by unstaged / D-stage / C-stage storage."""
+        return EpiSmemBytes()
 
     def smem_struct_field(self, gemm, params):
         """Return (field_name, field_type) for @cute.struct, or None if no smem needed.
@@ -160,6 +194,22 @@ class EpiOp:
         """Return list of TMA atoms for this op."""
         return []
 
+    def is_tile_load(self):
+        """Whether this op is a tile-sized epilogue input loaded through the C pipeline."""
+        return False
+
+    def load_g2s_copy_fn(
+        self,
+        gemm,
+        params,
+        smem_tensor,
+        tile_coord_mnkl,
+        varlen_manager,
+        epi_pipeline,
+    ):
+        """Return a per-subtile gmem->smem copy function, or None."""
+        return None
+
     # --- Device-side: kernel execution ---
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
@@ -169,6 +219,11 @@ class EpiOp:
     def begin_loop(self, gemm, state, epi_coord):
         """Per-subtile extraction. Returns value for epi_visit_subtile."""
         return state
+
+    @cute.jit
+    def load_s2r(self, gemm, param, state, stage_idx):
+        """Issue this op's tile-load smem->register copy for one epilogue stage."""
+        pass
 
     def end_loop(
         self,
@@ -261,8 +316,10 @@ class VecLoad(EpiOp):
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
         if arg_tensor is None:
-            return 0
-        return self._tile_size(cta_tile_shape_mnk) * (arg_tensor.element_type.width // 8)
+            return EpiSmemBytes()
+        return EpiSmemBytes(
+            unstaged=self._tile_size(cta_tile_shape_mnk) * (arg_tensor.element_type.width // 8)
+        )
 
     def smem_struct_field(self, gemm, params):
         tensor = getattr(params, self.name, None)
@@ -466,10 +523,14 @@ class TileStore(EpiOp):
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
         if arg_tensor is None:
-            return 0
+            return EpiSmemBytes()
         if self.epi_tile_fn is not None:
             epi_tile = self.epi_tile_fn(None, epi_tile)
-        return cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
+        # epi_tile may contain Layout entries (from SM100's compute_epilogue_tile_shape
+        # fixup path), so extract the int shape first.
+        return EpiSmemBytes(
+            d_stage=cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
+        )
 
     def smem_struct_field(self, gemm, params):
         smem_layout_key = self._smem_layout_key()
@@ -499,7 +560,192 @@ class TileStore(EpiOp):
     def tma_atoms(self, gemm, params):
         atom = getattr(params, self._tma_atom_key(), None)
         return [] if atom is None else [atom]
-        return []
+
+
+class _TileLoadState(NamedTuple):
+    """Per-tile register state produced by TileLoad.begin and consumed by load_s2r /
+    begin_loop. tRS_rTile is the register tile partitioned to match tRS_rD's layout;
+    tSR_sTile / tSR_rTile drive the per-stage smem→register copy."""
+
+    tiled_copy_s2r: object
+    tRS_rTile: object
+    tSR_rTile: object
+    tSR_sTile: object
+
+
+class TileLoad(EpiOp):
+    """Tile-sized auxiliary input loaded through the epilogue load pipeline.
+
+    TileLoad uses the same staged gmem->smem->register pipeline as GEMM's C operand,
+    but it is exposed to the epilogue as ``epi_loop_tensors[name]`` instead of as
+    ``tRS_rC``. That lets custom epilogues consume extra MxN tensors without using
+    the GEMM C argument.
+
+    Its shared memory is accounted as ``EpiSmemBytes.c_stage``, so it is allocated
+    per epilogue load stage. Multiple TileLoads are supported: each has its own TMA
+    descriptor and smem buffer, and the pipeline transaction count includes C plus
+    all enabled TileLoad buffers. Supported on SM90, SM100, and SM120.
+    """
+
+    def __init__(self, name, epi_tile_fn=None):
+        super().__init__(name)
+        self.epi_tile_fn = epi_tile_fn
+
+    def _tma_atom_key(self):
+        return f"tma_atom_{self.name}"
+
+    def _smem_layout_key(self):
+        return f"epi_{self.name}_smem_layout_staged"
+
+    def _epi_tile_key(self):
+        return f"epi_tile_{self.name}"
+
+    # The original LayoutEnum and element_type can't be recovered from the
+    # TMA-prepared tensor that ends up in params (`from_tensor` returns a typing
+    # annotation post-TMA, not a Numeric class). We stash both on the gemm at
+    # to_params time and read them back in begin(). The dtype is also exposed on
+    # the params dataclass for smem_struct_field.
+    def _layout_gemm_attr(self):
+        return f"_tile_load_layout_{self.name}"
+
+    def _dtype_gemm_attr(self):
+        return f"_tile_load_dtype_{self.name}"
+
+    def _dtype_field(self):
+        return f"{self.name}_dtype"
+
+    def param_fields(self):
+        from dataclasses import MISSING
+
+        return [
+            (self._tma_atom_key(), object, MISSING),
+            (self.name, object, MISSING),
+            (self._smem_layout_key(), object, MISSING),
+            (self._epi_tile_key(), object, MISSING),
+            (self._dtype_field(), object, MISSING),
+        ]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name, None)
+        if tensor is None:
+            return {
+                self._tma_atom_key(): None,
+                self.name: None,
+                self._smem_layout_key(): None,
+                self._epi_tile_key(): None,
+                self._dtype_field(): None,
+            }
+        setattr(gemm, self._layout_gemm_attr(), cutlass.utils.LayoutEnum.from_tensor(tensor))
+        setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
+        epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
+        tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
+            gemm, tensor, epi_tile=epi_tile, op_type="load", stage=gemm.epi_c_stage
+        )
+        return {
+            self._tma_atom_key(): tma_atom,
+            self.name: tma_tensor,
+            self._smem_layout_key(): smem_layout,
+            self._epi_tile_key(): epi_tile_out,
+            self._dtype_field(): tensor.element_type,
+        }
+
+    def is_tile_load(self):
+        return True
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
+        if arg_tensor is None:
+            return EpiSmemBytes()
+        if self.epi_tile_fn is not None:
+            epi_tile = self.epi_tile_fn(None, epi_tile)
+        # epi_tile may contain Layout entries from SM100's compute_epilogue_tile_shape
+        # fixup; extract the int shape first.
+        return EpiSmemBytes(
+            c_stage=cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
+        )
+
+    def smem_struct_field(self, gemm, params):
+        smem_layout = getattr(params, self._smem_layout_key(), None)
+        dtype = getattr(params, self._dtype_field(), None)
+        if smem_layout is None or dtype is None:
+            return (f"s_{self.name}", cute.struct.MemRange[Float32, 0])
+        return (
+            f"s_{self.name}",
+            cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(smem_layout)],
+                gemm.buffer_align_bytes,
+            ],
+        )
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        smem_layout = getattr(params, self._smem_layout_key(), None)
+        if smem_layout is None:
+            return None
+        return getattr(storage_epi, f"s_{self.name}").get_tensor(
+            smem_layout.outer,
+            swizzle=smem_layout.inner,
+        )
+
+    def tma_atoms(self, gemm, params):
+        atom = getattr(params, self._tma_atom_key(), None)
+        return [] if atom is None else [atom]
+
+    def load_g2s_copy_fn(
+        self,
+        gemm,
+        params,
+        smem_tensor,
+        tile_coord_mnkl,
+        varlen_manager,
+        epi_pipeline,
+    ):
+        tensor = getattr(params, self.name, None)
+        copy_tile = None
+        if const_expr(tensor is not None):
+            batch_idx = tile_coord_mnkl[3]
+            copy_tile_fn, _, _ = gemm.epilog_gmem_copy_and_partition(
+                getattr(params, self._tma_atom_key()),
+                varlen_manager.offset_batch_epi(tensor, batch_idx),
+                gemm.cta_tile_shape_mnk[:2],
+                getattr(params, self._epi_tile_key()),
+                smem_tensor,
+                tile_coord_mnkl,
+            )
+            copy_tile = copy_utils.tma_producer_copy_fn(copy_tile_fn, epi_pipeline)
+        return copy_tile
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is None):
+            return None
+        assert gemm.arch in (90, 100, 120), "TileLoad requires the SM90/SM100/SM120 epilogue path"
+        assert ctx.tRS_rD_layout is not None
+        smem_load_ref = ctx.tiled_copy_t2r if const_expr(gemm.arch == 100) else gemm.tiled_mma
+        tiled_copy_s2r, tRS_rTile, tSR_rTile, tSR_sTile = gemm.epilog_smem_load_and_partition(
+            smem_load_ref,
+            getattr(gemm, self._layout_gemm_attr()),
+            getattr(gemm, self._dtype_gemm_attr()),
+            smem_tensor,
+            ctx.tRS_rD_layout,
+            ctx.tidx,
+        )
+        # Shape: (s2r-copy-handle, register-tile-as-rD-layout, smem→r retile target,
+        # smem→r staged source). begin_loop returns tRS_rTile; load_s2r uses the rest.
+        return _TileLoadState(tiled_copy_s2r, tRS_rTile, tSR_rTile, tSR_sTile)
+
+    @cute.jit
+    def load_s2r(self, gemm, param, state, stage_idx):
+        if const_expr(param is not None):
+            cute.copy(
+                state.tiled_copy_s2r,
+                state.tSR_sTile[None, None, None, stage_idx],
+                state.tSR_rTile,
+            )
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is None):
+            return None
+        return state.tRS_rTile
 
 
 @cute.jit
@@ -635,8 +881,10 @@ class VecReduce(EpiOp):
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
         smem_warps = self._smem_warps(warp_shape_mnk)
         if arg_tensor is None or smem_warps == 0:
-            return 0
-        return self._tile_size(cta_tile_shape_mnk) * smem_warps * (Float32.width // 8)
+            return EpiSmemBytes()
+        return EpiSmemBytes(
+            unstaged=self._tile_size(cta_tile_shape_mnk) * smem_warps * (Float32.width // 8)
+        )
 
     def smem_struct_field(self, gemm, params):
         tensor = getattr(params, self.name, None)

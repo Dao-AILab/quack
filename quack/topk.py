@@ -228,7 +228,6 @@ def _topk_fwd(
         Tuple of (values tensor of shape (M, k), indices tensor of shape (M, k))
     """
     assert x.dim() == 2, "Input must be 2D"
-    assert x.is_cuda, "Tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert k > 0 and k <= x.shape[1], "k must be positive and <= N"
 
@@ -479,7 +478,6 @@ def _topk_bwd(
     if values is not None:
         assert values.dim() == 2, "values must be 2D"
     assert indices.dim() == 2, "indices must be 2D"
-    assert dvalues.is_cuda and indices.is_cuda, "Tensors must be on CUDA device"
     assert dvalues.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
 
     N = dx.size(1)

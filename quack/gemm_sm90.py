@@ -441,6 +441,16 @@ class GemmSm90(GemmTmaBase):
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
+        self.epi_load_bytes_per_stage = self.epi_smem_bytes(
+            epilogue_args,
+            self.cta_tile_shape_mnk,
+            self.epi_tile,
+            self.epi_smem_warp_shape_mnk(),
+        ).c_stage
+        if const_expr(mC is not None):
+            c_smem_layout = cute.slice_(self.epi_c_smem_layout_staged, (None, None, 0))
+            self.epi_load_bytes_per_stage += cute.size_in_bytes(self.c_dtype, c_smem_layout)
+
         TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m)
         tile_sched_args = self.get_scheduler_arguments(
             mA, mB, mD, scheduler_args, varlen_args, epilogue_args
@@ -576,6 +586,7 @@ class GemmSm90(GemmTmaBase):
             assert varlen_m or varlen_k
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
+        has_epi_load = const_expr(self.epi_c_stage > 0)
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -595,10 +606,10 @@ class GemmSm90(GemmTmaBase):
             ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
         )
         epi_pipeline = None
-        if const_expr(has_C):
+        if const_expr(has_epi_load):
             epi_pipeline = self.make_epi_pipeline(
-                c_smem_layout=cute.slice_(epi_c_smem_layout, (None, None, 0)),
                 epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
+                tx_count=self.epi_load_bytes_per_stage,
             )
         sched_pipeline = None
         sched_data = None
@@ -853,6 +864,15 @@ class GemmSm90(GemmTmaBase):
                         tile_coord_mnkl,
                     )
                     copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
+                if const_expr(has_epi_load):
+                    tile_load_copy_fns = self.epi_tile_load_g2s_copy_fns(
+                        epilogue_params,
+                        epi_smem_tensors,
+                        tile_coord_mnkl,
+                        varlen_manager,
+                        epi_pipeline,
+                    )
+                    copy_C = copy_utils.chain_tma_producer_copy_fns((copy_C, *tile_load_copy_fns))
 
                 d_dtype_for_layout = self.d_dtype if self.d_dtype is not None else cutlass.BFloat16
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
@@ -1254,14 +1274,21 @@ class GemmSm90(GemmTmaBase):
         """
 
         epi_stage = 4 if epi_tile[1] <= 16 else 2
-        d_bytes_per_stage = cute.size(epi_tile) * d_dtype.width // 8 if d_dtype is not None else 0
-        epi_bytes_per_stage = d_bytes_per_stage + cls.epi_smem_bytes_per_stage(
+        epi_smem_bytes = cls.epi_smem_bytes(
             epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
         )
-        epi_bytes = epi_bytes_per_stage * epi_stage
-        epi_c_stage = 0 if c_dtype is None else (4 if epi_tile[1] <= 16 else 2)
+        has_tile_load = epi_smem_bytes.c_stage > 0
+        epi_tile_elems = cute.size(cute.shape(epi_tile))
+        d_bytes_per_stage = epi_tile_elems * d_dtype.width // 8 if d_dtype is not None else 0
+        epi_bytes_per_stage = d_bytes_per_stage + epi_smem_bytes.d_stage
+        epi_bytes = epi_smem_bytes.unstaged + epi_bytes_per_stage * epi_stage
+        epi_c_stage = (
+            0 if c_dtype is None and not has_tile_load else (4 if epi_tile[1] <= 16 else 2)
+        )
         if c_dtype is not None:
-            epi_bytes += cute.size(epi_tile) * c_dtype.width // 8 * epi_c_stage
+            epi_bytes += epi_tile_elems * c_dtype.width // 8 * epi_c_stage
+        if has_tile_load:
+            epi_bytes += epi_smem_bytes.c_stage * epi_c_stage
 
         a_shape = cute.slice_(cta_tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(cta_tile_shape_mnk, (0, None, None))

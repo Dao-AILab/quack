@@ -860,6 +860,18 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
     return copy_fn
 
 
+def chain_tma_producer_copy_fns(copy_fns: Sequence[Optional[Callable]]):
+    if not any(fn is not None for fn in copy_fns):
+        return None
+
+    def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):
+        for fn in copy_fns:
+            if const_expr(fn is not None):
+                fn(src_idx=src_idx, producer_state=producer_state, **new_kwargs)
+
+    return copy_fn
+
+
 @cute.jit
 def gather_m_get_copy_fn(
     thr_copy_A: cute.ThrCopy,

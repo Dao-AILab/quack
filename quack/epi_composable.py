@@ -2,7 +2,7 @@
 """ComposableEpiMixin: composes EpiOps into epilogue hook methods.
 
 Subclasses declare _epi_ops as a tuple of EpiOp instances. The mixin auto-generates
-epi_smem_bytes_per_stage, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
+epi_smem_bytes, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
 epi_begin_loop, epi_end_loop, epi_end, and EpilogueParams by querying each op.
 
 epi_get_smem_tensors, epi_begin, and epi_begin_loop all return dicts keyed by op
@@ -20,7 +20,7 @@ import cutlass.cute as cute
 from cutlass import const_expr
 
 from quack.cute_dsl_utils import ParamsBase
-from quack.epi_ops import EpiContext, Scalar
+from quack.epi_ops import EpiContext, EpiSmemBytes, Scalar
 
 
 def _make_epi_params(epi_ops, extra_fields, bases):
@@ -44,12 +44,10 @@ class ComposableEpiMixin:
     _epi_ops = ()
     _extra_param_fields = ()  # [(name, type, default), ...] for non-op params (e.g. act_fn)
     _epi_param_bases = (ParamsBase,)  # Base classes for the auto-generated EpilogueParams
-    _epi_has_async_ops = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if cls._epi_ops:
-            cls._epi_has_async_ops = any(op.needs_async_fence() for op in cls._epi_ops)
             # Auto-generate EpilogueParams if not explicitly defined on this class
             if "EpilogueParams" not in cls.__dict__:
                 cls.EpilogueParams = _make_epi_params(
@@ -75,13 +73,13 @@ class ComposableEpiMixin:
     # --- Host-side: smem allocation (queried from ops) ---
 
     @classmethod
-    def epi_smem_bytes_per_stage(cls, args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
-        return sum(
-            op.smem_bytes(
+    def epi_smem_bytes(cls, args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
+        result = EpiSmemBytes()
+        for op in cls._epi_ops:
+            result += op.smem_bytes(
                 getattr(args, op.name, None), cta_tile_shape_mnk, epi_tile, warp_shape_mnk
             )
-            for op in cls._epi_ops
-        )
+        return result
 
     def epi_get_smem_struct(self, params):
         fields = []
@@ -128,6 +126,7 @@ class ComposableEpiMixin:
         varlen_manager,
         epilogue_barrier,
         tidx,
+        tRS_rD_layout=None,
     ):
         ctx = EpiContext(
             self,
@@ -138,6 +137,7 @@ class ComposableEpiMixin:
             varlen_manager,
             epilogue_barrier,
             tidx,
+            tRS_rD_layout,
         )
         results = {
             op.name: op.begin(
@@ -148,22 +148,47 @@ class ComposableEpiMixin:
             )
             for op in self._epi_ops
         }
-        if const_expr(self._epi_has_async_ops):
-            has_async_data = any(
-                getattr(params, op.name, None) is not None
-                for op in self._epi_ops
-                if op.needs_async_fence()
-            )
-            if const_expr(has_async_data):
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                epilogue_barrier.arrive_and_wait()
+        has_async_data = any(
+            getattr(params, op.name, None) is not None
+            for op in self._epi_ops
+            if op.needs_async_fence()
+        )
+        if const_expr(has_async_data):
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            epilogue_barrier.arrive_and_wait()
         return results
 
     def epi_begin_loop(self, params, epi_tensors, epi_coord):
         return {
             op.name: op.begin_loop(self, epi_tensors[op.name], epi_coord) for op in self._epi_ops
         }
+
+    def epi_tile_load_g2s_copy_fns(
+        self,
+        params,
+        epi_smem_tensors,
+        tile_coord_mnkl,
+        varlen_manager,
+        epi_pipeline,
+    ):
+        return tuple(
+            op.load_g2s_copy_fn(
+                self,
+                params,
+                epi_smem_tensors.get(op.name),
+                tile_coord_mnkl,
+                varlen_manager,
+                epi_pipeline,
+            )
+            for op in self._epi_ops
+            if op.is_tile_load()
+        )
+
+    @cute.jit
+    def epi_tile_load_s2r(self, params, epi_tensors, stage_idx):
+        for op in self._epi_ops:
+            op.load_s2r(self, getattr(params, op.name, None), epi_tensors[op.name], stage_idx)
 
     @cute.jit
     def epi_end_loop(

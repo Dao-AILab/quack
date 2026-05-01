@@ -81,7 +81,7 @@ class GemmActMixin(ComposableEpiMixin):
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
-    # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
+    # epi_get_tma_atoms, epi_smem_bytes, epi_get_smem_struct,
     # epi_get_smem_tensors are all inherited from ComposableEpiMixin via _epi_ops.
 
     def epi_make_aux_out_copy_atom_r2s(self, params, tiled_copy_t2r):

@@ -207,10 +207,11 @@ class GemmSm120(GemmSm90):
             ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
         )
         epi_pipeline = None
-        if const_expr(has_C):
+        has_epi_load = const_expr(self.epi_c_stage > 0)
+        if const_expr(has_epi_load):
             epi_pipeline = self.make_epi_pipeline(
-                c_smem_layout=cute.slice_(epi_c_smem_layout, (None, None, 0)),
                 epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
+                tx_count=self.epi_load_bytes_per_stage,
             )
         sched_pipeline = None
         sched_data = None
@@ -482,6 +483,15 @@ class GemmSm120(GemmSm90):
                         tile_coord_mnkl,
                     )
                     copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
+                if const_expr(has_epi_load):
+                    tile_load_copy_fns = self.epi_tile_load_g2s_copy_fns(
+                        epilogue_params,
+                        epi_smem_tensors,
+                        tile_coord_mnkl,
+                        varlen_manager,
+                        epi_pipeline,
+                    )
+                    copy_C = copy_utils.chain_tma_producer_copy_fns((copy_C, *tile_load_copy_fns))
 
                 d_dtype_for_layout = self.d_dtype if self.d_dtype is not None else cutlass.BFloat16
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(

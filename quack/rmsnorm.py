@@ -344,7 +344,7 @@ def _rmsnorm_fwd(
     Returns:
         Normalized output tensor of same shape as x
     """
-    # Don't need to check is_cuda since torch.library ensures that
+    # TVM FFI validates tensor devices at runtime.
     supported_types = {torch.float16, torch.bfloat16, torch.float32}
     assert x.dtype in supported_types, "Unsupported dtype"
     if weight is not None:
@@ -951,22 +951,18 @@ def _rmsnorm_bwd(
         - dw: Weight gradients tensor of same shape as weight (or None if weight is None)
     """
     assert x.dim() in (2, 3), "Input must be 2D or 3D"
-    assert x.is_cuda, "Input tensor must be on CUDA device"
     supported_types = {torch.float16, torch.bfloat16, torch.float32}
     assert x.dtype in supported_types, "Unsupported dtype"
     per_head = x.dim() == 3
     if weight is not None:
-        assert weight.is_cuda, "Weight tensor must be on CUDA device"
         assert weight.dtype in supported_types, "Weight must be float32, float16 or bfloat16"
     if dresidual_out is not None:
         assert dresidual_out.shape == x.shape
-        assert dresidual_out.is_cuda
         assert dresidual_out.dtype in supported_types, (
             "Residual must be float16, bfloat16, or float32"
         )
     if dresidual is not None:
         assert dresidual.shape == x.shape
-        assert dresidual.is_cuda
         assert dresidual.dtype in supported_types, "Residual must be float16, bfloat16, or float32"
 
     N = x.size(-1)

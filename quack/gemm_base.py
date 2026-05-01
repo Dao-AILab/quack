@@ -14,6 +14,7 @@ from cutlass.utils import LayoutEnum
 
 import quack.copy_utils as copy_utils
 from quack.cute_dsl_utils import ParamsBase
+from quack.epi_ops import EpiSmemBytes
 from quack.pipeline import PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
 from quack.tile_scheduler import (
@@ -81,9 +82,11 @@ class GemmBase:
         is_tma_warp: cutlass.Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
+        has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
+        inline_epi_load = const_expr(copy_C is not None)
         use_stochastic_rounding = const_expr(
             self.rounding_mode == RoundingMode.RS
             and self.acc_dtype == cutlass.Float32
@@ -120,9 +123,10 @@ class GemmBase:
             varlen_manager,
             epilogue_barrier,
             tidx,
+            tRS_rD.layout,
         )
 
-        if const_expr(copy_C is not None):
+        if const_expr(inline_epi_load):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
                 epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
                 if const_expr(use_tma_c):
@@ -141,13 +145,14 @@ class GemmBase:
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)  # (epi_m, epi_n)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_coord)
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
-            if const_expr(has_C):
+            if const_expr(has_epi_load):
                 if const_expr(use_tma_c):
                     epi_pipeline.consumer_wait(epi_read_state)
-                    cute.copy(
-                        tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
-                    )
+                    if const_expr(has_C):
+                        cute.copy(
+                            tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
+                        )
+                    self.epi_tile_load_s2r(params, epi_tensors, epi_read_state.index)
                     cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
@@ -158,7 +163,8 @@ class GemmBase:
                     cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, c_buffer], tSR_rC)
                     # TODO: cp.async wait once we switch to cp.async
                     epilogue_barrier.arrive_and_wait()
-            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
+            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
+            if const_expr(inline_epi_load and epi_idx + self.epi_c_stage < epi_tile_num):
                 epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
                 if const_expr(use_tma_c):
                     if is_tma_warp:
@@ -347,6 +353,7 @@ class GemmBase:
         varlen_manager: VarlenManager,
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
+        tRS_rD_layout=None,
     ) -> Tuple[cute.Tensor, ...]:
         return ()
 
@@ -414,14 +421,28 @@ class GemmBase:
         """Subclasses can override this."""
         return []
 
+    def epi_tile_load_g2s_copy_fns(
+        self,
+        params,
+        epi_smem_tensors,
+        tile_coord_mnkl,
+        varlen_manager,
+        epi_pipeline,
+    ):
+        return ()
+
+    @cute.jit
+    def epi_tile_load_s2r(self, params, epi_tensors, stage_idx):
+        pass
+
     @staticmethod
-    def epi_smem_bytes_per_stage(
+    def epi_smem_bytes(
         args: Optional[EpilogueArguments],
         cta_tile_shape_mnk: Tuple[int, int, int],
         epi_tile: cute.Tile,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
-    ) -> int:
-        return 0
+    ) -> EpiSmemBytes:
+        return EpiSmemBytes()
 
     def epi_get_smem_struct(self, params: EpilogueParams):
         return cute.struct.MemRange[Int32, 0]  # Dummy struct
@@ -617,7 +638,9 @@ class GemmTmaBase(GemmBase):
         )
 
     def make_epi_pipeline(
-        self, c_smem_layout: cute.Layout | cute.ComposedLayout, epi_pipeline_mbar_ptr: cute.Pointer
+        self,
+        epi_pipeline_mbar_ptr: cute.Pointer,
+        tx_count: int,
     ):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         # Each warp will contribute 1 to the arrive count
@@ -625,13 +648,12 @@ class GemmTmaBase(GemmBase):
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        tma_copy_c_bytes = cute.size_in_bytes(self.c_dtype, c_smem_layout)
         return pipeline.PipelineTmaAsync.create(
             barrier_storage=epi_pipeline_mbar_ptr,
             num_stages=self.epi_c_stage,
             producer_group=epi_pipeline_producer_group,
             consumer_group=epi_pipeline_consumer_group,
-            tx_count=tma_copy_c_bytes,
+            tx_count=tx_count,
             defer_sync=True,
         )
 

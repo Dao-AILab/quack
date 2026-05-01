@@ -546,7 +546,6 @@ def apply_rotary(
     x is (batch, seqlen, nheads, headdim) when cu_seqlens is None, otherwise
     (total_seqlen, nheads, headdim). cos/sin are (seqlen_ro, rotary_dim / 2).
     """
-    assert x.is_cuda and cos.is_cuda and sin.is_cuda
     supported_types = {torch.float16, torch.bfloat16, torch.float32}
     assert x.dtype in supported_types, "Unsupported x dtype"
     assert cos.dtype == sin.dtype, "cos and sin must have the same dtype"

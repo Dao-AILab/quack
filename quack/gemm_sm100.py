@@ -363,13 +363,25 @@ class GemmSm100(GemmTmaBase):
             self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
 
         # Compute epilogue subtile
+        tile_load_layout = None
+        tile_load_dtype = None
+        # If TileLoad exists without C, use the first non-None tile-load tensor as
+        # the C-like input for SM100's epilogue tile shape. Multiple TileLoads
+        # share the same epi_tile shape.
+        for op in getattr(self, "_epi_ops", ()):
+            if op.is_tile_load():
+                tile_load_tensor = getattr(epilogue_args, op.name, None)
+                if tile_load_tensor is not None:
+                    tile_load_layout = LayoutEnum.from_tensor(tile_load_tensor)
+                    tile_load_dtype = tile_load_tensor.element_type
+                    break
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
             self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
             self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
-            layout_c=self.c_layout,
-            elem_ty_c=self.c_dtype,
+            layout_c=self.c_layout if self.c_layout is not None else tile_load_layout,
+            elem_ty_c=self.c_dtype if self.c_dtype is not None else tile_load_dtype,
         )
         # TMA store tile starts must stay aligned when advancing across CTA-N tiles.
         # There's a bug w compute_epilogue_tile_shape (as of cutlass-dsl 4.4.2) where if
@@ -706,6 +718,16 @@ class GemmSm100(GemmTmaBase):
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
+        self.epi_load_bytes_per_stage = self.epi_smem_bytes(
+            epilogue_args,
+            self.cta_tile_shape_mnk,
+            self.epi_tile,
+            self.epi_smem_warp_shape_mnk(),
+        ).c_stage
+        if const_expr(mC is not None):
+            c_smem_layout = cute.slice_(self.epi_c_smem_layout_staged, (None, None, 0))
+            self.epi_load_bytes_per_stage += cute.size_in_bytes(self.c_dtype, c_smem_layout)
+
         TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m)
         tile_sched_args = self.get_scheduler_arguments(
             mA, mB, mD, scheduler_args, varlen_args, epilogue_args
@@ -873,6 +895,7 @@ class GemmSm100(GemmTmaBase):
             assert varlen_m or varlen_k
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
+        has_epi_load = const_expr(self.epi_c_stage > 0)
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -912,10 +935,10 @@ class GemmSm100(GemmTmaBase):
             is_leader_cta=is_leader_cta,
         )
         epi_pipeline = None
-        if const_expr(has_C):
+        if const_expr(has_epi_load):
             epi_pipeline = self.make_epi_pipeline(
-                c_smem_layout=cute.slice_(epi_c_smem_layout, (None, None, 0)),
                 epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
+                tx_count=self.epi_load_bytes_per_stage,
             )
         acc_pipeline = self.make_acc_pipeline(
             cluster_layout_vmnk=cluster_layout_vmnk,
@@ -927,7 +950,7 @@ class GemmSm100(GemmTmaBase):
             sched_pipeline = self.make_sched_pipeline(
                 self.cluster_shape_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
-                has_C=has_C,
+                has_C=has_epi_load,
             )
             sched_data = storage.sched_data.get_tensor((12, self.sched_stage))
         a_prefetch_pipeline = None
@@ -1006,7 +1029,7 @@ class GemmSm100(GemmTmaBase):
         )
 
         epi_load_barrier = None
-        if const_expr(has_C):
+        if const_expr(has_epi_load):
             epi_load_barrier = pipeline.NamedBarrier(
                 barrier_id=int(NamedBarrierGemm.EpilogueLoad), num_threads=2 * cute.arch.WARP_SIZE
             )
@@ -1338,9 +1361,9 @@ class GemmSm100(GemmTmaBase):
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
             # PDL: wait for prior kernel before any C TMA loads (matches cutlass C++ epi_load)
-            if const_expr(self.use_pdl and mC_mnl is not None):
+            if const_expr(self.use_pdl and has_epi_load):
                 cute.arch.griddepcontrol_wait()
-            if const_expr(mC_mnl is not None):
+            if const_expr(has_epi_load):
                 epi_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
                 )
@@ -1352,22 +1375,41 @@ class GemmSm100(GemmTmaBase):
                     # Get tile coord from tile scheduler
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
-                    copy_C_fn, _, bGS_gC = self.epilog_gmem_copy_and_partition(
-                        tma_atom_c,
-                        varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
-                        self.cta_tile_shape_mnk[:2],
-                        epi_tile,
-                        sC,
+                    copy_C = None
+                    if const_expr(has_C):
+                        copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
+                            tma_atom_c,
+                            varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
+                            self.cta_tile_shape_mnk[:2],
+                            epi_tile,
+                            sC,
+                            tile_coord_mnkl,
+                        )
+                        copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
+                    tile_load_copy_fns = self.epi_tile_load_g2s_copy_fns(
+                        epilogue_params,
+                        epi_smem_tensors,
                         tile_coord_mnkl,
+                        varlen_manager,
+                        epi_pipeline,
                     )
-                    copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
+                    copy_epi_load = copy_utils.chain_tma_producer_copy_fns(
+                        (copy_C, *tile_load_copy_fns)
+                    )
                     if do_epi_load_barrier_wait:
                         epi_load_barrier.arrive_and_wait()
                         do_epi_load_barrier_wait = Boolean(False)
-                    epi_tile_num = const_expr(cute.size(bGS_gC, mode=[1]))
+                    epi_tile_num = const_expr(
+                        cute.size(
+                            cute.zipped_divide(
+                                cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
+                            ),
+                            mode=[1],
+                        )
+                    )
                     for epi_idx in cutlass.range(epi_tile_num, unroll=1):
                         epi_pipeline.producer_acquire(epi_producer_state)
-                        copy_C(src_idx=epi_idx, producer_state=epi_producer_state)
+                        copy_epi_load(src_idx=epi_idx, producer_state=epi_producer_state)
                         # Epi pipeline's producer commit is a NOP
                         epi_pipeline.producer_commit(epi_producer_state)
                         epi_producer_state.advance()
@@ -2243,7 +2285,15 @@ class GemmSm100(GemmTmaBase):
 
         # Default D stages
         epi_stage = 4 if cute.size(epi_tile[1]) <= 16 else 2
-        epi_c_stage = 0 if c_dtype is None else (4 if cute.size(epi_tile[1]) <= 16 else 2)
+        epi_smem_bytes = cls.epi_smem_bytes(
+            epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
+        )
+        has_tile_load = epi_smem_bytes.c_stage > 0
+        epi_c_stage = (
+            0
+            if c_dtype is None and not has_tile_load
+            else (4 if cute.size(epi_tile[1]) <= 16 else 2)
+        )
 
         # Calculate smem layout and size for one stage of A, B, and C
         a_smem_layout_staged_one = sm100_utils.make_smem_layout_a(
@@ -2297,13 +2347,13 @@ class GemmSm100(GemmTmaBase):
         d_bytes_per_stage = (
             cute.size_in_bytes(d_dtype, d_smem_layout_staged_one) if d_dtype is not None else 0
         )
-        epi_bytes_per_stage = d_bytes_per_stage + cls.epi_smem_bytes_per_stage(
-            epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
-        )
-        epi_bytes = epi_bytes_per_stage * epi_stage
+        epi_bytes_per_stage = d_bytes_per_stage + epi_smem_bytes.d_stage
+        epi_bytes = epi_smem_bytes.unstaged + epi_bytes_per_stage * epi_stage
         if const_expr(c_dtype is not None):
             c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
             epi_bytes += c_bytes_per_stage * epi_c_stage
+        if const_expr(has_tile_load):
+            epi_bytes += epi_smem_bytes.c_stage * epi_c_stage
 
         # Calculate A/B/SFA/SFB stages:
         # Start with total smem per CTA (capacity / occupancy)
@@ -2315,7 +2365,8 @@ class GemmSm100(GemmTmaBase):
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
-        epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // (epi_bytes_per_stage)
+        if epi_bytes_per_stage > 0:
+            epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // epi_bytes_per_stage
         return num_acc_stage, ab_stage, epi_stage, epi_c_stage
 
     @staticmethod

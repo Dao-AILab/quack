@@ -64,9 +64,11 @@ class GemmSymmetricMixin(GemmActMixin):
         is_tma_warp: Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
+        has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
+        inline_epi_load = const_expr(copy_C is not None)
         use_stochastic_rounding = const_expr(
             self.rounding_mode == RoundingMode.RS
             and self.acc_dtype == cutlass.Float32
@@ -108,9 +110,10 @@ class GemmSymmetricMixin(GemmActMixin):
             varlen_manager,
             epilogue_barrier,
             tidx,
+            tRS_rD.layout,
         )
 
-        if const_expr(copy_C is not None):
+        if const_expr(inline_epi_load):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
                 epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
                 if const_expr(use_tma_c):
@@ -129,13 +132,14 @@ class GemmSymmetricMixin(GemmActMixin):
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)  # (epi_m, epi_n)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_coord)
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
-            if const_expr(has_C):
+            if const_expr(has_epi_load):
                 if const_expr(use_tma_c):
                     epi_pipeline.consumer_wait(epi_read_state)
-                    cute.copy(
-                        tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
-                    )
+                    if const_expr(has_C):
+                        cute.copy(
+                            tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
+                        )
+                    self.epi_tile_load_s2r(params, epi_tensors, epi_read_state.index)
                     cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
                     with cute.arch.elect_one():
@@ -146,7 +150,8 @@ class GemmSymmetricMixin(GemmActMixin):
                     cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, c_buffer], tSR_rC)
                     # TODO: cp.async wait once we switch to cp.async
                     epilogue_barrier.arrive_and_wait()
-            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
+            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
+            if const_expr(inline_epi_load and epi_idx + self.epi_c_stage < epi_tile_num):
                 epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
                 if const_expr(use_tma_c):
                     if is_tma_warp:

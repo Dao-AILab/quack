@@ -199,7 +199,6 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
         Softmax output tensor of same shape as x
     """
     assert x.dim() == 2, "Input must be 2D"
-    assert x.is_cuda, "Tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     N = x.size(1)
     dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
@@ -400,7 +399,6 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     assert dy.dim() == 2, "dy must be 2D"
     assert y.dim() == 2, "y must be 2D"
     assert dy.shape == y.shape, "dy and y must have same shape"
-    assert dy.is_cuda and y.is_cuda, "Tensors must be on CUDA device"
     assert dy.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert y.dtype == dy.dtype, "dy and y must have same dtype"
     N = dy.size(1)
