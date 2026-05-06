@@ -169,7 +169,7 @@ class GemmSm100(GemmTmaBase):
         self.sf_vec_size = sf_vec_size
         self.blockscaled = sf_vec_size is not None
         assert len(mma_tiler_mnk) in [2, 3], "MMA tiler must be (M, N) or (M, N, K)"
-        valid_2cta_m = self._valid_2cta_m()
+        valid_2cta_m = (128, 256) if not self.blockscaled else (256,)
         self.use_2cta_instrs = cluster_shape_mnk[0] % 2 == 0 and mma_tiler_mnk[0] in valid_2cta_m
         self.cluster_shape_mnk = cluster_shape_mnk
         assert cluster_shape_mnk[2] == 1, "Cluster shape K must be 1"
@@ -238,15 +238,6 @@ class GemmSm100(GemmTmaBase):
             (2, 2) if self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs else (4, 1)
         )
         return (warp_m, warp_n, 1)
-
-    def _valid_2cta_m(self):
-        """Return the set of mma_tiler[0] values for which 2-CTA MMA is enabled.
-
-        Subclasses override to exclude shapes whose epilogue layout doesn't yet
-        support certain features (e.g. gated postact with the (2, 2) epilogue
-        warp shape produced by mma_tiler_m=128 + 2-CTA).
-        """
-        return (128, 256) if not self.blockscaled else (256,)
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments, varlen_args: VarlenArguments):
         """Set up configurations that are dependent on GEMM inputs

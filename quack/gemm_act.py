@@ -123,7 +123,16 @@ class GemmActMixin(ComposableEpiMixin):
         tiled_copy_aux_out_r2s = self.epi_make_aux_out_tiled_copy_r2s(
             params, tiled_copy_r2s, tiled_copy_t2r
         )
+        # [INSTRUMENTATION] dump the destination partition shape.
+        print(
+            f"[INSTR epi_setup_aux_out]\n"
+            f"  sAuxOut.layout = {sAuxOut.layout}\n"
+            f"  tiled_copy_r2s = {tiled_copy_r2s}\n"
+            f"  tiled_copy_aux_out_r2s = {tiled_copy_aux_out_r2s}",
+            flush=True,
+        )
         tRS_sAuxOut = tiled_copy_aux_out_r2s.get_slice(tidx).partition_D(sAuxOut)
+        print(f"  tRS_sAuxOut.layout = {tRS_sAuxOut.layout}", flush=True)
         batch_idx = tile_coord_mnkl[3]
         copy_aux_out, _, _ = self.epilog_gmem_copy_and_partition(
             params.tma_atom_mAuxOut,
@@ -216,17 +225,6 @@ class GemmGatedMixin(GemmActMixin):
         TileStore("mAuxOut", epi_tile_fn=_gated_epi_tile_fn),
     )
 
-    def _valid_2cta_m(self):
-        # mma_tiler_m=128 with 2-CTA gives cta_tile_m=64, which forces a (2, 2)
-        # epilogue warp shape in compute_epilogue_tile_shape. The non-contiguous
-        # epi_tile_n that this layout produces (e.g. shape (32, 2) stride (1, 128))
-        # is recast by `_gated_epi_tile_fn` for the half-N postact tile, but the
-        # resulting smem/TMA partitioning miscomputes preact and postact (the
-        # corruption builds across persistent-kernel iterations). Until the
-        # gated epi_visit_subtile and aux-out r2s copy are taught about the
-        # (2, 2) layout, restrict 2-CTA to mma_tiler_m=256 for gated.
-        return (256,)
-
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
@@ -265,6 +263,18 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         # If we don't have .shape here, the compiler generates local stores and loads
         tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
+        # [INSTRUMENTATION] compile-time print of register layouts (fires at JIT trace).
+        print(
+            f"[INSTR gated.epi_visit_subtile JIT] arch={self.arch}\n"
+            f"  tRS_rD.layout      = {tRS_rD.layout}\n"
+            f"  tRS_rD.shape       = {tRS_rD.shape}\n"
+            f"  cute.size(tRS_rD)  = {cute.size(tRS_rD)}\n"
+            f"  tRS_rAuxOut_layout = {tRS_rAuxOut_layout}\n"
+            f"  tRS_rAuxOut.layout = {tRS_rAuxOut.layout}\n"
+            f"  tRS_rAuxOut.shape  = {tRS_rAuxOut.shape}\n"
+            f"  cute.size(tRS_rAuxOut) = {cute.size(tRS_rAuxOut)}",
+            flush=True,
+        )
         if const_expr(self.arch != 100):
             for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
                 tRS_rAuxOut[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
