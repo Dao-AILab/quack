@@ -1,111 +1,104 @@
-# Investigation: SM100 gated `(2, 2)` epilogue warp-shape bug
+# Investigation: SM100 gated `(2, 2)` epilogue warp-shape bug — RESOLVED
 
-## Setup
+## TL;DR
 
-Branch: `explore-22-warp` (forked from `fix-gated-dgated` HEAD).
+**Bug fixed at the source level.** The `_valid_2cta_m` overrides on
+`GemmGatedMixin` and `GemmDGatedMixin` (commit `b10ffed`) are no longer
+needed; this branch removes them and replaces the workaround with a real
+fix in `quack/gemm_act.py` — a 1-method override on `GemmGatedMixin` that
+constructs the aux-out r2s tiled copy with explicit thread + value layouts
+so the tiler MN matches aux smem.
 
-The `_valid_2cta_m` overrides on `GemmGatedMixin` and `GemmDGatedMixin`
-have been **reverted** so the bug fires. Plus `print()` instrumentation in
-`quack/gemm_base.py`, `quack/epi_ops.py`, and `quack/gemm_act.py`.
+## Verification
 
-Repro: `instr_run.py`. Run with fresh `QUACK_CACHE_DIR` and
-`QUACK_CACHE_ENABLED=0` to force re-compile each run.
+With `b10ffed`'s overrides reverted on this branch (so the bug *would* fire
+without the new fix):
 
-## Trigger
+| test                                                  | result                                                 |
+|-------------------------------------------------------|--------------------------------------------------------|
+| `solo_ab_min.py`                                      | phase A rel=0.0000 PASS, phase B rel=0.0000 PASS       |
+| `instr_run.py` original buggy shape (M=32768, E=8)    | preact rel=0, postact rel=8.21e-4 PASS                 |
+| 6 (M, H, I, E) × 2 cluster_m configs                  | All 12 PASS, identical errors between cm=1 and cm=2    |
+| `test_untuned_buggy_tiles.py --shapes small`          | 208/208 PASS, 0 timeouts (4 shapes × 52 forced configs)|
+| `sweep_gated_dgated.py` (216 autotuned shape grid)    | 216/216 PASS                                           |
 
-`tile_m=128, cluster_m=2, is_dynamic_persistent=True, use_tma_gather=True`
-on the gated forward path. With 2-CTA, `cta_tile_m=64`, which forces
-`compute_epilogue_tile_shape` to a `(2, 2)` M-warps × N-warps layout. The
-non-gated D path with the same warp shape works correctly — the bug is
-specific to the gated half-N postact aux-out chain.
+Phase A's monkey-patch in `solo_ab_min.py` is now a no-op (the override
+method doesn't exist on the class); even so, with 2-CTA forced on, output
+is correct.
 
-## Localization (the smoking gun)
+## Root cause (recap)
 
-`tiled_copy_aux_out_r2s` is built via:
+The gated postact tile has **half** the N elements of D's tile (via
+`_gated_epi_tile_fn`'s `recast_layout(2, 1, ...)`). The original
+construction at `gemm_act.py:104`:
 
     cute.make_tiled_copy_S(aux_atom, tiled_copy_r2s)
 
-`make_tiled_copy_S` keeps the source-side threading from `tiled_copy_r2s`
-(D's r2s copy) and only swaps the per-atom store op. The Tiler MN is
-inherited verbatim — full-N D dimensions, NOT half-N aux dimensions.
+inherits **D's full-N tiler MN** (e.g. 64×64) and applies it to aux smem
+which is half-N (e.g. 64×32). Per epi-iter, 128 threads × 32 vals/thread =
+4096 elements get emitted into a 2048-element smem region — a 2× overlap.
 
-Side-by-side for `tile_m=128, cm=2, swiglu fp16`, `cta_tile_shape=(64,256)`:
+For the (4, 1) epi-warp shape this is harmless: the over-emission has
+stride 0 in the smem layout's phantom N-warp dim (since there's only 1
+N-warp), so it's a no-op self-overwrite. For the (2, 2) shape, the smem
+N-warp dim has stride 1024 — the over-emitted elements land at warp 1's
+smem region, clobbering warp 1's data with a duplicate of warp 0's. TMA
+then dutifully scatters the duplicated smem to two distinct gmem
+positions, producing the observed corruption pattern at gmem[0..15] ==
+gmem[64..79].
 
-| object                                | shape / layout                                                          |
-|---------------------------------------|-------------------------------------------------------------------------|
-| D's r2s `tiled_copy_r2s` Tiler MN     | `((2,32):(32,1), (2,32):(32,1))` = 64M × 64N                            |
-| Aux's r2s `tiled_copy_aux_out_r2s`    | `((2,32):(32,1), (2,32):(32,1))` = 64M × 64N (**same as D**)            |
-| Aux's r2s TV layout                   | `((32,2,2),(1,32)):((2,1,64),(0,128))` -- 32 values per thread          |
-| Aux's smem `sAuxOut.layout`           | `((8,8),(16,2),(1,2)):((16,128),(1,1024),(0,2048))` = 64M × 32N         |
-| D's smem `sD.layout`                  | `((8,8),(32,2),(1,2)):((32,256),(1,2048),(0,4096))` = 64M × 64N         |
+The non-gated D path is unaffected because aux smem and D's smem have
+the same dimensions there (no half-N recast).
 
-**Mismatch:** the aux r2s copy has a 64×64 tiler producing 32 values per
-thread × 128 threads = 4096 elements, but aux smem per stage holds only
-64×32 = 2048 elements. Each aux smem position is written by **two
-threads** -- warp 0's threads and warp 1's threads collide on the same
-smem range. Whichever thread arrives last "wins"; warp 1's data is lost.
+The dgated bwd path is unaffected because `GemmDGatedMixin._epi_ops` uses
+`TileStore("mAuxOut")` with no `epi_tile_fn` (no half-N recast). The
+preventive override that `b10ffed` added on `GemmDGatedMixin` was
+empirically unneeded; the sweeps with that override removed all pass.
 
-The TMA descriptor for aux *is* correct (it scatters smem regions to gmem
-at warp-stride 64). It's just that smem holds duplicated data when the TMA
-reads it -- both the (smem) "warp 0 region" and the (smem) "warp 1 region"
-hold warp 0's values after the r2s race. TMA then dutifully writes warp 0's
-values to gmem `[0..15]` and warp 0's values again to gmem `[64..79]`,
-producing the observed:
+## The fix
 
-    postact[0,  0..15] = warp 0's values   (correct)
-    postact[0, 64..79] = warp 0's values   (DUPLICATE -- should be warp 1)
+`quack/gemm_act.py` adds an override on `GemmGatedMixin` only:
 
-## Why the (4, 1) warp shape works
+```python
+def epi_make_aux_out_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+    if self.arch != 100:
+        return super().epi_make_aux_out_tiled_copy_r2s(
+            params, tiled_copy_r2s, tiled_copy_t2r
+        )
+    copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(params, tiled_copy_t2r)
+    cta_tile_aux_m, _ = self.cta_tile_shape_aux_out_mn
+    _, num_n_warps, _ = self.epi_smem_warp_shape_mnk()
+    epi_tile_aux_n = cute.size(params.epi_tile_mAuxOut[1])
+    vals_per_thread_n = epi_tile_aux_n // num_n_warps
+    thr_layout = cute.make_layout(
+        (cta_tile_aux_m, num_n_warps), stride=(1, cta_tile_aux_m)
+    )
+    val_layout = cute.make_layout((1, vals_per_thread_n))
+    return cute.make_tiled_copy_tv(copy_atom_aux_out_r2s, thr_layout, val_layout)
+```
 
-For `cluster_m=1` (= `(4, 1)` warp shape), `epi_tile_n` is just `int 32`
-(no Layout). After `_gated_epi_tile_fn` halves to `int 16`, aux smem is
-flat with only 1 N-warp. The Tiler MN match between D and aux remains
-"D's full-N tile = aux's full-N tile" because there's no warp-N split in
-either; the per-thread value count of 16 lands cleanly in aux smem with no
-collision.
+Threading is `(cta_tile_aux_m, num_n_warps)` with stride `(1, cta_tile_aux_m)`
+— 128 threads laid out as 1 thread per (M-row, N-warp) cell. Each thread
+holds `vals_per_thread_n = size(epi_tile_aux_n) / num_n_warps` values
+along N. Total = 128 × `vals_per_thread_n` = aux smem per stage exactly,
+no overlap. SM90/SM120 fall back to the original construction (the
+Layout-typed `epi_tile_n` is SM100-specific via `compute_epilogue_tile_shape`).
 
-Per-thread `tRS_rD.layout` is `((1,32),1,1):((0,1),0,0)` for **both** warp
-shapes. The bug is purely in the destination-side (smem) partitioning of
-`tiled_copy_aux_out_r2s`, not in registers or in `act_fn` indexing.
+## What was removed in this branch
 
-## Why D's full-N path is unaffected
+- `GemmGatedMixin._valid_2cta_m -> (256,)` (workaround, no longer needed).
+- `GemmDGatedMixin._valid_2cta_m -> (256,)` (preventive workaround,
+  empirically unneeded — dgated has no half-N recast and no (2, 2) bug).
+- `GemmSm100._valid_2cta_m()` method indirection (introduced by `b10ffed`
+  to support the workaround).
 
-D's smem layout has 64 N elements (twice aux's), with warp 1 at smem
-stride 2048. D's r2s tiler `((2,32),(2,32))` produces 32 values per
-thread × 128 threads = 4096 elements -- matches D smem per stage exactly.
-No collision.
-
-## Fix direction
-
-The aux r2s tiled copy must be re-tiled to match aux's tile dimensions
-(half N) before being used to partition `sAuxOut`. Two plausible builders:
-
-1. Build from scratch via `make_tiled_copy_D(aux_atom, sAuxOut.layout)` so
-   the destination shape comes from aux smem rather than D's r2s.
-2. Re-tile `tiled_copy_r2s` to halve its N extent before passing through
-   `make_tiled_copy_S`.
-
-Either approach requires careful handling of the per-thread register slice
-(`tRS_rAuxOut` has 16 fp32 elements per thread, derived via
-`recast_layout(2, 1, tRS_rD.layout)`). The atom returned by
-`sm100_utils.get_smem_store_op(aux_layout, aux_dtype, acc_dtype, tiled_copy_t2r)`
-is selected based on `tiled_copy_t2r` (D's full-N pattern) -- it likely
-needs to be rebuilt from a t2r-equivalent for aux's half-N slice as well.
-
-This is real cuTeDSL design work. The current `_valid_2cta_m` override on
-`GemmGatedMixin` / `GemmDGatedMixin` is the practical workaround; this
-investigation explains exactly why the override is needed and what would
-need to change to remove it.
-
-## Reproduction commands
+## Reproduction
 
 ```bash
 git checkout explore-22-warp
 CACHE=$(mktemp -d /tmp/quack_explore_XXXX)
 CUDA_VISIBLE_DEVICES=0 QUACK_CACHE_DIR=$CACHE QUACK_CACHE_ENABLED=0 \
     python instr_run.py
-# CLUSTER_M=1 to compare against the working (4, 1) warp shape.
+# CLUSTER_M=2 (default) reproduces the previously-buggy cocktail; both
+# phase A and phase B of solo_ab_min.py now PASS with rel=0.
 ```
-
-The instrumentation prints D-path and aux-path layouts side by side; the
-mismatch in Tiler MN vs sAuxOut shape is the smoking gun.

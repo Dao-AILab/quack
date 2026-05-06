@@ -511,24 +511,8 @@ class TileStore(EpiOp):
                 self._epi_tile_key(): None,
             }
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
-        # [INSTRUMENTATION] print the recast tile vs the full tile.
-        print(
-            f"[INSTR TileStore.to_params name={self.name}]\n"
-            f"  cta_tile_shape_mnk={gemm.cta_tile_shape_mnk}\n"
-            f"  use_2cta_instrs={gemm.use_2cta_instrs}\n"
-            f"  gemm.epi_tile (full)        = {gemm.epi_tile}\n"
-            f"  epi_tile passed to setup    = {epi_tile}",
-            flush=True,
-        )
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
             gemm, tensor, epi_tile=epi_tile
-        )
-        print(
-            f"[INSTR TileStore.to_params name={self.name}] post-setup\n"
-            f"  smem_layout = {smem_layout}\n"
-            f"  epi_tile_out = {epi_tile_out}\n"
-            f"  tma_atom = {tma_atom}",
-            flush=True,
         )
         return {
             self._tma_atom_key(): tma_atom,

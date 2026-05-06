@@ -15,7 +15,11 @@ from quack.gemm_interface import gemm_gated_tuned, gemm_gated_ref
 
 
 def main():
-    M, H, I, E = 4096, 256, 128, 4  # small enough for tractable output
+    import os
+    M = int(os.environ.get("M", "4096"))
+    H = int(os.environ.get("H", "256"))
+    I = int(os.environ.get("I", "128"))
+    E = int(os.environ.get("E", "4"))
     device = torch.device("cuda:0")
     dtype = torch.float16
     g = torch.Generator(device=device).manual_seed(0)

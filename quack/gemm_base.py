@@ -569,15 +569,6 @@ class GemmTmaBase(GemmBase):
     ):
         tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
-            # [INSTRUMENTATION] print D-path inputs.
-            print(
-                f"[INSTR D-path make_tma_epilogue_atoms_and_tensors]\n"
-                f"  cta_tile_shape_mnk = {self.cta_tile_shape_mnk}\n"
-                f"  use_2cta_instrs    = {self.use_2cta_instrs}\n"
-                f"  self.epi_tile      = {self.epi_tile}\n"
-                f"  self.epi_smem_layout_staged = {self.epi_smem_layout_staged}",
-                flush=True,
-            )
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
                 copy_utils.create_ragged_tensor_for_tma(mD, ragged_dim=0, ptr_shift=True)
                 if varlen_m
@@ -587,10 +578,6 @@ class GemmTmaBase(GemmBase):
                 op_type="store"
                 if not (hasattr(epilogue_args, "add_to_output") and epilogue_args.add_to_output)
                 else "add",
-            )
-            print(
-                f"[INSTR D-path] tma_atom_d = {tma_atom_d}",
-                flush=True,
             )
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
