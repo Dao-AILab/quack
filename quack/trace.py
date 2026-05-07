@@ -85,7 +85,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, const_expr
 from cutlass.base_dsl.arch import Arch
-from cutlass._mlir.dialects import nvvm
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T
 
 from quack.copy_utils import store, store_v2
@@ -222,16 +222,42 @@ def _buf_total_bytes(total_slots: int, per_warp_cap: int) -> int:
 
 
 def _read_globaltimer():
-    return Int64(nvvm.read_ptx_sreg_globaltimer(T.i64()))
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+        )
+    )
 
 
 def _read_clock64():
-    return Int64(nvvm.read_ptx_sreg_clock64(T.i64()))
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %clock64;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+        )
+    )
 
 
 def _read_clock():
-    """Read %clock (32-bit, low half of clock64). Used in the hot path for delta encoding."""
-    return cutlass.Int32(nvvm.read_ptx_sreg_clock(T.i32()))
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %clock;",
+            "=r",
+            has_side_effects=True,
+            is_align_stack=False,
+        )
+    )
 
 
 def _read_smid():
