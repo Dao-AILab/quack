@@ -3,7 +3,13 @@
 import pytest
 import torch
 
-from quack.rmsnorm import layernorm_fwd, layernorm_ref, layernorm_rstd_ref, layernorm_mean_ref
+from quack.rmsnorm import (
+    layernorm_bwd,
+    layernorm_fwd,
+    layernorm_mean_ref,
+    layernorm_ref,
+    layernorm_rstd_ref,
+)
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
@@ -56,6 +62,66 @@ def test_layernorm_forward(M, N, input_dtype, eps):
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(rstd, rstd_ref_val, atol=6e-4, rtol=6e-4)
     torch.testing.assert_close(mean, mean_ref_val, atol=6e-4, rtol=6e-4)
+
+
+@pytest.mark.parametrize("eps", [1e-5, 1e-6])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("M", [1, 37, 199])
+@pytest.mark.parametrize(
+    "N", [256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+)
+def test_layernorm_backward(M, N, input_dtype, eps):
+    """Test LayerNorm backward against torch autograd."""
+    device = "cuda"
+    # RMSNormBackward rejects N > 128k with >=32-bit dtype (smem limit).
+    if N > 128 * 1024 and input_dtype == torch.float32:
+        pytest.skip("RMSNormBackward: N > 128k unsupported for fp32")
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12:
+        smem_n_limit = 131072 if input_dtype == torch.float32 else 262144
+        if N > smem_n_limit:
+            pytest.skip("SM12x: exceeds 99 KB SMEM")
+
+    if input_dtype == torch.bfloat16:
+        atol, rtol = 2e-2, 2e-2
+    elif input_dtype == torch.float16:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 1e-4, 1e-4
+
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    # F.layer_norm requires weight/bias dtype to match input; QuACK requires fp32 weight.
+    w_ref = torch.randn(N, device=device, dtype=input_dtype, requires_grad=True)
+    b_ref = torch.randn(N, device=device, dtype=input_dtype, requires_grad=True)
+    w_f32 = w_ref.detach().to(torch.float32).contiguous()
+
+    y_ref = torch.nn.functional.layer_norm(x, (N,), w_ref, b_ref, eps=eps)
+    dy = torch.randn_like(y_ref)
+    y_ref.backward(dy)
+    dx_ref = x.grad.detach()
+    dw_ref = w_ref.grad.detach()
+    db_ref = b_ref.grad.detach()
+
+    mean = x.detach().to(torch.float32).mean(dim=-1)
+    rstd = (x.detach().to(torch.float32).var(dim=-1, unbiased=False) + eps).rsqrt()
+
+    dx, dw, db = layernorm_bwd(x.detach(), w_f32, dy, rstd, mean)
+
+    assert dx.shape == x.shape and dx.dtype == input_dtype
+    assert dw.shape == (N,) and dw.dtype == torch.float32
+    assert db.shape == (N,) and db.dtype == torch.float32
+
+    torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)
+    # dw/db accumulate across rows so absolute error scales with M; use relative.
+    rel_dw = (dw.float() - dw_ref.float()).abs().max().item() / max(
+        dw_ref.float().abs().mean().item(), 1e-6
+    )
+    rel_db = (db.float() - db_ref.float()).abs().max().item() / max(
+        db_ref.float().abs().mean().item(), 1e-6
+    )
+    assert rel_dw < 0.05, f"dw rel err {rel_dw}"
+    assert rel_db < 0.05, f"db rel err {rel_db}"
 
 
 @pytest.mark.parametrize("return_rstd", [True, False])

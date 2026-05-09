@@ -29,7 +29,7 @@ pip install 'quack-kernels[heuristics]'
 - 🦆 RMSNorm forward + backward
 - 🦆 Softmax forward + backward
 - 🦆 Cross entropy forward + backward
-- 🦆 Layernorm forward
+- 🦆 Layernorm forward + backward
 - 🦆 Hopper gemm + epilogue
 - 🦆 Blackwell gemm + epilogue
 - 🦆 Blackwell GeForce gemm + epilogue
