@@ -24,7 +24,16 @@ from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.rmsnorm_config import RmsNormBwdConfig, get_sm_count
+from quack.autotuner import autotune, AutotuneConfig
+from quack.rmsnorm_config import (
+    RmsNormBwdConfig,
+    RmsNormFwdConfig,
+    get_all_bwd_configs,
+    get_all_fwd_configs,
+    get_sm_count,
+    prune_invalid_rmsnorm_bwd_configs,
+    prune_invalid_rmsnorm_fwd_configs,
+)
 from cutlass.base_dsl.arch import Arch
 
 
@@ -53,18 +62,31 @@ def _ensure_contiguous(t):
 
 
 class RMSNorm(ReductionBase):
-    def __init__(self, dtype: Type[cutlass.Numeric], N: int, is_layernorm: bool = False):
+    def __init__(
+        self,
+        dtype: Type[cutlass.Numeric],
+        N: int,
+        is_layernorm: bool = False,
+        config: Optional["RmsNormFwdConfig"] = None,
+    ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
-        self.reload_from = None if N <= (16384 if is_layernorm else 8192) else "smem"
-        self.delay_w_load = False
+        if config is None:
+            config = RmsNormFwdConfig.from_analytical_heuristic(
+                N, dtype.width, is_layernorm=is_layernorm
+            )
+        self.config = config
+        self.reload_from = config.reload_from
+        self.delay_w_load = config.delay_w_load
+        self._num_threads_val = config.num_threads
+        self._threads_per_row_val = config.threads_per_row
+        self._cluster_n_val = config.cluster_n
+
+    def _num_threads(self):
+        return self._num_threads_val
 
     def _threads_per_row(self):
-        N = self.N
-        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
-            if N <= limit:
-                return threads
-        return 256
+        return self._threads_per_row_val
 
     def _set_cluster_n(self):
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
@@ -74,28 +96,7 @@ class RMSNorm(ReductionBase):
             return
         # SM12x supports cluster up to 8
         max_cluster = 8 if arch.major == 12 else 16
-        N = self.N
-        # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
-        # Similarly cluster_n = 8 is faster for N=128k
-        if arch.major == 12 and const_expr(self.dtype.width >= 32):
-            # SM12x 99 KB SMEM: fp32 needs tighter clustering (conservative for residual case)
-            thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
-        elif const_expr(self.dtype.width == 16):
-            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
-        elif self.is_layernorm:
-            # fp32 layernorm: bump cluster earlier than fp16/bf16. The 2-pass path's
-            # single-CTA tile is bandwidth-limited at N=16k/32k; cluster_n=2 splits
-            # the row across two CTAs and recovers ~3-14% at those sizes.
-            thresholds = [(8 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
-        else:
-            # fp32 rmsnorm (1-pass) is already saturated at cluster_n=1 for N<=32k;
-            # bumping to cluster_n=2 there regresses ~3%.
-            thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
-        for limit, cluster in thresholds:
-            if N <= limit:
-                self.cluster_n = cluster
-                return
-        self.cluster_n = max_cluster
+        self.cluster_n = min(self._cluster_n_val, max_cluster)
 
     @cute.jit
     def __call__(
@@ -422,6 +423,7 @@ def _compile_rmsnorm_fwd(
     has_mean,
     is_layernorm,
     per_head,
+    config: Optional[RmsNormFwdConfig] = None,
 ):
     batch_sym = cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
@@ -439,7 +441,7 @@ def _compile_rmsnorm_fwd(
     rstd_cute = fake_tensor(Float32, batch_shape) if has_rstd else None
     mean_cute = fake_tensor(Float32, batch_shape) if has_mean else None
     return cute.compile(
-        RMSNorm(dtype, N, is_layernorm=is_layernorm),
+        RMSNorm(dtype, N, is_layernorm=is_layernorm, config=config),
         x_cute,
         weight_cute,
         bias_cute,
@@ -483,6 +485,58 @@ def rmsnorm_fwd(
     if residual_out is None:
         residual_out = x
     return out, residual_out, rstd
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_fwd_configs()],
+    key=["is_layernorm", "per_head"],
+    prune_configs_by={"early_config_prune": prune_invalid_rmsnorm_fwd_configs},
+)
+def rmsnorm_fwd_tuned(
+    x: Tensor,
+    weight: Optional[Tensor],
+    out: Tensor,
+    bias: Optional[Tensor] = None,
+    rstd: Optional[Tensor] = None,
+    mean: Optional[Tensor] = None,
+    residual: Optional[Tensor] = None,
+    residual_out: Optional[Tensor] = None,
+    eps: float = 1e-6,
+    is_layernorm: bool = False,
+    per_head: bool = False,
+    config: Optional[RmsNormFwdConfig] = None,
+) -> None:
+    """Autotuned RMSNorm/LayerNorm forward dispatch.
+
+    The ``@autotune`` decorator injects ``config`` from the exhaustive search
+    space at first call for a given (shape, dtype, ``is_layernorm``, ``per_head``)
+    and caches the winner for subsequent calls. The un-tuned counterpart is
+    :func:`rmsnorm_fwd`, which uses the analytical heuristic.
+    """
+    if config is None:
+        raise RuntimeError(
+            "rmsnorm_fwd_tuned requires a config (provided automatically by "
+            "the @autotune decorator). Use rmsnorm_fwd for the un-tuned path."
+        )
+    N = x.size(-1)
+    dtype, out_dtype, weight_dtype, bias_dtype, res_dtype, res_out_dtype = [
+        torch2cute_dtype_map[t.dtype] if t is not None else None
+        for t in [x, out, weight, bias, residual, residual_out]
+    ]
+    _compile_rmsnorm_fwd(
+        dtype,
+        out_dtype,
+        res_dtype,
+        weight_dtype,
+        bias_dtype,
+        res_out_dtype,
+        N,
+        rstd is not None,
+        mean is not None,
+        is_layernorm,
+        per_head,
+        config=config,
+    )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
 
 
 def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6):
@@ -546,18 +600,15 @@ class RMSNormBackward(ReductionBase):
         dout_dtype: Optional[Type[cutlass.Numeric]] = None,
         T_hint: int = 0,
         per_head: bool = False,
+        config: Optional["RmsNormBwdConfig"] = None,
     ):
         # 2 stages for double buffering when computing mean of x_hat * wdy
         super().__init__(dtype, N, stage=2, reduction_dtype=Float32)
         dout_width = dout_dtype.width if dout_dtype is not None else dtype.width
-        arch_major = (
-            torch.cuda.get_device_capability(torch.cuda.current_device())[0]
-            if torch.cuda.is_available()
-            else 0
-        )
-        config = RmsNormBwdConfig.from_analytical_heuristic(
-            N, dtype.width, dout_width, arch_major, T_hint
-        )
+        if config is None:
+            config = RmsNormBwdConfig.from_analytical_heuristic(
+                N, dtype.width, dout_width, T_hint=T_hint
+            )
         self.config = config
         self.reload_wdy = config.reload_wdy
         self.reload_x = config.reload_x
@@ -1174,6 +1225,7 @@ def _compile_rmsnorm_bwd(
     has_dw_partial,
     per_head=False,
     T_hint=0,
+    config: Optional[RmsNormBwdConfig] = None,
 ):
     batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
@@ -1197,6 +1249,7 @@ def _compile_rmsnorm_bwd(
             dout_dtype=dout_dtype,
             T_hint=T_hint,
             per_head=per_head,
+            config=config,
         ),
         x_cute,
         weight_cute,
@@ -1259,6 +1312,60 @@ def rmsnorm_bwd(
     if has_residual and dresidual is None:
         dresidual = dx
     return dx, dw, db, dresidual
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_bwd_configs()],
+    key=["per_head", "has_dw_partial", "has_db_partial"],
+    prune_configs_by={"early_config_prune": prune_invalid_rmsnorm_bwd_configs},
+)
+def rmsnorm_bwd_tuned(
+    x: Tensor,
+    weight: Optional[Tensor],
+    dout: Tensor,
+    rstd: Tensor,
+    dx: Tensor,
+    dw_partial: Optional[Tensor] = None,
+    db_partial: Optional[Tensor] = None,
+    dresidual_out: Optional[Tensor] = None,
+    dresidual: Optional[Tensor] = None,
+    sm_count: Optional[int] = None,
+    per_head: bool = False,
+    has_dw_partial: bool = False,
+    has_db_partial: bool = False,
+    config: Optional[RmsNormBwdConfig] = None,
+) -> None:
+    """Autotuned RMSNorm backward dispatch.
+
+    The ``@autotune`` decorator injects ``config`` from the exhaustive search
+    space at first call for a given (shape, dtype, ``per_head``, has_*) and
+    caches the winner for subsequent calls. The un-tuned counterpart is
+    :func:`rmsnorm_bwd`, which uses the analytical heuristic.
+    """
+    if config is None:
+        raise RuntimeError(
+            "rmsnorm_bwd_tuned requires a config (provided automatically by "
+            "the @autotune decorator). Use rmsnorm_bwd for the un-tuned path."
+        )
+    N = x.size(-1)
+    dtype, dout_dtype, dx_dtype, weight_dtype, dres_dtype, dres_out_dtype = [
+        torch2cute_dtype_map[t.dtype] if t is not None else None
+        for t in [x, dout, dx, weight, dresidual, dresidual_out]
+    ]
+    _compile_rmsnorm_bwd(
+        N,
+        dtype,
+        dout_dtype,
+        dx_dtype,
+        weight_dtype,
+        has_db_partial,
+        dres_dtype,
+        dres_out_dtype,
+        has_dw_partial,
+        per_head,
+        T_hint=0,
+        config=config,
+    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
 
 
 class RMSNormFunction(torch.autograd.Function):
