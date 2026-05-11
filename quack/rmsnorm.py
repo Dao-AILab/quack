@@ -529,7 +529,6 @@ class RMSNormBackward(ReductionBase):
         self._num_threads_val = config.num_threads
         self._threads_per_row_val = config.threads_per_row
         self._cluster_n_val = config.cluster_n
-        self._tma_stages_val = config.tma_stages
         tile_n = N // max(1, config.cluster_n)
         row_bytes_x = tile_n * dtype.width // 8
         row_bytes_do = tile_n * dout_width // 8
@@ -639,7 +638,7 @@ class RMSNormBackward(ReductionBase):
         threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        warp_idx_uniform = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if const_expr(self.per_head):
             bidx_start, _, bidz = cute.arch.block_idx()
         else:
@@ -664,7 +663,7 @@ class RMSNormBackward(ReductionBase):
 
         smem = cutlass.utils.SmemAllocator()
         USE_TMA = const_expr(self.USE_TMA)
-        n_smem_stages = const_expr(self._tma_stages_val if USE_TMA else 2)
+        n_smem_stages = const_expr(self.config.smem_stages)
         smem_layout = cute.make_ordered_layout(
             (tiler_mn[0], tiler_mn[1], n_smem_stages), order=(1, 0, 2)
         )
@@ -735,10 +734,10 @@ class RMSNormBackward(ReductionBase):
             tXrdB = cute.make_rmem_tensor_like(tXgdB, Float32)
 
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
-        NUM_TMA_STAGES = const_expr(self._tma_stages_val)
+        NUM_PIPE_STAGES = const_expr(self.config.smem_stages)
 
         if const_expr(USE_TMA):
-            tma_mbar_ptr = smem.allocate_array(Int64, num_elems=NUM_TMA_STAGES * 2)
+            tma_mbar_ptr = smem.allocate_array(Int64, num_elems=NUM_PIPE_STAGES * 2)
 
         self._initialize_cluster(tidx, mbar_ptr, num_warps, is_persistent=True)
 
@@ -756,6 +755,12 @@ class RMSNormBackward(ReductionBase):
         if const_expr(self.cluster_n > 1):
             cute.arch.cluster_wait()
 
+        producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, NUM_PIPE_STAGES
+        )
+        consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, NUM_PIPE_STAGES
+        )
         if const_expr(USE_TMA):
             num_threads_total = cute.size(tiled_copy)
             producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
@@ -764,7 +769,7 @@ class RMSNormBackward(ReductionBase):
             tma_bytes_do = const_expr(cute.size(tiler_mn) * mdO.element_type.width // 8)
             tma_pipeline = pipeline.PipelineTmaAsync.create(
                 barrier_storage=tma_mbar_ptr,
-                num_stages=NUM_TMA_STAGES,
+                num_stages=NUM_PIPE_STAGES,
                 producer_group=producer_group,
                 consumer_group=consumer_group,
                 tx_count=tma_bytes_x + tma_bytes_do,
@@ -786,12 +791,6 @@ class RMSNormBackward(ReductionBase):
                 cute.group_modes(sdO, 0, 2),
                 cute.group_modes(gdO_tma, 0, 2),
             )
-            producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, NUM_TMA_STAGES
-            )
-            consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, NUM_TMA_STAGES
-            )
 
         if const_expr(mdW is not None):
             tXrdW.fill(0.0)
@@ -800,101 +799,115 @@ class RMSNormBackward(ReductionBase):
         stage = Int32(0)
         producer_phase = Int32(1)
         consumer_phase = Int32(0)
+        next_wave_work_id = (NUM_PIPE_STAGES - 1) * gdim
+        next_wave_row_id = next_wave_work_id * tiler_mn[0]
 
         M_ceil = cute.ceil_div(M, tiler_mn[0])
-        row = tXcX[None, None, None, bidx_start][0][0]
         if const_expr(USE_TMA):
-            if warp_idx_uniform == 0:
-                if bidx_start < M_ceil:
-                    tma_pipeline.producer_acquire(producer_state)
-                    pipe_bar = tma_pipeline.producer_get_barrier(producer_state)
-                    cute.copy(
-                        tma_atom_X,
-                        tXgX_tma[None, bidx_start],
-                        tXsX_tma[None, producer_state.index],
-                        tma_bar_ptr=pipe_bar,
-                    )
-                    cute.copy(
-                        tma_atom_dO,
-                        tXgdO_tma[None, bidx_start],
-                        tXsdO_tma[None, producer_state.index],
-                        tma_bar_ptr=pipe_bar,
-                    )
-                    tma_pipeline.producer_commit(producer_state)
-                    producer_state.advance()
-        else:
-            if row < M:
-                copy(
-                    tXgX[None, None, None, bidx_start],
-                    tXsX[None, None, None, 0],
-                    is_async=True,
-                )
-                copy(
-                    tXgdO[None, None, None, bidx_start],
-                    tXsdO[None, None, None, 0],
-                    is_async=True,
-                )
-            else:
-                if const_expr(tiler_mn[0] > 1):
-                    utils.fill_oob(
-                        tXsX[None, None, None, 0],
-                        None,
-                        fill_value=mX.element_type.zero,
-                    )
-                    utils.fill_oob(
-                        tXsdO[None, None, None, 0],
-                        None,
-                        fill_value=mdO.element_type.zero,
-                    )
-            cute.arch.cp_async_commit_group()
-
-        for bidx in cutlass.range(bidx_start, cute.ceil_div(M, tiler_mn[0]), gdim):
-            row = tXcX[None, None, None, bidx][0][0]
-            if const_expr(USE_TMA):
-                next_bidx = bidx + gdim
-                if warp_idx_uniform == 0:
-                    if next_bidx < M_ceil:
+            for prefetch_iter in cutlass.range_constexpr(const_expr(NUM_PIPE_STAGES - 1)):
+                init_bidx = bidx_start + prefetch_iter * gdim
+                if warp_id == 0:
+                    if init_bidx < M_ceil:
                         tma_pipeline.producer_acquire(producer_state)
                         pipe_bar = tma_pipeline.producer_get_barrier(producer_state)
                         cute.copy(
                             tma_atom_X,
-                            tXgX_tma[None, next_bidx],
+                            tXgX_tma[None, init_bidx],
                             tXsX_tma[None, producer_state.index],
                             tma_bar_ptr=pipe_bar,
                         )
                         cute.copy(
                             tma_atom_dO,
-                            tXgdO_tma[None, next_bidx],
+                            tXgdO_tma[None, init_bidx],
+                            tXsdO_tma[None, producer_state.index],
+                            tma_bar_ptr=pipe_bar,
+                        )
+                        tma_pipeline.producer_commit(producer_state)
+                        producer_state.advance()
+        else:
+            # Pre-issue NUM_PIPE_STAGES-1 prefetches into smem stages 0..N-2.
+            # The bidx loop then maintains exactly NUM_PIPE_STAGES groups in flight
+            # via cp_async_wait_group(NUM_PIPE_STAGES - 1).
+            for prefetch_iter in cutlass.range_constexpr(const_expr(NUM_PIPE_STAGES - 1)):
+                init_bidx = bidx_start + prefetch_iter * gdim
+                init_row = tXcX[None, None, None, init_bidx][0][0]
+                if init_row < M:
+                    copy(
+                        tXgX[None, None, None, init_bidx],
+                        tXsX[None, None, None, producer_state.index],
+                        is_async=True,
+                    )
+                    copy(
+                        tXgdO[None, None, None, init_bidx],
+                        tXsdO[None, None, None, producer_state.index],
+                        is_async=True,
+                    )
+                else:
+                    if const_expr(tiler_mn[0] > 1):
+                        utils.fill_oob(
+                            tXsX[None, None, None, producer_state.index],
+                            None,
+                            fill_value=mX.element_type.zero,
+                        )
+                        utils.fill_oob(
+                            tXsdO[None, None, None, producer_state.index],
+                            None,
+                            fill_value=mdO.element_type.zero,
+                        )
+                cute.arch.cp_async_commit_group()
+                producer_state.advance()
+
+        for bidx in cutlass.range(bidx_start, cute.ceil_div(M, tiler_mn[0]), gdim):
+            row = tXcX[None, None, None, bidx][0][0]
+            if const_expr(USE_TMA):
+                ahead_bidx = bidx + next_wave_work_id
+                if warp_id == 0:
+                    if ahead_bidx < M_ceil:
+                        tma_pipeline.producer_acquire(producer_state)
+                        pipe_bar = tma_pipeline.producer_get_barrier(producer_state)
+                        cute.copy(
+                            tma_atom_X,
+                            tXgX_tma[None, ahead_bidx],
+                            tXsX_tma[None, producer_state.index],
+                            tma_bar_ptr=pipe_bar,
+                        )
+                        cute.copy(
+                            tma_atom_dO,
+                            tXgdO_tma[None, ahead_bidx],
                             tXsdO_tma[None, producer_state.index],
                             tma_bar_ptr=pipe_bar,
                         )
                         tma_pipeline.producer_commit(producer_state)
                         producer_state.advance()
             else:
-                if row + gdim * tiler_mn[0] < M:  # Prefetch the next batch
+                # cp.async: prefetch the (NUM_PIPE_STAGES-1)-ahead batch into the
+                # smem slot we're about to free up.
+                ahead_bidx = bidx + next_wave_work_id
+                if row + next_wave_row_id < M:
                     copy(
-                        tXgX[None, None, None, bidx + gdim],
-                        tXsX[None, None, None, stage ^ 1],
+                        tXgX[None, None, None, ahead_bidx],
+                        tXsX[None, None, None, producer_state.index],
                         is_async=True,
                     )
                     copy(
-                        tXgdO[None, None, None, bidx + gdim],
-                        tXsdO[None, None, None, stage ^ 1],
+                        tXgdO[None, None, None, ahead_bidx],
+                        tXsdO[None, None, None, producer_state.index],
                         is_async=True,
                     )
                 else:
                     if const_expr(tiler_mn[0] > 1):
                         utils.fill_oob(
-                            tXsX[None, None, None, stage ^ 1],
+                            tXsX[None, None, None, producer_state.index],
                             None,
                             fill_value=mX.element_type.zero,
                         )
                         utils.fill_oob(
-                            tXsdO[None, None, None, stage ^ 1],
+                            tXsdO[None, None, None, producer_state.index],
                             None,
                             fill_value=mdO.element_type.zero,
                         )
                 cute.arch.cp_async_commit_group()
+                producer_state.advance()
             rstd = cutlass.Float.zero
             if row < M or tiler_mn[0] == 1:
                 rstd = mRstd[row]
@@ -905,10 +918,9 @@ class RMSNormBackward(ReductionBase):
                     tXrdResO.fill(0.0)
             if const_expr(USE_TMA):
                 tma_pipeline.consumer_wait(consumer_state)
-                smem_stage = consumer_state.index
             else:
-                cute.arch.cp_async_wait_group(1)
-                smem_stage = stage
+                cute.arch.cp_async_wait_group(const_expr(NUM_PIPE_STAGES - 1))
+            smem_stage = consumer_state.index
             cute.autovec_copy(tXsX[None, None, None, smem_stage], tXrX)
             x = tXrX.load().to(cute.Float32)
             cute.autovec_copy(tXsdO[None, None, None, smem_stage], tXrdO)
@@ -975,7 +987,7 @@ class RMSNormBackward(ReductionBase):
                 tma_pipeline.sync_object_empty.arrive(
                     consumer_state.index, tma_pipeline.consumer_mask
                 )
-                consumer_state.advance()
+            consumer_state.advance()
 
             stage ^= 1
             if stage == 0:
