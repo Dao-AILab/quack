@@ -24,7 +24,7 @@ from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache_utils import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.rmsnorm_config import RmsNormConfig, get_sm_count
+from quack.rmsnorm_config import RmsNormBwdConfig, get_sm_count
 from cutlass.base_dsl.arch import Arch
 
 
@@ -521,7 +521,9 @@ class RMSNormBackward(ReductionBase):
             if torch.cuda.is_available()
             else 0
         )
-        config = RmsNormConfig.select(N, dtype.width, dout_width, arch_major, T_hint)
+        config = RmsNormBwdConfig.from_analytical_heuristic(
+            N, dtype.width, dout_width, arch_major, T_hint
+        )
         self.config = config
         self.reload_wdy = config.reload_wdy
         self.reload_x = config.reload_x

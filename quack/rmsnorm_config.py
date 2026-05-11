@@ -14,7 +14,7 @@ import torch
 
 
 @dataclass(frozen=True)
-class RmsNormConfig:
+class RmsNormBwdConfig:
     num_threads: int
     threads_per_row: int
     cluster_n: int
@@ -268,4 +268,3 @@ def _max_cluster_for(arch_major: int) -> int:
         return 1
     # SM12x (RTX 50) supports up to 8; Hopper/Blackwell up to 16.
     return 8 if arch_major == 12 else 16
-
