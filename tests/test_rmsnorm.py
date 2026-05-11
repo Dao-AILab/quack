@@ -3,7 +3,18 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, _compile_rmsnorm_fwd, rmsnorm_fwd, rmsnorm_bwd
+from quack.cute_dsl_utils import get_device_capacity
+from quack.rmsnorm import (
+    _compile_rmsnorm_fwd,
+    rmsnorm,
+    rmsnorm_bwd,
+    rmsnorm_bwd_ref,
+    rmsnorm_bwd_tuned,
+    rmsnorm_fwd,
+    rmsnorm_fwd_tuned,
+    rmsnorm_ref,
+)
+from quack.rmsnorm_config import RmsNormBwdConfig, RmsNormFwdConfig
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -597,3 +608,225 @@ def test_rmsnorm_bwd_empty(has_bias):
     else:
         assert db is None
     assert dresidual is None
+
+
+# ---------------------------------------------------------------------------
+# Tuned-path tests: mirror tests/test_linear.py::test_gemm — drive the
+# autotune-decorated fn directly with an explicit config (bypassing the search)
+# to exercise the plumbing for specific knob combinations, plus one end-to-end
+# autotune dispatch test for sanity.
+# ---------------------------------------------------------------------------
+
+
+def _device_capacity_or_skip() -> int:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for tuned-path tests")
+    return get_device_capacity(torch.device("cuda"))[0]
+
+
+@pytest.mark.parametrize("reload_from", [None, "smem", "gmem"])
+@pytest.mark.parametrize("cluster_n", [1, 2])
+@pytest.mark.parametrize("num_threads,threads_per_row", [(128, 32), (128, 128), (256, 128)])
+def test_rmsnorm_fwd_tuned_config(num_threads, threads_per_row, cluster_n, reload_from):
+    """Drive rmsnorm_fwd_tuned.fn with an explicit config, bypassing autotune.
+
+    Mirrors test_linear::test_gemm: exercises specific config combinations to
+    catch breakage in the tuned-path plumbing (config -> RMSNorm -> compile).
+    """
+    device_capacity = _device_capacity_or_skip()
+    if device_capacity < 9 and cluster_n > 1:
+        pytest.skip("SM8x lacks cluster support")
+    torch.random.manual_seed(0)
+    device = "cuda"
+    M, N = 1024, 4096
+    dtype = torch.bfloat16
+    if threads_per_row * cluster_n > N:
+        pytest.skip("Config over-clusters for this N")
+
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    weight = torch.randn(N, device=device, dtype=dtype) * 0.1
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=device, dtype=torch.float32)
+
+    config = RmsNormFwdConfig(
+        num_threads=num_threads,
+        threads_per_row=threads_per_row,
+        cluster_n=cluster_n,
+        reload_from=reload_from,
+        delay_w_load=False,
+    )
+    rmsnorm_fwd_tuned.fn(
+        x,
+        weight,
+        out,
+        bias=None,
+        rstd=rstd,
+        mean=None,
+        residual=None,
+        residual_out=None,
+        eps=1e-6,
+        is_layernorm=False,
+        per_head=False,
+        config=config,
+    )
+    out_ref = rmsnorm_ref(x, weight, eps=1e-6)
+    # rmsnorm_ref always promotes to fp32 internally, so a gemm-style "kernel
+    # vs pt" tolerance would collapse to zero. Tuned configs may pick a
+    # different reduction tree than the analytical heuristic, so allow 2x the
+    # un-tuned bf16 noise budget.
+    torch.testing.assert_close(out, out_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+
+
+@pytest.mark.parametrize("reload_x", [None, "smem"])
+@pytest.mark.parametrize("reload_wdy", [None, "smem"])
+@pytest.mark.parametrize("cluster_n", [1, 2])
+@pytest.mark.parametrize("num_threads,threads_per_row", [(128, 32), (256, 128)])
+def test_rmsnorm_bwd_tuned_config(
+    num_threads, threads_per_row, cluster_n, reload_wdy, reload_x
+):
+    """Drive rmsnorm_bwd_tuned.fn with an explicit config, bypassing autotune."""
+    device_capacity = _device_capacity_or_skip()
+    if device_capacity < 9 and cluster_n > 1:
+        pytest.skip("SM8x lacks cluster support")
+    torch.random.manual_seed(0)
+    device = "cuda"
+    M, N = 1024, 4096
+    dtype = torch.bfloat16
+    if threads_per_row * cluster_n > N:
+        pytest.skip("Config over-clusters for this N")
+
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    weight = torch.randn(N, device=device, dtype=dtype) * 0.1
+    rstd = torch.rsqrt(x.float().square().mean(dim=-1) + 1e-6)
+    dout = torch.randn(M, N, device=device, dtype=dtype)
+    dx = torch.empty_like(x)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 2
+    dw_partial = torch.empty((sm_count, N), device=device, dtype=torch.float32)
+
+    config = RmsNormBwdConfig(
+        num_threads=num_threads,
+        threads_per_row=threads_per_row,
+        cluster_n=cluster_n,
+        reload_wdy=reload_wdy,
+        reload_x=reload_x,
+        use_tma=False,
+        smem_stages=2,
+    )
+    rmsnorm_bwd_tuned.fn(
+        x,
+        weight,
+        dout,
+        rstd,
+        dx,
+        dw_partial=dw_partial,
+        db_partial=None,
+        dresidual_out=None,
+        dresidual=None,
+        sm_count=sm_count,
+        per_head=False,
+        has_dw_partial=True,
+        has_db_partial=False,
+        config=config,
+    )
+    dw = dw_partial.sum(dim=0).to(weight.dtype)
+    dx_ref, dw_ref = rmsnorm_bwd_ref(x, weight, dout, rstd, eps=1e-6)
+    torch.testing.assert_close(dx, dx_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+    torch.testing.assert_close(dw, dw_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+
+
+def test_rmsnorm_fwd_tuned_dispatch():
+    """End-to-end autotune dispatch: invoke rmsnorm_fwd_tuned (no .fn) so the
+    @autotune decorator picks a config from the search space, benchmarks, and
+    caches it. Validates the autotune cache key + prune flow."""
+    _device_capacity_or_skip()
+    torch.random.manual_seed(0)
+    device = "cuda"
+    # Small N keeps prune_invalid_rmsnorm_fwd_configs filtered list short so
+    # the bench doesn't dominate the test runtime.
+    M, N = 256, 256
+    dtype = torch.bfloat16
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    weight = torch.randn(N, device=device, dtype=dtype) * 0.1
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=device, dtype=torch.float32)
+    rmsnorm_fwd_tuned(
+        x,
+        weight,
+        out,
+        bias=None,
+        rstd=rstd,
+        mean=None,
+        residual=None,
+        residual_out=None,
+        eps=1e-6,
+        is_layernorm=False,
+        per_head=False,
+    )
+    assert rmsnorm_fwd_tuned.best_config is not None
+    out_ref = rmsnorm_ref(x, weight, eps=1e-6)
+    # Tuned path may pick a config with a different reduction tree than the
+    # analytical heuristic, so allow 2x the un-tuned bf16 noise budget.
+    torch.testing.assert_close(out, out_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+
+
+def test_rmsnorm_bwd_tuned_dispatch():
+    """End-to-end autotune dispatch for the bwd. See fwd counterpart."""
+    _device_capacity_or_skip()
+    torch.random.manual_seed(0)
+    device = "cuda"
+    M, N = 256, 256
+    dtype = torch.bfloat16
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    weight = torch.randn(N, device=device, dtype=dtype) * 0.1
+    rstd = torch.rsqrt(x.float().square().mean(dim=-1) + 1e-6)
+    dout = torch.randn(M, N, device=device, dtype=dtype)
+    dx = torch.empty_like(x)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 2
+    dw_partial = torch.empty((sm_count, N), device=device, dtype=torch.float32)
+    rmsnorm_bwd_tuned(
+        x,
+        weight,
+        dout,
+        rstd,
+        dx,
+        dw_partial=dw_partial,
+        db_partial=None,
+        dresidual_out=None,
+        dresidual=None,
+        sm_count=sm_count,
+        per_head=False,
+        has_dw_partial=True,
+        has_db_partial=False,
+    )
+    assert rmsnorm_bwd_tuned.best_config is not None
+    dw = dw_partial.sum(dim=0).to(weight.dtype)
+    dx_ref, dw_ref = rmsnorm_bwd_ref(x, weight, dout, rstd, eps=1e-6)
+    # Tuned path may pick a config with a different reduction tree than the
+    # analytical heuristic, so allow 2x the un-tuned bf16 noise budget.
+    torch.testing.assert_close(dx, dx_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+    torch.testing.assert_close(dw, dw_ref, atol=2 * TOLERANCES[dtype], rtol=1e-3)
+
+
+def test_rmsnorm_fwd_tuned_requires_config():
+    """rmsnorm_fwd_tuned.fn (bypassing autotune) must raise without a config."""
+    _device_capacity_or_skip()
+    device = "cuda"
+    x = torch.zeros(4, 256, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(256, device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(x)
+    with pytest.raises(RuntimeError, match="requires a config"):
+        rmsnorm_fwd_tuned.fn(x, weight, out)
+
+
+def test_rmsnorm_bwd_tuned_requires_config():
+    """rmsnorm_bwd_tuned.fn (bypassing autotune) must raise without a config."""
+    _device_capacity_or_skip()
+    device = "cuda"
+    M, N = 4, 256
+    x = torch.zeros(M, N, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(N, device=device, dtype=torch.bfloat16)
+    dout = torch.zeros_like(x)
+    rstd = torch.ones(M, device=device, dtype=torch.float32)
+    dx = torch.empty_like(x)
+    with pytest.raises(RuntimeError, match="requires a config"):
+        rmsnorm_bwd_tuned.fn(x, weight, dout, rstd, dx)
