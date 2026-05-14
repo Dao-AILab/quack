@@ -215,10 +215,11 @@ def _buf_total_bytes(total_slots: int, per_warp_cap: int) -> int:
 # ---------------------------------------------------------------------------
 # Device-side helpers
 # ---------------------------------------------------------------------------
-# Special register reads use NVVM intrinsics.  Unpredicated stores use
-# cute.arch.store (which wraps nvvm.store_ext with nice pointer/Numeric
-# handling).  Predicated stores still need inline asm since the NVVM store
-# op doesn't support PTX predication.
+# Timer reads use side-effecting inline asm instead of nvvm.read_ptx_sreg_* so
+# MLIR CSE cannot merge adjacent reads and erase elapsed time.
+# Unpredicated stores use cute.arch.store (which wraps nvvm.store_ext with nice
+# pointer/Numeric handling).  Predicated stores still need inline asm since the
+# NVVM store op doesn't support PTX predication.
 
 
 def _read_globaltimer():
