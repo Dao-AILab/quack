@@ -28,6 +28,21 @@ from quack.rmsnorm_config import RmsNormBwdConfig, get_sm_count
 from cutlass.base_dsl.arch import Arch
 
 
+def _bucket_T_hint(T_hint: int) -> int:
+    """Round ``T_hint`` up to the next power of 2 to bucket the JIT cache key.
+
+    Each base-2 order of magnitude becomes a single bucket so adjacent T
+    values share a compiled binary instead of triggering a recompile per row
+    count. Buckets align with powers of 2 (..., 512, 1024, 2048, ...), which
+    keeps the analytical heuristic thresholds (e.g. ``T_hint <= 1024``) exact
+    at their power-of-2 boundaries. ``T_hint <= 0`` (the "unknown shape"
+    SymInt sentinel) is preserved.
+    """
+    if T_hint <= 0:
+        return 0
+    return 1 << (T_hint - 1).bit_length()
+
+
 def _ensure_contiguous(t):
     """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
     (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
@@ -1111,7 +1126,7 @@ def _rmsnorm_bwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, dout, dx, weight, dresidual, dresidual_out]
     ]
-    T_hint = int(x.size(0)) if not isinstance(x.size(0), torch.SymInt) else 0
+    T_hint = _bucket_T_hint(int(x.size(0)) if not isinstance(x.size(0), torch.SymInt) else 0)
     _compile_rmsnorm_bwd(
         N,
         dtype,
