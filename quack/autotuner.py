@@ -75,6 +75,101 @@ def _base32(key):
     return base64.b32encode(bytes.fromhex(key)).decode("utf-8").rstrip("=")
 
 
+def _l2_cold_cuda_graph_bench(
+    fn,
+    tensor_sets,
+    current_kwargs,
+    n_warmup_calls: int = 50,
+    n_timed_calls: int = 200,
+    quantiles=None,
+):
+    """L2-cold single-replay CUDA-graph benchmark.
+
+    Warmup runs ``n_warmup_calls`` kernel invocations round-robin over the
+    pre-cloned ``tensor_sets`` as a plain Python loop (drains P-state
+    transitions and warms the launch path / kernel compile / smem alloc).
+    The timed window is a single ``graph.replay()`` of a captured CUDA graph
+    whose body records ``n_timed_calls`` round-robin invocations — no Python
+    loop, no per-launch CPU overhead — so the measurement is just GPU work /
+    total recorded calls.
+
+    Round-robin over fresh tensor sets defeats the L2-resident caching that
+    inflates short-kernel timing under ``triton.testing.do_bench`` (which
+    calls the kernel on the same single tensor each iteration). For
+    cache-cold production workloads the round-robin number predicts
+    real-world latency; the L2-hot number favours wider layouts / deeper
+    smem stages that don't actually win once data has to come from HBM.
+
+    ``fn`` is called as ``fn(*ts, **current_kwargs)`` once per recorded call.
+    Returns ms/call, or a ``len(quantiles)``-list replicating that value
+    when ``quantiles`` is provided (for API parity with
+    ``triton.testing.do_bench``).
+    """
+    n_sets = len(tensor_sets)
+    # Round timed-call count to a multiple of n_sets for even L2 turnover.
+    rounds_timed = max(1, n_timed_calls // n_sets)
+    total_timed_calls = rounds_timed * n_sets
+
+    # Warmup: plain Python loop over rotating sets, no graph capture.
+    for i in range(n_warmup_calls):
+        fn(*tensor_sets[i % n_sets], **current_kwargs)
+    torch.cuda.synchronize()
+
+    # Capture timed graph: a single replay covers all timed kernel launches.
+    timed_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(timed_graph):
+        for _ in range(rounds_timed):
+            for ts in tensor_sets:
+                fn(*ts, **current_kwargs)
+    torch.cuda.synchronize()
+
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    timed_graph.replay()
+    end_evt.record()
+    torch.cuda.synchronize()
+    ms = start_evt.elapsed_time(end_evt) / total_timed_calls
+
+    if quantiles:
+        return [ms for _ in quantiles]
+    return ms
+
+
+def _build_l2_cold_tensor_sets(args, n_graphs: int):
+    """Clone tensor args ``n_graphs`` times; pass through non-tensor args.
+
+    Returns a list of ``n_graphs`` arg-tuples sharing layout/dtype/contents
+    with ``args`` but at distinct memory addresses.
+    """
+    sets = []
+    for _ in range(n_graphs):
+        sets.append(tuple(a.clone() if isinstance(a, Tensor) else a for a in args))
+    return sets
+
+
+def _pick_n_graphs_for_l2_cold(args, target_ratio: int = 3, min_graphs: int = 4, max_graphs: int = 16):
+    """Pick ``n_graphs`` so cloned input bytes per round exceed
+    ``target_ratio * L2_size`` (defeats L2 reuse), capped by HBM headroom and
+    [min_graphs, max_graphs].
+    """
+    if not torch.cuda.is_available():
+        return min_graphs
+    tensor_bytes = sum(
+        a.numel() * a.element_size() for a in args if isinstance(a, Tensor)
+    )
+    if tensor_bytes == 0:
+        return min_graphs
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    l2_size = props.L2_cache_size
+    n_by_l2 = (target_ratio * l2_size + tensor_bytes - 1) // tensor_bytes
+    free_bytes, _ = torch.cuda.mem_get_info()
+    # Leave half of free memory headroom for the kernel's own scratch + the
+    # user's other allocations.
+    n_by_mem = max(1, int(free_bytes * 0.5) // tensor_bytes)
+    return max(min_graphs, min(max_graphs, min(n_by_l2, n_by_mem)))
+
+
 def _gpu_warmup(duration_ms=200):
     """Saturate the GPU to reach thermal steady-state before benchmarking.
 
@@ -306,6 +401,35 @@ class Autotuner:
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
+        # Default path: L2-cold CUDA-graph round-robin bench. ``__call__``
+        # sets ``self._l2_cold_tensor_sets`` to a list of cloned input-arg
+        # tuples once per shape (reused across all configs). Triton's default
+        # do_bench is L2-hot and systematically picks configs that win at
+        # cache-resident workloads but lose under production cache-cold
+        # patterns. The L2-cold bench fixes that.
+        l2_cold_sets = getattr(self, "_l2_cold_tensor_sets", None)
+        has_hooks = self.pre_hook is not None or self.post_hook is not None
+        use_l2_cold = (
+            self._do_bench is None and l2_cold_sets is not None and not has_hooks
+        )
+
+        if use_l2_cold:
+            try:
+                return _l2_cold_cuda_graph_bench(
+                    self.fn,
+                    l2_cold_sets,
+                    current_kwargs=current,
+                    quantiles=(0.5, 0.2, 0.8),
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"Autotuning failed with {e}")
+                return [float("inf"), float("inf"), float("inf")]
+
+        # Legacy path: triton.testing.do_bench or user-supplied do_bench.
+        # Used when (a) a custom do_bench was passed via the decorator's
+        # ``do_bench=`` arg, or (b) pre/post hooks are configured (the
+        # clone/restore inside hooks doesn't work under CUDA graph capture).
         def kernel_call():
             if self.pre_hook is not None:
                 self.pre_hook(full_nargs)
@@ -394,11 +518,32 @@ class Autotuner:
                 def benchmark():
                     self._precompile(*args, configs=pruned_configs, **kwargs)
                     _gpu_warmup()
+                    # Pre-allocate cloned input sets for L2-cold CUDA-graph
+                    # bench. One allocation reused across all configs for this
+                    # shape (~400 configs / shape would otherwise re-clone for
+                    # each). Skipped when hooks are present or a custom
+                    # do_bench was supplied (see _bench fall-back).
+                    has_hooks = self.pre_hook is not None or self.post_hook is not None
+                    if self._do_bench is None and not has_hooks:
+                        try:
+                            n_graphs = _pick_n_graphs_for_l2_cold(args)
+                            self._l2_cold_tensor_sets = _build_l2_cold_tensor_sets(args, n_graphs)
+                        except (RuntimeError, torch.cuda.OutOfMemoryError):
+                            # Cloning failed (likely OOM at extreme N); the
+                            # legacy do_bench path will be used instead.
+                            self._l2_cold_tensor_sets = None
+                    else:
+                        self._l2_cold_tensor_sets = None
                     bench_start = time.time()
-                    timings = {
-                        config: self._bench(*args, config=config, **kwargs)
-                        for config in pruned_configs
-                    }
+                    try:
+                        timings = {
+                            config: self._bench(*args, config=config, **kwargs)
+                            for config in pruned_configs
+                        }
+                    finally:
+                        # Free the cloned sets before persisting the cache so
+                        # the user's subsequent .fn(...) call has full HBM.
+                        self._l2_cold_tensor_sets = None
                     bench_end = time.time()
                     if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
                         for config, time_ in timings.items():
