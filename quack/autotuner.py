@@ -81,24 +81,30 @@ def _l2_cold_cuda_graph_bench(
     arg_sets,
     kwarg_sets,
     extra_kwargs,
-    n_warmup_calls: int = 50,
+    warmup_target_ms: float = 200.0,
     n_timed_calls: int = 200,
     quantiles=None,
 ):
     """L2-cold single-replay CUDA-graph benchmark.
 
-    Warmup runs ``n_warmup_calls`` kernel invocations round-robin over the
-    pre-cloned ``(arg_sets[i], kwarg_sets[i])`` pairs as a plain Python loop
-    (drains P-state transitions and warms the launch path / kernel compile /
-    smem alloc). The timed window is a single ``graph.replay()`` of a
-    captured CUDA graph whose body records ``n_timed_calls`` round-robin
-    invocations — no Python loop, no per-launch CPU overhead — so the
-    measurement is just GPU work / total recorded calls.
+    Warmup is time-based: probe a single kernel launch to estimate the
+    per-call cost, then iterate round-robin over the pre-cloned
+    ``(arg_sets[i], kwarg_sets[i])`` pairs as a plain Python loop for
+    ``warmup_target_ms`` of wall-clock GPU work. Heavy pipelined configs
+    (TMA + smem_stages=3) need enough warmup to drain the pipeline-fill
+    phase or the timed window catches them artificially fast - a fixed
+    count of warmup launches underwarms heavy configs while overpaying
+    for cheap ones.
 
-    Round-robin over fresh tensor sets defeats the L2-resident caching that
-    inflates short-kernel timing under ``triton.testing.do_bench`` (which
-    calls the kernel on the same single tensor each iteration). For
-    cache-cold production workloads the round-robin number predicts
+    The timed window is a single ``graph.replay()`` of a captured CUDA
+    graph whose body records ``n_timed_calls`` round-robin invocations -
+    no Python loop, no per-launch CPU overhead - so the measurement is
+    just GPU work / total recorded calls.
+
+    Round-robin over fresh tensor sets defeats the L2-resident caching
+    that inflates short-kernel timing under ``triton.testing.do_bench``
+    (which calls the kernel on the same single tensor each iteration).
+    For cache-cold production workloads the round-robin number predicts
     real-world latency; the L2-hot number favours wider layouts / deeper
     smem stages that don't actually win once data has to come from HBM.
 
@@ -114,6 +120,23 @@ def _l2_cold_cuda_graph_bench(
     # Round timed-call count to a multiple of n_sets for even L2 turnover.
     rounds_timed = max(1, n_timed_calls // n_sets)
     total_timed_calls = rounds_timed * n_sets
+
+    # A few priming launches so the probe doesn't catch first-launch
+    # driver / kernel-load overhead.
+    for _ in range(3):
+        fn(*arg_sets[0], **kwarg_sets[0], **extra_kwargs)
+    torch.cuda.synchronize()
+
+    # Probe a single launch to estimate per-call ms; size the warmup loop
+    # to hit ``warmup_target_ms`` of GPU work regardless of kernel cost.
+    probe_start = torch.cuda.Event(enable_timing=True)
+    probe_end = torch.cuda.Event(enable_timing=True)
+    probe_start.record()
+    fn(*arg_sets[0], **kwarg_sets[0], **extra_kwargs)
+    probe_end.record()
+    torch.cuda.synchronize()
+    est_ms = max(probe_start.elapsed_time(probe_end), 1e-3)
+    n_warmup_calls = max(50, int(warmup_target_ms / est_ms))
 
     # Warmup: plain Python loop over rotating sets, no graph capture.
     for i in range(n_warmup_calls):
