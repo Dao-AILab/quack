@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import sys
 import time
 import inspect
 import base64
@@ -77,8 +78,9 @@ def _base32(key):
 
 def _l2_cold_cuda_graph_bench(
     fn,
-    tensor_sets,
-    current_kwargs,
+    arg_sets,
+    kwarg_sets,
+    extra_kwargs,
     n_warmup_calls: int = 50,
     n_timed_calls: int = 200,
     quantiles=None,
@@ -86,12 +88,12 @@ def _l2_cold_cuda_graph_bench(
     """L2-cold single-replay CUDA-graph benchmark.
 
     Warmup runs ``n_warmup_calls`` kernel invocations round-robin over the
-    pre-cloned ``tensor_sets`` as a plain Python loop (drains P-state
-    transitions and warms the launch path / kernel compile / smem alloc).
-    The timed window is a single ``graph.replay()`` of a captured CUDA graph
-    whose body records ``n_timed_calls`` round-robin invocations — no Python
-    loop, no per-launch CPU overhead — so the measurement is just GPU work /
-    total recorded calls.
+    pre-cloned ``(arg_sets[i], kwarg_sets[i])`` pairs as a plain Python loop
+    (drains P-state transitions and warms the launch path / kernel compile /
+    smem alloc). The timed window is a single ``graph.replay()`` of a
+    captured CUDA graph whose body records ``n_timed_calls`` round-robin
+    invocations — no Python loop, no per-launch CPU overhead — so the
+    measurement is just GPU work / total recorded calls.
 
     Round-robin over fresh tensor sets defeats the L2-resident caching that
     inflates short-kernel timing under ``triton.testing.do_bench`` (which
@@ -100,27 +102,31 @@ def _l2_cold_cuda_graph_bench(
     real-world latency; the L2-hot number favours wider layouts / deeper
     smem stages that don't actually win once data has to come from HBM.
 
-    ``fn`` is called as ``fn(*ts, **current_kwargs)`` once per recorded call.
+    ``fn`` is called as ``fn(*arg_sets[i], **kwarg_sets[i], **extra_kwargs)``
+    once per recorded launch. ``extra_kwargs`` holds the per-config kwargs
+    (e.g. ``{"config": <RmsNormBwdConfig>}``) which don't need cloning;
+    keys in ``extra_kwargs`` must not overlap with ``kwarg_sets[i]``.
     Returns ms/call, or a ``len(quantiles)``-list replicating that value
     when ``quantiles`` is provided (for API parity with
     ``triton.testing.do_bench``).
     """
-    n_sets = len(tensor_sets)
+    n_sets = len(arg_sets)
     # Round timed-call count to a multiple of n_sets for even L2 turnover.
     rounds_timed = max(1, n_timed_calls // n_sets)
     total_timed_calls = rounds_timed * n_sets
 
     # Warmup: plain Python loop over rotating sets, no graph capture.
     for i in range(n_warmup_calls):
-        fn(*tensor_sets[i % n_sets], **current_kwargs)
+        idx = i % n_sets
+        fn(*arg_sets[idx], **kwarg_sets[idx], **extra_kwargs)
     torch.cuda.synchronize()
 
     # Capture timed graph: a single replay covers all timed kernel launches.
     timed_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(timed_graph):
         for _ in range(rounds_timed):
-            for ts in tensor_sets:
-                fn(*ts, **current_kwargs)
+            for i in range(n_sets):
+                fn(*arg_sets[i], **kwarg_sets[i], **extra_kwargs)
     torch.cuda.synchronize()
 
     start_evt = torch.cuda.Event(enable_timing=True)
@@ -136,27 +142,44 @@ def _l2_cold_cuda_graph_bench(
     return ms
 
 
-def _build_l2_cold_tensor_sets(args, n_graphs: int):
-    """Clone tensor args ``n_graphs`` times; pass through non-tensor args.
+def _build_l2_cold_tensor_sets(args, kwargs, n_graphs: int):
+    """Clone tensor args AND tensor kwargs ``n_graphs`` times.
 
-    Returns a list of ``n_graphs`` arg-tuples sharing layout/dtype/contents
-    with ``args`` but at distinct memory addresses.
+    Returns ``(arg_sets, kwarg_sets)``: ``arg_sets[i]`` is a tuple matching
+    ``args``' positional shape with tensors cloned to fresh memory;
+    ``kwarg_sets[i]`` is a dict matching ``kwargs``' keys with tensor values
+    cloned. Non-tensor values (ints, strings, None, dataclasses, etc.) are
+    shared across all sets (no clone).
+
+    Both args and kwargs are cloned so that every recorded launch in the
+    L2-cold round-robin CUDA graph touches distinct GMEM addresses,
+    including for write-target kwargs like ``dw_partial`` / ``dx``.
     """
-    sets = []
+    arg_sets = []
+    kwarg_sets = []
     for _ in range(n_graphs):
-        sets.append(tuple(a.clone() if isinstance(a, Tensor) else a for a in args))
-    return sets
+        arg_sets.append(tuple(a.clone() if isinstance(a, Tensor) else a for a in args))
+        kwarg_sets.append({
+            k: v.clone() if isinstance(v, Tensor) else v for k, v in kwargs.items()
+        })
+    return arg_sets, kwarg_sets
 
 
-def _pick_n_graphs_for_l2_cold(args, target_ratio: int = 3, min_graphs: int = 4, max_graphs: int = 16):
+def _pick_n_graphs_for_l2_cold(
+    args, kwargs, target_ratio: int = 3, min_graphs: int = 4, max_graphs: int = 16
+):
     """Pick ``n_graphs`` so cloned input bytes per round exceed
     ``target_ratio * L2_size`` (defeats L2 reuse), capped by HBM headroom and
-    [min_graphs, max_graphs].
+    [min_graphs, max_graphs]. Counts tensor bytes across both ``args`` and
+    ``kwargs`` so write-target kwargs (``dw_partial``, ``dx``, etc.) are
+    included in the L2-turnover calculation.
     """
     if not torch.cuda.is_available():
         return min_graphs
     tensor_bytes = sum(
         a.numel() * a.element_size() for a in args if isinstance(a, Tensor)
+    ) + sum(
+        v.numel() * v.element_size() for v in kwargs.values() if isinstance(v, Tensor)
     )
     if tensor_bytes == 0:
         return min_graphs
@@ -402,28 +425,38 @@ class Autotuner:
         full_nargs = {**self.nargs, **current}
 
         # Default path: L2-cold CUDA-graph round-robin bench. ``__call__``
-        # sets ``self._l2_cold_tensor_sets`` to a list of cloned input-arg
-        # tuples once per shape (reused across all configs). Triton's default
-        # do_bench is L2-hot and systematically picks configs that win at
-        # cache-resident workloads but lose under production cache-cold
-        # patterns. The L2-cold bench fixes that.
-        l2_cold_sets = getattr(self, "_l2_cold_tensor_sets", None)
+        # sets ``self._l2_cold_arg_sets`` / ``self._l2_cold_kwarg_sets`` to
+        # pre-cloned (args, kwargs) sets once per shape (reused across all
+        # configs). Round-robin over fresh sets keeps the kernel measured
+        # under the cache-cold conditions that match production access
+        # patterns, so the autotuner picks configs that win at the same
+        # workload the user actually runs.
+        l2_cold_arg_sets = getattr(self, "_l2_cold_arg_sets", None)
+        l2_cold_kwarg_sets = getattr(self, "_l2_cold_kwarg_sets", None)
         has_hooks = self.pre_hook is not None or self.post_hook is not None
         use_l2_cold = (
-            self._do_bench is None and l2_cold_sets is not None and not has_hooks
+            self._do_bench is None
+            and l2_cold_arg_sets is not None
+            and l2_cold_kwarg_sets is not None
+            and not has_hooks
         )
 
         if use_l2_cold:
             try:
                 return _l2_cold_cuda_graph_bench(
                     self.fn,
-                    l2_cold_sets,
-                    current_kwargs=current,
+                    l2_cold_arg_sets,
+                    l2_cold_kwarg_sets,
+                    extra_kwargs=config.all_kwargs(),
                     quantiles=(0.5, 0.2, 0.8),
                 )
-            except Exception as e:
+            except (RuntimeError, MemoryError) as e:
+                # Narrow catch: only swallow GPU-side failures (smem
+                # overflow, kernel launch errors, OOM). Programming errors
+                # (TypeError, AssertionError, ValueError from conflict check
+                # above) propagate so the user sees them.
                 if verbose:
-                    print(f"Autotuning failed with {e}")
+                    print(f"Autotuning failed with {type(e).__name__}: {e}")
                 return [float("inf"), float("inf"), float("inf")]
 
         # Legacy path: triton.testing.do_bench or user-supplied do_bench.
@@ -518,22 +551,27 @@ class Autotuner:
                 def benchmark():
                     self._precompile(*args, configs=pruned_configs, **kwargs)
                     _gpu_warmup()
-                    # Pre-allocate cloned input sets for L2-cold CUDA-graph
-                    # bench. One allocation reused across all configs for this
-                    # shape (~400 configs / shape would otherwise re-clone for
-                    # each). Skipped when hooks are present or a custom
-                    # do_bench was supplied (see _bench fall-back).
+                    # Pre-allocate cloned (args, kwargs) sets once per shape;
+                    # the same sets are reused across all configs to avoid
+                    # ~400x re-cloning. Skipped when hooks are present or a
+                    # custom do_bench was supplied (legacy fallback in _bench).
                     has_hooks = self.pre_hook is not None or self.post_hook is not None
                     if self._do_bench is None and not has_hooks:
                         try:
-                            n_graphs = _pick_n_graphs_for_l2_cold(args)
-                            self._l2_cold_tensor_sets = _build_l2_cold_tensor_sets(args, n_graphs)
-                        except (RuntimeError, torch.cuda.OutOfMemoryError):
-                            # Cloning failed (likely OOM at extreme N); the
-                            # legacy do_bench path will be used instead.
-                            self._l2_cold_tensor_sets = None
+                            n_graphs = _pick_n_graphs_for_l2_cold(args, kwargs)
+                            arg_sets, kwarg_sets = _build_l2_cold_tensor_sets(
+                                args, kwargs, n_graphs
+                            )
+                            self._l2_cold_arg_sets = arg_sets
+                            self._l2_cold_kwarg_sets = kwarg_sets
+                        except (RuntimeError, MemoryError):
+                            # Cloning failed (likely OOM at extreme N); legacy
+                            # do_bench path will be used by _bench.
+                            self._l2_cold_arg_sets = None
+                            self._l2_cold_kwarg_sets = None
                     else:
-                        self._l2_cold_tensor_sets = None
+                        self._l2_cold_arg_sets = None
+                        self._l2_cold_kwarg_sets = None
                     bench_start = time.time()
                     try:
                         timings = {
@@ -543,11 +581,25 @@ class Autotuner:
                     finally:
                         # Free the cloned sets before persisting the cache so
                         # the user's subsequent .fn(...) call has full HBM.
-                        self._l2_cold_tensor_sets = None
+                        self._l2_cold_arg_sets = None
+                        self._l2_cold_kwarg_sets = None
                     bench_end = time.time()
-                    if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
+                    verbose = (
+                        os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+                    )
+                    if verbose:
                         for config, time_ in timings.items():
                             print(f"[{config}] -> {time_[0]:.3f}ms")
+                    # Surface bench failures (configs returning inf timings)
+                    # so smem-overflow / launch errors aren't silently masked.
+                    n_failed = sum(1 for t in timings.values() if t[0] == float("inf"))
+                    if n_failed:
+                        print(
+                            f"quack autotune: {n_failed}/{len(timings)} configs "
+                            f"failed for {self.fn.__name__}{key}; "
+                            f"set {PACKAGE_NAME.upper()}_PRINT_AUTOTUNING=1 for details",
+                            file=sys.stderr,
+                        )
                     self.bench_time = bench_end - bench_start
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     self.configs_timings = timings
