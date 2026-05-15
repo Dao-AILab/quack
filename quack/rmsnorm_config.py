@@ -369,10 +369,15 @@ def get_all_fwd_configs() -> List[RmsNormFwdConfig]:
     max_cluster = _max_cluster_for(arch_major)
     cluster_vals = tuple(c for c in (1, 2, 4, 8, 16) if c <= max_cluster)
     reload_from_vals = (None, "smem", "gmem")
+    delay_w_load_vals = (False, True)
 
     configs: List[RmsNormFwdConfig] = []
-    for num_threads, threads_per_row, cluster_n, reload_from in itertools.product(
-        _CTA_THREAD_SIZE, _AUTOTUNE_THREADS_PER_REDUCTION_DIM, cluster_vals, reload_from_vals
+    for num_threads, threads_per_row, cluster_n, reload_from, delay_w_load in itertools.product(
+        _CTA_THREAD_SIZE,
+        _AUTOTUNE_THREADS_PER_REDUCTION_DIM,
+        cluster_vals,
+        reload_from_vals,
+        delay_w_load_vals,
     ):
         if threads_per_row > num_threads:
             continue
@@ -384,7 +389,7 @@ def get_all_fwd_configs() -> List[RmsNormFwdConfig]:
                 threads_per_row=threads_per_row,
                 cluster_n=cluster_n,
                 reload_from=reload_from,
-                delay_w_load=False,
+                delay_w_load=delay_w_load,
             )
         )
     return configs
@@ -460,21 +465,32 @@ def prune_invalid_rmsnorm_fwd_configs(configs, named_args: dict, **kwargs):
 
 
 def prune_invalid_rmsnorm_bwd_configs(configs, named_args: dict, **kwargs):
-    """Same per-call shape filter as the fwd, plus: drop ``use_tma=True`` configs
-    when ``per_head`` is set, since :class:`RMSNormBackward` forces
-    ``USE_TMA=False`` in that case (would otherwise duplicate the non-TMA
-    timing). The search space is already restricted to the current device.
+    """Same per-call shape filter as the fwd, plus three ``use_tma`` drops
+    that mirror the runtime ``USE_TMA`` guard in :class:`RMSNormBackward`
+    (``USE_TMA = use_tma and not per_head and row_bytes_x % 16 == 0 and
+    row_bytes_do % 16 == 0``). Configs that would silently fall back to the
+    cp.async path are dropped here so the autotune bench doesn't time the
+    same kernel twice and pick whichever happens to bench faster by noise.
     """
     kwargs = named_args | kwargs
     x = kwargs["x"]
+    dout = kwargs.get("dout")
     N = int(x.size(-1))
     per_head = bool(kwargs.get("per_head", x.dim() == 3))
+    x_bytes = x.element_size()
+    dout_bytes = dout.element_size() if dout is not None else x_bytes
     pruned = []
     for ac in configs:
         c = ac.kwargs["config"]
         if c.threads_per_row * c.cluster_n > N:
             continue
-        if per_head and c.use_tma:
-            continue
+        if c.use_tma:
+            if per_head:
+                continue
+            tile_n = N // max(1, c.cluster_n)
+            row_bytes_x = tile_n * x_bytes
+            row_bytes_do = tile_n * dout_bytes
+            if row_bytes_x % 16 != 0 or row_bytes_do % 16 != 0:
+                continue
         pruned.append(ac)
     return pruned

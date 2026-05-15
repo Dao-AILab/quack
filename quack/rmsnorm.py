@@ -1328,6 +1328,20 @@ def rmsnorm_bwd_tuned(
             "rmsnorm_bwd_tuned requires a config (provided automatically by "
             "the @autotune decorator). Use rmsnorm_bwd for the un-tuned path."
         )
+    # The persistent grid size is encoded in the partial-accumulator shape
+    # (dw_partial / db_partial have shape (sm_count, ..., N)). Derive
+    # sm_count from there when available; require it explicitly only when
+    # neither buffer is provided. Mirrors the _rmsnorm_bwd torch-op
+    # contract.
+    if dw_partial is not None:
+        sm_count = dw_partial.shape[0]
+    elif db_partial is not None:
+        sm_count = db_partial.shape[0]
+    elif sm_count is None:
+        raise ValueError(
+            "rmsnorm_bwd_tuned: sm_count is required when neither dw_partial "
+            "nor db_partial is provided."
+        )
     N = x.size(-1)
     dtype, dout_dtype, dx_dtype, weight_dtype, dres_dtype, dres_out_dtype = [
         torch2cute_dtype_map[t.dtype] if t is not None else None
