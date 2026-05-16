@@ -74,8 +74,10 @@ def _torch_dtype(name: str) -> torch.dtype:
 def parse_comma_separated_ints(s: str):
     try:
         return tuple([int(x.strip()) for x in s.split(",")])
-    except ValueError:
-        raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            "Invalid format. Expected comma-separated integers."
+        ) from e
 
 
 def parse_cluster_shape_mnk(s: str):
