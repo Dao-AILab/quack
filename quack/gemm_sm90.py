@@ -123,6 +123,8 @@ class GemmSm90(GemmTmaBase):
         use_clc_persistence: bool = False,
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
+        sf_vec_size: Optional[int] = None,
+        weight_n_block: Optional[int] = None,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -140,6 +142,9 @@ class GemmSm90(GemmTmaBase):
 
         self.acc_dtype = acc_dtype
         self.pingpong = pingpong
+        self.sf_vec_size = sf_vec_size
+        self.weight_n_block = weight_n_block
+        self.blockscaled = sf_vec_size is not None
         self.is_persistent = is_persistent
         self.use_clc_persistence = use_clc_persistence
         if self.use_clc_persistence:
@@ -147,7 +152,7 @@ class GemmSm90(GemmTmaBase):
         self.use_pdl = use_pdl
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
-        self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
+        self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8 and not self.blockscaled
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
         if gather_A:
@@ -228,7 +233,7 @@ class GemmSm90(GemmTmaBase):
         regs_per_thread = math.prod(self.cta_tile_shape_mnk[:2]) // (
             math.prod(self.atom_layout_mnk) * self.num_threads_per_warp_group
         )
-        if self.fp8_slow_accum:
+        if self.fp8_slow_accum or self.blockscaled:
             regs_per_thread *= 2
         if not self.gather_A:
             if self.mma_warp_groups == 3:
@@ -290,6 +295,8 @@ class GemmSm90(GemmTmaBase):
         tile_k = (
             self.cta_tile_shape_mnk[2] if self.cta_tile_shape_mnk[2] > 0 else mma_inst_shape_k * 4
         )
+        if self.blockscaled:
+            assert self.sf_vec_size == tile_k
         assert tile_k > 0, "CTA tile K must be positive"
         assert tile_k % mma_inst_shape_k == 0, (
             f"CTA tile K ({tile_k}) must be divisible by MMA instruction K ({mma_inst_shape_k})"
@@ -325,7 +332,13 @@ class GemmSm90(GemmTmaBase):
         )
         self.epi_tile_shape = cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile)
 
-        # Compute stage before compute smem layout
+        # Compute stage before compute smem layout. SFA staging (mxfp8) needs
+        # BLOCK_M * 4 extra bytes per stage so reduce ab_stage accordingly.
+        sfa_bytes_per_stage = (
+            self.cta_tile_shape_mnk[0] * 4
+            if (self.blockscaled and not self.gather_A)
+            else 0
+        )
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
             self.cta_tile_shape_mnk,
             self.epi_tile,
@@ -337,6 +350,7 @@ class GemmSm90(GemmTmaBase):
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
+            sfa_bytes_per_stage=sfa_bytes_per_stage,
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -345,6 +359,7 @@ class GemmSm90(GemmTmaBase):
             self.b_smem_layout_staged,
             self.epi_smem_layout_staged,
             self.epi_c_smem_layout_staged,
+            self.sfa_smem_layout_staged,
         ) = self._make_smem_layouts(
             self.cta_tile_shape_mnk,
             self.epi_tile,
@@ -359,6 +374,7 @@ class GemmSm90(GemmTmaBase):
             self.c_dtype,
             self.c_layout,
             self.epi_c_stage,
+            sfa_staged=self.blockscaled and not self.gather_A,
         )
 
     @cute.jit
@@ -372,6 +388,8 @@ class GemmSm90(GemmTmaBase):
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
+        mSFA: Optional[cute.Tensor] = None,
+        mSFB: Optional[cute.Tensor] = None,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """Execute the GEMM operation in steps:
@@ -434,6 +452,22 @@ class GemmSm90(GemmTmaBase):
         if const_expr(not self.gather_A):
             self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
 
+        # SFA TMA atom: stage activation scales into smem alongside A/B per K-block.
+        # mSFA arrives as (M, SF_K, L) (non-varlen, permuted in dispatch) or
+        # (total_M, SF_K) (varlen). The atom's smem_tile is (BLOCK_M, 1) — one column
+        # of sf_k per K-stage. mcast=1 since per-CTA SFA is small.
+        tma_atom_sfa, tma_tensor_sfa = None, None
+        sfa_smem_layout = None
+        if const_expr(self.blockscaled and not self.gather_A):
+            sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, 0))
+            tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
+                mSFA,
+                sfa_smem_layout,
+                (self.cta_tile_shape_mnk[0], 1),
+                1,  # no multicast
+            )
+            self.num_tma_load_bytes += cute.size_in_bytes(Float32, sfa_smem_layout)
+
         tma_atom_d, tma_tensor_d, tma_atom_c, tma_tensor_c = (
             self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
         )
@@ -462,6 +496,11 @@ class GemmSm90(GemmTmaBase):
 
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
+        sfa_smem_size = (
+            cute.cosize(self.sfa_smem_layout_staged)
+            if (self.blockscaled and not self.gather_A)
+            else 0
+        )
 
         @cute.struct
         class SharedStorage:
@@ -490,6 +529,10 @@ class GemmSm90(GemmTmaBase):
                 cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[Float32, sfa_smem_size],
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -511,8 +554,14 @@ class GemmSm90(GemmTmaBase):
             self.b_smem_layout_staged,
             self.epi_smem_layout_staged,
             self.epi_c_smem_layout_staged,
+            self.sfa_smem_layout_staged,
             tile_sched_params,
             TileSchedulerCls,
+            tma_atom_sfa,
+            tma_tensor_sfa
+            if (self.blockscaled and not self.gather_A)
+            else mSFA,
+            mSFB,
             trace_ptr,
         ).launch(
             grid=grid,
@@ -544,8 +593,12 @@ class GemmSm90(GemmTmaBase):
         b_smem_layout: cute.ComposedLayout,
         epi_smem_layout: cute.ComposedLayout,
         epi_c_smem_layout: cute.ComposedLayout,
+        sfa_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        tma_atom_sfa: Optional[cute.CopyAtom] = None,
+        mSFA: Optional[cute.Tensor] = None,
+        mSFB: Optional[cute.Tensor] = None,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """
@@ -627,6 +680,10 @@ class GemmSm90(GemmTmaBase):
         # Generate smem tensor A/B
         sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+        sSFA = None
+        if const_expr(sfa_smem_layout is not None):
+            # Plain layout (no swizzle) — get_tensor without the swizzle kwarg.
+            sSFA = storage.sSFA.get_tensor(sfa_smem_layout)
         sD = None
         if const_expr(has_D):
             sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
@@ -729,11 +786,38 @@ class GemmSm90(GemmTmaBase):
                         dst_tensor=sB,
                         mcast_mask=b_mcast_mask,
                     )
+                    # SFA: TMA-load activation scales staged alongside A/B per K-block.
+                    # mSFA is (M, SF_K, L) for non-varlen (permuted in dispatch) or
+                    # (total_M, SF_K) for varlen. After offset_batch_SFA we have (M, SF_K).
+                    copy_SFA = None
+                    if const_expr(sSFA is not None):
+                        if const_expr(varlen_m):
+                            mSFA_mk = cute.domain_offset(
+                                (varlen_params.cu_seqlens_m[batch_idx], 0), mSFA
+                            )
+                        else:
+                            mSFA_mk = mSFA[None, None, batch_idx]
+                        gSFA_mk = cute.local_tile(
+                            mSFA_mk,
+                            (self.cta_tile_shape_mnk[0], 1),
+                            (tile_coord_mnkl[0], None),
+                        )
+                        copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_sfa,
+                            cta_coord=Int32(0),  # no multicast
+                            cta_layout=cute.make_layout(1),
+                            src_tensor=gSFA_mk,
+                            dst_tensor=sSFA,
+                            mcast_mask=Int32(0),
+                        )
                     len_k = varlen_manager.len_k(batch_idx)
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
+                        copy_fns = [copy_A, copy_B]
+                        if const_expr(copy_SFA is not None):
+                            copy_fns.append(copy_SFA)
                         ab_producer_state = self.load_tma(
-                            ab_pipeline, ab_producer_state, [copy_A, copy_B], k_tile_cnt
+                            ab_pipeline, ab_producer_state, copy_fns, k_tile_cnt
                         )
                     else:
                         ab_producer_state = self.load_AB_gather_A(
@@ -785,6 +869,9 @@ class GemmSm90(GemmTmaBase):
             acc_slow = None
             if const_expr(self.fp8_slow_accum):
                 acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
+            total_acc = None
+            if const_expr(self.blockscaled):
+                total_acc = cute.make_rmem_tensor(acc.layout, self.acc_dtype)
             mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
 
             if const_expr(self.pingpong):
@@ -830,9 +917,16 @@ class GemmSm90(GemmTmaBase):
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
                 tctx.b("mma")
-                ab_read_state = self.mma(
-                    ab_pipeline, ab_read_state, mma_fn, acc, acc_slow, k_tile_cnt, warp_group_idx
-                )
+                if const_expr(self.blockscaled):
+                    ab_read_state = self.mma_blockscaled(
+                        ab_pipeline, ab_read_state, mma_fn, acc, total_acc,
+                        mSFB[batch_idx, None, None], tile_coord_mnkl[1], k_tile_cnt, warp_group_idx,
+                        sSFA=sSFA,
+                    )
+                else:
+                    ab_read_state = self.mma(
+                        ab_pipeline, ab_read_state, mma_fn, acc, acc_slow, k_tile_cnt, warp_group_idx
+                    )
                 if const_expr(varlen_k):
                     if k_tile_cnt == 0:
                         acc.fill(0.0)
@@ -1130,6 +1224,80 @@ class GemmSm90(GemmTmaBase):
             acc.store(acc_slow.load())
         return ab_read_state
 
+    @cute.jit
+    def mma_blockscaled(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_read_state: cutlass.pipeline.PipelineState,
+        mma_fn: Callable,
+        acc: cute.Tensor,
+        total_acc: cute.Tensor,
+        mSFB_nk: cute.Tensor,
+        n_tile_coord: Int32,
+        k_tile_cnt: Int32,
+        warp_group_idx: Int32,
+        sSFA: Optional[cute.Tensor] = None,
+    ) -> cutlass.pipeline.PipelineState:
+        tidx, _, _ = cute.arch.thread_idx()
+        tidx_wg = tidx % Int32(self.num_threads_per_warp_group)
+
+        thread_m_offset = (
+            Int32(16) * (tidx_wg // Int32(32))
+            + ((tidx_wg % Int32(32)) // Int32(4))
+        )
+
+        peek_full = Boolean(True)
+        if 0 < k_tile_cnt:
+            peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
+
+        for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+            ab_pipeline.consumer_wait(ab_read_state, peek_full)
+
+            mma_fn(
+                A_idx=ab_read_state.index,
+                B_idx=ab_read_state.index,
+                zero_init=True,
+            )
+
+            warpgroup.wait_group(0)
+
+            stage = ab_read_state.index
+
+            m0 = thread_m_offset
+            m1 = thread_m_offset + Int32(8)
+
+            scale_a_0 = sSFA[m0, 0, stage]
+            scale_a_1 = sSFA[m1, 0, stage]
+
+            scale_b = mSFB_nk[n_tile_coord, k_tile]
+
+            scale_0 = scale_a_0 * scale_b
+            scale_1 = scale_a_1 * scale_b
+
+            for i in cutlass.range_constexpr(16):
+                r = Int32(i * 4)
+
+                if k_tile == 0:
+                    total_acc[r + 0] = acc[r + 0] * scale_0
+                    total_acc[r + 1] = acc[r + 1] * scale_0
+                    total_acc[r + 2] = acc[r + 2] * scale_1
+                    total_acc[r + 3] = acc[r + 3] * scale_1
+                else:
+                    total_acc[r + 0] = total_acc[r + 0] + acc[r + 0] * scale_0
+                    total_acc[r + 1] = total_acc[r + 1] + acc[r + 1] * scale_0
+                    total_acc[r + 2] = total_acc[r + 2] + acc[r + 2] * scale_1
+                    total_acc[r + 3] = total_acc[r + 3] + acc[r + 3] * scale_1
+
+            ab_pipeline.consumer_release(ab_read_state)
+            ab_read_state.advance()
+
+        if const_expr(self.pingpong):
+            self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
+
+        acc.store(total_acc.load())
+        return ab_read_state
+
+
     def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s):
         """Retile accumulator for epilogue subtile access."""
         acc_reshaped = layout_utils.reshape_acc_to_frgA(acc)  # ((2, 2, 2), MMA_M, MMA_N)
@@ -1254,6 +1422,7 @@ class GemmSm90(GemmTmaBase):
         smem_capacity: int,
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
+        sfa_bytes_per_stage: int = 0,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1294,6 +1463,7 @@ class GemmSm90(GemmTmaBase):
         b_shape = cute.slice_(cta_tile_shape_mnk, (0, None, None))
         ab_bytes_per_stage = (
             cute.size(a_shape) * a_dtype.width // 8 + cute.size(b_shape) * b_dtype.width // 8
+            + sfa_bytes_per_stage  # mxfp8: BLOCK_M floats of activation scale per stage
         )
         mbar_helpers_bytes = 1024
 
@@ -1363,8 +1533,13 @@ class GemmSm90(GemmTmaBase):
         c_dtype: Optional[Type[cutlass.Numeric]],
         c_layout: Optional[LayoutEnum],
         epi_c_stage: int,
+        sfa_staged: bool = False,
     ) -> Tuple[
-        cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout, Optional[cute.ComposedLayout]
+        cute.ComposedLayout,
+        cute.ComposedLayout,
+        cute.ComposedLayout,
+        Optional[cute.ComposedLayout],
+        Optional[cute.ComposedLayout],
     ]:
         """Create shared memory layouts for A, B, and C tensors.
 
@@ -1433,11 +1608,20 @@ class GemmSm90(GemmTmaBase):
                 c_dtype, c_layout, epi_tile, epi_c_stage
             )
 
+        sfa_smem_layout_staged = None
+        if sfa_staged:
+            BM = cta_tile_shape_mnk[0]
+            sfa_smem_layout_staged = cute.make_layout(
+                (BM, 1, ab_stage),
+                stride=(1, BM, BM),
+            )
+
         return (
             a_smem_layout_staged,
             b_smem_layout_staged,
             epi_smem_layout_staged,
             epi_c_smem_layout_staged,
+            sfa_smem_layout_staged,
         )
 
     @staticmethod

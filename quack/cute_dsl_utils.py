@@ -59,6 +59,8 @@ torch2cute_dtype_map = {
     torch.float32: Float32,
     torch.int32: Int32,
     torch.int64: Int64,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
 }
 
 

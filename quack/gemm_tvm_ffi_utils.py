@@ -214,7 +214,7 @@ def compile_gemm_kernel(
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    sf_args = () if device_capacity[0] in (8, 9, 12) else (mSFA, mSFB)
+    sf_args = () if device_capacity[0] in (8, 12) else (mSFA, mSFB)
     # Trace pointer: Optional[Int64]. Compile with Int64(0) when tracing is
     # requested, None otherwise. TVM-FFI caches each variant separately.
     trace_ptr = Int64(0) if has_trace_ptr else None
