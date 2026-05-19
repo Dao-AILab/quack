@@ -110,10 +110,10 @@ def default_config(device):
     else:
         return GemmConfig(
             tile_m=128,
-            tile_n=192,
+            tile_n=128,
             cluster_m=2,
             cluster_n=1,
-            pingpong=True,
+            pingpong=False,
             is_dynamic_persistent=False,
         )
 
@@ -642,16 +642,7 @@ def mxfp8_gemm_gated_tuned(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
 ) -> None:
     if config is None:
-        # config = default_config(A.device)
-        config = GemmConfig(
-            tile_m=64,
-            tile_n=128,
-            cluster_m=2,
-            cluster_n=1,
-            pingpong=False,
-            # pingpong=True,
-            is_dynamic_persistent=False,
-        )
+        config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"

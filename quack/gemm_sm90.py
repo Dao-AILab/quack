@@ -152,7 +152,7 @@ class GemmSm90(GemmTmaBase):
         self.use_pdl = use_pdl
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
-        self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8 and not self.blockscaled
+        self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8 or self.blockscaled
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
         if gather_A:
@@ -233,7 +233,7 @@ class GemmSm90(GemmTmaBase):
         regs_per_thread = math.prod(self.cta_tile_shape_mnk[:2]) // (
             math.prod(self.atom_layout_mnk) * self.num_threads_per_warp_group
         )
-        if self.fp8_slow_accum or self.blockscaled:
+        if self.fp8_slow_accum:
             regs_per_thread *= 2
         if not self.gather_A:
             if self.mma_warp_groups == 3:
@@ -869,9 +869,6 @@ class GemmSm90(GemmTmaBase):
             acc_slow = None
             if const_expr(self.fp8_slow_accum):
                 acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
-            total_acc = None
-            if const_expr(self.blockscaled):
-                total_acc = cute.make_rmem_tensor(acc.layout, self.acc_dtype)
             mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
 
             if const_expr(self.pingpong):
@@ -919,7 +916,7 @@ class GemmSm90(GemmTmaBase):
                 tctx.b("mma")
                 if const_expr(self.blockscaled):
                     ab_read_state = self.mma_blockscaled(
-                        ab_pipeline, ab_read_state, mma_fn, acc, total_acc,
+                        ab_pipeline, ab_read_state, mma_fn, acc, acc_slow,
                         mSFB[batch_idx, None, None], tile_coord_mnkl[1], k_tile_cnt, warp_group_idx,
                         sSFA=sSFA,
                     )
@@ -1231,7 +1228,7 @@ class GemmSm90(GemmTmaBase):
         ab_read_state: cutlass.pipeline.PipelineState,
         mma_fn: Callable,
         acc: cute.Tensor,
-        total_acc: cute.Tensor,
+        acc_slow: cute.Tensor,
         mSFB_nk: cute.Tensor,
         n_tile_coord: Int32,
         k_tile_cnt: Int32,
@@ -1245,12 +1242,18 @@ class GemmSm90(GemmTmaBase):
             Int32(16) * (tidx_wg // Int32(32))
             + ((tidx_wg % Int32(32)) // Int32(4))
         )
+        if const_expr(self.atom_layout_mnk[0] > 1 and not self.pingpong):
+            wg_m_offset = warp_group_idx * Int32(64)
+        else:
+            wg_m_offset = Int32(0)
+        m0 = wg_m_offset + thread_m_offset
+        m1 = wg_m_offset + thread_m_offset + Int32(8)
 
-        peek_full = Boolean(True)
-        if 0 < k_tile_cnt:
-            peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
+        ab_release_state = ab_read_state.clone()
+        acc_slow.fill(0.0)
 
         for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+            peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
             ab_pipeline.consumer_wait(ab_read_state, peek_full)
 
             mma_fn(
@@ -1258,43 +1261,43 @@ class GemmSm90(GemmTmaBase):
                 B_idx=ab_read_state.index,
                 zero_init=True,
             )
-
-            warpgroup.wait_group(0)
-
+            print(acc, acc_slow)
             stage = ab_read_state.index
-
-            m0 = thread_m_offset
-            m1 = thread_m_offset + Int32(8)
-
             scale_a_0 = sSFA[m0, 0, stage]
             scale_a_1 = sSFA[m1, 0, stage]
+            ab_read_state.advance()
 
             scale_b = mSFB_nk[n_tile_coord, k_tile]
+            scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
+            scales[0] = scale_a_0 * scale_b
+            scales[1] = scale_a_1 * scale_b
+            warpgroup.wait_group(0)
+            ab_pipeline.consumer_release(ab_release_state)
+            ab_release_state.advance()
 
-            scale_0 = scale_a_0 * scale_b
-            scale_1 = scale_a_1 * scale_b
+            # a broadcast impl
+            scales_bcast = cute.make_tensor(
+                scales.iterator,
+                cute.make_layout(
+                    acc.shape,
+                    stride=((0, 1, 0), 0, 0),
+                ),
+            )
+            acc_slow.store(acc_slow.load() + acc.load() * scales_bcast.load())
 
-            for i in cutlass.range_constexpr(16):
-                r = Int32(i * 4)
+            # Doing it by hand
+            # for i in cutlass.range_constexpr(acc_slow.shape[0][2]):
+            #     r = Int32(i * 4)
 
-                if k_tile == 0:
-                    total_acc[r + 0] = acc[r + 0] * scale_0
-                    total_acc[r + 1] = acc[r + 1] * scale_0
-                    total_acc[r + 2] = acc[r + 2] * scale_1
-                    total_acc[r + 3] = acc[r + 3] * scale_1
-                else:
-                    total_acc[r + 0] = total_acc[r + 0] + acc[r + 0] * scale_0
-                    total_acc[r + 1] = total_acc[r + 1] + acc[r + 1] * scale_0
-                    total_acc[r + 2] = total_acc[r + 2] + acc[r + 2] * scale_1
-                    total_acc[r + 3] = total_acc[r + 3] + acc[r + 3] * scale_1
-
-            ab_pipeline.consumer_release(ab_read_state)
-            ab_read_state.advance()
+            #     acc_slow[r + 0] += acc[r + 0] * scales[0]
+            #     acc_slow[r + 1] += acc[r + 1] * scales[0]
+            #     acc_slow[r + 2] += acc[r + 2] * scales[1]
+            #     acc_slow[r + 3] += acc[r + 3] * scales[1]
 
         if const_expr(self.pingpong):
             self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
 
-        acc.store(total_acc.load())
+        acc.store(acc_slow.load())
         return ab_read_state
 
 
