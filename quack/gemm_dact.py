@@ -42,7 +42,22 @@ from quack import layout_utils
 class GemmDActMixin(GemmActMixin):
     # Different from GemmActSm90, here act_bwd_fn must take in 2 arguments (x, dout)
     # and return 2 arguments (dx, out)
-    EpilogueArguments = GemmActMixin.EpilogueArguments
+    _epi_ops = (
+        Scalar("sr_seed", dtype=Int32),
+        ColVecLoad("mColVecBroadcast"),
+        TileStore("mAuxOut"),
+        ColVecReduce("mColVecReduce"),
+    )
+    _extra_param_fields = (("act_fn", cutlass.Constexpr, None),)
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mAuxOut: cute.Tensor
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     @cute.jit
     def epi_visit_subtile(
@@ -53,6 +68,8 @@ class GemmDActMixin(GemmActMixin):
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         assert tRS_rC is not None
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
+        tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         # We don't add C to the accumulator
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
         tRS_rC_acc = cute.make_rmem_tensor_like(tRS_rC, self.acc_dtype)
@@ -74,6 +91,40 @@ class GemmDActMixin(GemmActMixin):
                     )
         else:
             tRS_rAuxOut = tRS_rC_acc
+        if const_expr(tDrColVecReduce is not None):
+            # Accumulate unscaled postact * GEMM output for router-score gradients.
+            colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rAuxOut, rScale=tRS_rD)
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch != 100):
+                tRS_rD.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
+                tRS_rAuxOut.store(
+                    tRS_rAuxOut.load() * tDrColVec.load().to(tRS_rAuxOut.element_type)
+                )
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
+                tRS_rAuxOut_mn = layout_utils.convert_layout_zero_stride(
+                    tRS_rAuxOut, tDrColVec.layout
+                )
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(
+                        cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
+                    ):
+                        scale = (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0])
+                        tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1] = (
+                            cute.arch.mul_packed_f32x2(
+                                (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]), scale
+                            )
+                        )
+                        tRS_rAuxOut_mn[m, 2 * n], tRS_rAuxOut_mn[m, 2 * n + 1] = (
+                            cute.arch.mul_packed_f32x2(
+                                (
+                                    tRS_rAuxOut_mn[m, 2 * n],
+                                    tRS_rAuxOut_mn[m, 2 * n + 1],
+                                ),
+                                scale,
+                            )
+                        )
         return tRS_rAuxOut
 
 
@@ -301,30 +352,30 @@ def _compile_gemm_dact(
     pa_shape = (m, n) if varlen_m else (m, n, l)
     mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading, divisibility=div_pa)
 
+    mColVec = None
+    if colvec_scale_ndim == 2:
+        mColVec = fake_tensor(colvec_scale_dtype, (l, m), leading_dim=1, divisibility=4)
+    elif colvec_scale_ndim == 1:
+        mColVec = fake_tensor(colvec_scale_dtype, (m,), leading_dim=0, divisibility=4)
+    mColVecReduce = None
+    n_tiles = cute.sym_int()
+    if colvec_reduce_ndim == 3:
+        mColVecReduce = fake_tensor(
+            colvec_reduce_dtype,
+            (l, m, n_tiles),
+            leading_dim=2,
+            divisibility=1,
+        )
+    elif colvec_reduce_ndim == 2:
+        mColVecReduce = fake_tensor(
+            colvec_reduce_dtype,
+            (m, n_tiles),
+            leading_dim=1,
+            divisibility=1,
+        )
+
     if is_dgated:
         act_fn = dgate_fn_map[activation]
-
-        mColVec = None
-        if colvec_scale_ndim == 2:
-            mColVec = fake_tensor(colvec_scale_dtype, (l, m), leading_dim=1, divisibility=4)
-        elif colvec_scale_ndim == 1:
-            mColVec = fake_tensor(colvec_scale_dtype, (m,), leading_dim=0, divisibility=4)
-        mColVecReduce = None
-        n_tiles = cute.sym_int()
-        if colvec_reduce_ndim == 3:
-            mColVecReduce = fake_tensor(
-                colvec_reduce_dtype,
-                (l, m, n_tiles),
-                leading_dim=2,
-                divisibility=1,
-            )
-        elif colvec_reduce_ndim == 2:
-            mColVecReduce = fake_tensor(
-                colvec_reduce_dtype,
-                (m, n_tiles),
-                leading_dim=1,
-                divisibility=1,
-            )
         epi_args = GemmCls.EpilogueArguments(
             mAuxOut,
             act_fn,
@@ -338,7 +389,12 @@ def _compile_gemm_dact(
         post_init = _set_implicit_dtype
     else:
         act_fn = dact_fn_map[activation]
-        epi_args = GemmCls.EpilogueArguments(mAuxOut, act_fn)
+        epi_args = GemmCls.EpilogueArguments(
+            mAuxOut,
+            act_fn,
+            mColVecBroadcast=mColVec,
+            mColVecReduce=mColVecReduce,
+        )
         post_init = None
 
     scheduler_args = make_fake_scheduler_args(
@@ -384,7 +440,7 @@ def gemm_dact(
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
-    colvec_scale: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m (dgated only)
+    colvec_scale: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     # (l, m, ceildiv(n, tile_n)), or (total_m, ceildiv(n, tile_n)) if varlen_m (dgated only)
     colvec_reduce: Optional[Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
@@ -394,8 +450,6 @@ def gemm_dact(
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
         assert activation in dact_fn_map, f"Unsupported activation {activation}"
-        assert colvec_scale is None, "colvec_scale is only supported for gated activations"
-        assert colvec_reduce is None, "colvec_reduce is only supported for gated activations"
     gemm_cls_name = "dgated" if is_dgated else "dact"
 
     varlen_m = cu_seqlens_m is not None
@@ -500,6 +554,8 @@ def gemm_dact(
         epi_args = GemmDActMixin.EpilogueArguments(
             PostAct_p,
             None,
+            mColVecBroadcast=colvec_scale,
+            mColVecReduce=colvec_reduce,
             rounding_mode=None,
             sr_seed=None,
         )

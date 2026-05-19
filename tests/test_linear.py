@@ -194,9 +194,11 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
 
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("colvec_reduce", [False, True])
+@pytest.mark.parametrize("has_colvec_scale", [False, True])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("n", [1504, 2048])
-def test_gemm_dact(n, k, input_dtype, activation):
+def test_gemm_dact(n, k, has_colvec_scale, colvec_reduce, input_dtype, activation):
     """Test GEMM with activation gradient computation."""
     device = "cuda"
     torch.random.manual_seed(0)
@@ -204,14 +206,39 @@ def test_gemm_dact(n, k, input_dtype, activation):
     dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
     weight = torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)
     preact = torch.randn((m, n), device=device, dtype=input_dtype, requires_grad=True)
+    colvec_scale = torch.randn(m, device=device) if has_colvec_scale else None
     # Disable tuning for faster test
-    dx, postact = gemm_dact(dout_input, weight.T, preact, activation=activation, tuned=False)
+    dx, postact, *rest = gemm_dact(
+        dout_input,
+        weight.T,
+        preact,
+        colvec_scale=colvec_scale,
+        activation=activation,
+        colvec_reduce=colvec_reduce,
+        tuned=False,
+    )
+    if colvec_reduce:
+        colvec_reduce_out = rest[0]
     dx_ref, postact_ref = gemm_dact_ref(
         dout_input.float(), weight.float().T, preact.float(), activation=activation
     )
     dx_pt, postact_pt = gemm_dact_ref(dout_input, weight.T, preact, activation=activation)
+    if colvec_reduce:
+        colvec_reduce_ref = (postact_ref * gemm_ref(dout_input.float(), weight.float().T)).sum(
+            dim=-1
+        )
+        colvec_reduce_pt = (postact_pt * gemm_ref(dout_input, weight.T)).sum(dim=-1)
+    if has_colvec_scale:
+        dx_ref *= colvec_scale.float()[:, None]
+        postact_ref *= colvec_scale.float()[:, None]
+        dx_pt *= colvec_scale[:, None]
+        postact_pt *= colvec_scale[:, None]
     assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+    if colvec_reduce:
+        assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
+            colvec_reduce_pt - colvec_reduce_ref
+        ).abs().max() + 1e-5
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
