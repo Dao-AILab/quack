@@ -369,7 +369,7 @@ def get_all_fwd_configs() -> List[RmsNormFwdConfig]:
     max_cluster = _max_cluster_for(arch_major)
     cluster_vals = tuple(c for c in (1, 2, 4, 8, 16) if c <= max_cluster)
     reload_from_vals = (None, "smem", "gmem")
-    delay_w_load_vals = (False, True)
+    delay_w_load_vals = (False)
 
     configs: List[RmsNormFwdConfig] = []
     for num_threads, threads_per_row, cluster_n, reload_from, delay_w_load in itertools.product(
