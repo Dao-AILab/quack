@@ -657,9 +657,7 @@ def test_rmsnorm_fwd_tuned_config(num_threads, threads_per_row, cluster_n, reloa
 @pytest.mark.parametrize("reload_wdy", [None, "smem"])
 @pytest.mark.parametrize("cluster_n", [1, 2])
 @pytest.mark.parametrize("num_threads,threads_per_row", [(128, 32), (256, 128)])
-def test_rmsnorm_bwd_tuned_config(
-    num_threads, threads_per_row, cluster_n, reload_wdy, reload_x
-):
+def test_rmsnorm_bwd_tuned_config(num_threads, threads_per_row, cluster_n, reload_wdy, reload_x):
     """Drive rmsnorm_bwd_tuned.fn with an explicit config, bypassing autotune."""
     device_capacity = _device_capacity_or_skip()
     if device_capacity < 9 and cluster_n > 1:
