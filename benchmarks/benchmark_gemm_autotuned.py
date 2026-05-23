@@ -36,8 +36,8 @@ from quack.autotuner import default_cache_dir
 from quack.cache_utils import get_cache_path
 from quack.gemm_blockscaled_interface import (
     mxfp8_gemm_act,
-    mxfp8_quantize_act,
-    mxfp8_quantize_weight,
+    quantize_act_sm90,
+    quantize_weight_sm90,
 )
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import (
@@ -279,8 +279,8 @@ def benchmark_mxfp8_gemm_act(
     b_n = 2 * n
     w_bf16 = torch.randn(b_n, k, device="cuda", dtype=dtype) / math.sqrt(k)
 
-    a_q, a_sc = mxfp8_quantize_act(a_bf16)
-    w_q, w_sc = mxfp8_quantize_weight(w_bf16)
+    a_q, a_sc = quantize_act_sm90(a_bf16)
+    w_q, w_sc = quantize_weight_sm90(w_bf16)
     b_q, b_sc = w_q.mT, w_sc.mT
 
     nflops = 2 * m * b_n * k
@@ -294,7 +294,7 @@ def benchmark_mxfp8_gemm_act(
         out_dtype=dtype,
         postact_dtype=dtype,
         store_preact=False,
-        tuned=False,  # mxfp8 gated path forces tuned=False internally; be explicit
+        tuned=False,
     )
     fn()  # warmup
 

@@ -279,34 +279,6 @@ to_mxfp4_compiled = torch.compile(to_mxfp4, dynamic=True)
 to_nvfp4_compiled = torch.compile(to_nvfp4, dynamic=True)
 
 
-def quantize_act_sm90(x: torch.Tensor):
-    """Quantize activations for SM90 mxfp8 GEMM.
-
-    Block size: (1, 128) — one E8M0 scale per row per 128-element K-group.
-
-    Args:
-        x: (M, K) or (L, M, K) bf16/fp32, K % 128 == 0.
-    Returns:
-        qdata: same shape as x, float8_e4m3fn
-        scale: (..., M, K // 128) float8_e8m0fnu
-    """
-    return to_mx(x, block_size=128)
-
-
-def quantize_weight_sm90(w: torch.Tensor):
-    """Quantize weights for SM90 mxfp8 GEMM.
-
-    Block size: (128, 128) — one E8M0 scale per 128-row × 128-K tile.
-
-    Args:
-        w: (N, K) bf16/fp32, N % 128 == 0, K % 128 == 0.
-    Returns:
-        qdata: (N, K) float8_e4m3fn
-        scale: (N // 128, K // 128) float8_e8m0fnu
-    """
-    return to_mx_2d(w, block_rows=128, block_cols=128)
-
-
 def _ceil_div(a, b):
     return (a + b - 1) // b
 

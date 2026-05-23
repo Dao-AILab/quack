@@ -1,20 +1,31 @@
 # Copyright (c) 2026, Tri Dao.
 
-"""PyTorch-friendly interface for the SM100 MXFP8 blockscaled GEMM.
+"""PyTorch-friendly interface for the MXFP8 blockscaled GEMM (SM90 + SM100).
 
-Shape / layout conventions (matches torch.matmul, torch._scaled_mm, cuBLAS):
+Layout overview:
   A:       (M, K)     or (L, M, K)       dtype float8_e4m3fn, K-contiguous (row-major)
   B:       (K, N)     or (L, K, N)       dtype float8_e4m3fn, K-contiguous (col-major)
-  A_scale: (M, K/32)  or (L, M, K/32)    dtype float32 (power-of-2 values), K-contiguous
-  B_scale: (K/32, N)  or (L, K/32, N)    dtype float32 (power-of-2 values), K-contiguous
+  A_scale: (M, K/V)   or (L, M, K/V)     dtype float8_e8m0fnu/float32, K-contiguous
+  B_scale: (K/V, N)   or (L, K/V, N)     dtype float8_e8m0fnu/float32, K-contiguous
   out:     (M, N)     or (L, M, N)       dtype bfloat16/float16, contiguous
 
+K-block size V differs by target:
+  - SM100 (Blackwell): V = 32  (true MX granularity)
+  - SM90  (Hopper):    V = 128 (coarser, faster on H100)
+
 "K-contiguous" means stride 1 on the K axis. This matches how torchao/cuBLAS
-use `torch._scaled_mm(a, b.t(), ...)`:
-  - you store a weight as nn.Linear-style `W` of shape `(N, K)` row-major
-  - you pass `W.mT` (a zero-copy view of shape (K, N) with K-contig) as B
-The interface applies `.mT` internally to reach the `(N, K) K-major` layout
-the quack kernel consumes. No data is copied.
+use `torch._scaled_mm(a, b.t(), ...)`: weight stored as `(N, K)` row-major,
+pass `W.mT` (zero-copy view of shape `(K, N)` with K-contig) as B. The
+interface applies `.mT` internally to reach the `(N, K) K-major` layout the
+kernels consume; no data is copied.
+
+File organization (top to bottom):
+  1. Helpers
+  2. Quantization (`quantize_act`, `quantize_*_sm{90,100}`, `quantize_weight_sm90`)
+  3. SM100 GEMM (`mxfp8_gemm_sm100`, etc.)
+  4. SM90 GEMM  (`mxfp8_gemm_act_sm90`, etc.)
+  5. Unified dispatch (`mxfp8_gemm`, `mxfp8_gemm_act`)
+  6. Reference / utility
 """
 
 from functools import lru_cache, partial
@@ -61,51 +72,14 @@ from quack.gemm_tvm_ffi_utils import (
 )
 from quack.mx_utils import to_mx, to_mx_2d
 
-_SF_VEC_SIZE = 32  # SM100 K-block size
+_SF_VEC_SIZE_SM100 = 32  # SM100 K-block size
 _SF_VEC_SIZE_SM90 = 128  # SM90 K-block size (activations and weights)
 _WEIGHT_BLOCK_N_SM90 = 128  # SM90 N-block size for weight scales
-_TORCH_TO_CUTLASS_D = {
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float16: cutlass.Float16,
-    torch.float32: cutlass.Float32,
-}
 
 
 def default_config(device):
     cap = get_device_capacity(device)[0]
-    if cap == 8:
-        return GemmConfig(
-            tile_m=128,
-            tile_n=128,
-            tile_k=32,
-            num_warps=4,
-            cluster_m=1,
-            cluster_n=1,
-            pingpong=False,
-            is_dynamic_persistent=False,
-            device_capacity=8,
-        )
-    elif cap in [10, 11]:
-        return GemmConfig(
-            tile_m=256,
-            tile_n=256,
-            cluster_m=2,
-            cluster_n=1,
-            pingpong=False,
-            is_dynamic_persistent=True,
-            device_capacity=10,
-        )
-    elif cap == 12:
-        return GemmConfig(
-            tile_m=128,
-            tile_n=128,
-            cluster_m=1,
-            cluster_n=1,
-            pingpong=True,
-            is_dynamic_persistent=True,
-            device_capacity=12,
-        )
-    else:
+    if cap == 9:
         return GemmConfig(
             tile_m=256,
             tile_n=128,
@@ -114,10 +88,24 @@ def default_config(device):
             pingpong=False,
             is_dynamic_persistent=False,
         )
+    else:
+        raise NotImplementedError("Currently only Hopper is supported")
+
+
+def _default_tiler_cluster_sm100(m: int, n: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Pick a reasonable default (mma_tiler_mn, cluster_shape_mn)."""
+    if m >= 512 and n >= 128:
+        return (256, 128), (2, 1)
+    return (128, 128), (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Quantization
+# ---------------------------------------------------------------------------
 
 
 def _f32_to_e8m0(scale_f32: torch.Tensor) -> torch.Tensor:
-    """Convert float32 power-of-2 scales (from mxfp8_quantize) to E8M0 bytes.
+    """Convert float32 power-of-2 scales to E8M0 bytes.
 
     Extracts the biased exponent byte: (f32_bits >> 23) & 0xFF.
     """
@@ -125,15 +113,72 @@ def _f32_to_e8m0(scale_f32: torch.Tensor) -> torch.Tensor:
     return e8m0_byte.view(torch.float8_e8m0fnu)
 
 
-def _default_tiler_cluster(m: int, n: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-    """Pick a reasonable default (mma_tiler_mn, cluster_shape_mn)."""
-    if m >= 512 and n >= 128:
-        return (256, 128), (2, 1)
-    return (128, 128), (1, 1)
+def _e8m0_to_f32(scale_e8m0: torch.Tensor) -> torch.Tensor:
+    """E8M0 (float8_e8m0fnu viewed as uint8) → float32 power-of-2 scale."""
+    bits = scale_e8m0.contiguous().view(torch.uint8).to(torch.int32) << 23
+    return (bits & 0x7F000000).view(torch.float32)
+
+
+def quantize_act_sm100(x: Tensor) -> Tuple[Tensor, Tensor]:
+    """SM100 activation quantization: 32-element K-blocks, per-row.
+    Returns (qdata: float8_e4m3fn, scale: float8_e8m0fnu) in torchao layout."""
+    assert x.shape[-1] % _SF_VEC_SIZE_SM100 == 0, (
+        f"last dim ({x.shape[-1]}) must be divisible by {_SF_VEC_SIZE_SM100}"
+    )
+    return to_mx(x.contiguous(), _SF_VEC_SIZE_SM100)
+
+
+def quantize_act_sm90(x: Tensor) -> Tuple[Tensor, Tensor]:
+    """SM90 activation quantization: 128-element K-blocks, per-row. Scales as float32."""
+    assert x.shape[-1] % _SF_VEC_SIZE_SM90 == 0, (
+        f"last dim ({x.shape[-1]}) must be divisible by {_SF_VEC_SIZE_SM90}"
+    )
+    qdata, scale_e8m0 = to_mx(x.contiguous(), _SF_VEC_SIZE_SM90)
+    return qdata, _e8m0_to_f32(scale_e8m0).mT.contiguous().mT
+
+
+def quantize_weight_sm90(w: Tensor) -> Tuple[Tensor, Tensor]:
+    """SM90 weight quantization: 128×128 block size (per-block, not per-row).
+
+    Args:
+        w: (..., N, K) bf16/fp32, N % 128 == 0, K % 128 == 0.
+    Returns:
+        qdata: float8_e4m3fn, same shape as w.
+        scale: float32, shape (..., N // 128, K // 128). One scale per 128×128 tile.
+    """
+    assert w.shape[-1] % _SF_VEC_SIZE_SM90 == 0, (
+        f"last dim K ({w.shape[-1]}) must be divisible by {_SF_VEC_SIZE_SM90}"
+    )
+    assert w.shape[-2] % _WEIGHT_BLOCK_N_SM90 == 0, (
+        f"second-to-last dim N ({w.shape[-2]}) must be divisible by {_WEIGHT_BLOCK_N_SM90}"
+    )
+    *batch_shape, N, K = w.shape
+    qdata_2d, scale_2d = to_mx_2d(
+        w.reshape(-1, K).contiguous(), _WEIGHT_BLOCK_N_SM90, _SF_VEC_SIZE_SM90
+    )
+    qdata = qdata_2d.reshape(*batch_shape, N, K)
+    scale = scale_2d.reshape(*batch_shape, N // _WEIGHT_BLOCK_N_SM90, K // _SF_VEC_SIZE_SM90)
+    return qdata, scale
+
+
+def quantize_act(x: Tensor) -> Tuple[Tensor, Tensor]:
+    """Auto-dispatch activation quantization based on device capability."""
+    cap = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+    if cap == 9:
+        return quantize_act_sm90(x)
+    elif cap == 10:
+        return quantize_act_sm100(x)
+    else:
+        raise NotImplementedError(f"sm_{cap}0 not supported")
+
+
+# ---------------------------------------------------------------------------
+# SM100 GEMM (Blackwell)
+# ---------------------------------------------------------------------------
 
 
 @lru_cache(maxsize=64)
-def _compile_cached(
+def _compile_cached_sm100(
     m: int,
     n: int,
     k: int,
@@ -148,7 +193,7 @@ def _compile_cached(
     dev = torch.device("cuda")
     rm = ceil_div(m, 128)
     rn = ceil_div(n, 128)
-    rk = ceil_div(k // _SF_VEC_SIZE, 4)
+    rk = ceil_div(k // _SF_VEC_SIZE_SM100, 4)
     # K-major: (l, m, k) contiguous, viewed as (m, k, l) strides (k, 1, m*k)
     fake_mA = torch.empty(l, m, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
     fake_mB = torch.empty(l, n, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
@@ -156,13 +201,13 @@ def _compile_cached(
     fake_mD = torch.empty(l, m, n, dtype=out_torch_dtype, device=dev).permute(1, 2, 0)
     fake_sc_A = torch.empty(l, rm, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
     fake_sc_B = torch.empty(l, rn, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
-    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE, l)
-    fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // _SF_VEC_SIZE, l)
+    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE_SM100, l)
+    fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // _SF_VEC_SIZE_SM100, l)
     return compile_blockscaled_gemm_tvm_ffi(
         ab_dtype_cutlass,
         sf_dtype_cutlass,
-        _SF_VEC_SIZE,
-        _TORCH_TO_CUTLASS_D[out_torch_dtype],
+        _SF_VEC_SIZE_SM100,
+        torch2cute_dtype_map[out_torch_dtype],
         mma_tiler_mn,
         cluster_shape_mn,
         fake_mA,
@@ -180,7 +225,7 @@ def _as_3d(x: Tensor, ndim_in: int) -> Tensor:
     return x
 
 
-def _to_kernel_layout(
+def _to_kernel_layout_sm100(
     A: Tensor,
     B: Tensor,
     A_scale: Tensor,
@@ -200,10 +245,6 @@ def _to_kernel_layout(
     assert B_scale.dtype in (torch.float8_e8m0fnu, torch.float32), (
         f"B_scale dtype must be float8_e8m0fnu or float32, got {B_scale.dtype}"
     )
-    if A_scale.dtype == torch.float32:
-        A_scale = _f32_to_e8m0(A_scale)
-    if B_scale.dtype == torch.float32:
-        B_scale = _f32_to_e8m0(B_scale)
     was_2d = A.dim() == 2
     # Flip B from (K,N) to (N,K) via .mT (zero-copy). User's B K-contig → .mT K-contig.
     A3 = _as_3d(A, A.dim())  # (l, m, k) K-contig row-major expected
@@ -212,12 +253,12 @@ def _to_kernel_layout(
     l2, n, k2 = B3.shape
     assert l == l2, f"batch mismatch: A={l}, B={l2}"
     assert k == k2, f"K mismatch: A K={k}, B K={k2}"
-    assert k % _SF_VEC_SIZE == 0, f"K ({k}) must be divisible by {_SF_VEC_SIZE}"
+    assert k % _SF_VEC_SIZE_SM100 == 0, f"K ({k}) must be divisible by {_SF_VEC_SIZE_SM100}"
     assert A3.stride(-1) == 1, "A must be K-contiguous (stride 1 on K)"
     assert B3.stride(-1) == 1, (
         "B must be K-contiguous on its K axis (pass .mT of an (N,K) row-major tensor)"
     )
-    sf_k = k // _SF_VEC_SIZE
+    sf_k = k // _SF_VEC_SIZE_SM100
     as3 = _as_3d(A_scale, A_scale.dim())  # expected (l, m, sf_k) K-contig row-major
     bs3 = _as_3d(B_scale, B_scale.dim()).mT  # (l, n, sf_k) K-contig (view) from (l, sf_k, n)
     assert as3.stride(-1) == 1, "A_scale must be K-contiguous"
@@ -244,7 +285,7 @@ def _to_kernel_layout(
     return m, n, k, l, mA_mkl, mB_nkl, sc_contig_A, sc_contig_B, sfa_view, sfb_view, was_2d
 
 
-def mxfp8_gemm_out(
+def mxfp8_gemm_out_sm100(
     A: Tensor,
     B: Tensor,
     A_scale: Tensor,
@@ -255,9 +296,11 @@ def mxfp8_gemm_out(
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
 ) -> None:
     """MXFP8 blockscaled GEMM with pre-allocated output. See module doc for shape conventions."""
-    m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
+    m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout_sm100(
+        A, B, A_scale, B_scale
+    )
     out_dtype = out.dtype
-    assert out_dtype in _TORCH_TO_CUTLASS_D, f"unsupported out dtype: {out_dtype}"
+    assert out_dtype in torch2cute_dtype_map, f"unsupported out dtype: {out_dtype}"
     expected_out_shape = (m, n) if was_2d else (l, m, n)
     assert tuple(out.shape) == expected_out_shape, (
         f"out shape {tuple(out.shape)} != expected {expected_out_shape}"
@@ -267,14 +310,14 @@ def mxfp8_gemm_out(
     out_3d = out.unsqueeze(0) if was_2d else out  # (l, m, n)
     mD = out_3d.permute(1, 2, 0)  # (m, n, l), strides (n, 1, m*n)
     if mma_tiler_mn is None or cluster_shape_mn is None:
-        tlr, clu = _default_tiler_cluster(m, n)
+        tlr, clu = _default_tiler_cluster_sm100(m, n)
         mma_tiler_mn = mma_tiler_mn or tlr
         cluster_shape_mn = cluster_shape_mn or clu
     if not GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
-        _SF_VEC_SIZE,
-        _TORCH_TO_CUTLASS_D[out_dtype],
+        _SF_VEC_SIZE_SM100,
+        torch2cute_dtype_map[out_dtype],
         mma_tiler_mn,
         cluster_shape_mn,
         m,
@@ -289,7 +332,7 @@ def mxfp8_gemm_out(
             f"unsupported config: m={m}, n={n}, k={k}, l={l}, "
             f"tiler={mma_tiler_mn}, cluster={cluster_shape_mn}"
         )
-    runner = _compile_cached(
+    runner = _compile_cached_sm100(
         m,
         n,
         k,
@@ -303,7 +346,7 @@ def mxfp8_gemm_out(
     runner(mA, mB, mD, sfa, sfb)
 
 
-def mxfp8_gemm(
+def mxfp8_gemm_sm100(
     A: Tensor,
     B: Tensor,
     A_scale: Tensor,
@@ -322,7 +365,7 @@ def mxfp8_gemm(
         else:
             out_shape = (A.shape[0], A.shape[1], B.shape[2])
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
-    mxfp8_gemm_out(
+    mxfp8_gemm_out_sm100(
         A,
         B,
         A_scale,
@@ -334,8 +377,13 @@ def mxfp8_gemm(
     return out
 
 
+# ---------------------------------------------------------------------------
+# SM90 GEMM (Hopper)
+# ---------------------------------------------------------------------------
+
+
 @jit_cache
-def _compile_mxfp8_gemm_act(
+def _compile_mxfp8_gemm_act_sm90(
     a_dtype,
     b_dtype,
     d_dtype,
@@ -473,7 +521,7 @@ def _compile_mxfp8_gemm_act(
     mSFA = _make_compile_tensor_like(sc_fake, cutlass.Float8E8M0FNU, dynamic_layout=True)
     mSFB = _make_compile_tensor_like(sc_fake, cutlass.Float8E8M0FNU, dynamic_layout=True)
     return compile_gemm_kernel(
-        partial(GemmCls, sf_vec_size=_SF_VEC_SIZE),
+        partial(GemmCls, sf_vec_size=_SF_VEC_SIZE_SM100),
         a_dtype,
         tile_shape_mn,
         cluster_shape_mnk,
@@ -496,7 +544,7 @@ def _compile_mxfp8_gemm_act(
     )
 
 
-def mxfp8_gemm_act_dispatch(
+def mxfp8_gemm_act_dispatch_sm90(
     A: Tensor,  # (l, m, k) K-contig
     B: Tensor,  # (l, n, k) K-contig
     A_scale: Tensor,  # (l, m, k/32) K-contig
@@ -546,7 +594,7 @@ def mxfp8_gemm_act_dispatch(
 
     device_capacity = get_device_capacity(A.device)
     sm = device_capacity[0]
-    assert sm in (9, 10, 11), "mxfp8_gemm_act_dispatch requires SM90, SM100, or SM110"
+    assert sm in (9, 10, 11), "mxfp8_gemm_act_dispatch_sm90 requires SM90, SM100, or SM110"
 
     if sm == 9 and not GemmActSm90.is_valid_dtypes(
         a_dtype, b_dtype, cutlass.Float32, d_dtype, a_major, b_major
@@ -558,7 +606,7 @@ def mxfp8_gemm_act_dispatch(
         )
 
     concat_layout_key = tuple(sorted(concat_layout)) if concat_layout else ()
-    compiled_fn = _compile_mxfp8_gemm_act(
+    compiled_fn = _compile_mxfp8_gemm_act_sm90(
         a_dtype,
         b_dtype,
         d_dtype,
@@ -631,11 +679,11 @@ def mxfp8_gemm_act_dispatch(
         )
     else:
         # SM100/SM110: pack scales and pass to blockscaled kernel.
-        # Scales may be float32 (from mxfp8_quantize) — convert to E8M0 first.
+        # Scales may be float32 (from quantize_act_*) — convert to E8M0 first.
         k = A.shape[-1]
         l = B.shape[0]
         n = B.shape[1]
-        sf_k = k // _SF_VEC_SIZE
+        sf_k = k // _SF_VEC_SIZE_SM100
         a_scale_e8m0 = _f32_to_e8m0(A_scale) if A_scale.dtype == torch.float32 else A_scale
         b_scale_e8m0 = _f32_to_e8m0(B_scale) if B_scale.dtype == torch.float32 else B_scale
         if varlen_m:
@@ -683,7 +731,7 @@ def mxfp8_gemm_act_dispatch(
 #     key=["activation", "dynamic_scheduler"],
 #     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 # )
-def mxfp8_gemm_gated_tuned(
+def mxfp8_gemm_gated_tuned_sm90(
     # (M, K) or or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     A: Tensor,
     B: Tensor,  # (K, N) or (L, K, N)
@@ -739,7 +787,7 @@ def mxfp8_gemm_gated_tuned(
         if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
-    mxfp8_gemm_act_dispatch(
+    mxfp8_gemm_act_dispatch_sm90(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
         A_scale if not config.swap_ab else B_scale,
@@ -767,7 +815,7 @@ def mxfp8_gemm_gated_tuned(
     )
 
 
-def mxfp8_gemm_act_tuned(
+def mxfp8_gemm_act_tuned_sm90(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)
     A_scale: Tensor,
@@ -812,7 +860,7 @@ def mxfp8_gemm_act_tuned(
         if dynamic_scheduler and get_device_capacity(A.device)[0] == 9
         else None
     )
-    mxfp8_gemm_act_dispatch(
+    mxfp8_gemm_act_dispatch_sm90(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
         A_scale if not config.swap_ab else B_scale,
@@ -839,7 +887,7 @@ def mxfp8_gemm_act_tuned(
     )
 
 
-def mxfp8_gemm_gated_out(
+def mxfp8_gemm_gated_out_sm90(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)
     A_scale: Tensor,
@@ -857,8 +905,8 @@ def mxfp8_gemm_gated_out(
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     # TODO: add tuning
-    tuned = False
-    fn = mxfp8_gemm_gated_tuned if tuned else partial(mxfp8_gemm_gated_tuned, config=None)
+    assert not tuned, "currently tuning is not available"
+    fn = mxfp8_gemm_gated_tuned_sm90 if tuned else partial(mxfp8_gemm_gated_tuned_sm90, config=None)
     fn(
         A,
         B,
@@ -876,7 +924,7 @@ def mxfp8_gemm_gated_out(
     )
 
 
-def mxfp8_gemm_act_out(
+def mxfp8_gemm_act_out_sm90(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)
     A_scale: Tensor,
@@ -894,7 +942,7 @@ def mxfp8_gemm_act_out(
     """GEMM with activation and pre-allocated output tensors."""
     # TODO: add tuning
     tuned = False
-    fn = mxfp8_gemm_act_tuned if tuned else partial(mxfp8_gemm_act_tuned, config=None)
+    fn = mxfp8_gemm_act_tuned_sm90 if tuned else partial(mxfp8_gemm_act_tuned_sm90, config=None)
     fn(
         A,
         B,
@@ -911,7 +959,7 @@ def mxfp8_gemm_act_out(
     )
 
 
-def mxfp8_gemm_act(
+def mxfp8_gemm_act_sm90(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)
     A_scale: Tensor,
@@ -958,7 +1006,7 @@ def mxfp8_gemm_act(
         return preact_out, postact_out
     concat_str = ",".join(concat_layout) if concat_layout else None
     if is_gated:
-        mxfp8_gemm_gated_out(
+        mxfp8_gemm_gated_out_sm90(
             A,
             B,
             A_scale,
@@ -975,7 +1023,7 @@ def mxfp8_gemm_act(
             concat_layout=concat_str,
         )
     else:
-        mxfp8_gemm_act_out(
+        mxfp8_gemm_act_out_sm90(
             A,
             B,
             A_scale,
@@ -993,78 +1041,71 @@ def mxfp8_gemm_act(
     return preact_out, postact_out
 
 
-def _e8m0_to_f32(scale_e8m0: torch.Tensor) -> torch.Tensor:
-    """E8M0 (float8_e8m0fnu viewed as uint8) → float32 power-of-2 scale."""
-    bits = scale_e8m0.contiguous().view(torch.uint8).to(torch.int32) << 23
-    return (bits & 0x7F000000).view(torch.float32)
+# ---------------------------------------------------------------------------
+# Unified dispatch entry points
+# ---------------------------------------------------------------------------
+# Top-level public API. These detect the device capability at runtime and
+# route to the SM-specific implementation. Callers that don't care about the
+# underlying hardware should use these; callers that need to pin a specific
+# implementation can still call the *_sm90 / *_sm100 functions directly.
 
 
-def mxfp8_quantize(x: Tensor) -> Tuple[Tensor, Tensor]:
-    """Quantize a (..., K) bf16/fp32 tensor to MXFP8.
+def mxfp8_gemm(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    out: Optional[Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    **kwargs,
+) -> Tensor:
+    """MXFP8 blockscaled GEMM. Dispatches to SM90 or SM100 by device capability.
 
-    Returns (qdata, scale_f32) where qdata is float8_e4m3fn and scale_f32 is
-    float32 with shape (..., K/32). Scales are power-of-2 values derived from
-    E8M0 exponents (mantissa and sign masked to zero via 0x7F000000).
+    SM100 path expects 32-element K-block scales (`quantize_act_sm100`).
+    SM90 path expects 128-element K-block scales (`quantize_act_sm90`,
+    `quantize_weight_sm90`). Caller is responsible for using the matching
+    quantization for the target device.
     """
-    assert x.shape[-1] % _SF_VEC_SIZE == 0, (
-        f"last dim ({x.shape[-1]}) must be divisible by {_SF_VEC_SIZE}"
-    )
-    qdata, scale_e8m0 = to_mx(x.contiguous(), _SF_VEC_SIZE)
-    return qdata, _e8m0_to_f32(scale_e8m0)
-
-
-def mxfp8_quantize_act(x: Tensor) -> Tuple[Tensor, Tensor]:
-    """SM90 activation quantization: (1, 128) block size.
-
-    Args:
-        x: (..., K) bf16/fp32, K % 128 == 0.
-    Returns:
-        qdata: float8_e4m3fn, same shape as x.
-        scale: float32, shape (..., K // 128). One scale per row per 128-element K block.
-    """
-    assert x.shape[-1] % _SF_VEC_SIZE_SM90 == 0, (
-        f"last dim ({x.shape[-1]}) must be divisible by {_SF_VEC_SIZE_SM90}"
-    )
-    qdata, scale_e8m0 = to_mx(x.contiguous(), _SF_VEC_SIZE_SM90)
-    return qdata, _e8m0_to_f32(scale_e8m0).mT.contiguous().mT
-
-
-def mxfp8_quantize_weight(w: Tensor) -> Tuple[Tensor, Tensor]:
-    """SM90 weight quantization: (128, 128) block size.
-
-    Args:
-        w: (..., N, K) bf16/fp32, N % 128 == 0, K % 128 == 0.
-    Returns:
-        qdata: float8_e4m3fn, same shape as w.
-        scale: float32, shape (..., N // 128, K // 128). One scale per 128×128 tile.
-    """
-    assert w.shape[-1] % _SF_VEC_SIZE_SM90 == 0, (
-        f"last dim K ({w.shape[-1]}) must be divisible by {_SF_VEC_SIZE_SM90}"
-    )
-    assert w.shape[-2] % _WEIGHT_BLOCK_N_SM90 == 0, (
-        f"second-to-last dim N ({w.shape[-2]}) must be divisible by {_WEIGHT_BLOCK_N_SM90}"
-    )
-    # to_mx_2d only handles 2D; apply per-batch for higher-rank inputs.
-    if w.ndim == 2:
-        qdata, scale = to_mx_2d(w.contiguous(), _WEIGHT_BLOCK_N_SM90, _SF_VEC_SIZE_SM90)
-    else:
-        batch_shape = w.shape[:-2]
-        w_flat = w.reshape(-1, w.shape[-2], w.shape[-1])
-        qs, ss = zip(
-            *[
-                to_mx_2d(w_flat[i].contiguous(), _WEIGHT_BLOCK_N_SM90, _SF_VEC_SIZE_SM90)
-                for i in range(w_flat.shape[0])
-            ]
+    cap = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+    if cap == 10:
+        return mxfp8_gemm_sm100(A, B, A_scale, B_scale, out=out, out_dtype=out_dtype, **kwargs)
+    if cap == 9:
+        # SM90 has no plain-GEMM entry; use the act path with activation=None.
+        if out is None:
+            out_shape = (A.shape[0], B.shape[-1]) if A.dim() == 2 else (*A.shape[:-1], B.shape[-1])
+            out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+        mxfp8_gemm_act_sm90(
+            A,
+            B,
+            A_scale,
+            B_scale,
+            activation=None,
+            preact_out=None,
+            postact_out=out,
+            store_preact=False,
+            **kwargs,
         )
-        qdata = torch.stack(qs).reshape(*batch_shape, w.shape[-2], w.shape[-1])
-        scale = torch.stack(ss).reshape(
-            *batch_shape, w.shape[-2] // _WEIGHT_BLOCK_N_SM90, w.shape[-1] // _SF_VEC_SIZE_SM90
-        )
-    # to_mx_2d returns float32 scales (already E8M0-derived power-of-2 values).
-    return qdata, scale
+        return out
+    raise NotImplementedError(f"mxfp8_gemm: sm_{cap}0 not supported")
 
 
-def mxfp8_gemm_quantize(
+def mxfp8_gemm_act(*args, **kwargs) -> Tuple[Optional[Tensor], Tensor]:
+    """GEMM + (optionally gated) activation. SM90-only at present.
+
+    See `mxfp8_gemm_act_sm90` for the full signature.
+    """
+    cap = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+    if cap == 9:
+        return mxfp8_gemm_act_sm90(*args, **kwargs)
+    raise NotImplementedError(f"mxfp8_gemm_act: sm_{cap}0 not supported (SM90 only)")
+
+
+# ---------------------------------------------------------------------------
+# Reference / utility
+# ---------------------------------------------------------------------------
+
+
+def mxfp8_gemm_quantize_sm100(
     A: Tensor,
     B: Tensor,
     out: Optional[Tensor] = None,
@@ -1076,11 +1117,11 @@ def mxfp8_gemm_quantize(
     """High-level: quantize bf16 A, B_as_NK to MXFP8, then run C = A @ B_as_NK.mT.
     Inputs: A=(M,K)/(L,M,K), B_as_NK=(N,K)/(L,N,K) bf16/fp32. Quantization
     scales along the last (K) dim. Returned output has shape (M,N)/(L,M,N)."""
-    A_q, A_sc = mxfp8_quantize(A)
-    B_q, B_sc = mxfp8_quantize(B)
+    A_q, A_sc = quantize_act(A)
+    B_q, B_sc = quantize_act(B)
     # B_q, B_sc are (..., N, K) / (..., N, K/32). Flip to (..., K, N) / (..., K/32, N)
     # K-contig zero-copy views to match the interface convention.
-    return mxfp8_gemm(
+    return mxfp8_gemm_sm100(
         A_q,
         B_q.mT,
         A_sc,
@@ -1092,7 +1133,7 @@ def mxfp8_gemm_quantize(
     )
 
 
-def mxfp8_gemm_cublas(
+def mxfp8_gemm_cublas_sm100(
     A: Tensor,
     B: Tensor,
     A_scale: Tensor,
@@ -1100,13 +1141,15 @@ def mxfp8_gemm_cublas(
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
     """Reference path via torch._scaled_mm. Requires l=1 (or 2D inputs)."""
-    m, n, k, l, _mA, _mB, sc_A, sc_B, _sfa, _sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
+    m, n, k, l, _mA, _mB, sc_A, sc_B, _sfa, _sfb, was_2d = _to_kernel_layout_sm100(
+        A, B, A_scale, B_scale
+    )
     assert l == 1, "torch._scaled_mm MXFP8 path is 2D only; pass 2D inputs or l=1"
     # torch._scaled_mm: A=(M,K) row-major, B=(K,N) col-major (both K-contig) -- same layout user gave us.
     a2d = A if A.dim() == 2 else A.squeeze(0)
     b2d = B if B.dim() == 2 else B.squeeze(0)
-    sca = scale_blocked_for_cublas(sc_A, m, k // _SF_VEC_SIZE, 0)
-    scb = scale_blocked_for_cublas(sc_B, n, k // _SF_VEC_SIZE, 0)
+    sca = scale_blocked_for_cublas(sc_A, m, k // _SF_VEC_SIZE_SM100, 0)
+    scb = scale_blocked_for_cublas(sc_B, n, k // _SF_VEC_SIZE_SM100, 0)
     out = torch._scaled_mm(
         a2d,
         b2d,
@@ -1117,7 +1160,7 @@ def mxfp8_gemm_cublas(
     return out if was_2d else out.unsqueeze(0)
 
 
-def mxfp8_gemm_ref(
+def mxfp8_gemm_ref_sm100(
     A: Tensor,
     B: Tensor,
     A_scale: Tensor,
@@ -1132,7 +1175,7 @@ def mxfp8_gemm_ref(
     B3 = _as_3d(B, B.dim()).mT.contiguous().float()
     as3 = _as_3d(A_scale, A_scale.dim()).float()
     bs3 = _as_3d(B_scale, B_scale.dim()).mT.contiguous().float()
-    a_dq = A3 * as3.repeat_interleave(_SF_VEC_SIZE, dim=-1)
-    b_dq = B3 * bs3.repeat_interleave(_SF_VEC_SIZE, dim=-1)
+    a_dq = A3 * as3.repeat_interleave(_SF_VEC_SIZE_SM100, dim=-1)
+    b_dq = B3 * bs3.repeat_interleave(_SF_VEC_SIZE_SM100, dim=-1)
     out3 = torch.einsum("lmk,lnk->lmn", a_dq, b_dq).to(out_dtype)
     return out3.squeeze(0) if was_2d else out3
