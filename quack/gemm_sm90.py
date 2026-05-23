@@ -877,7 +877,6 @@ class GemmSm90(GemmTmaBase):
                     partial_acc_shape = (acc.shape[0], acc.shape[1] // 2, acc.shape[2])
                     acc_slow = cute.make_rmem_tensor(partial_acc_shape, self.acc_dtype)
 
-
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
                     # WG0 needs a start signal at the very beginning
@@ -1283,33 +1282,26 @@ class GemmSm90(GemmTmaBase):
         scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
         for k_tile in cutlass.range(k_tile_cnt, unroll=1):
             peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
+            scale_b = mSFB_nk[n_tile_coord, k_tile]
             ab_pipeline.consumer_wait(ab_read_state, peek_full)
             for m_idx in cutlass.range_constexpr(MMA_M):
                 curr_tCrA = layout_utils.expand(tCrA[None, m_idx, None, None], dim=1, size=1)
                 curr_acc = layout_utils.expand(acc[None, m_idx, None], dim=1, size=1)
+                m_off = Int32(m_idx * self.atom_layout_mnk[0] * wgmma_m)
+                stage = ab_read_state.index
+                scales[0] = sSFA[m0 + m_off, 0, stage] * scale_b
+                scales[1] = sSFA[m1 + m_off, 0, stage] * scale_b
                 mma_fn(
-                    tCrA = curr_tCrA,
-                    A_idx=ab_read_state.index,
-                    B_idx=ab_read_state.index,
+                    tCrA=curr_tCrA,
+                    A_idx=stage,
+                    B_idx=stage,
                     zero_init=True,
                 )
-                stage = ab_read_state.index
-                scale_b = mSFB_nk[n_tile_coord, k_tile]
+                if const_expr(m_idx == MMA_M - 1):
+                    ab_pipeline.consumer_release(ab_release_state)
                 # scale_b = Float32(1.0)
                 # Each m_idx iteration is one tiled-MMA step further down M.
                 # Stride = atom_layout_m * atom_m (= 2*64 = 128 for tile_m=256, atom_layout_m=2).
-                m_off = Int32(m_idx * self.atom_layout_mnk[0] * wgmma_m)
-                scales[0] = sSFA[m0 + m_off, 0, stage] * scale_b
-                scales[1] = sSFA[m1 + m_off, 0, stage] * scale_b
-                # mma_m_atom_stride = const_expr(self.atom_layout_mnk[0] * 64)
-                # scale_b = mSFB_nk[n_tile_coord, k_tile]
-                # for m_atom in cutlass.range_constexpr(MMA_M):
-                #     # Each MMA_M iteration covers atom_layout_m * 64 rows further down M.
-                #     m_off = Int32(m_atom * mma_m_atom_stride)
-                #     scale_a_0 = sSFA[m0 + m_off, 0, stage]
-                #     scale_a_1 = sSFA[m1 + m_off, 0, stage]
-                #     scales[0, m_atom] = scale_a_0 * scale_b
-                #     scales[1, m_atom] = scale_a_1 * scale_b
 
                 warpgroup.wait_group(0)
 
@@ -1324,10 +1316,8 @@ class GemmSm90(GemmTmaBase):
                 )
                 curr_acc.store(curr_acc.load() + acc_slow.load() * scales_bcast.load())
             ab_read_state.advance()
-            ab_pipeline.consumer_release(ab_release_state)
+
             ab_release_state.advance()
-
-
 
         return ab_read_state
 

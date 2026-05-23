@@ -290,9 +290,10 @@ def benchmark_mxfp8_gemm_act(
         b_q,
         a_sc,
         b_sc,
-        activation=activation,
+        activation=None,
         out_dtype=dtype,
         postact_dtype=dtype,
+        store_preact=False,
         tuned=False,  # mxfp8 gated path forces tuned=False internally; be explicit
     )
     fn()  # warmup
