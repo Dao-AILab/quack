@@ -255,9 +255,9 @@ def to_mx_2d(data_hp: torch.Tensor, block_rows: int = 128, block_cols: int = 128
     max_abs = torch.amax(torch.abs(blocked), dim=(1, 3), keepdim=True)  # (nr, 1, nk, 1)
 
     scale_e8m0_biased = _compute_e8m0_scale_floor(max_abs, F8E4M3_MAX_POW2)  # (nr, 1, nk, 1)
-    scale_fp32 = (
-        torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)
-    ).view(torch.float32)
+    scale_fp32 = (torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)).view(
+        torch.float32
+    )
     scale_fp32 = torch.clamp(scale_fp32, min=F32_MIN_NORMAL)
 
     data_lp = blocked / scale_fp32
