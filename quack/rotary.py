@@ -27,18 +27,40 @@ def _ensure_last_dim_contiguous(t: Tensor) -> Tensor:
     return t if t.stride(-1) == 1 else t.contiguous()
 
 
+def _copy_vecsize_for_rows(
+    element_width: int,
+    logical_dim: int,
+    tile_dim: int,
+    rows: int,
+    num_threads: int,
+) -> int:
+    vecsize = math.gcd(128 // element_width, logical_dim)
+    while vecsize > 1:
+        vecs_per_row = tile_dim // vecsize
+        threads_per_row = math.gcd(32, vecs_per_row)
+        rows_per_copy = num_threads // threads_per_row
+        if rows % rows_per_copy == 0:
+            return vecsize
+        vecsize //= 2
+    return 1
+
+
 class RotaryKernel:
     def __init__(
         self,
         dtype: type[cutlass.Numeric],
         dim: int,
+        headdim: int,
         interleaved: bool = False,
         conjugate: bool = False,
+        copy_tail: bool = False,
     ):
         self.dtype = dtype
         self.dim = dim
+        self.headdim = headdim
         self.interleaved = interleaved
         self.conjugate = conjugate
+        self.copy_tail = copy_tail
         self.num_threads = 128
         self.tile_h = 2 if self.dim <= 96 else 1
         multiple = 32 if dim <= 128 else 64
@@ -61,6 +83,7 @@ class RotaryKernel:
         assert mCos.element_type == mSin.element_type
         assert mCos.shape[1] == mSin.shape[1]
         assert mCos.shape[1] * 2 == self.dim
+        assert self.dim <= self.headdim
 
         self.is_varlen = const_expr(mCuSeqlens is not None)
 
@@ -91,6 +114,26 @@ class RotaryKernel:
             mCos.element_type, threads_per_row_cs, self.num_threads, vecsize_cs
         )
         assert tiler_mn[0] % (self.num_threads // threads_per_row_cs) == 0
+        tail_tiler_mn = tiler_mn
+        tiled_copy_tail = tiled_copy
+        if const_expr(self.copy_tail):
+            tail_dim = self.headdim - self.dim
+            tail_multiple = 32 if tail_dim <= 128 else 64
+            tail_tile_d = (tail_dim + tail_multiple - 1) // tail_multiple * tail_multiple
+            tail_vecsize = _copy_vecsize_for_rows(
+                mX.element_type.width,
+                tail_dim,
+                tail_tile_d,
+                tiler_mn[0],
+                self.num_threads,
+            )
+            tail_vecs_per_row = tail_tile_d // tail_vecsize
+            tail_threads_per_row = math.gcd(32, tail_vecs_per_row)
+            tail_tiler_mn = (tiler_mn[0], tail_tile_d)
+            tiled_copy_tail = copy_utils.tiled_copy_2d(
+                mX.element_type, tail_threads_per_row, self.num_threads, tail_vecsize
+            )
+            assert tiler_mn[0] % (self.num_threads // tail_threads_per_row) == 0
 
         # (b, s, h, d) -> (s, d, h, b); (s, h, d) -> (s, d, h)
         x_layout_transpose = [0, 2, 1] if const_expr(self.is_varlen) else [1, 3, 2, 0]
@@ -116,8 +159,10 @@ class RotaryKernel:
             mO,
             max_seqlen,
             tiler_mn,
+            tail_tiler_mn,
             tiled_copy,
             tiled_copy_cs,
+            tiled_copy_tail,
         ).launch(
             grid=[
                 cute.ceil_div(nheads, self.tile_h),
@@ -139,8 +184,10 @@ class RotaryKernel:
         mO: cute.Tensor,
         max_seqlen: Int32,
         tiler_mn: cute.Shape,
+        tail_tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         tiled_copy_cs: cute.TiledCopy,
+        tiled_copy_tail: cute.TiledCopy,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         head_idx, m_idx, batch_idx = cute.arch.block_idx()
@@ -285,6 +332,41 @@ class RotaryKernel:
                     if tXcX[0, m, 0][0] < seq_len:
                         copy(tXrX[None, m, None], tXgO[None, m, None, h])
 
+        if const_expr(self.copy_tail):
+            tail_dim = const_expr(self.headdim - self.dim)
+            tail_tiler_mnh = (tail_tiler_mn[0], tail_tiler_mn[1], self.tile_h)
+            if const_expr(self.is_varlen):
+                cTail_shape = (max_seqlen, tail_tiler_mn[1])
+            else:
+                cTail_shape = (mX.shape[0], tail_tiler_mn[1])
+            mX_tail = cute.domain_offset((None, self.dim, None), mX_batch)
+            mO_tail = cute.domain_offset((None, self.dim, None), mO_batch)
+            gTailX = cute.local_tile(mX_tail, tail_tiler_mnh, (m_idx, 0, head_idx))
+            gTailO = cute.local_tile(mO_tail, tail_tiler_mnh, (m_idx, 0, head_idx))
+            cTail = cute.local_tile(
+                cute.make_identity_tensor(cTail_shape), tail_tiler_mn, (m_idx, 0)
+            )
+            thr_copy_tail = tiled_copy_tail.get_slice(tidx)
+            tTailcTail_full = thr_copy_tail.partition_S(cTail)
+            tTailcTail = tTailcTail_full[(0, None), None, None]
+            tTailgX = thr_copy_tail.partition_S(gTailX)
+            tTailgO = thr_copy_tail.partition_D(gTailO)
+            is_even_tail_dim = const_expr(tail_tiler_mn[1] == tail_dim)
+            pred_tail = None
+            if const_expr(not is_even_tail_dim):
+                pred_tail = copy_utils.predicate_k(tTailcTail_full, limit=tail_dim)
+            copy_tail = partial(
+                copy_utils.copy,
+                pred=pred_tail[None, 0, None] if not is_even_tail_dim else None,
+            )
+            for h in cutlass.range_constexpr(self.tile_h):
+                if self.tile_h == 1 or h < nheads - head_idx * self.tile_h:
+                    for m in cutlass.range(cute.size(tTailgX, mode=[1]), unroll_full=True):
+                        if tTailcTail[0, m, 0][0] < seq_len:
+                            tTailrX = cute.make_rmem_tensor_like(tTailgX[None, m, None, h])
+                            copy_tail(tTailgX[None, m, None, h], tTailrX)
+                            copy_tail(tTailrX, tTailgO[None, m, None, h])
+
     @staticmethod
     @jit_cache
     def compile(
@@ -293,8 +375,10 @@ class RotaryKernel:
         seqlen_offsets_dtype,
         cu_seqlens_dtype,
         dim,
+        headdim,
         interleaved,
         conjugate,
+        copy_tail,
     ):
         is_varlen = cu_seqlens_dtype is not None
         has_seqlen_offsets = seqlen_offsets_dtype is not None
@@ -303,7 +387,7 @@ class RotaryKernel:
         seqlen_sym = cute.sym_int()
         total_seqlen_sym = cute.sym_int()
         nheads_sym = cute.sym_int()
-        x_dim_sym = cute.sym_int()
+        x_dim_sym = headdim if copy_tail else cute.sym_int()
         seqlen_ro_sym = cute.sym_int()
         x_shape = (
             (total_seqlen_sym, nheads_sym, x_dim_sym)
@@ -325,7 +409,14 @@ class RotaryKernel:
         )
         cu_seqlens_cute = fake_tensor(cu_seqlens_dtype, (batch_p1_sym,)) if is_varlen else None
         return cute.compile(
-            RotaryKernel(dtype, dim, interleaved=interleaved, conjugate=conjugate),
+            RotaryKernel(
+                dtype,
+                dim,
+                headdim,
+                interleaved=interleaved,
+                conjugate=conjugate,
+                copy_tail=copy_tail,
+            ),
             x_cute,
             cos_cute,
             sin_cute,
@@ -357,8 +448,11 @@ def _launch_rotary(
         return
     dtype = torch2cute_dtype_map[x.dtype]
     cossin_dtype = torch2cute_dtype_map[cos.dtype]
+    headdim = x.size(-1)
     dim_half = cos.size(1)
     dim = dim_half * 2
+    copy_tail = out is not x and dim < headdim
+    compile_headdim = headdim if copy_tail else dim
     seqlen_offsets_dtype = (
         torch2cute_dtype_map[seqlen_offsets.dtype] if seqlen_offsets is not None else None
     )
@@ -369,8 +463,10 @@ def _launch_rotary(
         seqlen_offsets_dtype,
         cu_seqlens_dtype,
         dim,
+        compile_headdim,
         interleaved,
         conjugate,
+        copy_tail,
     )(x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen)
 
 
@@ -506,8 +602,6 @@ def apply_rotary(
 
     cos, sin = _ensure_last_dim_contiguous(cos), _ensure_last_dim_contiguous(sin)
     out = x if inplace else torch.empty_like(x)
-    if rotary_dim < headdim and not inplace:
-        out[..., rotary_dim:].copy_(x[..., rotary_dim:])
     if inplace:
         _rotary_fwd_inplace(
             x,
