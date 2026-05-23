@@ -94,13 +94,13 @@ def _make_varied_scale_inputs(M, K, N, *, dtype=torch.bfloat16, device="cuda"):
 @pytest.mark.parametrize(
     "M, K, N",
     [
-        (512,  2048, 1024),
+        (512, 2048, 1024),
         # TODO: M=1 fails with varied scales (cosine_diff ~0.87). Real kernel bug
         # at M<BLOCK_M=64 that uniform-scale randn was diluting. Suspect: TMA SFA
         # descriptor / row-scale load when M<BLOCK_M. Re-enable once fixed.
         # (1,    2048, 1024),   # M=1 edge
-        (512,   768, 2048),   # K not divisible by 512 (sf_k not divisible by 4)
-        (256,  1024,  512),
+        (512, 768, 2048),  # K not divisible by 512 (sf_k not divisible by 4)
+        (256, 1024, 512),
         (1536, 4096, 2048),
     ],
 )
@@ -117,7 +117,10 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
     B_q, B_sc = W_q.mT, W_sc.mT
 
     preact, postact = mxfp8_gemm_act(
-        A_q, B_q, A_sc, B_sc,
+        A_q,
+        B_q,
+        A_sc,
+        B_sc,
         activation=activation,
         out_dtype=dtype,
         postact_dtype=dtype,
@@ -126,9 +129,7 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
     )
 
     A_dq, B_dq = _fp8_dequant_ref(A_q, A_sc, W_q, W_sc)
-    pre_ref, post_ref = gemm_gated_ref(
-        A_dq, B_dq, activation=activation, store_preact=store_preact
-    )
+    pre_ref, post_ref = gemm_gated_ref(A_dq, B_dq, activation=activation, store_preact=store_preact)
 
     assert postact.shape == (M, N)
     _assert_cos_close(postact, post_ref, "postact")
@@ -139,6 +140,7 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
     else:
         assert preact is None
 
+
 # ---------------------------------------------------------------------------
 # Variable-length M (grouped / ragged batch)
 # ---------------------------------------------------------------------------
@@ -147,9 +149,9 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
 @pytest.mark.parametrize(
     "seq_lens, K, N",
     [
-        ([128, 256,  64, 512], 2048, 1024),
-        ([32]  * 8,            1024,  512),
-        ([128, 256],            768, 1024),  # K not divisible by 512
+        ([128, 256, 64, 512], 2048, 1024),
+        ([32] * 8, 1024, 512),
+        ([128, 256], 768, 1024),  # K not divisible by 512
     ],
 )
 def test_mxfp8_gemm_gated_sm90_varlen(seq_lens, K, N, activation, store_preact):
@@ -160,10 +162,12 @@ def test_mxfp8_gemm_gated_sm90_varlen(seq_lens, K, N, activation, store_preact):
 
     L = len(seq_lens)
     total_m = sum(seq_lens)
-    cu_seqlens_m = torch.cat([
-        torch.zeros(1, dtype=torch.int32),
-        torch.tensor(seq_lens, dtype=torch.int32).cumsum(0).int(),
-    ]).to(device)
+    cu_seqlens_m = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32),
+            torch.tensor(seq_lens, dtype=torch.int32).cumsum(0).int(),
+        ]
+    ).to(device)
 
     A_bf16, _ = _make_varied_scale_inputs(total_m, K, N, dtype=dtype, device=device)
     # Per-batch varied W; same indexing-aware scale pattern, fresh random base per batch.
@@ -177,7 +181,10 @@ def test_mxfp8_gemm_gated_sm90_varlen(seq_lens, K, N, activation, store_preact):
     B_q, B_sc = W_q.mT, W_sc.mT
 
     preact, postact = mxfp8_gemm_act(
-        A_q, B_q, A_sc, B_sc,
+        A_q,
+        B_q,
+        A_sc,
+        B_sc,
         activation=activation,
         out_dtype=dtype,
         postact_dtype=dtype,
@@ -188,7 +195,11 @@ def test_mxfp8_gemm_gated_sm90_varlen(seq_lens, K, N, activation, store_preact):
 
     A_dq, B_dq = _fp8_dequant_ref(A_q, A_sc, W_q, W_sc)
     pre_ref, post_ref = gemm_gated_ref(
-        A_dq, B_dq, activation=activation, store_preact=store_preact, cu_seqlens_m=cu_seqlens_m,
+        A_dq,
+        B_dq,
+        activation=activation,
+        store_preact=store_preact,
+        cu_seqlens_m=cu_seqlens_m,
     )
 
     assert postact.shape == (total_m, N)

@@ -272,9 +272,7 @@ def benchmark_mxfp8_gemm_act(
     """
     is_gated = activation in gated_to_pytorch_fn_map
     if not is_gated:
-        raise ValueError(
-            f"benchmark_mxfp8_gemm_act expects a gated activation; got {activation!r}"
-        )
+        raise ValueError(f"benchmark_mxfp8_gemm_act expects a gated activation; got {activation!r}")
 
     a_bf16 = torch.randn(m, k, device="cuda", dtype=dtype)
     # W: (2*N, K) for gated; quantize then build a (K, 2*N) K-contig view for B.
@@ -288,7 +286,10 @@ def benchmark_mxfp8_gemm_act(
     nflops = 2 * m * b_n * k
 
     fn = lambda: mxfp8_gemm_act(
-        a_q, b_q, a_sc, b_sc,
+        a_q,
+        b_q,
+        a_sc,
+        b_sc,
         activation=activation,
         out_dtype=dtype,
         postact_dtype=dtype,
