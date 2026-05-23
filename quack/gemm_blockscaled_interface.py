@@ -25,7 +25,6 @@ from torch import Tensor
 
 import cutlass
 import cutlass.cute as cute
-from quack.autotuner import autotune, AutotuneConfig
 
 from quack.activation import act_fn_map, gate_fn_map
 from quack.blockscaled_gemm_utils import (
@@ -48,7 +47,6 @@ from quack.gemm_interface import (
     _concat_interleave_bias,
     _empty_k_matmul_into,
     gated_to_pytorch_fn_map,
-    prune_invalid_gemm_configs
 )
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
@@ -62,16 +60,16 @@ from quack.gemm_tvm_ffi_utils import (
     perm3d_single,
 )
 from quack.mx_utils import to_mx, to_mx_2d
-from quack.gemm_config import GemmConfig, get_all_configs
 
-_SF_VEC_SIZE = 32          # SM100 K-block size
-_SF_VEC_SIZE_SM90 = 128    # SM90 K-block size (activations and weights)
+_SF_VEC_SIZE = 32  # SM100 K-block size
+_SF_VEC_SIZE_SM90 = 128  # SM90 K-block size (activations and weights)
 _WEIGHT_BLOCK_N_SM90 = 128  # SM90 N-block size for weight scales
 _TORCH_TO_CUTLASS_D = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
     torch.float32: cutlass.Float32,
 }
+
 
 def default_config(device):
     cap = get_device_capacity(device)[0]
@@ -109,13 +107,14 @@ def default_config(device):
         )
     else:
         return GemmConfig(
-            tile_m=128,
+            tile_m=256,
             tile_n=128,
-            cluster_m=2,
-            cluster_n=1,
+            cluster_m=1,
+            cluster_n=2,
             pingpong=False,
             is_dynamic_persistent=False,
         )
+
 
 def _f32_to_e8m0(scale_f32: torch.Tensor) -> torch.Tensor:
     """Convert float32 power-of-2 scales (from mxfp8_quantize) to E8M0 bytes.
@@ -195,8 +194,12 @@ def _to_kernel_layout(
     """
     assert A.dtype == torch.float8_e4m3fn, f"A dtype must be float8_e4m3fn, got {A.dtype}"
     assert B.dtype == torch.float8_e4m3fn, f"B dtype must be float8_e4m3fn, got {B.dtype}"
-    assert A_scale.dtype in (torch.float8_e8m0fnu, torch.float32), f"A_scale dtype must be float8_e8m0fnu or float32, got {A_scale.dtype}"
-    assert B_scale.dtype in (torch.float8_e8m0fnu, torch.float32), f"B_scale dtype must be float8_e8m0fnu or float32, got {B_scale.dtype}"
+    assert A_scale.dtype in (torch.float8_e8m0fnu, torch.float32), (
+        f"A_scale dtype must be float8_e8m0fnu or float32, got {A_scale.dtype}"
+    )
+    assert B_scale.dtype in (torch.float8_e8m0fnu, torch.float32), (
+        f"B_scale dtype must be float8_e8m0fnu or float32, got {B_scale.dtype}"
+    )
     if A_scale.dtype == torch.float32:
         A_scale = _f32_to_e8m0(A_scale)
     if B_scale.dtype == torch.float32:
@@ -367,9 +370,16 @@ def _compile_mxfp8_gemm_act(
         GemmCls = GemmGatedSm100 if is_gated else GemmActSm100
 
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
-        a_dtype, b_dtype, d_dtype, c_dtype,
-        a_major, b_major, d_major, c_major,
-        varlen_m=varlen_m, gather_A=gather_A,
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        varlen_m=varlen_m,
+        gather_A=gather_A,
     )
 
     pa_leading = 1 if postact_major == "n" else 0
@@ -379,11 +389,19 @@ def _compile_mxfp8_gemm_act(
     pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
     mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
 
-    mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4) if rowvec_dtype else None
+    mRowVec = (
+        fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4) if rowvec_dtype else None
+    )
     if colvec_ndim == 2:
-        mColVec = fake_tensor(colvec_dtype, (l, m), leading_dim=1, divisibility=4) if colvec_dtype else None
+        mColVec = (
+            fake_tensor(colvec_dtype, (l, m), leading_dim=1, divisibility=4)
+            if colvec_dtype
+            else None
+        )
     elif colvec_ndim == 1:
-        mColVec = fake_tensor(colvec_dtype, (m,), leading_dim=0, divisibility=4) if colvec_dtype else None
+        mColVec = (
+            fake_tensor(colvec_dtype, (m,), leading_dim=0, divisibility=4) if colvec_dtype else None
+        )
     else:
         mColVec = None
 
@@ -408,9 +426,7 @@ def _compile_mxfp8_gemm_act(
         rounding_mode=0,  # RoundingMode.RN, Constexpr baked at compile time
         sr_seed=fake_scalar(sr_seed_mode),
     )
-    scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and sm == 9), False, l
-    )
+    scheduler_args = make_fake_scheduler_args((is_dynamic_persistent and sm == 9), False, l)
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
 
     if sm == 9:
@@ -424,7 +440,9 @@ def _compile_mxfp8_gemm_act(
             fake_sfa = fake_tensor(cutlass.Float32, (m, sf_k_sym), leading_dim=0, divisibility=1)
         else:
             fake_sfa = fake_tensor(cutlass.Float32, (m, sf_k_sym, l), leading_dim=0, divisibility=1)
-        fake_sfb = fake_tensor(cutlass.Float32, (l, n_blocks_sym, sf_k_sym), leading_dim=2, divisibility=1)
+        fake_sfb = fake_tensor(
+            cutlass.Float32, (l, n_blocks_sym, sf_k_sym), leading_dim=2, divisibility=1
+        )
         return compile_gemm_kernel(
             partial(GemmCls, sf_vec_size=_SF_VEC_SIZE_SM90, weight_n_block=_WEIGHT_BLOCK_N_SM90),
             a_dtype,
@@ -435,9 +453,15 @@ def _compile_mxfp8_gemm_act(
             gather_A,
             is_dynamic_persistent,
             device_capacity,
-            mA, mB, mD, mC,
-            epi_args, scheduler_args, varlen_args,
-            mSFA=fake_sfa, mSFB=fake_sfb,
+            mA,
+            mB,
+            mD,
+            mC,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            mSFA=fake_sfa,
+            mSFB=fake_sfb,
             use_tma_gather=use_tma_gather,
             concat_layout=concat_layout or None,
         )
@@ -458,22 +482,28 @@ def _compile_mxfp8_gemm_act(
         gather_A,
         is_dynamic_persistent,
         device_capacity,
-        mA, mB, mD, mC,
-        epi_args, scheduler_args, varlen_args,
-        mSFA=mSFA, mSFB=mSFB,
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        mSFA=mSFA,
+        mSFB=mSFB,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
     )
 
 
 def mxfp8_gemm_act_dispatch(
-    A: Tensor,          # (l, m, k) K-contig
-    B: Tensor,          # (l, n, k) K-contig
-    A_scale: Tensor,    # (l, m, k/32) K-contig
-    B_scale: Tensor,    # (l, n, k/32) K-contig
-    D: Optional[Tensor],      # (l, m, n) or None (preact_out)
-    C: Optional[Tensor],      # (l, m, n) or None
-    PostAct: Tensor,          # (l, m, n//2) for gated
+    A: Tensor,  # (l, m, k) K-contig
+    B: Tensor,  # (l, n, k) K-contig
+    A_scale: Tensor,  # (l, m, k/32) K-contig
+    B_scale: Tensor,  # (l, n, k/32) K-contig
+    D: Optional[Tensor],  # (l, m, n) or None (preact_out)
+    C: Optional[Tensor],  # (l, m, n) or None
+    PostAct: Tensor,  # (l, m, n//2) for gated
     tile_count_semaphore: Optional[Tensor],
     activation: str,
     tile_M: int,
@@ -529,15 +559,28 @@ def mxfp8_gemm_act_dispatch(
 
     concat_layout_key = tuple(sorted(concat_layout)) if concat_layout else ()
     compiled_fn = _compile_mxfp8_gemm_act(
-        a_dtype, b_dtype, d_dtype, c_dtype, postact_dtype,
-        a_major, b_major, d_major, c_major, postact_major,
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        postact_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        postact_major,
         (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N),
         (cluster_M, cluster_N, 1),
-        pingpong, persistent, is_dynamic_persistent,
+        pingpong,
+        persistent,
+        is_dynamic_persistent,
         activation,
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
         torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
-        colvec_ndim, varlen_m, gather_A, concat_layout_key,
+        colvec_ndim,
+        varlen_m,
+        gather_A,
+        concat_layout_key,
         device_capacity,
         use_tma_gather=use_tma_gather,
     )
@@ -548,13 +591,15 @@ def mxfp8_gemm_act_dispatch(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     epi_args = GemmActMixin.EpilogueArguments(
         PostAct_p,
-        None,   # act_fn is Constexpr, baked at compile time
+        None,  # act_fn is Constexpr, baked at compile time
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
         rounding_mode=None,  # Constexpr, baked at compile time
         sr_seed=None,
     )
-    scheduler_args = make_scheduler_args(max_active_clusters, max_swizzle_size, tile_count_semaphore)
+    scheduler_args = make_scheduler_args(
+        max_active_clusters, max_swizzle_size, tile_count_semaphore
+    )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
     if sm == 9:
@@ -573,8 +618,16 @@ def mxfp8_gemm_act_dispatch(
             sfa_sm90 = A_scale.permute(1, 2, 0)  # view: (m, sf_k, l), M innermost
         sfb_sm90 = B_scale.contiguous()  # (l, n_blocks, sf_k); read directly from gmem
         compiled_fn(
-            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args,
-            sfa_sm90, sfb_sm90, None,
+            A_p,
+            B_p,
+            D_p,
+            C_p,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            sfa_sm90,
+            sfb_sm90,
+            None,
         )
     else:
         # SM100/SM110: pack scales and pass to blockscaled kernel.
@@ -603,9 +656,7 @@ def mxfp8_gemm_act_dispatch(
                 row_padded = (row // tile + i) * tile
                 sa_padded[row_padded : row_padded + m_i] = a_scale_e8m0[row : row + m_i]
                 row += m_i
-            sc_contig_A = pack_scale_2d_to_blocked_contig(
-                sa_padded.view(1, total_padded_m, sf_k)
-            )
+            sc_contig_A = pack_scale_2d_to_blocked_contig(sa_padded.view(1, total_padded_m, sf_k))
             sfa = scale_view_for_kernel(sc_contig_A, total_padded_m, sf_k, 1)
         else:
             m = A.shape[1]
@@ -614,9 +665,18 @@ def mxfp8_gemm_act_dispatch(
         sc_contig_B = pack_scale_2d_to_blocked_contig(b_scale_e8m0.contiguous())
         sfb = scale_view_for_kernel(sc_contig_B, n, sf_k, l)
         compiled_fn(
-            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args,
-            sfa, sfb, None,
+            A_p,
+            B_p,
+            D_p,
+            C_p,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            sfa,
+            sfb,
+            None,
         )
+
 
 # @autotune(
 #     configs=[AutotuneConfig(config=c) for c in get_all_configs("gated")],
@@ -705,6 +765,7 @@ def mxfp8_gemm_gated_tuned(
         use_tma_gather=config.use_tma_gather,
         concat_layout=concat_layout,
     )
+
 
 def mxfp8_gemm_act_tuned(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -834,7 +895,20 @@ def mxfp8_gemm_act_out(
     # TODO: add tuning
     tuned = False
     fn = mxfp8_gemm_act_tuned if tuned else partial(mxfp8_gemm_act_tuned, config=None)
-    fn(A, B, A_scale, B_scale, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
+    fn(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        preact_out,
+        postact_out,
+        C,
+        bias,
+        activation,
+        cu_seqlens_m,
+        A_idx,
+        dynamic_scheduler,
+    )
 
 
 def mxfp8_gemm_act(
@@ -918,6 +992,7 @@ def mxfp8_gemm_act(
         )
     return preact_out, postact_out
 
+
 def _e8m0_to_f32(scale_e8m0: torch.Tensor) -> torch.Tensor:
     """E8M0 (float8_e8m0fnu viewed as uint8) → float32 power-of-2 scale."""
     bits = scale_e8m0.contiguous().view(torch.uint8).to(torch.int32) << 23
@@ -975,10 +1050,12 @@ def mxfp8_quantize_weight(w: Tensor) -> Tuple[Tensor, Tensor]:
     else:
         batch_shape = w.shape[:-2]
         w_flat = w.reshape(-1, w.shape[-2], w.shape[-1])
-        qs, ss = zip(*[
-            to_mx_2d(w_flat[i].contiguous(), _WEIGHT_BLOCK_N_SM90, _SF_VEC_SIZE_SM90)
-            for i in range(w_flat.shape[0])
-        ])
+        qs, ss = zip(
+            *[
+                to_mx_2d(w_flat[i].contiguous(), _WEIGHT_BLOCK_N_SM90, _SF_VEC_SIZE_SM90)
+                for i in range(w_flat.shape[0])
+            ]
+        )
         qdata = torch.stack(qs).reshape(*batch_shape, w.shape[-2], w.shape[-1])
         scale = torch.stack(ss).reshape(
             *batch_shape, w.shape[-2] // _WEIGHT_BLOCK_N_SM90, w.shape[-1] // _SF_VEC_SIZE_SM90
