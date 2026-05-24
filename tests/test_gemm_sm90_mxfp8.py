@@ -7,8 +7,8 @@ from quack.gemm_blockscaled_interface import (
     _SF_VEC_SIZE_SM90 as SF,
     _WEIGHT_BLOCK_N_SM90 as BN,
     mxfp8_gemm_act,
-    mxfp8_quantize_act,
-    mxfp8_quantize_weight,
+    quantize_act_sm90,
+    quantize_weight_sm90,
 )
 from quack.gemm_interface import gemm_gated_ref
 
@@ -99,7 +99,7 @@ def _make_varied_scale_inputs(M, K, N, *, dtype=torch.bfloat16, device="cuda"):
         # at M<BLOCK_M=64 that uniform-scale randn was diluting. Suspect: TMA SFA
         # descriptor / row-scale load when M<BLOCK_M. Re-enable once fixed.
         # (1,    2048, 1024),   # M=1 edge
-        (512, 768, 2048),  # K not divisible by 512 (sf_k not divisible by 4)
+        (512, 768, 2048),
         (256, 1024, 512),
         (1536, 4096, 2048),
     ],
@@ -112,8 +112,8 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
 
     A_bf16, W_bf16 = _make_varied_scale_inputs(M, K, N, dtype=dtype, device=device)
 
-    A_q, A_sc = mxfp8_quantize_act(A_bf16)
-    W_q, W_sc = mxfp8_quantize_weight(W_bf16)
+    A_q, A_sc = quantize_act_sm90(A_bf16)
+    W_q, W_sc = quantize_weight_sm90(W_bf16)
     B_q, B_sc = W_q.mT, W_sc.mT
 
     preact, postact = mxfp8_gemm_act(
@@ -176,8 +176,8 @@ def test_mxfp8_gemm_gated_sm90_varlen(seq_lens, K, N, activation, store_preact):
         dim=0,
     )
 
-    A_q, A_sc = mxfp8_quantize_act(A_bf16)
-    W_q, W_sc = mxfp8_quantize_weight(W_bf16)
+    A_q, A_sc = quantize_act_sm90(A_bf16)
+    W_q, W_sc = quantize_weight_sm90(W_bf16)
     B_q, B_sc = W_q.mT, W_sc.mT
 
     preact, postact = mxfp8_gemm_act(

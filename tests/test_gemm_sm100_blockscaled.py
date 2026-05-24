@@ -571,10 +571,10 @@ def test_mxfp8_interface(shape_mnk, batched):
     _skip_if_not_sm100()
     from quack.gemm_blockscaled_interface import (
         mxfp8_gemm,
-        mxfp8_gemm_cublas,
-        mxfp8_gemm_ref,
-        mxfp8_gemm_quantize,
-        mxfp8_quantize,
+        mxfp8_gemm_cublas_sm100,
+        mxfp8_gemm_ref_sm100,
+        mxfp8_gemm_quantize_sm100,
+        quantize_act_sm100,
     )
 
     M, N, K = shape_mnk
@@ -586,8 +586,8 @@ def test_mxfp8_interface(shape_mnk, batched):
     A_hp = torch.randn(*shape_A, device="cuda", dtype=torch.bfloat16) * K**-0.5
     W_hp = torch.randn(*shape_W, device="cuda", dtype=torch.bfloat16) * K**-0.5
 
-    A_q, A_sc = mxfp8_quantize(A_hp)
-    W_q, W_sc = mxfp8_quantize(W_hp)  # (..., N, K), (..., N, K/32)
+    A_q, A_sc = quantize_act_sm100(A_hp)
+    W_q, W_sc = quantize_act_sm100(W_hp)  # (..., N, K), (..., N, K/32)
     assert A_q.dtype == torch.float8_e4m3fn and A_sc.dtype == torch.float8_e8m0fnu
 
     B_q = W_q.mT  # (..., K, N) K-contig view
@@ -597,17 +597,17 @@ def test_mxfp8_interface(shape_mnk, batched):
     assert out.shape == ((L, M, N) if batched else (M, N))
     assert out.dtype == torch.bfloat16
 
-    ref = mxfp8_gemm_ref(A_q, B_q, A_sc, B_sc)
+    ref = mxfp8_gemm_ref_sm100(A_q, B_q, A_sc, B_sc)
     err = (out.float() - ref.float()).abs().max().item()
     assert err < 5e-3, f"quack vs ref max_err={err}"
 
     # cuBLAS comparison only for 2D / L=1
     if not batched:
-        out_cublas = mxfp8_gemm_cublas(A_q, B_q, A_sc, B_sc)
+        out_cublas = mxfp8_gemm_cublas_sm100(A_q, B_q, A_sc, B_sc)
         assert torch.equal(out, out_cublas), "quack interface != cuBLAS"
 
     # High-level quantize+gemm convenience fn
-    out2 = mxfp8_gemm_quantize(A_hp, W_hp)
+    out2 = mxfp8_gemm_quantize_sm100(A_hp, W_hp)
     assert torch.equal(out, out2)
 
 
@@ -889,14 +889,14 @@ def test_blockscaled_mxfp8_strided_sf(rk_pad):
 
 def test_mxfp8_interface_preallocated_out():
     _skip_if_not_sm100()
-    from quack.gemm_blockscaled_interface import mxfp8_gemm, mxfp8_quantize
+    from quack.gemm_blockscaled_interface import mxfp8_gemm, quantize_act_sm100
 
     M, N, K = 256, 256, 256
     torch.manual_seed(0)
     A_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
     W_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    A_q, A_sc = mxfp8_quantize(A_hp)
-    W_q, W_sc = mxfp8_quantize(W_hp)
+    A_q, A_sc = quantize_act_sm100(A_hp)
+    W_q, W_sc = quantize_act_sm100(W_hp)
     B_q, B_sc = W_q.mT, W_sc.mT
 
     out_alloc = mxfp8_gemm(A_q, B_q, A_sc, B_sc)

@@ -983,6 +983,22 @@ def mxfp8_gemm_act_sm90(
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
+    if not varlen_m:
+        # SM90 constraints (non-varlen): M % 8, and the "1d2d" block-scaled quant scheme:
+        #   A_scale: (..., M,        K // 128)   from quantize_act_sm90    (1 × 128)
+        #   B_scale: (..., K // 128, N // 128)   from quantize_weight_sm90 (128 × 128), passed as .mT
+        m_dim = A.shape[-2]  # works for both 2D (M, K) and 3D (L, M, K)
+        k_dim = A.shape[-1]
+        n_dim = B.shape[-1]
+        assert m_dim % 8 == 0, f"SM90 mxfp8 GEMM requires M % 8 == 0; got M={m_dim}"
+        assert A_scale.shape[-2:] == (m_dim, k_dim // 128), (
+            f"SM90 expects A_scale from quantize_act_sm90 (1x128): "
+            f"shape (..., M={m_dim}, K/128={k_dim // 128}); got {tuple(A_scale.shape)}"
+        )
+        assert B_scale.shape[-2:] == (k_dim // 128, n_dim // 128), (
+            f"SM90 expects B_scale from quantize_weight_sm90 (128x128, passed as .mT): "
+            f"shape (..., K/128={k_dim // 128}, N/128={n_dim // 128}); got {tuple(B_scale.shape)}"
+        )
     # Determine output shape based on gather_A
     if varlen_m:
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
