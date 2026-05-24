@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Tri Dao.
 
 import itertools
+import os
 from functools import partial
 from typing import Callable, Optional, Type, Tuple
 
@@ -11,7 +12,13 @@ import cutlass.cute as cute
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_default_epi import GemmDefaultSm100
+from quack.gemm_default_epi import GemmDefaultSm100, GemmDefaultSm120
+from quack.gemm_sm120 import GemmSm120
+from quack.sm120_blockscaled_utils import (
+    validate_sm120_nvfp4_ab_storage,
+    validate_sm120_nvfp4_d_storage,
+    validate_sm120_nvfp4_scale_storage,
+)
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
 from quack.mx_utils import (
     to_mx_compiled,
@@ -89,7 +96,10 @@ def _leading_dim_from_stride(tensor: torch.Tensor) -> int:
 def _make_compile_tensor_like(
     tensor: torch.Tensor, dtype: Type[cutlass.Numeric], dynamic_layout: bool = False
 ) -> cute.Tensor:
-    compile_tensor = cute.runtime.from_dlpack(tensor)
+    compile_tensor = cute.runtime.from_dlpack(
+        tensor,
+        enable_tvm_ffi=dtype is not cutlass.Float4E2M1FN,
+    )
     compile_tensor.element_type = dtype
     if dynamic_layout:
         marked = compile_tensor.mark_layout_dynamic(leading_dim=_leading_dim_from_stride(tensor))
@@ -592,6 +602,158 @@ def create_blockscaled_varlen_k_operands(
     return a_ref_list, b_ref_list, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_k
 
 
+def _compile_sm120_nvfp4_blockscaled_gemm_tvm_ffi(
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    d_dtype: Type[cutlass.Numeric],
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    mA: torch.Tensor,
+    mB: torch.Tensor,
+    mD: torch.Tensor,
+    mSFA: torch.Tensor,
+    mSFB: torch.Tensor,
+    *,
+    varlen_m: bool = False,
+    varlen_k: bool = False,
+    keep_ptx: bool = False,
+) -> Callable:
+    if varlen_m or varlen_k:
+        raise ValueError("SM120 NVFP4 blockscaled does not support varlen")
+    if ab_dtype is not cutlass.Float4E2M1FN:
+        raise ValueError("SM120 NVFP4 blockscaled requires Float4E2M1FN A/B")
+    if sf_dtype is not cutlass.Float8E4M3FN:
+        raise ValueError("SM120 NVFP4 blockscaled requires Float8E4M3FN scales")
+    if sf_vec_size != 16:
+        raise ValueError("SM120 NVFP4 blockscaled requires sf_vec_size=16")
+    if d_dtype is not cutlass.BFloat16:
+        raise ValueError("SM120 NVFP4 blockscaled requires BFloat16 output")
+    tile_m, tile_n = tuple(mma_tiler_mn)
+    tile_k = 128
+    if (tile_m, tile_n) != (128, 128):
+        raise ValueError("SM120 NVFP4 blockscaled currently requires mma_tiler_mn=(128,128)")
+    if tuple(cluster_shape_mn) != (1, 1):
+        raise ValueError("SM120 NVFP4 blockscaled requires cluster_shape_mn=(1,1)")
+
+    m, packed_k, l = mA.shape
+    n, packed_k_b, l_b = mB.shape
+    if packed_k != packed_k_b or l != l_b:
+        raise ValueError("A/B packed K and batch dimensions must match")
+    k = packed_k * 2
+    validate_sm120_nvfp4_d_storage(mD, m=m, n=n, l=l)
+    if not GemmSm120.can_implement_blockscaled(
+        ab_dtype,
+        sf_dtype,
+        sf_vec_size,
+        d_dtype,
+        (tile_m, tile_n, tile_k),
+        cluster_shape_mn,
+        m,
+        n,
+        k,
+        l,
+        "k",
+        "k",
+        "n",
+    ):
+        raise ValueError(
+            f"unsupported SM120 NVFP4 config: m={m}, n={n}, k={k}, l={l}, "
+            f"tiler={mma_tiler_mn}, cluster={cluster_shape_mn}"
+        )
+    validate_sm120_nvfp4_ab_storage(mA, logical_k=k, major_extent=m, batch_extent=l)
+    validate_sm120_nvfp4_ab_storage(mB, logical_k=k, major_extent=n, batch_extent=l)
+    validate_sm120_nvfp4_scale_storage(mSFA, logical_k=k, major_extent=m, batch_extent=l)
+    validate_sm120_nvfp4_scale_storage(mSFB, logical_k=k, major_extent=n, batch_extent=l)
+
+    gemm = GemmDefaultSm120(
+        cutlass.Float32,
+        ab_dtype,
+        (tile_m, tile_n, tile_k),
+        (1, 1, 1),
+        pingpong=True,
+        use_pdl=True,
+        sf_vec_size=sf_vec_size,
+        sf_dtype=sf_dtype,
+    )
+    gemm.max_active_clusters = get_max_active_clusters(
+        1, device_capacity=get_device_capacity(mA.device)
+    )
+    compile_epi_args = gemm.EpilogueArguments()
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    @cute.jit
+    def runner(
+        a: cute.Tensor,
+        b: cute.Tensor,
+        d: cute.Tensor,
+        sfa: cute.Tensor,
+        sfb: cute.Tensor,
+        problem_m: cutlass.Constexpr[int],
+        problem_n: cutlass.Constexpr[int],
+        problem_k: cutlass.Constexpr[int],
+        problem_l: cutlass.Constexpr[int],
+        stream,
+    ):
+        gemm.blockscaled_call(
+            a,
+            b,
+            d,
+            sfa,
+            sfb,
+            problem_m,
+            problem_n,
+            problem_k,
+            problem_l,
+            compile_epi_args,
+            stream,
+        )
+
+    gpu_arch = os.environ.get("GPU_ARCH") or os.environ.get("CUTE_DSL_ARCH", "sm_120a")
+    options = f"--gpu-arch={gpu_arch} --enable-tvm-ffi"
+    if keep_ptx:
+        options += " --keep-ptx"
+
+    compiled = cute.compile(
+        runner,
+        _make_compile_tensor_like(mA, ab_dtype),
+        _make_compile_tensor_like(mB, ab_dtype),
+        _make_compile_tensor_like(mD, d_dtype),
+        _make_compile_tensor_like(mSFA, sf_dtype),
+        _make_compile_tensor_like(mSFB, sf_dtype),
+        m,
+        n,
+        k,
+        l,
+        stream,
+        options=options,
+    )
+    compile_device = mA.device
+
+    def run(a, b, d, sfa, sfb):
+        for tensor_name, tensor in (
+            ("A", a),
+            ("B", b),
+            ("D", d),
+            ("SFA", sfa),
+            ("SFB", sfb),
+        ):
+            if tensor.device != compile_device:
+                raise ValueError(
+                    f"SM120 NVFP4 {tensor_name} tensor must be on {compile_device}, "
+                    f"got {tensor.device}"
+                )
+        validate_sm120_nvfp4_ab_storage(a, logical_k=k, major_extent=m, batch_extent=l)
+        validate_sm120_nvfp4_ab_storage(b, logical_k=k, major_extent=n, batch_extent=l)
+        validate_sm120_nvfp4_d_storage(d, m=m, n=n, l=l)
+        validate_sm120_nvfp4_scale_storage(sfa, logical_k=k, major_extent=m, batch_extent=l)
+        validate_sm120_nvfp4_scale_storage(sfb, logical_k=k, major_extent=n, batch_extent=l)
+        compiled(a, b, d, sfa, sfb)
+
+    run.compiled = compiled
+    return run
+
+
 def compile_blockscaled_gemm_tvm_ffi(
     ab_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
@@ -608,8 +770,9 @@ def compile_blockscaled_gemm_tvm_ffi(
     use_clc_persistence: bool = True,
     varlen_m: bool = False,
     varlen_k: bool = False,
+    keep_ptx: bool = False,
 ) -> Callable:
-    """Compile the SM100 blockscaled GEMM.
+    """Compile the blockscaled GEMM.
 
     When varlen_m: mA is (total_m, k) K-major, mD is (total_m, n) N-major,
     mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
@@ -617,8 +780,43 @@ def compile_blockscaled_gemm_tvm_ffi(
     run(...) takes an extra cu_seqlens_k tensor.
     """
     device_capacity = get_device_capacity(mA.device)
+    is_sm120_nvfp4 = (
+        device_capacity[0] == 12
+        and ab_dtype is cutlass.Float4E2M1FN
+        and sf_dtype is cutlass.Float8E4M3FN
+        and sf_vec_size == 16
+        and d_dtype is cutlass.BFloat16
+        and tuple(mma_tiler_mn) == (128, 128)
+        and tuple(cluster_shape_mn) == (1, 1)
+        and not varlen_m
+        and not varlen_k
+    )
+    if is_sm120_nvfp4:
+        return _compile_sm120_nvfp4_blockscaled_gemm_tvm_ffi(
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
+            d_dtype,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            mA,
+            mB,
+            mD,
+            mSFA,
+            mSFB,
+            varlen_m=varlen_m,
+            varlen_k=varlen_k,
+            keep_ptx=keep_ptx,
+        )
+    if device_capacity[0] == 12:
+        raise RuntimeError(
+            "SM120 blockscaled GEMM currently supports only NVFP4 "
+            "(Float4E2M1FN A/B, Float8E4M3FN scales, sf_vec_size=16, "
+            "BFloat16 output, mma_tiler_mn=(128,128), "
+            "cluster_shape_mn=(1,1), no varlen)"
+        )
     if device_capacity[0] not in (10, 11):
-        raise RuntimeError("Blockscaled SM100 GEMM requires SM100/SM110")
+        raise RuntimeError("Blockscaled GEMM requires SM100/SM110 or SM120")
     assert not (varlen_m and varlen_k), "Only one of varlen_m / varlen_k"
 
     gemm = partial(
