@@ -61,12 +61,18 @@ class GemmSm120(GemmSm90):
         use_pdl: bool = True,
         sf_vec_size: Optional[int] = None,
         sf_dtype: Optional[Type[cutlass.Numeric]] = None,
+        sm120_nvfp4_path: str = "validated",
     ):
         # Don't call super().__init__ — we set up our own config
         self.acc_dtype = acc_dtype
         self.sf_vec_size = sf_vec_size
         self.sf_dtype = sf_dtype
         self.blockscaled = sf_vec_size is not None
+        if sm120_nvfp4_path not in ("validated", "fast"):
+            raise ValueError("SM120 NVFP4 path must be 'validated' or 'fast'")
+        if not self.blockscaled and sm120_nvfp4_path != "validated":
+            raise ValueError("SM120 NVFP4 fast path requires blockscaled NVFP4")
+        self.sm120_nvfp4_path = sm120_nvfp4_path
         if self.blockscaled:
             self._validate_blockscaled_nvfp4_config(
                 acc_dtype,
@@ -196,13 +202,10 @@ class GemmSm120(GemmSm90):
         self.direct_elected_tma = direct_128_default and self.blockscaled_pingpong_elected_tma
         self.direct_setmaxregister = True
         self.direct_cute_dsl_helpers = False
-        # The delayed TMA epilogue path currently drops subtiles on larger SM120
-        # NVFP4 grids. Keep the validated direct-store epilogue as the default.
-        self.direct_global_store = True
+        self.direct_global_store = sm120_nvfp4_path == "validated"
         self.direct_global_store_probe = False
         self.direct_tile_scheduler = direct_128_default
-        # CLC scheduling is still unsafe for large split ping-pong NVFP4 grids.
-        self.direct_cute_static_scheduler = True
+        self.direct_cute_static_scheduler = sm120_nvfp4_path == "validated"
         self.direct_pipelined_consumer = direct_128_default
         self.direct_split_tma_pipelines = direct_128_default and not self.direct_elected_tma
         self.direct_full_tma_pipeline = False

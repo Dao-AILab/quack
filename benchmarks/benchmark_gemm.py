@@ -29,6 +29,11 @@ Usage (blockscaled NVFP4):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
         --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN \
         --sf_vec_size 16 --d_dtype BFloat16
+
+Usage (blockscaled NVFP4 fast SM120 path):
+    python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
+        --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN \
+        --sf_vec_size 16 --d_dtype BFloat16 --sm120_nvfp4_path fast
 """
 
 
@@ -131,6 +136,14 @@ def parse_arguments() -> argparse.Namespace:
         help="SM120 NVFP4 input initialization. tensorfill uses bounded random non-zero "
         "FP4/scales close to CUTLASS 79a TensorFillRandomUniform; ones preserves the "
         "old all-ones microbenchmark.",
+    )
+    parser.add_argument(
+        "--sm120_nvfp4_path",
+        choices=("validated", "fast"),
+        default="validated",
+        help="SM120 NVFP4 kernel policy. validated uses the conservative direct-store "
+        "static-scheduler path; fast uses the CLC/full-grid scheduler and delayed TMA "
+        "epilogue path.",
     )
     # Dtype flags. Blockscaled path is selected automatically when --sf_dtype is passed.
     parser.add_argument(
@@ -350,6 +363,7 @@ def _run_blockscaled(args):
             mSFA,
             mSFB,
             varlen_m=True,
+            sm120_nvfp4_path=args.sm120_nvfp4_path,
         )
 
         def fn():
@@ -408,6 +422,7 @@ def _run_blockscaled(args):
             mD,
             mSFA,
             mSFB,
+            sm120_nvfp4_path=args.sm120_nvfp4_path,
         )
 
         def fn():
@@ -444,6 +459,7 @@ def _run_blockscaled(args):
     print(f"a_major: {a_major}, b_major: {b_major}")
     if is_sm120_nvfp4:
         print(f"sm120_nvfp4_init: {args.sm120_nvfp4_init}")
+        print(f"sm120_nvfp4_path: {args.sm120_nvfp4_path}")
 
     flops = 2 * m * n * k * l
     timing = _bench_and_report("quack ", fn, flops, args.warmup_iterations, args.iterations)

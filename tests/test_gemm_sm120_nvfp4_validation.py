@@ -74,6 +74,45 @@ def test_sm120_dense_pingpong_constructor_still_works():
     )
 
 
+def test_sm120_nvfp4_path_policy_selects_scheduler_and_epilogue():
+    validated = GemmSm120(
+        cutlass.Float32,
+        cutlass.Float4E2M1FN,
+        (128, 128, 128),
+        (1, 1, 1),
+        pingpong=True,
+        sf_vec_size=16,
+        sf_dtype=cutlass.Float8E4M3FN,
+    )
+    assert validated.direct_global_store
+    assert validated.direct_cute_static_scheduler
+
+    fast = GemmSm120(
+        cutlass.Float32,
+        cutlass.Float4E2M1FN,
+        (128, 128, 128),
+        (1, 1, 1),
+        pingpong=True,
+        sf_vec_size=16,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sm120_nvfp4_path="fast",
+    )
+    assert not fast.direct_global_store
+    assert not fast.direct_cute_static_scheduler
+
+    with pytest.raises(ValueError, match="validated.*fast"):
+        GemmSm120(
+            cutlass.Float32,
+            cutlass.Float4E2M1FN,
+            (128, 128, 128),
+            (1, 1, 1),
+            pingpong=True,
+            sf_vec_size=16,
+            sf_dtype=cutlass.Float8E4M3FN,
+            sm120_nvfp4_path="unknown",
+        )
+
+
 def test_sm120_nvfp4_source_has_no_experimental_env_matrix():
     source = (Path(__file__).parents[1] / "quack/gemm_sm120.py").read_text()
 

@@ -11,6 +11,7 @@ python benchmarks/benchmark_gemm.py \
   --sf_dtype Float8E4M3FN \
   --sf_vec_size 16 \
   --d_dtype BFloat16 \
+  --sm120_nvfp4_path "${SM120_NVFP4_PATH:-validated}" \
   --warmup_iterations "${WARMUP:-5}" \
   --iterations "${ITERS:-10}" \
   --skip_ref_check

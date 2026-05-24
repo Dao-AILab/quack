@@ -618,7 +618,10 @@ def _compile_sm120_nvfp4_blockscaled_gemm_tvm_ffi(
     varlen_m: bool = False,
     varlen_k: bool = False,
     keep_ptx: bool = False,
+    sm120_nvfp4_path: str = "validated",
 ) -> Callable:
+    if sm120_nvfp4_path not in ("validated", "fast"):
+        raise ValueError("SM120 NVFP4 path must be 'validated' or 'fast'")
     if varlen_m or varlen_k:
         raise ValueError("SM120 NVFP4 blockscaled does not support varlen")
     if ab_dtype is not cutlass.Float4E2M1FN:
@@ -675,6 +678,7 @@ def _compile_sm120_nvfp4_blockscaled_gemm_tvm_ffi(
         use_pdl=True,
         sf_vec_size=sf_vec_size,
         sf_dtype=sf_dtype,
+        sm120_nvfp4_path=sm120_nvfp4_path,
     )
     gemm.max_active_clusters = get_max_active_clusters(
         1, device_capacity=get_device_capacity(mA.device)
@@ -771,6 +775,7 @@ def compile_blockscaled_gemm_tvm_ffi(
     varlen_m: bool = False,
     varlen_k: bool = False,
     keep_ptx: bool = False,
+    sm120_nvfp4_path: str = "validated",
 ) -> Callable:
     """Compile the blockscaled GEMM.
 
@@ -807,7 +812,10 @@ def compile_blockscaled_gemm_tvm_ffi(
             varlen_m=varlen_m,
             varlen_k=varlen_k,
             keep_ptx=keep_ptx,
+            sm120_nvfp4_path=sm120_nvfp4_path,
         )
+    if sm120_nvfp4_path != "validated":
+        raise ValueError("sm120_nvfp4_path applies only to the SM120 NVFP4 blockscaled path")
     if device_capacity[0] == 12:
         raise RuntimeError(
             "SM120 blockscaled GEMM currently supports only NVFP4 "
