@@ -238,7 +238,6 @@ class GemmSm90(GemmTmaBase):
             if self.blockscaled:
                 assert tile_M % 128 == 0
                 if tile_M >= 256:
-                    assert math.prod(self.atom_layout_mnk[1:]) == 1
                     regs_per_thread += regs_per_thread // 2
                     self.fp8_partial_acc = True
             else:
@@ -304,7 +303,8 @@ class GemmSm90(GemmTmaBase):
             self.cta_tile_shape_mnk[2] if self.cta_tile_shape_mnk[2] > 0 else mma_inst_shape_k * 4
         )
         if self.blockscaled:
-            assert self.sf_vec_size == tile_k == self.cta_tile_shape_mnk[1]
+            assert self.sf_vec_size == tile_k
+            # assert self.sf_vec_size == self.cta_tile_shape_mnk[1]
         assert tile_k > 0, "CTA tile K must be positive"
         assert tile_k % mma_inst_shape_k == 0, (
             f"CTA tile K ({tile_k}) must be divisible by MMA instruction K ({mma_inst_shape_k})"
@@ -951,7 +951,7 @@ class GemmSm90(GemmTmaBase):
                     ab_read_state = self.mma_blockscaled(
                         ab_pipeline,
                         ab_read_state,
-                        partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc_slow, tCrB=tCrB),
+                        partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc=acc_slow, tCrB=tCrB),
                         acc,
                         acc_slow,
                         tCrA,
@@ -1305,7 +1305,6 @@ class GemmSm90(GemmTmaBase):
 
         ab_release_state = ab_read_state.clone()
         acc.fill(0.0)
-
         scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
         for k_tile in cutlass.range(k_tile_cnt, unroll=8):
             peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
@@ -1324,13 +1323,12 @@ class GemmSm90(GemmTmaBase):
                     B_idx=stage,
                     zero_init=True,
                 )
-                if const_expr(m_idx == MMA_M - 1):
-                    ab_pipeline.consumer_release(ab_release_state)
-                # scale_b = Float32(1.0)
                 # Each m_idx iteration is one tiled-MMA step further down M.
                 # Stride = atom_layout_m * atom_m (= 2*64 = 128 for tile_m=256, atom_layout_m=2).
 
                 warpgroup.wait_group(0)
+                if const_expr(m_idx == MMA_M - 1):
+                    ab_pipeline.consumer_release(ab_release_state)
 
                 # Broadcast layout: ((2,2,16), MMA_M, MMA_N) -> offset = b + 2*m
                 # b chooses scale_a_0 vs scale_a_1 within an atom; m chooses the atom.
@@ -1345,7 +1343,6 @@ class GemmSm90(GemmTmaBase):
             ab_read_state.advance()
 
             ab_release_state.advance()
-
         return ab_read_state
 
     def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s):
