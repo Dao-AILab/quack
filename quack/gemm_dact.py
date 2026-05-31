@@ -43,8 +43,8 @@ class GemmDActMixin(GemmActMixin):
     # Different from GemmActSm90, here act_bwd_fn must take in 2 arguments (x, dout)
     # and return 2 arguments (dx, out)
     _epi_ops = (
-        Scalar("sr_seed", dtype=Int32),
         ColVecLoad("mColVecBroadcast"),
+        Scalar("sr_seed", dtype=Int32),
         TileStore("mAuxOut"),
         ColVecReduce("mColVecReduce"),
     )
@@ -67,11 +67,14 @@ class GemmDActMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        assert tRS_rC is not None
         tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
-        # We don't add C to the accumulator
-        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
+        assert tRS_rC is not None
+        if const_expr(tDrColVec is None and tDrColVecReduce is None):
+            GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
+        if const_expr(tDrColVecReduce is not None):
+            tRS_rD_raw = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
+            tRS_rD_raw.store(tRS_rD.load())
         tRS_rC_acc = cute.make_rmem_tensor_like(tRS_rC, self.acc_dtype)
         tRS_rC_acc.store(tRS_rC.load().to(self.acc_dtype))
         # If we don't have .shape here, the compiler generates local stores and loads
@@ -93,13 +96,12 @@ class GemmDActMixin(GemmActMixin):
             tRS_rAuxOut = tRS_rC_acc
         if const_expr(tDrColVecReduce is not None):
             # Accumulate unscaled postact * GEMM output for router-score gradients.
-            colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rAuxOut, rScale=tRS_rD)
+            colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rAuxOut, rScale=tRS_rD_raw)
         if const_expr(tDrColVec is not None):
             if const_expr(self.arch != 100):
-                tRS_rD.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
-                tRS_rAuxOut.store(
-                    tRS_rAuxOut.load() * tDrColVec.load().to(tRS_rAuxOut.element_type)
-                )
+                for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+                    tRS_rD[i] *= tDrColVec[i].to(tRS_rD.element_type)
+                    tRS_rAuxOut[i] *= tDrColVec[i].to(tRS_rAuxOut.element_type)
             else:
                 tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
                 tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
@@ -118,11 +120,7 @@ class GemmDActMixin(GemmActMixin):
                         )
                         tRS_rAuxOut_mn[m, 2 * n], tRS_rAuxOut_mn[m, 2 * n + 1] = (
                             cute.arch.mul_packed_f32x2(
-                                (
-                                    tRS_rAuxOut_mn[m, 2 * n],
-                                    tRS_rAuxOut_mn[m, 2 * n + 1],
-                                ),
-                                scale,
+                                (tRS_rAuxOut_mn[m, 2 * n], tRS_rAuxOut_mn[m, 2 * n + 1]), scale,
                             )
                         )
         return tRS_rAuxOut

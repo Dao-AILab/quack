@@ -40,8 +40,6 @@ from quack.gemm_interface import (
     gemm,
     gemm_act,
     gemm_act_tuned,
-    gemm_dact,
-    gemm_dact_tuned,
     gemm_dgated,
     gemm_dgated_tuned,
     gemm_tuned,
@@ -132,43 +130,6 @@ def _torch_dgated_act(dact_fn, x, w, preact):
     return dx, postact
 
 
-def _drelu(x):
-    return (x > 0).to(x.dtype), F.relu(x)
-
-
-def _drelu_sq(x):
-    relu_x = F.relu(x)
-    return 2.0 * relu_x, relu_x.square()
-
-
-def _dgelu_tanh_approx(x):
-    c1 = math.sqrt(2.0 / math.pi)
-    c2 = 0.044715
-    z = c1 * (x + c2 * x * x * x)
-    tanh_z = torch.tanh(z)
-    sech2_z = 1.0 - tanh_z * tanh_z
-    dz_dx = c1 * (1.0 + 3.0 * c2 * x * x)
-    postact = 0.5 * x * (1.0 + tanh_z)
-    dact = 0.5 * (1.0 + tanh_z) + 0.5 * x * sech2_z * dz_dx
-    return dact, postact
-
-
-def _torch_dact_act(dact_fn, x, w, preact):
-    """Reference: GEMM + activation backward over preact."""
-    dout = F.linear(x, w)
-    dact, postact = dact_fn(preact)
-    return dout * dact, postact
-
-
-_dact_act_fns = {
-    "silu": _dsilu_exp,
-    "silu-tanh": _dsilu_tanh,
-    "relu": _drelu,
-    "relu_sq": _drelu_sq,
-    "gelu_tanh_approx": _dgelu_tanh_approx,
-}
-
-
 _dgated_act_fns = {
     "swiglu": _dsilu_exp,
     "swiglu-tanh": _dsilu_tanh,
@@ -219,60 +180,6 @@ def benchmark_gemm_act(
         act_fn = act_to_pytorch_fn_map[activation]
         ref_fn = torch.compile(lambda: act_fn(F.linear(a, w)))
     ref_fn()  # compile warmup
-    ref_fn()
-    time.sleep(0.5)
-    ms_pt = do_bench(ref_fn, warmup=5, rep=repeats)
-    tf_pt = tflops(nflops, ms_pt)
-
-    print(f"  quack: {ms:.3f}ms  {tf:.1f} TFLOPS")
-    print(f"  cuBLAS + torch.compile: {ms_pt:.3f}ms  {tf_pt:.1f} TFLOPS")
-    print(f"  speedup: {ms_pt / ms:.2f}x")
-    return ms, tf
-
-
-def benchmark_gemm_dact(
-    m,
-    n,
-    k,
-    activation="gelu_tanh_approx",
-    dtype=torch.bfloat16,
-    repeats=30,
-    tuned=True,
-    config=None,
-):
-    """Benchmark fused GEMM + activation backward."""
-    a = torch.randn(m, k, device="cuda", dtype=dtype)
-    b = torch.randn(k, n, device="cuda", dtype=dtype) / math.sqrt(k)
-    preact = torch.randn(m, n, device="cuda", dtype=dtype)
-    nflops = 2 * m * n * k
-
-    if config is None:
-        fn = lambda: gemm_dact(a, b, preact, activation=activation, out_dtype=dtype, tuned=tuned)
-    else:
-        dx_out = torch.empty(m, n, device="cuda", dtype=dtype)
-        postact_out = torch.empty(m, n, device="cuda", dtype=preact.dtype)
-        fn = lambda: gemm_dact_tuned.fn(
-            a,
-            b,
-            preact,
-            dx_out,
-            postact_out,
-            None,
-            activation,
-            False,
-            None,
-            None,
-            True,
-            config=config,
-        )
-    fn()  # warmup / autotune
-    time.sleep(0.5)
-    ms = do_bench(fn, warmup=5, rep=repeats)
-    tf = tflops(nflops, ms)
-
-    w = b.T.contiguous()
-    ref_fn = torch.compile(lambda: _torch_dact_act(_dact_act_fns[activation], a, w, preact))
-    ref_fn()
     ref_fn()
     time.sleep(0.5)
     ms_pt = do_bench(ref_fn, warmup=5, rep=repeats)
@@ -381,17 +288,6 @@ def main():
         help="Only run the transformer FFN gated backward GEMM benchmark",
     )
     parser.add_argument(
-        "--only-dact",
-        action="store_true",
-        help="Only run the GEMM activation backward benchmark",
-    )
-    parser.add_argument(
-        "--dact-activation",
-        choices=sorted(_dact_act_fns),
-        default=None,
-        help="Restrict the activation backward benchmark to one activation",
-    )
-    parser.add_argument(
         "--dgated-activation",
         choices=sorted(_dgated_act_fns),
         default=None,
@@ -436,19 +332,11 @@ def main():
             "swiglu-tanh",
         ]
     )
-    dact_activations = (
-        [args.dact_activation]
-        if args.dact_activation
-        else [
-            "gelu_tanh_approx",
-            "relu",
-        ]
-    )
     forced_config = forced_config_from_args(args)
     ffn = int(args.dim * 3.5)  # Llama-3 ratio
 
-    if sum([args.only_gated, args.only_dgated, args.only_dact]) > 1:
-        raise ValueError("--only-gated, --only-dgated, and --only-dact are mutually exclusive")
+    if args.only_gated and args.only_dgated:
+        raise ValueError("--only-gated and --only-dgated are mutually exclusive")
 
     if args.only_gated:
         print(
@@ -465,27 +353,6 @@ def main():
                 args.batch,
                 ffn,
                 args.dim,
-                activation,
-                dtype,
-                repeats=args.repeats,
-                tuned=not args.untuned and forced_config is None,
-                config=forced_config,
-            )
-        return
-
-    if args.only_dact:
-        print(
-            f"GEMM activation backward benchmark  (workers={os.environ.get('QUACK_COMPILE_WORKERS', '4')})"
-        )
-        print(f"  M={M}, N={N}, K={K}, dtype={args.dtype}")
-        if forced_config is not None:
-            print(f"  forced config: {forced_config}")
-        for activation in dact_activations:
-            print(f"\n  d{activation}: ({M}, {K}) x ({K}, {N})")
-            benchmark_gemm_dact(
-                M,
-                N,
-                K,
                 activation,
                 dtype,
                 repeats=args.repeats,
@@ -546,23 +413,7 @@ def main():
     )
     print()
 
-    # --- 3. GEMM + activation backward ---
-    print("=" * 60)
-    print(f"GEMM + dGeLU: ({M}, {K}) x ({K}, {N})")
-    print("=" * 60)
-    benchmark_gemm_dact(
-        M,
-        N,
-        K,
-        "gelu_tanh_approx",
-        dtype,
-        repeats=args.repeats,
-        tuned=not args.untuned and forced_config is None,
-        config=forced_config,
-    )
-    print()
-
-    # --- 4. Transformer-relevant shapes ---
+    # --- 3. Transformer-relevant shapes ---
     batch = args.batch
     dim = args.dim
     head_dim = 128

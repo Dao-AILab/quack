@@ -394,6 +394,7 @@ def gemm_act_tuned(
 
 
 def prune_invalid_gemm_dact_configs(configs, named_args: dict, **kwargs):
+    # gemm_dact and gemm_dgated share this colvec scale/reduce layout restriction.
     kwargs = named_args | kwargs
     if kwargs.get("colvec_scale", None) is not None or kwargs.get("colvec_reduce", False):
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
@@ -1194,44 +1195,25 @@ def gemm_dact(
             colvec_shape = (*out_shape[:-1],)
             results.append(torch.zeros(colvec_shape, dtype=torch.float32, device=A.device))
         return tuple(results)
-    if is_dgated:
-        colvec_reduce_final = gemm_dgated_out(
-            A,
-            B,
-            PreAct,
-            dx_out,
-            postact_out,
-            colvec_scale,
-            activation,
-            colvec_reduce,
-            cu_seqlens_m,
-            A_idx,
-            dynamic_scheduler,
-            tuned,
-        )
-        results = [dx_out, postact_out]
-        if colvec_reduce:
-            results.append(colvec_reduce_final)
-        return tuple(results)
-    else:
-        colvec_reduce_final = gemm_dact_out(
-            A,
-            B,
-            PreAct,
-            dx_out,
-            postact_out,
-            colvec_scale,
-            activation,
-            colvec_reduce,
-            cu_seqlens_m,
-            A_idx,
-            dynamic_scheduler,
-            tuned,
-        )
-        results = [dx_out, postact_out]
-        if colvec_reduce:
-            results.append(colvec_reduce_final)
-        return tuple(results)
+    dact_out_fn = gemm_dgated_out if is_dgated else gemm_dact_out
+    colvec_reduce_final = dact_out_fn(
+        A,
+        B,
+        PreAct,
+        dx_out,
+        postact_out,
+        colvec_scale,
+        activation,
+        colvec_reduce,
+        cu_seqlens_m,
+        A_idx,
+        dynamic_scheduler,
+        tuned,
+    )
+    results = [dx_out, postact_out]
+    if colvec_reduce:
+        results.append(colvec_reduce_final)
+    return tuple(results)
 
 
 gemm_dgated = gemm_dact
@@ -1256,22 +1238,10 @@ def gemm_dact_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-) -> Tensor:
+    ) -> Tensor:
     """GEMM with activation gradient and pre-allocated output tensors."""
     fn = gemm_dact_tuned if tuned else partial(gemm_dact_tuned.fn, config=None)
-    result = fn(
-        A,
-        B,
-        PreAct,
-        dx_out,
-        postact_out,
-        colvec_scale,
-        activation,
-        colvec_reduce,
-        cu_seqlens_m,
-        A_idx,
-        dynamic_scheduler,
-    )
+    result = fn(A, B, PreAct, dx_out, postact_out, colvec_scale, activation, colvec_reduce, cu_seqlens_m, A_idx, dynamic_scheduler)
     if result is None:
         return torch.empty(0, device=A.device, dtype=torch.float32)
     return result
@@ -1522,18 +1492,10 @@ def gemm_gated_tuned(
     )
 
 
-def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
-    kwargs = named_args | kwargs
-    # if there's colvec_scale or colvec_reduce, don't swap_AB
-    if kwargs.get("colvec_scale", None) is not None or kwargs.get("colvec_reduce", False):
-        configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
-    return prune_invalid_gemm_configs(configs, named_args, **kwargs)
-
-
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs("dgated")],
     key=["activation", "colvec_reduce", "dynamic_scheduler"],
-    prune_configs_by={"early_config_prune": prune_invalid_gemm_dgated_configs},
+    prune_configs_by={"early_config_prune": prune_invalid_gemm_dact_configs},
 )
 def gemm_dgated_tuned(
     # (M, K) or or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1550,7 +1512,7 @@ def gemm_dgated_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     config: Optional[GemmConfig] = None,
-) -> Optional[Tensor]:
+    ) -> Tensor:
     if config is None:
         config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
@@ -1887,7 +1849,7 @@ _register_precompile_fake(gemm_act_out, gemm_act_tuned)
 _register_precompile_fake(gemm_gated_out, gemm_gated_tuned)
 
 
-@gemm_dact_out.register_fake
+@torch.library.register_fake("quack::gemm_dact_out")
 def gemm_dact_out_fake(
     A: Tensor,
     B: Tensor,
@@ -1901,7 +1863,7 @@ def gemm_dact_out_fake(
     A_idx: Optional[Tensor] = None,
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-) -> Tensor:
+) -> Optional[Tensor]:
     _precompile_default_config(
         gemm_dact_tuned,
         A,
