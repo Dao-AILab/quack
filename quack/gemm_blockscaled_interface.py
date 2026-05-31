@@ -81,8 +81,8 @@ def default_config(device):
     cap = get_device_capacity(device)[0]
     if cap == 9:
         return GemmConfig(
-            tile_m=256,
-            tile_n=128,
+            tile_m=128,
+            tile_n=256,
             cluster_m=1,
             cluster_n=2,
             pingpong=False,

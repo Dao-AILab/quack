@@ -110,6 +110,12 @@ class GemmSm90(GemmTmaBase):
     EpilogueArguments = GemmTmaBase.EpilogueArguments
     EpilogueParams = GemmTmaBase.EpilogueParams
 
+    # Fixed upper bound (in floats) for the once-per-CTA SFB smem buffer staged
+    # for blockscaled (mxfp8) non-pingpong kernels. 512 floats = 2KB, covers K up
+    # to 64K with BLOCK_K=128. This is a fixed reservation (not per-stage), so it
+    # must be subtracted from the smem budget in _compute_stages.
+    SFB_SMEM_MAX = 512
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -197,6 +203,9 @@ class GemmSm90(GemmTmaBase):
                     atom_layout_m, atom_layout_n = 3, 1
                 else:
                     atom_layout_m, atom_layout_n = 1, 2
+            elif self.blockscaled and tile_N >= 256:
+                # we do this to keep the kernel simple
+                atom_layout_m, atom_layout_n = 1, 2
             else:
                 atom_layout_m = (
                     self.cta_tile_shape_mnk[0] // 64 if self.cta_tile_shape_mnk[0] < 256 else 2
@@ -237,7 +246,7 @@ class GemmSm90(GemmTmaBase):
         if self.fp8_slow_accum:
             if self.blockscaled:
                 assert tile_M % 128 == 0
-                if tile_M >= 256:
+                if tile_M >= 256 or tile_N >= 256:
                     regs_per_thread += regs_per_thread // 2
                     self.fp8_partial_acc = True
             else:
@@ -343,8 +352,12 @@ class GemmSm90(GemmTmaBase):
         # Compute stage before compute smem layout. SFA staging (mxfp8) needs
         # BLOCK_M * 4 extra bytes per stage so reduce ab_stage accordingly.
         sfa_bytes_per_stage = (
-            self.cta_tile_shape_mnk[0] * 4 if (self.blockscaled and not self.gather_A) else 0
+            math.prod(self.cta_tile_shape_mnk[:2]) * 4 // 128
+            if (self.blockscaled and not self.gather_A)
+            else 0
         )
+        # Fixed (once-per-CTA) SFB buffer; not staged, so reserve it up front.
+        sfb_fixed_bytes = self.SFB_SMEM_MAX * 4 if (self.blockscaled and not self.pingpong) else 0
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
             self.cta_tile_shape_mnk,
             self.epi_tile,
@@ -357,6 +370,7 @@ class GemmSm90(GemmTmaBase):
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
             sfa_bytes_per_stage=sfa_bytes_per_stage,
+            sfb_fixed_bytes=sfb_fixed_bytes,
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -469,7 +483,7 @@ class GemmSm90(GemmTmaBase):
             tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
                 mSFA,
                 sfa_smem_layout,
-                (self.cta_tile_shape_mnk[0], 1),
+                (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1] // 128),
                 self.cluster_shape_mnk[1],
             )
             self.num_tma_load_bytes += cute.size_in_bytes(Float32, sfa_smem_layout)
@@ -507,11 +521,10 @@ class GemmSm90(GemmTmaBase):
             if (self.blockscaled and not self.gather_A)
             else 0
         )
-        # Fixed upper bound: 512 floats = 2KB. Covers K up to 64K with BLOCK_K=128.
-        # Used to stage mSFB into smem once per output block (DeepGEMM-style),
-        # eliminating the per-k_tile gmem dependency on the wgmma issue path.
-        SFB_SMEM_MAX = 512
-        sfb_smem_size = SFB_SMEM_MAX if (self.blockscaled and not self.pingpong) else 0
+        # Fixed buffer staged once per output block (DeepGEMM-style), eliminating
+        # the per-k_tile gmem dependency on the wgmma issue path. Size reserved in
+        # _compute_stages via sfb_fixed_bytes so ab_stage leaves room for it.
+        sfb_smem_size = self.SFB_SMEM_MAX if (self.blockscaled and not self.pingpong) else 0
 
         @cute.struct
         class SharedStorage:
@@ -550,6 +563,37 @@ class GemmSm90(GemmTmaBase):
             ]
 
         self.shared_storage = SharedStorage
+
+        # --- Shared memory usage breakdown (per field, from real struct layout) ---
+        # _offsets gives each field's byte offset; the span to the next offset
+        # (or total size for the last field) is the true footprint *including*
+        # any alignment padding inserted before the next aligned field.
+        offsets = self.shared_storage._offsets
+        total = self.shared_storage.size_in_bytes()
+        names = list(offsets.keys())
+        starts = [offsets[n] for n in names]
+        bounds = starts + [total]
+        print("=== SharedStorage breakdown ===")
+        accounted = 0
+        for i, name in enumerate(names):
+            span = bounds[i + 1] - starts[i]
+            accounted += span
+            print(f"  {name:<26} {span:>8} B  ({span / 1024:6.2f} KB)  @ off {starts[i]}")
+        print(f"  {'TOTAL (size_in_bytes)':<26} {total:>8} B  ({total / 1024:6.2f} KB)")
+        # H100/SM90 opt-in dynamic shared memory cap. Requesting more makes
+        # cudaFuncSetAttribute / the launch return cudaErrorInvalidValue.
+        SMEM_OPTIN_MAX = 232448
+        tile = self.cta_tile_shape_mnk
+        if const_expr(total > SMEM_OPTIN_MAX):
+            print(
+                f"  !! OVER SMEM LIMIT by {total - SMEM_OPTIN_MAX} B "
+                f"(cta_tile_mnk={tile}, cap={SMEM_OPTIN_MAX} B / 227 KB)"
+            )
+        else:
+            print(
+                f"  OK: {SMEM_OPTIN_MAX - total} B headroom "
+                f"(cta_tile_mnk={tile}, cap={SMEM_OPTIN_MAX} B / 227 KB)"
+            )
 
         # Launch the kernel synchronously
         self.kernel(
@@ -816,7 +860,7 @@ class GemmSm90(GemmTmaBase):
                             mSFA_mk = mSFA[None, None, batch_idx]
                         gSFA_mk = cute.local_tile(
                             mSFA_mk,
-                            (self.cta_tile_shape_mnk[0], 1),
+                            (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1] // 128),
                             (tile_coord_mnkl[0], None),
                         )
                         copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
@@ -889,6 +933,7 @@ class GemmSm90(GemmTmaBase):
             if const_expr(self.fp8_slow_accum):
                 acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
                 if const_expr(self.fp8_partial_acc):
+                    print(acc.shape)
                     partial_acc_shape = (acc.shape[0], acc.shape[1] // 2, acc.shape[2])
                     acc_slow = cute.make_rmem_tensor(partial_acc_shape, self.acc_dtype)
 
@@ -1470,6 +1515,7 @@ class GemmSm90(GemmTmaBase):
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
         sfa_bytes_per_stage: int = 0,
+        sfb_fixed_bytes: int = 0,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1515,7 +1561,9 @@ class GemmSm90(GemmTmaBase):
         )
         mbar_helpers_bytes = 1024
 
-        remaining_bytes = smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes
+        remaining_bytes = (
+            smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes - sfb_fixed_bytes
+        )
         ab_stage = remaining_bytes // ab_bytes_per_stage
 
         # Refine epilogue stages:
@@ -1659,9 +1707,12 @@ class GemmSm90(GemmTmaBase):
         sfa_smem_layout_staged = None
         if sfa_staged:
             BM = cta_tile_shape_mnk[0]
+            N = cta_tile_shape_mnk[1]
+            assert N % 128 == 0
+            BN = N // 128
             sfa_smem_layout_staged = cute.make_layout(
-                (BM, 1, ab_stage),
-                stride=(1, BM, BM),
+                (BM, BN, ab_stage),
+                stride=(1, BM, BM * BN),
             )
 
         return (
