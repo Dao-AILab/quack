@@ -71,7 +71,9 @@ class GemmDActMixin(GemmActMixin):
         tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         assert tRS_rC is not None
         if const_expr(tDrColVec is None and tDrColVecReduce is None):
-            GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
+            GemmDefaultEpiMixin.epi_visit_subtile(
+                self, params, epi_loop_tensors, tRS_rD, tRS_rC=None
+            )
         if const_expr(tDrColVecReduce is not None):
             tRS_rD_raw = cute.make_rmem_tensor_like(tRS_rD, self.acc_dtype)
             tRS_rD_raw.store(tRS_rD.load())
@@ -113,14 +115,13 @@ class GemmDActMixin(GemmActMixin):
                         cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
                     ):
                         scale = (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0])
-                        tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1] = (
-                            cute.arch.mul_packed_f32x2(
-                                (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]), scale
-                            )
+                        tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1] = cute.arch.mul_packed_f32x2(
+                            (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]), scale
                         )
                         tRS_rAuxOut_mn[m, 2 * n], tRS_rAuxOut_mn[m, 2 * n + 1] = (
                             cute.arch.mul_packed_f32x2(
-                                (tRS_rAuxOut_mn[m, 2 * n], tRS_rAuxOut_mn[m, 2 * n + 1]), scale,
+                                (tRS_rAuxOut_mn[m, 2 * n], tRS_rAuxOut_mn[m, 2 * n + 1]),
+                                scale,
                             )
                         )
         return tRS_rAuxOut

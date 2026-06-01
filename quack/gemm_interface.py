@@ -1238,10 +1238,22 @@ def gemm_dact_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-    ) -> Tensor:
+) -> Tensor:
     """GEMM with activation gradient and pre-allocated output tensors."""
     fn = gemm_dact_tuned if tuned else partial(gemm_dact_tuned.fn, config=None)
-    result = fn(A, B, PreAct, dx_out, postact_out, colvec_scale, activation, colvec_reduce, cu_seqlens_m, A_idx, dynamic_scheduler)
+    result = fn(
+        A,
+        B,
+        PreAct,
+        dx_out,
+        postact_out,
+        colvec_scale,
+        activation,
+        colvec_reduce,
+        cu_seqlens_m,
+        A_idx,
+        dynamic_scheduler,
+    )
     if result is None:
         return torch.empty(0, device=A.device, dtype=torch.float32)
     return result
@@ -1512,7 +1524,7 @@ def gemm_dgated_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     config: Optional[GemmConfig] = None,
-    ) -> Tensor:
+) -> Tensor:
     if config is None:
         config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
