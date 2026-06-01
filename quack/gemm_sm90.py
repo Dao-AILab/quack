@@ -352,9 +352,7 @@ class GemmSm90(GemmTmaBase):
         # Compute stage before compute smem layout. SFA staging (mxfp8) needs
         # BLOCK_M * 4 extra bytes per stage so reduce ab_stage accordingly.
         sfa_bytes_per_stage = (
-            math.prod(self.cta_tile_shape_mnk[:2]) * 4 // 128
-            if (self.blockscaled and not self.gather_A)
-            else 0
+            self.cta_tile_shape_mnk[0] * 4 if (self.blockscaled and not self.gather_A) else 0
         )
         # Fixed (once-per-CTA) SFB buffer; not staged, so reserve it up front.
         sfb_fixed_bytes = self.SFB_SMEM_MAX * 4 if (self.blockscaled and not self.pingpong) else 0
@@ -483,7 +481,7 @@ class GemmSm90(GemmTmaBase):
             tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
                 mSFA,
                 sfa_smem_layout,
-                (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1] // 128),
+                (self.cta_tile_shape_mnk[0], 1),
                 self.cluster_shape_mnk[1],
             )
             self.num_tma_load_bytes += cute.size_in_bytes(Float32, sfa_smem_layout)
@@ -573,27 +571,27 @@ class GemmSm90(GemmTmaBase):
         names = list(offsets.keys())
         starts = [offsets[n] for n in names]
         bounds = starts + [total]
-        print("=== SharedStorage breakdown ===")
-        accounted = 0
-        for i, name in enumerate(names):
-            span = bounds[i + 1] - starts[i]
-            accounted += span
-            print(f"  {name:<26} {span:>8} B  ({span / 1024:6.2f} KB)  @ off {starts[i]}")
-        print(f"  {'TOTAL (size_in_bytes)':<26} {total:>8} B  ({total / 1024:6.2f} KB)")
-        # H100/SM90 opt-in dynamic shared memory cap. Requesting more makes
-        # cudaFuncSetAttribute / the launch return cudaErrorInvalidValue.
-        SMEM_OPTIN_MAX = 232448
-        tile = self.cta_tile_shape_mnk
-        if const_expr(total > SMEM_OPTIN_MAX):
-            print(
-                f"  !! OVER SMEM LIMIT by {total - SMEM_OPTIN_MAX} B "
-                f"(cta_tile_mnk={tile}, cap={SMEM_OPTIN_MAX} B / 227 KB)"
-            )
-        else:
-            print(
-                f"  OK: {SMEM_OPTIN_MAX - total} B headroom "
-                f"(cta_tile_mnk={tile}, cap={SMEM_OPTIN_MAX} B / 227 KB)"
-            )
+        # print("=== SharedStorage breakdown ===")
+        # accounted = 0
+        # for i, name in enumerate(names):
+        #     span = bounds[i + 1] - starts[i]
+        #     accounted += span
+        #     print(f"  {name:<26} {span:>8} B  ({span / 1024:6.2f} KB)  @ off {starts[i]}")
+        # print(f"  {'TOTAL (size_in_bytes)':<26} {total:>8} B  ({total / 1024:6.2f} KB)")
+        # # H100/SM90 opt-in dynamic shared memory cap. Requesting more makes
+        # # cudaFuncSetAttribute / the launch return cudaErrorInvalidValue.
+        # SMEM_OPTIN_MAX = 232448
+        # tile = self.cta_tile_shape_mnk
+        # if const_expr(total > SMEM_OPTIN_MAX):
+        #     print(
+        #         f"  !! OVER SMEM LIMIT by {total - SMEM_OPTIN_MAX} B "
+        #         f"(cta_tile_mnk={tile}, cap={SMEM_OPTIN_MAX} B / 227 KB)"
+        #     )
+        # else:
+        #     print(
+        #         f"  OK: {SMEM_OPTIN_MAX - total} B headroom "
+        #         f"(cta_tile_mnk={tile}, cap={SMEM_OPTIN_MAX} B / 227 KB)"
+        #     )
 
         # Launch the kernel synchronously
         self.kernel(
@@ -860,7 +858,7 @@ class GemmSm90(GemmTmaBase):
                             mSFA_mk = mSFA[None, None, batch_idx]
                         gSFA_mk = cute.local_tile(
                             mSFA_mk,
-                            (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1] // 128),
+                            (self.cta_tile_shape_mnk[0], 1),
                             (tile_coord_mnkl[0], None),
                         )
                         copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
@@ -933,7 +931,6 @@ class GemmSm90(GemmTmaBase):
             if const_expr(self.fp8_slow_accum):
                 acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
                 if const_expr(self.fp8_partial_acc):
-                    print(acc.shape)
                     partial_acc_shape = (acc.shape[0], acc.shape[1] // 2, acc.shape[2])
                     acc_slow = cute.make_rmem_tensor(partial_acc_shape, self.acc_dtype)
 
@@ -982,15 +979,15 @@ class GemmSm90(GemmTmaBase):
                 # Stage scale_b for this output block into smem (non-pingpong only).
                 # Math threads cooperatively load mSFB[batch, n_tile, 0..k_tile_cnt-1]
                 # into sSFB, then sync the math WGs via the epilogue_barrier (256 threads).
-                if const_expr(self.blockscaled and not self.pingpong):
-                    threads_per_math = self.mma_warp_groups * self.num_threads_per_warp_group
-                    # Each pass covers `threads_per_math` scales; 2 passes covers k_tile_cnt up to 512.
-                    NUM_SFB_PASSES = const_expr(512 // threads_per_math)
-                    for pass_idx in cutlass.range_constexpr(NUM_SFB_PASSES):
-                        kk = tidx + pass_idx * threads_per_math
-                        if kk < k_tile_cnt:
-                            sSFB[kk] = mSFB[batch_idx, tile_coord_mnkl[1], kk]
-                    self.epilogue_barrier.arrive_and_wait()
+                # if const_expr(self.blockscaled and not self.pingpong):
+                #     threads_per_math = self.mma_warp_groups * self.num_threads_per_warp_group
+                #     # Each pass covers `threads_per_math` scales; 2 passes covers k_tile_cnt up to 512.
+                #     NUM_SFB_PASSES = const_expr(512 // threads_per_math)
+                #     for pass_idx in cutlass.range_constexpr(NUM_SFB_PASSES):
+                #         kk = tidx + pass_idx * threads_per_math
+                #         if kk < k_tile_cnt:
+                #             sSFB[kk] = mSFB[batch_idx, tile_coord_mnkl[1], kk]
+                #     self.epilogue_barrier.arrive_and_wait()
                 tctx.b("mma")
                 if const_expr(self.blockscaled):
                     ab_read_state = self.mma_blockscaled(
@@ -1000,6 +997,7 @@ class GemmSm90(GemmTmaBase):
                         acc,
                         acc_slow,
                         tCrA,
+                        mSFB[batch_idx, None, None],
                         tile_coord_mnkl[1],
                         k_tile_cnt,
                         warp_group_idx,
@@ -1323,6 +1321,7 @@ class GemmSm90(GemmTmaBase):
         acc: cute.Tensor,
         acc_slow: cute.Tensor,
         tCrA: cute.Tensor,
+        mSFB_nk: cute.Tensor,
         n_tile_coord: Int32,
         k_tile_cnt: Int32,
         warp_group_idx: Int32,
@@ -1350,18 +1349,29 @@ class GemmSm90(GemmTmaBase):
 
         ab_release_state = ab_read_state.clone()
         acc.fill(0.0)
-        scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
+        NUM_N_FRAG = const_expr(acc_slow.shape[0][2])
+        scales = cute.make_rmem_tensor(cute.make_layout((2, NUM_N_FRAG)), acc.dtype)
+        scale_b = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
         for k_tile in cutlass.range(k_tile_cnt, unroll=8):
             peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
-            scale_b = sSFB[k_tile]
+            if const_expr(self.cta_tile_shape_mnk[1] <= 128):
+                scale_b[0] = mSFB_nk[n_tile_coord, k_tile]
+                scale_b[1] = scale_b[0]
+            else:
+                scale_b[0] = mSFB_nk[n_tile_coord * 2, k_tile]
+                scale_b[1] = mSFB_nk[n_tile_coord * 2 + 1, k_tile]
             ab_pipeline.consumer_wait(ab_read_state, peek_full)
             for m_idx in cutlass.range_constexpr(MMA_M):
                 curr_tCrA = layout_utils.expand(tCrA[None, m_idx, None, None], dim=1, size=1)
                 curr_acc = layout_utils.expand(acc[None, m_idx, None], dim=1, size=1)
                 m_off = Int32(m_idx * self.atom_layout_mnk[0] * wgmma_m)
                 stage = ab_read_state.index
-                scales[0] = sSFA[m0 + m_off, 0, stage] * scale_b
-                scales[1] = sSFA[m1 + m_off, 0, stage] * scale_b
+                scale_a0 = sSFA[m0 + m_off, 0, stage]
+                scale_a1 = sSFA[m1 + m_off, 0, stage]
+                for n_frag in cutlass.range_constexpr(NUM_N_FRAG):
+                    b_idx = const_expr(n_frag // (NUM_N_FRAG // 2))
+                    scales[0, n_frag] = scale_a0 * scale_b[b_idx]
+                    scales[1, n_frag] = scale_a1 * scale_b[b_idx]
                 mma_fn(
                     tCrA=curr_tCrA,
                     A_idx=stage,
@@ -1381,7 +1391,7 @@ class GemmSm90(GemmTmaBase):
                     scales.iterator,
                     cute.make_layout(
                         acc_slow.shape,
-                        stride=((0, 1, 0), 0, 0),
+                        stride=((0, 1, 2), 0, 0),
                     ),
                 )
                 curr_acc.store(curr_acc.load() + acc_slow.load() * scales_bcast.load())
@@ -1707,12 +1717,9 @@ class GemmSm90(GemmTmaBase):
         sfa_smem_layout_staged = None
         if sfa_staged:
             BM = cta_tile_shape_mnk[0]
-            N = cta_tile_shape_mnk[1]
-            assert N % 128 == 0
-            BN = N // 128
             sfa_smem_layout_staged = cute.make_layout(
-                (BM, BN, ab_stage),
-                stride=(1, BM, BM * BN),
+                (BM, 1, ab_stage),
+                stride=(1, BM, BM),
             )
 
         return (
