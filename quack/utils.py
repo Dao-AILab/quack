@@ -209,10 +209,11 @@ def make_vector(elem_type, *values, loc=None, ip=None):
     vec_ty = ir.VectorType.get([n], mlir_ty)
     vec = llvm.mlir_undef(vec_ty, loc=loc, ip=ip)
     for i, v in enumerate(values):
-        vec = vector.insertelement(
+        vec = vector.insert(
             elem_type(v).ir_value(loc=loc, ip=ip),
             vec,
-            position=_arith.constant(T.i32(), i, loc=loc, ip=ip),
+            dynamic_position=[],
+            static_position=[i],
             loc=loc,
             ip=ip,
         )
