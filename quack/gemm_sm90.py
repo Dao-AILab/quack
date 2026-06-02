@@ -203,9 +203,6 @@ class GemmSm90(GemmTmaBase):
                     atom_layout_m, atom_layout_n = 3, 1
                 else:
                     atom_layout_m, atom_layout_n = 1, 2
-            elif self.blockscaled and tile_N >= 256:
-                # we do this to keep the kernel simple
-                atom_layout_m, atom_layout_n = 1, 2
             else:
                 atom_layout_m = (
                     self.cta_tile_shape_mnk[0] // 64 if self.cta_tile_shape_mnk[0] < 256 else 2
@@ -283,6 +280,11 @@ class GemmSm90(GemmTmaBase):
 
     def _setup_tiled_mma(self):
         """Set up tiled MMA and tile K dimension. Override for different MMA types."""
+        tile_N = self.cta_tile_shape_mnk[1]
+        tiler_n = tile_N // self.atom_layout_mnk[1]
+        # a trick to reduce the number of registers
+        if tile_N == 256 and self.blockscaled:
+            tiler_n //= 2
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -290,7 +292,7 @@ class GemmSm90(GemmTmaBase):
             self.b_layout.sm90_mma_major_mode(),
             self.acc_dtype,
             self.atom_layout_mnk,
-            tiler_mn=(64, self.cta_tile_shape_mnk[1] // self.atom_layout_mnk[1]),
+            tiler_mn=(64, tiler_n),
         )
         if const_expr(self.atom_layout_mnk[1] > 1):
             # If N dimension is split among 2 WGs, we need to permute the N dimension so
@@ -931,7 +933,9 @@ class GemmSm90(GemmTmaBase):
             if const_expr(self.fp8_slow_accum):
                 acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
                 if const_expr(self.fp8_partial_acc):
-                    partial_acc_shape = (acc.shape[0], acc.shape[1] // 2, acc.shape[2])
+                    # Single (m, n) fragment of scratch, reused across all MMA_M * MMA_N
+                    # fragments in mma_blockscaled. This is the register-saving "partial acc".
+                    partial_acc_shape = (acc.shape[0], 1, 1)
                     acc_slow = cute.make_rmem_tensor(partial_acc_shape, self.acc_dtype)
 
             if const_expr(self.pingpong):
@@ -993,10 +997,11 @@ class GemmSm90(GemmTmaBase):
                     ab_read_state = self.mma_blockscaled(
                         ab_pipeline,
                         ab_read_state,
-                        partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc=acc_slow, tCrB=tCrB),
+                        partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc=acc_slow),
                         acc,
                         acc_slow,
                         tCrA,
+                        tCrB,
                         mSFB[batch_idx, None, None],
                         tile_coord_mnkl[1],
                         k_tile_cnt,
@@ -1321,6 +1326,7 @@ class GemmSm90(GemmTmaBase):
         acc: cute.Tensor,
         acc_slow: cute.Tensor,
         tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
         mSFB_nk: cute.Tensor,
         n_tile_coord: Int32,
         k_tile_cnt: Int32,
@@ -1336,9 +1342,8 @@ class GemmSm90(GemmTmaBase):
         # See: https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-register-fragment-wgmma-64n32
         thread_m_offset = Int32(16) * (tidx_wg // Int32(32)) + ((tidx_wg % Int32(32)) // Int32(4))
 
-        MMA_M = const_expr(acc.shape[1])
+        MMA_M, MMA_N = const_expr(acc.shape[1]), const_expr(acc.shape[0])
         # Sanity check that MMA_M of acc is the same as the MMA_M of tCrA
-        assert MMA_M == tCrA.shape[1]
         wgmma_m = const_expr(cute.size(self.tiled_mma.shape_mnk, mode=[0]))
         if const_expr(self.atom_layout_mnk[0] > 1 and not self.pingpong):
             wg_m_offset = warp_group_idx * Int32(wgmma_m)
@@ -1347,10 +1352,14 @@ class GemmSm90(GemmTmaBase):
         m0 = wg_m_offset + thread_m_offset
         m1 = wg_m_offset + thread_m_offset + Int32(8)
 
+        MMA_N = const_expr(acc.shape[2])
+        assert MMA_N == tCrB.shape[1]
+
         ab_release_state = ab_read_state.clone()
         acc.fill(0.0)
-        NUM_N_FRAG = const_expr(acc_slow.shape[0][2])
-        scales = cute.make_rmem_tensor(cute.make_layout((2, NUM_N_FRAG)), acc.dtype)
+        # scales holds the per-(m0, m1) row-pair scale for one (m, n) fragment.
+        scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
+        # scale_b[n] is the SFB scale for the n-th 128-wide N block of this CTA tile.
         scale_b = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
         for k_tile in cutlass.range(k_tile_cnt, unroll=8):
             peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
@@ -1361,42 +1370,41 @@ class GemmSm90(GemmTmaBase):
                 scale_b[0] = mSFB_nk[n_tile_coord * 2, k_tile]
                 scale_b[1] = mSFB_nk[n_tile_coord * 2 + 1, k_tile]
             ab_pipeline.consumer_wait(ab_read_state, peek_full)
+            stage = ab_read_state.index
             for m_idx in cutlass.range_constexpr(MMA_M):
-                curr_tCrA = layout_utils.expand(tCrA[None, m_idx, None, None], dim=1, size=1)
-                curr_acc = layout_utils.expand(acc[None, m_idx, None], dim=1, size=1)
                 m_off = Int32(m_idx * self.atom_layout_mnk[0] * wgmma_m)
-                stage = ab_read_state.index
                 scale_a0 = sSFA[m0 + m_off, 0, stage]
                 scale_a1 = sSFA[m1 + m_off, 0, stage]
-                for n_frag in cutlass.range_constexpr(NUM_N_FRAG):
-                    b_idx = const_expr(n_frag // (NUM_N_FRAG // 2))
-                    scales[0, n_frag] = scale_a0 * scale_b[b_idx]
-                    scales[1, n_frag] = scale_a1 * scale_b[b_idx]
-                mma_fn(
-                    tCrA=curr_tCrA,
-                    A_idx=stage,
-                    B_idx=stage,
-                    zero_init=True,
-                )
-                # Each m_idx iteration is one tiled-MMA step further down M.
-                # Stride = atom_layout_m * atom_m (= 2*64 = 128 for tile_m=256, atom_layout_m=2).
+                curr_tCrA = layout_utils.expand(tCrA[None, m_idx, None, None], dim=1, size=1)
+                for n_idx in cutlass.range_constexpr(MMA_N):
+                    curr_tCrB = layout_utils.expand(tCrB[None, n_idx, None, None], dim=1, size=1)
+                    # acc[m_idx, n_idx] reshaped to a single ((2,2,16),1,1) fragment.
+                    curr_acc = layout_utils.expand(
+                        layout_utils.expand(acc[None, m_idx, n_idx], dim=1, size=1),
+                        dim=2,
+                        size=1,
+                    )
+                    scales[0] = scale_a0 * scale_b[n_idx]
+                    scales[1] = scale_a1 * scale_b[n_idx]
+                    mma_fn(
+                        tCrA=curr_tCrA,
+                        tCrB=curr_tCrB,
+                        A_idx=stage,
+                        B_idx=stage,
+                        zero_init=True,
+                    )
+                    warpgroup.wait_group(0)
+                    if const_expr(m_idx == MMA_M - 1 and n_idx == MMA_N - 1):
+                        ab_pipeline.consumer_release(ab_release_state)
 
-                warpgroup.wait_group(0)
-                if const_expr(m_idx == MMA_M - 1):
-                    ab_pipeline.consumer_release(ab_release_state)
-
-                # Broadcast layout: ((2,2,16), MMA_M, MMA_N) -> offset = b + 2*m
-                # b chooses scale_a_0 vs scale_a_1 within an atom; m chooses the atom.
-                scales_bcast = cute.make_tensor(
-                    scales.iterator,
-                    cute.make_layout(
-                        acc_slow.shape,
-                        stride=((0, 1, 2), 0, 0),
-                    ),
-                )
-                curr_acc.store(curr_acc.load() + acc_slow.load() * scales_bcast.load())
+                    # Broadcast scales over the ((2,2,16),1,1) fragment: only the second
+                    # mode-0 axis (the m0/m1 row pair) selects scales[0] vs scales[1].
+                    scales_bcast = cute.make_tensor(
+                        scales.iterator,
+                        cute.make_layout(acc_slow.shape, stride=((0, 1, 0), 0, 0)),
+                    )
+                    curr_acc.store(curr_acc.load() + acc_slow.load() * scales_bcast.load())
             ab_read_state.advance()
-
             ab_release_state.advance()
         return ab_read_state
 

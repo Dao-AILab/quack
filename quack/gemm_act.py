@@ -90,16 +90,6 @@ class GemmActMixin(ComposableEpiMixin):
             return sm100_utils.get_smem_store_op(
                 self.aux_out_layout, self.aux_out_dtype, self.acc_dtype, tiled_copy_t2r
             )
-        elif (
-            self.arch == 90
-            and self.atom_layout_mnk[1] > 1
-            and self.cta_tile_shape_aux_out_mn[1] != self.cta_tile_shape_mnk[1]
-        ):
-            return cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                self.aux_out_dtype,
-                num_bits_per_copy=self.aux_out_dtype.width,
-            )
         else:
             return copy_utils.get_smem_store_atom(
                 self.aux_out_dtype,
@@ -134,13 +124,6 @@ class GemmActMixin(ComposableEpiMixin):
             params, tiled_copy_r2s, tiled_copy_t2r
         )
         tRS_sAuxOut = tiled_copy_aux_out_r2s.get_slice(tidx).partition_D(sAuxOut)
-        if const_expr(
-            self.arch == 90
-            and self.atom_layout_mnk[1] > 1
-            and self.cta_tile_shape_aux_out_mn[1] != self.cta_tile_shape_mnk[1]
-        ):
-            sAuxOut_store = layout_utils.permute_gated_sm90_postact_n(sAuxOut, 1)
-            tRS_sAuxOut = tiled_copy_aux_out_r2s.get_slice(tidx).partition_D(sAuxOut_store)
         batch_idx = tile_coord_mnkl[3]
         copy_aux_out, _, _ = self.epilog_gmem_copy_and_partition(
             params.tma_atom_mAuxOut,
