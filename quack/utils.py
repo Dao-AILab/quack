@@ -123,16 +123,6 @@ def store_shared_remote_x4(
 
 @dsl_user_op
 def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
-    if cutlass.const_expr(cutlass.CUDA_VERSION.major) == 12:
-        return Float32(
-            nvvm.fmin(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                loc=loc,
-                ip=ip,
-            )
-        )
     return Float32(
         nvvm.fmin(
             Float32(a).ir_value(loc=loc, ip=ip),
@@ -267,19 +257,9 @@ def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
 
 @dsl_user_op
 def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
-        return nvvm.atomicrmw(
-            res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
-    else:
-        # New API: infers result type automatically
-        return nvvm.atomicrmw(
-            op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
+    return nvvm.atomicrmw(
+        op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+    )
 
 
 @dsl_user_op
