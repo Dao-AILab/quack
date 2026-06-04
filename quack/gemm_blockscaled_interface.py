@@ -24,8 +24,11 @@ from torch import Tensor
 
 import cutlass
 
+from quack.activation import dgate_fn_map, gate_fn_map
 from quack.blockscaled_gemm_utils import (
     ceil_div,
+    compile_blockscaled_gemm_dgated_tvm_ffi,
+    compile_blockscaled_gemm_gated_tvm_ffi,
     compile_blockscaled_gemm_tvm_ffi,
     pack_scale_2d_to_blocked_contig,
     scale_blocked_for_cublas,
@@ -303,6 +306,165 @@ def mxfp8_gemm_cublas(
         out_dtype=out_dtype,
     )
     return out if was_2d else out.unsqueeze(0)
+
+
+# ---------------------------------------------------------------------------
+# Gated (SwiGLU/GeGLU) forward + backward — blockscaled MXFP8
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=64)
+def _compile_gated_cached(
+    m, n_full, k, l, mma_tiler_mn, cluster_shape_mn, activation, out_torch_dtype
+):
+    dev = torch.device("cuda")
+    n_out = n_full // 2
+    rm, rn = ceil_div(m, 128), ceil_div(n_full, 128)
+    rk = ceil_div(k // _SF_VEC_SIZE, 4)
+    fake_mA = torch.empty(l, m, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
+    fake_mB = torch.empty(l, n_full, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
+    fake_aux = torch.empty(l, m, n_out, dtype=out_torch_dtype, device=dev).permute(1, 2, 0)
+    fake_sc_A = torch.empty(l, rm, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
+    fake_sc_B = torch.empty(l, rn, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
+    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE, l)
+    fake_mSFB = scale_view_for_kernel(fake_sc_B, n_full, k // _SF_VEC_SIZE, l)
+    return compile_blockscaled_gemm_gated_tvm_ffi(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        _SF_VEC_SIZE,
+        _TORCH_TO_CUTLASS_D[out_torch_dtype],
+        activation,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        fake_mA,
+        fake_mB,
+        fake_mSFA,
+        fake_mSFB,
+        fake_aux,
+    )
+
+
+def mxfp8_gemm_gated(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    activation: str,
+    out: Optional[Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    *,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+) -> Tensor:
+    assert activation in gate_fn_map, f"unknown gate activation {activation!r}"
+    m, n_full, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(
+        A, B, A_scale, B_scale
+    )
+    assert n_full % 2 == 0, f"fused N ({n_full}) must be even"
+    n_out = n_full // 2
+    assert out_dtype in _TORCH_TO_CUTLASS_D, f"unsupported out dtype: {out_dtype}"
+    if out is None:
+        out = torch.empty((m, n_out) if was_2d else (l, m, n_out), dtype=out_dtype, device=A.device)
+    else:
+        assert out.dtype in _TORCH_TO_CUTLASS_D, f"unsupported out dtype: {out.dtype}"
+    assert out.is_contiguous(), "out must be contiguous"
+    out_3d = out.unsqueeze(0) if was_2d else out  # (l, m, n_out)
+    mAuxOut = out_3d.permute(1, 2, 0)  # (m, n_out, l), N-major
+
+    if mma_tiler_mn is None or cluster_shape_mn is None:
+        tlr, clu = _default_tiler_cluster(m, n_full)
+        mma_tiler_mn = mma_tiler_mn or tlr
+        cluster_shape_mn = cluster_shape_mn or clu
+    runner = _compile_gated_cached(
+        m, n_full, k, l, mma_tiler_mn, cluster_shape_mn, activation, out.dtype
+    )
+    runner(mA, mB, sfa, sfb, mAuxOut)
+    return out
+
+
+@lru_cache(maxsize=64)
+def _compile_dgated_cached(
+    m, n, k, l, mma_tiler_mn, cluster_shape_mn, activation, postact_torch_dtype
+):
+    dev = torch.device("cuda")
+    rm, rn = ceil_div(m, 128), ceil_div(n, 128)
+    rk = ceil_div(k // _SF_VEC_SIZE, 4)
+    fake_mA = torch.empty(l, m, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
+    fake_mB = torch.empty(l, n, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
+    # C (PreAct) / D (dPreAct) are (l, m, 2n) 16-bit, viewed as (l, m, n) f32, N-major.
+    fake_C = torch.empty(l, m, 2 * n, dtype=postact_torch_dtype, device=dev)
+    fake_D = torch.empty(l, m, 2 * n, dtype=postact_torch_dtype, device=dev)
+    fake_C = fake_C.view(torch.float32).permute(1, 2, 0)
+    fake_D = fake_D.view(torch.float32).permute(1, 2, 0)
+    fake_aux = torch.empty(l, m, n, dtype=postact_torch_dtype, device=dev).permute(1, 2, 0)
+    fake_sc_A = torch.empty(l, rm, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
+    fake_sc_B = torch.empty(l, rn, rk, 512, dtype=torch.float8_e8m0fnu, device=dev)
+    fake_mSFA = scale_view_for_kernel(fake_sc_A, m, k // _SF_VEC_SIZE, l)
+    fake_mSFB = scale_view_for_kernel(fake_sc_B, n, k // _SF_VEC_SIZE, l)
+    sf_dtype_d = _TORCH_TO_CUTLASS_D[postact_torch_dtype]
+    return compile_blockscaled_gemm_dgated_tvm_ffi(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        _SF_VEC_SIZE,
+        sf_dtype_d,  # implicit_dtype (the 16-bit packed element)
+        sf_dtype_d,  # postact_dtype
+        activation,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        fake_mA,
+        fake_mB,
+        fake_C,
+        fake_D,
+        fake_mSFA,
+        fake_mSFB,
+        fake_aux,
+    )
+
+
+def mxfp8_gemm_dgated(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    PreAct: Tensor,
+    activation: str,
+    dPreAct: Optional[Tensor] = None,
+    PostAct: Optional[Tensor] = None,
+    *,
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+) -> Tuple[Tensor, Tensor]:
+    assert activation in dgate_fn_map, f"unknown dgate activation {activation!r}"
+    m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
+    assert PreAct.dtype in _TORCH_TO_CUTLASS_D and PreAct.element_size() == 2, (
+        f"PreAct must be bf16/fp16, got {PreAct.dtype}"
+    )
+    PreAct3 = _as_3d(PreAct, PreAct.dim())  # (l, m, 2n)
+    assert tuple(PreAct3.shape) == (l, m, 2 * n), (
+        f"PreAct shape: expected (l={l}, m={m}, 2n={2 * n}), got {tuple(PreAct3.shape)}"
+    )
+    assert PreAct3.is_contiguous(), "PreAct must be contiguous (row-major)"
+
+    if dPreAct is None:
+        dPreAct = torch.empty_like(PreAct)
+    if PostAct is None:
+        PostAct = torch.empty((m, n) if was_2d else (l, m, n), dtype=PreAct.dtype, device=A.device)
+    dPreAct3 = _as_3d(dPreAct, dPreAct.dim())
+    PostAct3 = _as_3d(PostAct, PostAct.dim())
+    assert dPreAct3.is_contiguous() and PostAct3.is_contiguous()
+
+    # 16-bit (l, m, 2n) -> f32 (l, m, n) -> (m, n, l) N-major view (no copy).
+    mC = PreAct3.view(torch.float32).permute(1, 2, 0)
+    mD = dPreAct3.view(torch.float32).permute(1, 2, 0)
+    mAuxOut = PostAct3.permute(1, 2, 0)  # (m, n, l) N-major
+
+    if mma_tiler_mn is None or cluster_shape_mn is None:
+        tlr, clu = _default_tiler_cluster(m, n)
+        mma_tiler_mn = mma_tiler_mn or tlr
+        cluster_shape_mn = cluster_shape_mn or clu
+    runner = _compile_dgated_cached(
+        m, n, k, l, mma_tiler_mn, cluster_shape_mn, activation, PreAct.dtype
+    )
+    runner(mA, mB, mC, mD, sfa, sfb, mAuxOut)
+    return dPreAct, PostAct
 
 
 def mxfp8_gemm_ref(

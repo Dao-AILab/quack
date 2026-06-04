@@ -233,6 +233,10 @@ class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
     pass
 
 
+class GemmDGatedBlockscaledSm100(GemmDGatedSm100):
+    pass
+
+
 class GemmDGatedSm120(GemmDGatedMixin, GemmSm120):
     pass
 
