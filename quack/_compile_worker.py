@@ -167,8 +167,14 @@ def main():
                     fake_args.append(_make_fake_tensor(meta))
                 else:
                     fake_args.append(meta)
+            fake_kwargs = {}
+            for k, v in kwargs.items():
+                if isinstance(v, dict) and "shape" in v:
+                    fake_kwargs[k] = _make_fake_tensor(v)
+                else:
+                    fake_kwargs[k] = v
             try:
-                fn(*fake_args, **kwargs, **config_kwargs)
+                fn(*fake_args, **fake_kwargs, **config_kwargs)
                 _send(stdout, "OK")
             except Exception as e:
                 _send(stdout, f"ERR:{e}")
