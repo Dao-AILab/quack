@@ -115,10 +115,11 @@ class GemmActMixin(ComposableEpiMixin):
     ):
         """Setup aux output TMA copies and partitions before the epilogue loop.
 
-        Returns None when mAuxOut wasn't supplied so the framework skips the aux-out path.
+        Returns an empty tuple when mAuxOut wasn't supplied so the framework
+        skips the aux-out path.
         """
         if getattr(params, "mAuxOut", None) is None:
-            return None
+            return ()
         sAuxOut = epi_smem_tensors["mAuxOut"]
         tiled_copy_aux_out_r2s = self.epi_make_aux_out_tiled_copy_r2s(
             params, tiled_copy_r2s, tiled_copy_t2r
@@ -133,11 +134,18 @@ class GemmActMixin(ComposableEpiMixin):
             sAuxOut,
             tile_coord_mnkl,
         )
-        return tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out
+        return ((tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out),)
 
     @cute.jit
     def epi_convert_aux_out(
-        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        self,
+        output_idx: cutlass.Constexpr[int],
+        tRS_rAuxOut,
+        sr_seed,
+        tidx,
+        tile_coord_mnkl,
+        num_prev_subtiles,
+        epi_idx,
     ):
         """Convert aux output from acc_dtype to aux_out_dtype. Override for custom postprocessing."""
         if const_expr(
@@ -164,7 +172,7 @@ class GemmActMixin(ComposableEpiMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         # Apply activation function if provided
         # If we don't have .shape here, the compiler generates local stores and loads
@@ -180,7 +188,7 @@ class GemmActMixin(ComposableEpiMixin):
                     )
         else:
             tRS_rAuxOut = tRS_rD
-        return tRS_rAuxOut
+        return (tRS_rAuxOut,)
 
 
 class GemmActSm90(GemmActMixin, GemmSm90):
@@ -249,7 +257,7 @@ class GemmGatedMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         # If we don't have .shape here, the compiler generates local stores and loads
@@ -262,14 +270,28 @@ class GemmGatedMixin(GemmActMixin):
                 tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
                 )
-        return tRS_rAuxOut
+        return (tRS_rAuxOut,)
 
     @cute.jit
     def epi_convert_aux_out(
-        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        self,
+        output_idx: cutlass.Constexpr[int],
+        tRS_rAuxOut,
+        sr_seed,
+        tidx,
+        tile_coord_mnkl,
+        num_prev_subtiles,
+        epi_idx,
     ):
         tRS_rAuxOut_out = GemmActMixin.epi_convert_aux_out(
-            self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+            self,
+            output_idx,
+            tRS_rAuxOut,
+            sr_seed,
+            tidx,
+            tile_coord_mnkl,
+            num_prev_subtiles,
+            epi_idx,
         )
         if const_expr(self.arch in (90, 120)):
             # Only need this if we're using STSM
