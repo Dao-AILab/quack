@@ -617,9 +617,9 @@ def _compile_blockscaled_gemm_sm120(
 
     SM120 uses CTA tile (128, 128, 128) with epi (128, 128) and cluster (1, 1);
     the requested mma_tiler_mn / cluster_shape_mn hints are mapped onto that.
-    Only dense, K-major MXFP8 (e4m3/e5m2 + e8m0 scales, sf_vec=32) with
-    f16/bf16 output is supported; FP4/NVFP4/mixed, f32 output, non-K-major
-    operands, and varlen remain SM100/SM110-only (tcgen05/TMEM).
+    Supports dense, K-major, same-dtype MXFP8 / MXFP4 / NVFP4 with f16/bf16/f32
+    output. Mixed FP4xFP8, non-K-major operands, and varlen remain
+    SM100/SM110-only (tcgen05/TMEM).
     """
     if varlen_m or varlen_k:
         raise NotImplementedError("SM120 block-scaled GEMM does not support varlen yet")
@@ -636,10 +636,9 @@ def _compile_blockscaled_gemm_sm120(
             f"SM120 block-scaled GEMM supports same-dtype MXFP8/MXFP4/NVFP4 "
             f"(e4m3/e5m2/e2m1), got ab_dtype={ab_dtype}. Mixed FP4xFP8 not yet wired."
         )
-    if d_dtype not in (cutlass.Float16, cutlass.BFloat16):
+    if d_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
         raise NotImplementedError(
-            f"SM120 block-scaled GEMM epilogue requires Float16/BFloat16 output "
-            f"(f32 output is unsupported by the geforce kernel), got {d_dtype}."
+            f"SM120 block-scaled GEMM supports Float16/BFloat16/Float32 output, got {d_dtype}."
         )
     # A and B must be K-major: the K axis (mode 1 of the (mn, k, l) operand)
     # must vary faster than the MN axis (mode 0). For l>1 FP4 the innermost

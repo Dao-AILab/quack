@@ -810,12 +810,19 @@ class Sm120BlockScaledGemmKernel:
                     elem_ty_acc=self.acc_dtype,
                 )
 
+                # copy_atom_C only defines the register->smem TILING GEOMETRY
+                # (via make_tiled_copy_C_atom); the actual element store is done
+                # by copy_atom_r2s. Build it from Float16 (as in gemm_sm90) so
+                # the StMatrix source layout is used for ALL output dtypes; the
+                # geometry is dtype-independent and the real copy uses
+                # copy_atom_r2s, which sm120_get_smem_store_op picks correctly
+                # (StMatrix for 16-bit, universal copy for f32).
                 copy_atom_C = cute.make_copy_atom(
                     cute.nvgpu.warp.StMatrix8x8x16bOp(
                         self.c_layout.is_m_major_c(),
                         2,
                     ),
-                    self.c_dtype,
+                    cutlass.Float16,
                 )
 
                 tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
