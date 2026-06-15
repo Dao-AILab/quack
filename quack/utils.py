@@ -249,16 +249,12 @@ def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
 
 @dsl_user_op
 def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(
-        op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-    )   
+    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
 
 
 @dsl_user_op
 def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(
-        op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-    )
+    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
 
 
 @dsl_user_op
