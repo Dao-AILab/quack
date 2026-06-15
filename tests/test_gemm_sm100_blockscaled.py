@@ -31,9 +31,10 @@ def _is_sm120():
 def _skip_if_sm120_unsupported(
     ab_dtype=None, d_dtype=None, a_major="k", b_major="k", varlen=False
 ):
-    """SM120 block-scaled GEMM capability boundary: dense, K-major MXFP8
-    (e4m3/e5m2) with f16/bf16 output. FP4/NVFP4/mixed, f32 output, non-K-major
-    operands, and varlen are SM100/SM110-only (tcgen05) for now."""
+    """SM120 block-scaled GEMM capability boundary: dense, K-major, same-dtype
+    MXFP8/MXFP4/NVFP4 with f16/bf16 output. Float32 output (unsupported even by
+    the geforce reference kernel), non-K-major operands, mixed FP4xFP8, and
+    varlen are SM100/SM110-only (tcgen05) for now."""
     if not _is_sm120():
         return
     if varlen:
@@ -41,10 +42,11 @@ def _skip_if_sm120_unsupported(
     if ab_dtype is not None and ab_dtype not in (
         cutlass.Float8E4M3FN,
         cutlass.Float8E5M2,
+        cutlass.Float4E2M1FN,
     ):
-        pytest.skip("SM120 block-scaled GEMM supports MXFP8 only (no FP4/NVFP4/mixed yet)")
+        pytest.skip("SM120 block-scaled GEMM supports same-dtype MXFP8/MXFP4/NVFP4 only")
     if d_dtype is not None and d_dtype not in (cutlass.Float16, cutlass.BFloat16):
-        pytest.skip("SM120 block-scaled GEMM epilogue requires f16/bf16 output")
+        pytest.skip("SM120 block-scaled GEMM requires f16/bf16 output (no f32 out)")
     if a_major != "k" or b_major != "k":
         pytest.skip("SM120 block-scaled GEMM requires K-major A and B")
 
@@ -462,6 +464,57 @@ def test_blockscaled_correctness(
     err = (d_torch.float() - ref).abs().max().item()
     tol = 5e-3 if d_dtype != cutlass.Float32 else 5e-4
     assert err < tol, f"max_err={err}"
+
+
+# ---------------------------------------------------------------------------
+# FP4 block-scaled (NVFP4 / MXFP4) with f16/bf16 output.
+#
+# The shared test_blockscaled_correctness FP4 cases all use Float32 output,
+# which the SM120 geforce kernel does not support (f32 out is unsupported even
+# in the NVIDIA reference). These cases exercise the FP4 input path on SM120
+# (and SM100/SM110) with the supported f16/bf16 output.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("d_dtype", [cutlass.BFloat16, cutlass.Float16])
+@pytest.mark.parametrize(
+    "sf_dtype,sf_vec_size",
+    [
+        (cutlass.Float8E8M0FNU, 32),  # MXFP4
+        (cutlass.Float8E4M3FN, 16),  # NVFP4
+    ],
+)
+@pytest.mark.parametrize("m,n,k,l", [(256, 256, 256, 1), (512, 512, 512, 1), (256, 384, 512, 1)])
+def test_blockscaled_fp4_f16out(m, n, k, l, sf_dtype, sf_vec_size, d_dtype):
+    # NOTE: l==1 only. QuACK's FP4 operand builder lays L innermost for l>1
+    # (packed float4_e2m1fn_x2 storage), which is not K-major; batched FP4 is a
+    # separate follow-up. l=1 is the common FP4 inference case.
+    _skip_if_not_sm100()
+    ab_dtype = cutlass.Float4E2M1FN
+    a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
+    b_ref, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype)
+    _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
+    sfa_ref, mSFA = create_blockscaled_scale_tensor(l, m, k, sf_vec_size, sf_dtype)
+    sfb_ref, mSFB = create_blockscaled_scale_tensor(l, n, k, sf_vec_size, sf_dtype)
+
+    runner = compile_blockscaled_gemm_tvm_ffi(
+        ab_dtype,
+        sf_dtype,
+        sf_vec_size,
+        d_dtype,
+        (128, 128),
+        (1, 1),
+        mA,
+        mB,
+        mD,
+        mSFA,
+        mSFB,
+    )
+    runner(mA, mB, mD, mSFA, mSFB)
+    torch.cuda.synchronize()
+
+    ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
+    err = (mD.float() - ref).abs().max().item()
+    rel = err / (ref.abs().max().item() + 1e-6)
+    assert rel < 5e-2, f"rel_err={rel} (max_abs={err})"
 
 
 # ---------------------------------------------------------------------------

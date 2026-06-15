@@ -623,24 +623,32 @@ def _compile_blockscaled_gemm_sm120(
     """
     if varlen_m or varlen_k:
         raise NotImplementedError("SM120 block-scaled GEMM does not support varlen yet")
-    # SM120 capability boundary (warp-level mma.sync.kind::mxf8f6f4 + ldmatrix,
-    # 16-bit STMatrix epilogue). Mirrors the NVIDIA geforce reference.
-    if ab_dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2):
+    # SM120 capability boundary (warp-level block-scaled MMA + ldmatrix, 16-bit
+    # STMatrix / universal-copy epilogue). Mirrors the NVIDIA geforce reference.
+    # Same-dtype A/B only (this interface passes one ab_dtype): MXFP8 (e4m3/e5m2
+    # + e8m0, vec32), MXFP4 (e2m1 + e8m0, vec32), NVFP4 (e2m1 + e4m3, vec16).
+    if ab_dtype not in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+        cutlass.Float4E2M1FN,
+    ):
         raise NotImplementedError(
-            f"SM120 block-scaled GEMM currently supports MXFP8 (e4m3/e5m2) only, "
-            f"got ab_dtype={ab_dtype}. FP4/NVFP4/mixed not yet wired for SM120."
+            f"SM120 block-scaled GEMM supports same-dtype MXFP8/MXFP4/NVFP4 "
+            f"(e4m3/e5m2/e2m1), got ab_dtype={ab_dtype}. Mixed FP4xFP8 not yet wired."
         )
     if d_dtype not in (cutlass.Float16, cutlass.BFloat16):
         raise NotImplementedError(
-            f"SM120 block-scaled GEMM epilogue uses 16-bit STMatrix; out dtype "
-            f"must be Float16/BFloat16, got {d_dtype}."
+            f"SM120 block-scaled GEMM epilogue requires Float16/BFloat16 output "
+            f"(f32 output is unsupported by the geforce kernel), got {d_dtype}."
         )
-    # A and B must be K-major (stride 1 on the K axis). Operands are (mn, k, l)
-    # so K is mode 1; the fp8 transpose ldmatrix path is unaligned for
-    # m-major A / n-major B on SM120.
-    if mA.stride(1) != 1 or mB.stride(1) != 1:
+    # A and B must be K-major: the K axis (mode 1 of the (mn, k, l) operand)
+    # must vary faster than the MN axis (mode 0). For l>1 FP4 the innermost
+    # contiguous dim can be L, so compare strides rather than testing ==1.
+    # The fp8/fp4 transpose ldmatrix path is 64-bit-unaligned for m-major A /
+    # n-major B on SM120.
+    if mA.stride(1) > mA.stride(0) or mB.stride(1) > mB.stride(0):
         raise NotImplementedError(
-            "SM120 block-scaled GEMM requires K-major A and B (stride 1 on K)."
+            "SM120 block-scaled GEMM requires K-major A and B (K varies faster than MN)."
         )
 
     from quack.gemm_sm120_blockscaled import Sm120BlockScaledGemmKernel
