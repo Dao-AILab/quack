@@ -803,14 +803,25 @@ def _compile_blockscaled_gemm_sm120(
         raise NotImplementedError(
             f"SM120 block-scaled GEMM supports Float16/BFloat16/Float32 output, got {d_dtype}."
         )
-    # A and B must be K-major: the K axis (mode 1 of the (mn, k, l) operand)
-    # must vary faster than the MN axis (mode 0). For l>1 FP4 the innermost
-    # contiguous dim can be L, so compare strides rather than testing ==1.
-    # The fp8/fp4 transpose ldmatrix path is 64-bit-unaligned for m-major A /
-    # n-major B on SM120.
-    if mA.stride(1) > mA.stride(0) or mB.stride(1) > mB.stride(0):
+    # Operand major support on SM120:
+    #   - B must be K-major. The warp MMA is m16n8k32: the N fragment is only 8
+    #     wide, below the 16 elements ldmatrix.m16n16.trans.b8 needs to transpose
+    #     8-bit data, so N-major B cannot feed the transpose path.
+    #   - A may be K-major or M-major *for FP8* (m16 fragment >= 16, so
+    #     ldmatrix.m16n16.trans.b8 works). FP4 A must stay K-major (no 4-bit
+    #     ldmatrix transpose primitive).
+    # K-major check: K (mode 1 of (mn, k, l)) varies faster than MN (mode 0).
+    a_is_k_major = mA.stride(1) <= mA.stride(0)
+    b_is_k_major = mB.stride(1) <= mB.stride(0)
+    if not b_is_k_major:
         raise NotImplementedError(
-            "SM120 block-scaled GEMM requires K-major A and B (K varies faster than MN)."
+            "SM120 block-scaled GEMM requires K-major B (the m16n8k32 warp MMA "
+            "N-fragment is 8-wide, below the 16 needed for ldmatrix.trans.b8)."
+        )
+    if not a_is_k_major and a_dtype.width != 8:
+        raise NotImplementedError(
+            "SM120 block-scaled GEMM supports M-major A only for FP8 "
+            "(no 4-bit ldmatrix transpose primitive); FP4 A must be K-major."
         )
 
     from quack.gemm_sm120_blockscaled import Sm120BlockScaledGemmKernel

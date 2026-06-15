@@ -55,8 +55,12 @@ def _skip_if_sm120_unsupported(
             pytest.skip("SM120 NVFP4 (vec16) requires Float8E4M3FN scales")
         if sf_vec_size == 32 and sf_dtype != cutlass.Float8E8M0FNU:
             pytest.skip("SM120 MXFP4 (vec32) requires Float8E8M0FNU scales")
-    if a_major != "k" or b_major != "k":
-        pytest.skip("SM120 block-scaled GEMM requires K-major A and B")
+    # B must be K-major on SM120. A may be M-major for FP8 (m16 fragment
+    # feeds ldmatrix.m16n16.trans.b8); FP4 A must stay K-major.
+    if b_major != "k":
+        pytest.skip("SM120 block-scaled GEMM requires K-major B")
+    if a_major != "k" and ab_dtype is not None and ab_dtype == cutlass.Float4E2M1FN:
+        pytest.skip("SM120 supports M-major A only for FP8 (FP4 A must be K-major)")
 
 
 def _compile_blockscaled_gemm(

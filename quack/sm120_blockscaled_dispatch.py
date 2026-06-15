@@ -77,6 +77,16 @@ def make_ldmatrix_atom(operand_dtype, transpose, num_matrices=4, mixed_mode=Fals
             ),
             cutlass.Int8,
         )
+    # Transposed 8-bit (FP8) load: the 16-bit StMatrix-style atom
+    # (LdMatrix8x8x16bOp) cannot transpose 8-bit elements (its src needs a
+    # 128-bit aligned 16-bit lane pattern). The dedicated 8-bit transpose
+    # primitive is ldmatrix.m16n16.trans.b8 (LdMatrix16x16x8bOp, num_matrices=2),
+    # which the M-major-A path requires.
+    if transpose and operand_dtype.width == 8 and not mixed_mode:
+        return cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2),
+            operand_dtype,
+        )
     atom_element_type = operand_dtype
     if mixed_mode and operand_dtype.width < 8:
         atom_element_type = cutlass.Int8
