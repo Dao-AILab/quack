@@ -130,14 +130,11 @@ def make_sm120_blockscaled_mma_op(a_dtype, b_dtype, acc_dtype, sf_dtype, sf_vec_
                     cute.nvgpu.warp.MmaMXF4Op(a_dtype, acc_dtype, sf_dtype),
                     False,
                 )
-            raise ValueError(
-                f"Float4E2M1FN requires sf_vec_size in (16, 32), got {sf_vec_size}"
-            )
+            raise ValueError(f"Float4E2M1FN requires sf_vec_size in (16, 32), got {sf_vec_size}")
         if a_dtype in _FP8_DTYPES:
             if sf_vec_size != 32:
                 raise ValueError(
-                    f"FP8 ab_dtype ({a_dtype}) requires sf_vec_size=32, "
-                    f"got {sf_vec_size}"
+                    f"FP8 ab_dtype ({a_dtype}) requires sf_vec_size=32, got {sf_vec_size}"
                 )
             if sf_dtype != cutlass.Float8E8M0FNU:
                 raise ValueError(
@@ -205,9 +202,7 @@ def validate_blockscaled_args(args, fp4_allowed_tiles, fp8_allowed_tiles):
     b_dtype = args.b_dtype
     # Generic sf_vec_size sanity check applies to every dtype branch below.
     if args.sf_vec_size not in (16, 32):
-        raise ValueError(
-            f"--sf_vec_size must be 16 or 32, got {args.sf_vec_size}"
-        )
+        raise ValueError(f"--sf_vec_size must be 16 or 32, got {args.sf_vec_size}")
     # Mixed-precision A/B: only the four FP4 x FP8 pairs are allowed.
     if a_dtype != b_dtype:
         if (a_dtype, b_dtype) not in MXF8F6F4_SUPPORTED_PAIRS:
@@ -224,8 +219,7 @@ def validate_blockscaled_args(args, fp4_allowed_tiles, fp8_allowed_tiles):
             )
         if args.sf_vec_size != 32:
             raise ValueError(
-                f"FP4 x FP8 mixed-precision requires --sf_vec_size 32, "
-                f"got {args.sf_vec_size}"
+                f"FP4 x FP8 mixed-precision requires --sf_vec_size 32, got {args.sf_vec_size}"
             )
         if args.sf_dtype != cutlass.Float8E8M0FNU:
             raise ValueError(
@@ -242,8 +236,7 @@ def validate_blockscaled_args(args, fp4_allowed_tiles, fp8_allowed_tiles):
     if a_dtype in _FP8_DTYPES:
         if args.sf_vec_size != 32:
             raise ValueError(
-                f"FP8 a_dtype ({a_dtype}) requires --sf_vec_size 32, "
-                f"got {args.sf_vec_size}"
+                f"FP8 a_dtype ({a_dtype}) requires --sf_vec_size 32, got {args.sf_vec_size}"
             )
         if args.sf_dtype != cutlass.Float8E8M0FNU:
             raise ValueError(
@@ -258,13 +251,11 @@ def validate_blockscaled_args(args, fp4_allowed_tiles, fp8_allowed_tiles):
     elif a_dtype == cutlass.Float4E2M1FN:
         if args.sf_vec_size == 16 and args.sf_dtype != cutlass.Float8E4M3FN:
             raise ValueError(
-                f"FP4 + --sf_vec_size 16 requires --sf_dtype Float8E4M3FN, "
-                f"got {args.sf_dtype}"
+                f"FP4 + --sf_vec_size 16 requires --sf_dtype Float8E4M3FN, got {args.sf_dtype}"
             )
         if args.sf_vec_size == 32 and args.sf_dtype != cutlass.Float8E8M0FNU:
             raise ValueError(
-                f"FP4 + --sf_vec_size 32 requires --sf_dtype Float8E8M0FNU, "
-                f"got {args.sf_dtype}"
+                f"FP4 + --sf_vec_size 32 requires --sf_dtype Float8E8M0FNU, got {args.sf_dtype}"
             )
         if tile not in fp4_allowed_tiles:
             raise ValueError(
@@ -279,6 +270,5 @@ def validate_blockscaled_args(args, fp4_allowed_tiles, fp8_allowed_tiles):
             )
     else:
         raise ValueError(
-            f"--a_dtype must be Float4E2M1FN, Float8E4M3FN, or Float8E5M2; "
-            f"got {a_dtype}"
+            f"--a_dtype must be Float4E2M1FN, Float8E4M3FN, or Float8E5M2; got {a_dtype}"
         )

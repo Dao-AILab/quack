@@ -28,9 +28,7 @@ def _is_sm120():
     return torch.cuda.get_device_properties(0).major == 12
 
 
-def _skip_if_sm120_unsupported(
-    ab_dtype=None, d_dtype=None, a_major="k", b_major="k", varlen=False
-):
+def _skip_if_sm120_unsupported(ab_dtype=None, d_dtype=None, a_major="k", b_major="k", varlen=False):
     """SM120 block-scaled GEMM capability boundary: dense, K-major, same-dtype
     MXFP8/MXFP4/NVFP4 with f16/bf16 output. Float32 output (unsupported even by
     the geforce reference kernel), non-K-major operands, mixed FP4xFP8, and

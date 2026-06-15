@@ -664,9 +664,7 @@ def _compile_blockscaled_gemm_sm120(
     sfa_cute = _make_compile_tensor_like(mSFA, sf_dtype)
     sfb_cute = _make_compile_tensor_like(mSFB, sf_dtype)
 
-    gemm = Sm120BlockScaledGemmKernel(
-        cutlass.Float32, sf_vec_size, tile_shape_mnk, epi_tile
-    )
+    gemm = Sm120BlockScaledGemmKernel(cutlass.Float32, sf_vec_size, tile_shape_mnk, epi_tile)
     max_active_clusters = get_max_active_clusters(1)
     import cutlass.torch as cutlass_torch
 
@@ -722,8 +720,19 @@ def compile_blockscaled_gemm_tvm_ffi(
     device_capacity = get_device_capacity(mA.device)
     if device_capacity[0] == 12:
         return _compile_blockscaled_gemm_sm120(
-            ab_dtype, sf_dtype, sf_vec_size, d_dtype, mma_tiler_mn, cluster_shape_mn,
-            mA, mB, mD, mSFA, mSFB, varlen_m=varlen_m, varlen_k=varlen_k,
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
+            d_dtype,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            mA,
+            mB,
+            mD,
+            mSFA,
+            mSFB,
+            varlen_m=varlen_m,
+            varlen_k=varlen_k,
         )
     if device_capacity[0] not in (10, 11):
         raise RuntimeError("Blockscaled GEMM requires SM100/SM110 (tcgen05) or SM120 (warp MMA)")

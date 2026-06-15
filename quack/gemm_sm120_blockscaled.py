@@ -26,6 +26,7 @@ from quack.sm120_blockscaled_dispatch import (
     make_sm120_blockscaled_mma_op,
 )
 
+
 class Sm120BlockScaledGemmKernel:
     def __init__(
         self,
@@ -199,14 +200,10 @@ class Sm120BlockScaledGemmKernel:
 
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-        self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            a.shape, self.sf_vec_size
-        )
+        self.sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
         sfa_tensor = cute.make_tensor(sfa.iterator, self.sfa_layout)
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-        self.sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b.shape, self.sf_vec_size
-        )
+        self.sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
         sfb_tensor = cute.make_tensor(sfb.iterator, self.sfb_layout)
 
         tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
@@ -255,9 +252,7 @@ class Sm120BlockScaledGemmKernel:
 
         @cute.struct
         class SharedStorage:
-            mainloop_pipeline_array_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.ab_stage * 2
-            ]
+            mainloop_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             sA: cute.struct.Align[
                 cute.struct.MemRange[
                     self.smem_alloc_a_dtype, cute.cosize(self.a_smem_layout_staged)
@@ -271,21 +266,15 @@ class Sm120BlockScaledGemmKernel:
                 self.buffer_align_bytes,
             ]
             sSFA: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sSFB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sC: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.c_dtype, cute.cosize(self.epi_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.c_dtype, cute.cosize(self.epi_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
 
@@ -387,9 +376,7 @@ class Sm120BlockScaledGemmKernel:
             cpasync.prefetch_descriptor(tma_atom_sfb)
             cpasync.prefetch_descriptor(tma_atom_c)
 
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
 
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
@@ -413,9 +400,7 @@ class Sm120BlockScaledGemmKernel:
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
         # Threads/warps participating in this pipeline
-        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
-        )
+        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, self.num_mma_warps
         )
@@ -437,12 +422,8 @@ class Sm120BlockScaledGemmKernel:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Generate smem tensor A/B
         # ///////////////////////////////////////////////////////////////////////////////
-        sA = storage.sA.get_tensor(
-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
-        )
-        sB = storage.sB.get_tensor(
-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
-        )
+        sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
+        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
@@ -651,18 +632,12 @@ class Sm120BlockScaledGemmKernel:
                     )
 
                 #  Wait for TMA copies to complete
-                mainloop_pipeline.consumer_wait(
-                    mainloop_consumer_state, peek_ab_full_status
-                )
+                mainloop_pipeline.consumer_wait(mainloop_consumer_state, peek_ab_full_status)
                 # tCsA_p: (MMA, (4, MMA_M / 4), MMA_K), tCsA_p: (MMA, (4, MMA_N / 4), MMA_K)
                 tCsA_p = tCsA_copy_view[None, None, None, mainloop_consumer_state.index]
                 tCsB_p = tCsB_copy_view[None, None, None, mainloop_consumer_state.index]
-                tCsSFA_p = tCsSFA_copy_view[
-                    None, None, None, mainloop_consumer_state.index
-                ]
-                tCsSFB_p = tCsSFB_copy_view[
-                    None, None, None, mainloop_consumer_state.index
-                ]
+                tCsSFA_p = tCsSFA_copy_view[None, None, None, mainloop_consumer_state.index]
+                tCsSFB_p = tCsSFB_copy_view[None, None, None, mainloop_consumer_state.index]
                 cute.copy(
                     smem_tiled_copy_A,
                     tCsA_p[None, None, 0],
@@ -693,9 +668,7 @@ class Sm120BlockScaledGemmKernel:
                 for k_tile in range(0, k_tile_cnt - 1, 1, unroll=1):
                     # unroll the loop
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        k_block_next = (
-                            0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
-                        )
+                        k_block_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
 
                         if k_block_idx == num_k_blocks - 1:
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
@@ -706,12 +679,8 @@ class Sm120BlockScaledGemmKernel:
                                 mainloop_consumer_state
                             )
 
-                            tCsA_p = tCsA_copy_view[
-                                None, None, None, mainloop_consumer_state.index
-                            ]
-                            tCsB_p = tCsB_copy_view[
-                                None, None, None, mainloop_consumer_state.index
-                            ]
+                            tCsA_p = tCsA_copy_view[None, None, None, mainloop_consumer_state.index]
+                            tCsB_p = tCsB_copy_view[None, None, None, mainloop_consumer_state.index]
                             tCsSFA_p = tCsSFA_copy_view[
                                 None, None, None, mainloop_consumer_state.index
                             ]
@@ -725,26 +694,14 @@ class Sm120BlockScaledGemmKernel:
                         # Mixed FP4 x FP8 register-side bit shift before mma.sync
                         # to move the FP4 nibble (in low half of each byte after
                         # b4x16_p64 ldmatrix) into the middle as mxf8f6f4 expects.
-                        if cutlass.const_expr(
-                            self.mixed_mode and self.a_dtype.width < 8
-                        ):
-                            a_view = cute.recast_tensor(
-                                tCrA[None, None, k_block_idx], cutlass.Int8
-                            )
+                        if cutlass.const_expr(self.mixed_mode and self.a_dtype.width < 8):
+                            a_view = cute.recast_tensor(tCrA[None, None, k_block_idx], cutlass.Int8)
                             for _i in cutlass.range_constexpr(cute.size(a_view)):
-                                a_view[_i] = cutlass.Int8(
-                                    a_view[_i] << FP4_SHIFT_BITS
-                                )
-                        if cutlass.const_expr(
-                            self.mixed_mode and self.b_dtype.width < 8
-                        ):
-                            b_view = cute.recast_tensor(
-                                tCrB[None, None, k_block_idx], cutlass.Int8
-                            )
+                                a_view[_i] = cutlass.Int8(a_view[_i] << FP4_SHIFT_BITS)
+                        if cutlass.const_expr(self.mixed_mode and self.b_dtype.width < 8):
+                            b_view = cute.recast_tensor(tCrB[None, None, k_block_idx], cutlass.Int8)
                             for _i in cutlass.range_constexpr(cute.size(b_view)):
-                                b_view[_i] = cutlass.Int8(
-                                    b_view[_i] << FP4_SHIFT_BITS
-                                )
+                                b_view[_i] = cutlass.Int8(b_view[_i] << FP4_SHIFT_BITS)
                         cute.gemm(
                             tiled_mma,
                             accumulators,
@@ -788,9 +745,7 @@ class Sm120BlockScaledGemmKernel:
                 # end of for loop
                 # Hoist out last k_tile
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                    k_block_next = (
-                        0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
-                    )
+                    k_block_next = 0 if k_block_idx + 1 == num_k_blocks else k_block_idx + 1
 
                     if k_block_idx == num_k_blocks - 1:
                         cute.arch.fence_proxy("async.shared", space="cta")
@@ -823,26 +778,14 @@ class Sm120BlockScaledGemmKernel:
                             tCrSFB_copy_view_filtered[None, None, k_block_next],
                         )
                     # Mixed FP4 x FP8 register-side bit shift before mma.sync (hoisted tail).
-                    if cutlass.const_expr(
-                        self.mixed_mode and self.a_dtype.width < 8
-                    ):
-                        a_view_h = cute.recast_tensor(
-                            tCrA[None, None, k_block_idx], cutlass.Int8
-                        )
+                    if cutlass.const_expr(self.mixed_mode and self.a_dtype.width < 8):
+                        a_view_h = cute.recast_tensor(tCrA[None, None, k_block_idx], cutlass.Int8)
                         for _i in cutlass.range_constexpr(cute.size(a_view_h)):
-                            a_view_h[_i] = cutlass.Int8(
-                                a_view_h[_i] << FP4_SHIFT_BITS
-                            )
-                    if cutlass.const_expr(
-                        self.mixed_mode and self.b_dtype.width < 8
-                    ):
-                        b_view_h = cute.recast_tensor(
-                            tCrB[None, None, k_block_idx], cutlass.Int8
-                        )
+                            a_view_h[_i] = cutlass.Int8(a_view_h[_i] << FP4_SHIFT_BITS)
+                    if cutlass.const_expr(self.mixed_mode and self.b_dtype.width < 8):
+                        b_view_h = cute.recast_tensor(tCrB[None, None, k_block_idx], cutlass.Int8)
                         for _i in cutlass.range_constexpr(cute.size(b_view_h)):
-                            b_view_h[_i] = cutlass.Int8(
-                                b_view_h[_i] << FP4_SHIFT_BITS
-                            )
+                            b_view_h[_i] = cutlass.Int8(b_view_h[_i] << FP4_SHIFT_BITS)
                     cute.gemm(
                         tiled_mma,
                         accumulators,
@@ -930,27 +873,19 @@ class Sm120BlockScaledGemmKernel:
                             for mma_m_in_epi in cutlass.range_constexpr(MmaMPerEpiM):
                                 mma_n = (epi_n * MmaNPerEpiN) + mma_n_in_epi
                                 mma_m = (epi_m * MmaMPerEpiM) + mma_m_in_epi
-                                tRS_rD_slice = tRS_rD[
-                                    (None, mma_m_in_epi, mma_n_in_epi)
-                                ]
+                                tRS_rD_slice = tRS_rD[(None, mma_m_in_epi, mma_n_in_epi)]
                                 tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
-                                for elem_idx in cutlass.range_constexpr(
-                                    cute.size(tRS_rD_slice)
-                                ):
+                                for elem_idx in cutlass.range_constexpr(cute.size(tRS_rD_slice)):
                                     tRS_rD_slice[elem_idx] = tRS_rAcc_slice[elem_idx]
 
                         # Type conversion
-                        tRS_rD_out = cute.make_rmem_tensor(
-                            tRS_rD_layout.shape, self.c_dtype
-                        )
+                        tRS_rD_out = cute.make_rmem_tensor(tRS_rD_layout.shape, self.c_dtype)
                         acc_vec = tRS_rD.load()
                         tRS_rD_out.store(acc_vec.to(self.c_dtype))
 
                         # Register to shared memory
                         epi_buffer = epi_buffer + 1
-                        epi_buffer = epi_buffer % cute.size(
-                            tRS_sD, mode=[3]
-                        )
+                        epi_buffer = epi_buffer % cute.size(tRS_sD, mode=[3])
                         self.epilog_sync_barrier.arrive_and_wait()
                         cute.copy(
                             tiled_copy_r2s,
@@ -1024,33 +959,25 @@ class Sm120BlockScaledGemmKernel:
                         tma_atom_a,
                         tAgA_k,
                         tAsA_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state
-                        ),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state),
                     )
                     cute.copy(
                         tma_atom_b,
                         tBgB_k,
                         tBsB_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state
-                        ),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state),
                     )
                     cute.copy(
                         tma_atom_sfa,
                         tAgSFA_k,
                         tAsSFA_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state
-                        ),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state),
                     )
                     cute.copy(
                         tma_atom_sfb,
                         tBgSFB_k,
                         tBsSFB_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state
-                        ),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state),
                     )
                     # Mainloop pipeline's producer commit is a NOP
                     mainloop_pipeline.producer_commit(mainloop_producer_state)
@@ -1095,9 +1022,7 @@ class Sm120BlockScaledGemmKernel:
         :rtype: tuple[int, int]
         """
 
-        epi_stage_max = (tile_shape_mnk[1] // epi_tile[1]) * (
-            tile_shape_mnk[0] // epi_tile[0]
-        )
+        epi_stage_max = (tile_shape_mnk[1] // epi_tile[1]) * (tile_shape_mnk[0] // epi_tile[0])
         epi_stage = min(epi_stage_max, 4)
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_bytes = c_bytes_per_stage * epi_stage
@@ -1106,8 +1031,7 @@ class Sm120BlockScaledGemmKernel:
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
         ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8
-            + cute.size(b_shape) * b_dtype.width // 8
+            cute.size(a_shape) * a_dtype.width // 8 + cute.size(b_shape) * b_dtype.width // 8
         )
         # SFA/SFB shared memory size
         sf_bytes_per_stage = (
@@ -1118,9 +1042,7 @@ class Sm120BlockScaledGemmKernel:
         mbar_helpers_bytes = 1024
 
         ab_stage = (
-            (smem_capacity - occupancy * 1024) // occupancy
-            - mbar_helpers_bytes
-            - epi_bytes
+            (smem_capacity - occupancy * 1024) // occupancy - mbar_helpers_bytes - epi_bytes
         ) // (ab_bytes_per_stage + sf_bytes_per_stage)
         return ab_stage, epi_stage
 
@@ -1261,9 +1183,7 @@ class Sm120BlockScaledGemmKernel:
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (1, 1, 1)
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl
-        )
+        tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )
@@ -1404,5 +1324,3 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     for i in cutlass.range(cute.size(sf_ref_tensor)):
         mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
-
-
