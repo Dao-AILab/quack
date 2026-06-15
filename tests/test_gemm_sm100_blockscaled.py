@@ -526,6 +526,55 @@ def test_blockscaled_fp4(m, n, k, l, sf_dtype, sf_vec_size, d_dtype):
 
 
 # ---------------------------------------------------------------------------
+# Mixed-precision FP4xFP8 (SM120 only). One operand is FP4 (e2m1), the other
+# FP8 (e4m3 / e5m2), with e8m0 scales at sf_vec_size=32. The geforce kernel's
+# MmaMXF8F6F4Op handles a_dtype != b_dtype via its mixed-mode ldmatrix path;
+# this exercises it through the public interface's b_dtype argument.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("d_dtype", [cutlass.BFloat16, cutlass.Float32])
+@pytest.mark.parametrize(
+    "a_dtype,b_dtype",
+    [
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN),
+        (cutlass.Float8E4M3FN, cutlass.Float4E2M1FN),
+        (cutlass.Float4E2M1FN, cutlass.Float8E5M2),
+        (cutlass.Float8E5M2, cutlass.Float4E2M1FN),
+    ],
+)
+@pytest.mark.parametrize("m,n,k", [(256, 256, 256), (512, 512, 512), (256, 384, 512)])
+def test_blockscaled_mixed_fp4_fp8(m, n, k, a_dtype, b_dtype, d_dtype):
+    if not _is_sm120():
+        pytest.skip("Mixed FP4xFP8 block-scaled GEMM is SM120-only")
+    l, sf_vec_size, sf_dtype = 1, 32, cutlass.Float8E8M0FNU
+    a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, a_dtype)
+    b_ref, mB = create_blockscaled_operand_tensor(l, n, k, False, b_dtype)
+    _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
+    sfa_ref, mSFA = create_blockscaled_scale_tensor(l, m, k, sf_vec_size, sf_dtype)
+    sfb_ref, mSFB = create_blockscaled_scale_tensor(l, n, k, sf_vec_size, sf_dtype)
+
+    runner = compile_blockscaled_gemm_tvm_ffi(
+        a_dtype,
+        sf_dtype,
+        sf_vec_size,
+        d_dtype,
+        (128, 128),
+        (1, 1),
+        mA,
+        mB,
+        mD,
+        mSFA,
+        mSFB,
+        b_dtype=b_dtype,
+    )
+    runner(mA, mB, mD, mSFA, mSFB)
+    torch.cuda.synchronize()
+
+    ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
+    rel = (mD.float() - ref).abs().max().item() / (ref.abs().max().item() + 1e-6)
+    assert rel < 6e-2, f"mixed {a_dtype}x{b_dtype} rel_err={rel}"
+
+
+# ---------------------------------------------------------------------------
 # Scale layout invariants
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("mn,sf_k,l", [(128, 4, 1), (256, 16, 1), (384, 12, 2), (512, 8, 1)])

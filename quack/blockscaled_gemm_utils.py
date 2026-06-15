@@ -735,6 +735,7 @@ def _compile_blockscaled_gemm_sm120(
     mSFA: torch.Tensor,
     mSFB: torch.Tensor,
     *,
+    b_dtype: Optional[Type[cutlass.Numeric]] = None,
     varlen_m: bool = False,
     varlen_k: bool = False,
 ) -> Callable:
@@ -747,11 +748,14 @@ def _compile_blockscaled_gemm_sm120(
 
     SM120 uses CTA tile (128, 128, 128) with epi (128, 128) and cluster (1, 1);
     the requested mma_tiler_mn / cluster_shape_mn hints are mapped onto that.
-    Supports dense, K-major, same-dtype MXFP8 / MXFP4 / NVFP4 with f16/bf16/f32
-    output, plus varlen_m / varlen_k via per-expert dense dispatch (the geforce
-    kernel has no grouped scheduler, so each expert is launched as its own dense
-    GEMM). Mixed FP4xFP8 and non-K-major operands remain SM100/SM110-only.
+    Supports dense, K-major MXFP8 / MXFP4 / NVFP4 (same-dtype A/B) and mixed
+    FP4xFP8 (one operand FP4, the other FP8 + e8m0 scales, vec32) with
+    f16/bf16/f32 output, plus varlen_m / varlen_k via per-expert dense dispatch.
+    Non-K-major operands remain SM100/SM110-only.
     """
+    a_dtype = ab_dtype
+    if b_dtype is None:
+        b_dtype = ab_dtype
     if varlen_m or varlen_k:
         return _compile_blockscaled_gemm_sm120_varlen(
             ab_dtype,
@@ -768,16 +772,32 @@ def _compile_blockscaled_gemm_sm120(
         )
     # SM120 capability boundary (warp-level block-scaled MMA + ldmatrix, 16-bit
     # STMatrix / universal-copy epilogue). Mirrors the NVIDIA geforce reference.
-    # Same-dtype A/B only (this interface passes one ab_dtype): MXFP8 (e4m3/e5m2
-    # + e8m0, vec32), MXFP4 (e2m1 + e8m0, vec32), NVFP4 (e2m1 + e4m3, vec16).
-    if ab_dtype not in (
+    # Same-dtype: MXFP8 (e4m3/e5m2 + e8m0, vec32), MXFP4 (e2m1 + e8m0, vec32),
+    # NVFP4 (e2m1 + e4m3, vec16). Mixed: {FP4, FP8} pair + e8m0 scales, vec32.
+    _fp8 = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+    _fp4 = (cutlass.Float4E2M1FN,)
+    mixed = a_dtype != b_dtype
+    if mixed:
+        pair = {a_dtype, b_dtype}
+        is_fp4_fp8 = any(d in _fp4 for d in pair) and any(d in _fp8 for d in pair)
+        if not is_fp4_fp8:
+            raise NotImplementedError(
+                f"SM120 mixed block-scaled GEMM supports only FP4xFP8 pairs, "
+                f"got a_dtype={a_dtype}, b_dtype={b_dtype}."
+            )
+        if sf_dtype != cutlass.Float8E8M0FNU or sf_vec_size != 32:
+            raise NotImplementedError(
+                f"SM120 mixed FP4xFP8 requires sf_dtype=Float8E8M0FNU and "
+                f"sf_vec_size=32, got sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}."
+            )
+    elif a_dtype not in (
         cutlass.Float8E4M3FN,
         cutlass.Float8E5M2,
         cutlass.Float4E2M1FN,
     ):
         raise NotImplementedError(
             f"SM120 block-scaled GEMM supports same-dtype MXFP8/MXFP4/NVFP4 "
-            f"(e4m3/e5m2/e2m1), got ab_dtype={ab_dtype}. Mixed FP4xFP8 not yet wired."
+            f"(e4m3/e5m2/e2m1), got ab_dtype={a_dtype}."
         )
     if d_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
         raise NotImplementedError(
@@ -800,8 +820,8 @@ def _compile_blockscaled_gemm_sm120(
     tile_shape_mnk = (128, 128, 128)
     epi_tile = (128, 128)
 
-    a_cute = _make_compile_tensor_like(mA, ab_dtype, dynamic_layout=True)
-    b_cute = _make_compile_tensor_like(mB, ab_dtype, dynamic_layout=True)
+    a_cute = _make_compile_tensor_like(mA, a_dtype, dynamic_layout=True)
+    b_cute = _make_compile_tensor_like(mB, b_dtype, dynamic_layout=True)
     d_cute = _make_compile_tensor_like(mD, d_dtype, dynamic_layout=True)
     sfa_cute = _make_compile_tensor_like(mSFA, sf_dtype)
     sfb_cute = _make_compile_tensor_like(mSFB, sf_dtype)
@@ -825,8 +845,8 @@ def _compile_blockscaled_gemm_sm120(
             sfa = sfa.contiguous()
         if not sfb.is_contiguous():
             sfb = sfb.contiguous()
-        a_t = _make_compile_tensor_like(a, ab_dtype, dynamic_layout=True)
-        b_t = _make_compile_tensor_like(b, ab_dtype, dynamic_layout=True)
+        a_t = _make_compile_tensor_like(a, a_dtype, dynamic_layout=True)
+        b_t = _make_compile_tensor_like(b, b_dtype, dynamic_layout=True)
         d_t = _make_compile_tensor_like(d, d_dtype, dynamic_layout=True)
         sfa_t = _make_compile_tensor_like(sfa, sf_dtype)
         sfb_t = _make_compile_tensor_like(sfb, sf_dtype)
@@ -848,6 +868,7 @@ def compile_blockscaled_gemm_tvm_ffi(
     mSFA: torch.Tensor,
     mSFB: torch.Tensor,
     *,
+    b_dtype: Optional[Type[cutlass.Numeric]] = None,
     use_clc_persistence: bool = True,
     varlen_m: bool = False,
     varlen_k: bool = False,
@@ -858,11 +879,19 @@ def compile_blockscaled_gemm_tvm_ffi(
     mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
     When varlen_k: mA is (m, total_k), mB is (n, total_k), mD is (m, n, l);
     run(...) takes an extra cu_seqlens_k tensor.
+
+    ``b_dtype`` defaults to ``ab_dtype`` (same-dtype A/B). Pass a different
+    ``b_dtype`` for mixed-precision (SM120 mixed FP4xFP8 only): one operand is
+    Float4E2M1FN and the other Float8E4M3FN/E5M2, with sf_dtype=Float8E8M0FNU
+    and sf_vec_size=32.
     """
+    a_dtype = ab_dtype
+    if b_dtype is None:
+        b_dtype = ab_dtype
     device_capacity = get_device_capacity(mA.device)
     if device_capacity[0] == 12:
         return _compile_blockscaled_gemm_sm120(
-            ab_dtype,
+            a_dtype,
             sf_dtype,
             sf_vec_size,
             d_dtype,
@@ -873,9 +902,12 @@ def compile_blockscaled_gemm_tvm_ffi(
             mD,
             mSFA,
             mSFB,
+            b_dtype=b_dtype,
             varlen_m=varlen_m,
             varlen_k=varlen_k,
         )
+    if b_dtype != a_dtype:
+        raise NotImplementedError("Mixed-precision A/B block-scaled GEMM is currently SM120-only.")
     if device_capacity[0] not in (10, 11):
         raise RuntimeError("Blockscaled GEMM requires SM100/SM110 (tcgen05) or SM120 (warp MMA)")
     assert not (varlen_m and varlen_k), "Only one of varlen_m / varlen_k"
