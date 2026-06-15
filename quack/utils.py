@@ -7,7 +7,6 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cutlass_dsl import T, dsl_user_op
 

@@ -13,7 +13,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Uint32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith, llvm, vector
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cutlass_dsl import dsl_user_op, Int32, T
 
 
