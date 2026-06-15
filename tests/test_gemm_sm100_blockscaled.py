@@ -24,6 +24,31 @@ def _skip_if_not_sm100():
         pytest.skip("SM100+ required")
 
 
+def _is_sm120():
+    return torch.cuda.get_device_properties(0).major == 12
+
+
+def _skip_if_sm120_unsupported(
+    ab_dtype=None, d_dtype=None, a_major="k", b_major="k", varlen=False
+):
+    """SM120 block-scaled GEMM capability boundary: dense, K-major MXFP8
+    (e4m3/e5m2) with f16/bf16 output. FP4/NVFP4/mixed, f32 output, non-K-major
+    operands, and varlen are SM100/SM110-only (tcgen05) for now."""
+    if not _is_sm120():
+        return
+    if varlen:
+        pytest.skip("SM120 block-scaled GEMM does not support varlen yet")
+    if ab_dtype is not None and ab_dtype not in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+    ):
+        pytest.skip("SM120 block-scaled GEMM supports MXFP8 only (no FP4/NVFP4/mixed yet)")
+    if d_dtype is not None and d_dtype not in (cutlass.Float16, cutlass.BFloat16):
+        pytest.skip("SM120 block-scaled GEMM epilogue requires f16/bf16 output")
+    if a_major != "k" or b_major != "k":
+        pytest.skip("SM120 block-scaled GEMM requires K-major A and B")
+
+
 def _compile_blockscaled_gemm(
     ab_dtype,
     sf_dtype,
@@ -412,6 +437,7 @@ def test_blockscaled_correctness(
     ab_dtype, sf_dtype, sf_vec_size, d_dtype, mma_tiler_mn, cluster_shape_mn, m, n, k, l
 ):
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(ab_dtype=ab_dtype, d_dtype=d_dtype)
 
     (
         compiled,
@@ -617,6 +643,7 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     """MXFP8 with A in {k,m}-major × B in {k,n}-major. The SF tensor layout
     stays K-major (hardware convention); only A/B operand strides differ."""
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(a_major=a_major, b_major=b_major)
     from quack.mx_utils import to_mx
 
     m, n, k, l = 256, 256, 256, 1
@@ -705,6 +732,7 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
     SFA is stored in dQaccum-style padded format; kernel reads it via
     offset_batch_SFA."""
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(varlen=True)
     num_experts = len(seqlens_m)
     n, k = 256, 256
     sf_vec = 32
@@ -770,6 +798,7 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
     is NOT required). SFA/SFB use dQaccum-style K-padded storage and the kernel
     reads them via offset_batch_SFA/offset_batch_SFB padded-K formula."""
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(varlen=True)
     num_experts = len(seqlens_k)
     m, n = 256, 256
     sf_vec = 32
