@@ -35,15 +35,12 @@ def _skip_if_sm120_unsupported(
     d_dtype=None,
     a_major="k",
     b_major="k",
-    varlen=False,
 ):
-    """SM120 block-scaled GEMM capability boundary: dense, K-major, same-dtype
-    MXFP8/MXFP4/NVFP4 with f16/bf16/f32 output. Non-K-major operands, mixed
-    FP4xFP8, and varlen are SM100/SM110-only (tcgen05) for now."""
+    """SM120 block-scaled GEMM capability boundary: dense + varlen, K-major,
+    same-dtype MXFP8/MXFP4/NVFP4 with f16/bf16/f32 output. Non-K-major operands
+    and mixed FP4xFP8 are SM100/SM110-only (tcgen05) for now."""
     if not _is_sm120():
         return
-    if varlen:
-        pytest.skip("SM120 block-scaled GEMM does not support varlen yet")
     if ab_dtype is not None and ab_dtype not in (
         cutlass.Float8E4M3FN,
         cutlass.Float8E5M2,
@@ -494,11 +491,10 @@ def test_blockscaled_correctness(
         (cutlass.Float8E4M3FN, 16),  # NVFP4
     ],
 )
-@pytest.mark.parametrize("m,n,k,l", [(256, 256, 256, 1), (512, 512, 512, 1), (256, 384, 512, 1)])
+@pytest.mark.parametrize(
+    "m,n,k,l", [(256, 256, 256, 1), (512, 512, 512, 1), (256, 384, 512, 1), (256, 256, 256, 2)]
+)
 def test_blockscaled_fp4(m, n, k, l, sf_dtype, sf_vec_size, d_dtype):
-    # NOTE: l==1 only. QuACK's FP4 operand builder lays L innermost for l>1
-    # (packed float4_e2m1fn_x2 storage), which is not K-major; batched FP4 is a
-    # separate follow-up. l=1 is the common FP4 inference case.
     _skip_if_not_sm100()
     ab_dtype = cutlass.Float4E2M1FN
     a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
@@ -797,7 +793,6 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
     SFA is stored in dQaccum-style padded format; kernel reads it via
     offset_batch_SFA."""
     _skip_if_not_sm100()
-    _skip_if_sm120_unsupported(varlen=True)
     num_experts = len(seqlens_m)
     n, k = 256, 256
     sf_vec = 32
@@ -863,7 +858,6 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
     is NOT required). SFA/SFB use dQaccum-style K-padded storage and the kernel
     reads them via offset_batch_SFA/offset_batch_SFB padded-K formula."""
     _skip_if_not_sm100()
-    _skip_if_sm120_unsupported(varlen=True)
     num_experts = len(seqlens_k)
     m, n = 256, 256
     sf_vec = 32
