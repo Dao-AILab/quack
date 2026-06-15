@@ -1,0 +1,24 @@
+mxfp8  m256 n256 k128 (sf_k=4, %16=4): rel=0.0029 PASS
+mxfp8  m256 n256 k256 (sf_k=8, %16=8): rel=0.0019 PASS
+mxfp8  m256 n256 k384 (sf_k=12, %16=12): rel=0.0029 PASS
+mxfp8  m256 n256 k512 (sf_k=16, %16=0): rel=0.0016 PASS
+mxfp8  m256 n256 k640 (sf_k=20, %16=4): rel=0.0021 PASS
+mxfp8  m256 n256 k1024 (sf_k=32, %16=0): rel=0.0029 PASS
+mxfp8  m256 n256 k2048 (sf_k=64, %16=0): rel=0.0018 PASS
+
+mxfp4  m256 n256 k128 (sf_k=4, %16=4): rel=0.0030 PASS
+mxfp4  m256 n256 k256 (sf_k=8, %16=8): rel=0.0024 PASS
+mxfp4  m256 n256 k384 (sf_k=12, %16=12): rel=0.0018 PASS
+mxfp4  m256 n256 k512 (sf_k=16, %16=0): rel=0.0027 PASS
+mxfp4  m256 n256 k640 (sf_k=20, %16=4): rel=0.0033 PASS
+mxfp4  m256 n256 k1024 (sf_k=32, %16=0): rel=0.0024 PASS
+mxfp4  m256 n256 k2048 (sf_k=64, %16=0): rel=0.0023 PASS
+
+nvfp4  m256 n256 k128 (sf_k=8, %16=8): rel=0.0030 PASS
+nvfp4  m256 n256 k256 (sf_k=16, %16=0): rel=0.0020 PASS
+nvfp4  m256 n256 k384 (sf_k=24, %16=8): rel=0.0023 PASS
+nvfp4  m256 n256 k512 (sf_k=32, %16=0): rel=0.0018 PASS
+nvfp4  m256 n256 k640 (sf_k=40, %16=8): rel=0.0032 PASS
+nvfp4  m256 n256 k1024 (sf_k=64, %16=0): rel=0.0029 PASS
+nvfp4  m256 n256 k2048 (sf_k=128, %16=0): rel=0.0037 PASS
+
