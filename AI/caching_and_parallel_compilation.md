@@ -6,7 +6,7 @@ step may trigger dozens of compilations (different dtypes, tile sizes, activatio
 serial compilation dominates wall-clock time. This doc explains the multi-layer caching and
 parallel compilation design that makes it fast.
 
-## Layer 1: `@jit_cache` Decorator (`cache_utils.py`)
+## Layer 1: `@jit_cache` Decorator (`quack/cache/jit.py`)
 
 Each `_compile_*` function (e.g. `_compile_gemm` in `gemm.py`, `_compile_softmax_fwd` in
 `softmax.py`) is decorated with `@jit_cache`. This single decorator provides both in-memory
@@ -179,7 +179,7 @@ Compilation only needs metadata (shapes, strides, dtypes) to generate correct co
 
 ## The `COMPILE_ONLY` Flag
 
-`cache_utils.COMPILE_ONLY` is a global boolean (default `False`). When `True`:
+`quack.cache.COMPILE_ONLY` is a global boolean (default `False`). When `True`:
 
 1. `@jit_cache` still compiles and exports `.o`, but returns `_noop_kernel`
    instead of the real compiled function
@@ -191,7 +191,7 @@ Compilation only needs metadata (shapes, strides, dtypes) to generate correct co
 # In gemm.py — the critical boundary
 compiled_fn = _compile_gemm(...)   # ← compilation happens here
 
-from quack.cache_utils import COMPILE_ONLY
+from quack.cache import COMPILE_ONLY
 if COMPILE_ONLY:
     return                          # ← avoid data_ptr() below
 
@@ -245,7 +245,7 @@ when `COMPILE_ONLY` is set. The pattern is the same across all kernels:
 ```python
 @_softmax_fwd.register_fake
 def _softmax_fwd_fake(x, out):
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import COMPILE_ONLY
 
     if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
         N = x.size(1)
@@ -299,7 +299,7 @@ prevents reaching runtime code that:
 # gemm.py — the critical boundary
 compiled_fn = _compile_gemm(...)   # ← compilation happens here
 
-from quack.cache_utils import COMPILE_ONLY
+from quack.cache import COMPILE_ONLY
 if COMPILE_ONLY:
     return                          # ← avoid data_ptr() below
 
@@ -361,7 +361,7 @@ pytest
 
 | File | Role |
 |------|------|
-| `cache_utils.py` | `@jit_cache` decorator (in-memory + `.o` disk cache), `FileLock`, `COMPILE_ONLY` flag |
+| `quack/cache/jit.py` | `@jit_cache` decorator (in-memory + `.o` disk cache), `FileLock`, `COMPILE_ONLY` flag |
 | `compile_utils.py` | `make_fake_tensor()` — symbolic CuTe tensors for compilation |
 | `gemm_tvm_ffi_utils.py` | `make_fake_gemm_tensors()`, `compile_gemm_kernel()` |
 | `autotuner.py` | `Autotuner._precompile()` — subprocess worker pool, `FileCacheManager` |

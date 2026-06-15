@@ -5,9 +5,12 @@ Each EpiOp encapsulates a single tensor kind's behavior across the epilogue life
 smem allocation, begin (one-time per-tile setup), begin_loop (per-subtile extraction),
 end (cleanup).
 
-The ops are composed via ComposableEpiMixin which iterates over a static _epi_ops tuple
-to generate epi_smem_bytes, epi_get_smem_struct, epi_get_smem_tensors, epi_begin,
-and epi_begin_loop automatically.
+The ops are composed via ComposableEpiMixin. Class-level `_epi_ops` is the
+static schema; `_epi_ops_to_params_dict` (called from each subclass's
+`epi_to_underlying_arguments`) shadows it with an instance-level tuple of only
+the active ops (those whose arg tensor is non-None). All EpiOp hook methods
+below therefore assume their `param` / `arg_tensor` is non-None — the
+framework guarantees inactive ops are never iterated.
 """
 
 import math
@@ -276,14 +279,9 @@ class Scalar(EpiOp):
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
-        result = None
-        if const_expr(param is not None):
-            result = (
-                utils.load_scalar_or_pointer(param, dtype=self.dtype)
-                if const_expr(self.dtype is not None)
-                else utils.load_scalar_or_pointer(param)
-            )
-        return result
+        if const_expr(self.dtype is not None):
+            return utils.load_scalar_or_pointer(param, dtype=self.dtype)
+        return utils.load_scalar_or_pointer(param)
 
 
 class VecLoad(EpiOp):
@@ -315,24 +313,19 @@ class VecLoad(EpiOp):
         return 1 if self.dim == 1 else 0
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
-        if arg_tensor is None:
-            return EpiSmemBytes()
         return EpiSmemBytes(
             unstaged=self._tile_size(cta_tile_shape_mnk) * (arg_tensor.element_type.width // 8)
         )
 
     def smem_struct_field(self, gemm, params):
-        tensor = getattr(params, self.name, None)
-        if tensor is None:
-            size, dtype = 0, Float32
-        else:
-            size = self._tile_size(gemm.cta_tile_shape_mnk)
-            dtype = tensor.element_type
-        return (f"s_{self.name}", cute.struct.Align[cute.struct.MemRange[dtype, size], 16])
+        tensor = getattr(params, self.name)
+        size = self._tile_size(gemm.cta_tile_shape_mnk)
+        return (
+            f"s_{self.name}",
+            cute.struct.Align[cute.struct.MemRange[tensor.element_type, size], 16],
+        )
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        if getattr(params, self.name, None) is None:
-            return None
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
             cute.make_layout(self._tile_size(gemm.cta_tile_shape_mnk))
         )
@@ -341,8 +334,6 @@ class VecLoad(EpiOp):
         return True
 
     def epi_m_major_score(self, arg_tensor, gemm):
-        if arg_tensor is None:
-            return 0
         # It costs more registers (say 4x) to keep rowvec in register vs keeping colvec in register
         return 4 if self.dim == 1 else -1
 
@@ -352,55 +343,52 @@ class VecLoad(EpiOp):
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
-        tDsV = None
-        tDrV_cvt = None
-        if const_expr(param is not None):
-            dtype = param.element_type
-            num_copy_elems = const_expr(max(32, dtype.width)) // dtype.width
-            thr_copy = copy_utils.tiled_copy_1d(
-                dtype, ctx.num_epi_threads, num_copy_elems, is_async=True
-            ).get_slice(ctx.tidx)
-            mVec = self._get_gmem_vec(param, ctx)
-            tile_dim = self._tile_dim(ctx)
-            coord_idx = ctx.tile_coord_mnkl[self._coord_idx()]
-            gVec = cute.local_tile(mVec, (tile_dim,), (coord_idx,))
-            tVgV = thr_copy.partition_S(gVec)
-            tVsV = thr_copy.partition_D(smem_tensor)
-            tVcV = thr_copy.partition_S(cute.make_identity_tensor(tile_dim))
-            limit = min(cute.size(mVec, mode=[0]) - coord_idx * tile_dim, tile_dim)
-            pred = cute.make_rmem_tensor((1, cute.size(tVsV.shape[1])), Boolean)
-            for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
-                pred[0, m] = tVcV[0, m] < limit
-            cute.copy(thr_copy, tVgV, tVsV, pred=pred)
-            tDsV = ctx.partition_for_epilogue_fn(
-                cute.make_tensor(
-                    smem_tensor.iterator,
-                    cute.make_layout((ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride()),
-                )
+        dtype = param.element_type
+        num_copy_elems = const_expr(max(32, dtype.width)) // dtype.width
+        thr_copy = copy_utils.tiled_copy_1d(
+            dtype, ctx.num_epi_threads, num_copy_elems, is_async=True
+        ).get_slice(ctx.tidx)
+        mVec = self._get_gmem_vec(param, ctx)
+        tile_dim = self._tile_dim(ctx)
+        coord_idx = ctx.tile_coord_mnkl[self._coord_idx()]
+        gVec = cute.local_tile(mVec, (tile_dim,), (coord_idx,))
+        tVgV = thr_copy.partition_S(gVec)
+        tVsV = thr_copy.partition_D(smem_tensor)
+        tVcV = thr_copy.partition_S(cute.make_identity_tensor(tile_dim))
+        limit = min(cute.size(mVec, mode=[0]) - coord_idx * tile_dim, tile_dim)
+        for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
+            if tVcV[0, m] < tile_dim:  # Guard to avoid writing beyond the smem we've allocated
+                pred = cute.make_rmem_tensor(1, Boolean)
+                pred[0] = tVcV[0, m] < limit
+                cute.copy(thr_copy, tVgV[None, m], tVsV[None, m], pred=pred)
+        tDsV = ctx.partition_for_epilogue_fn(
+            cute.make_tensor(
+                smem_tensor.iterator,
+                cute.make_layout((ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride()),
             )
-            if const_expr(ctx.tiled_copy_t2r is not None):
-                tDsV = ctx.tiled_copy_r2s.retile(tDsV)
-            # Pre-allocate register tensor reused across begin_loop calls
-            tDsV_sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
-            tDrV_cvt = cute.make_rmem_tensor(tDsV_sub.layout, gemm.acc_dtype)
+        )
+        if const_expr(ctx.tiled_copy_t2r is not None):
+            tDsV = ctx.tiled_copy_r2s.retile(tDsV)
+        # Pre-allocate register tensor reused across begin_loop calls
+        tDsV_sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
+        tDrV_cvt = cute.make_rmem_tensor(tDsV_sub.layout, gemm.acc_dtype)
         return [tDsV, tDrV_cvt]
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
         tDsV, tDrV_cvt = state[0], state[1]
-        if const_expr(tDsV is not None):
-            should_load = Boolean(True)
-            if const_expr(self.dim == 1):
-                if const_expr(gemm.epi_m_major):
-                    should_load = epi_coord[0] == 0
-            else:
-                if const_expr(not gemm.epi_m_major):
-                    should_load = epi_coord[1] == 0
-            if should_load:
-                tDsV_cur = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, epi_coord]
-                tDrV = cute.make_rmem_tensor(tDsV_cur.layout, tDsV_cur.element_type)
-                cute.autovec_copy(cute.filter_zeros(tDsV_cur), cute.filter_zeros(tDrV))
-                tDrV_cvt.store(tDrV.load().to(gemm.acc_dtype))
+        should_load = Boolean(True)
+        if const_expr(self.dim == 1):
+            if const_expr(gemm.epi_m_major):
+                should_load = epi_coord[0] == 0
+        else:
+            if const_expr(not gemm.epi_m_major):
+                should_load = epi_coord[1] == 0
+        if should_load:
+            tDsV_cur = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, epi_coord]
+            tDrV = cute.make_rmem_tensor(tDsV_cur.layout, tDsV_cur.element_type)
+            cute.autovec_copy(cute.filter_zeros(tDsV_cur), cute.filter_zeros(tDrV))
+            tDrV_cvt.store(tDrV.load().to(gemm.acc_dtype))
         return tDrV_cvt
 
 
@@ -432,41 +420,39 @@ class ColVecLoad(VecLoad):
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
-        tDsV = None
-        tDrV_cvt = None
-        if const_expr(param is not None):
-            dtype = param.element_type
-            num_copy_elems = const_expr(max(32, dtype.width)) // dtype.width
-            thr_copy = copy_utils.tiled_copy_1d(
-                dtype, ctx.num_epi_threads, num_copy_elems, is_async=True
-            ).get_slice(ctx.tidx)
-            mVec = self._get_gmem_vec(param, ctx)
-            tile_dim = self._tile_dim(ctx)
-            coord_idx = ctx.tile_coord_mnkl[self._coord_idx()]
-            gVec = cute.local_tile(mVec, (tile_dim,), (coord_idx,))
-            tVgV = thr_copy.partition_S(gVec)
-            tVsV = thr_copy.partition_D(smem_tensor)
-            tVcV = thr_copy.partition_S(cute.make_identity_tensor(tile_dim))
-            # ColVec uses varlen-aware limit
-            limit = min(
-                ctx.varlen_manager.len_m(ctx.batch_idx) - coord_idx * tile_dim,
-                tile_dim,
+        dtype = param.element_type
+        num_copy_elems = const_expr(max(32, dtype.width)) // dtype.width
+        thr_copy = copy_utils.tiled_copy_1d(
+            dtype, ctx.num_epi_threads, num_copy_elems, is_async=True
+        ).get_slice(ctx.tidx)
+        mVec = self._get_gmem_vec(param, ctx)
+        tile_dim = self._tile_dim(ctx)
+        coord_idx = ctx.tile_coord_mnkl[self._coord_idx()]
+        gVec = cute.local_tile(mVec, (tile_dim,), (coord_idx,))
+        tVgV = thr_copy.partition_S(gVec)
+        tVsV = thr_copy.partition_D(smem_tensor)
+        tVcV = thr_copy.partition_S(cute.make_identity_tensor(tile_dim))
+        # ColVec uses varlen-aware limit
+        limit = min(
+            ctx.varlen_manager.len_m(ctx.batch_idx) - coord_idx * tile_dim,
+            tile_dim,
+        )
+        for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
+            if tVcV[0, m] < tile_dim:  # Guard to avoid writing beyond the smem we've allocated
+                pred = cute.make_rmem_tensor(1, Boolean)
+                pred[0] = tVcV[0, m] < limit
+                cute.copy(thr_copy, tVgV[None, m], tVsV[None, m], pred=pred)
+        tDsV = ctx.partition_for_epilogue_fn(
+            cute.make_tensor(
+                smem_tensor.iterator,
+                cute.make_layout((ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride()),
             )
-            pred = cute.make_rmem_tensor((1, cute.size(tVsV.shape[1])), Boolean)
-            for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
-                pred[0, m] = tVcV[0, m] < limit
-            cute.copy(thr_copy, tVgV, tVsV, pred=pred)
-            tDsV = ctx.partition_for_epilogue_fn(
-                cute.make_tensor(
-                    smem_tensor.iterator,
-                    cute.make_layout((ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride()),
-                )
-            )
-            if const_expr(ctx.tiled_copy_t2r is not None):
-                tDsV = ctx.tiled_copy_r2s.retile(tDsV)
-            # Pre-allocate register tensor reused across begin_loop calls
-            tDsV_sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
-            tDrV_cvt = cute.make_rmem_tensor(tDsV_sub.layout, gemm.acc_dtype)
+        )
+        if const_expr(ctx.tiled_copy_t2r is not None):
+            tDsV = ctx.tiled_copy_r2s.retile(tDsV)
+        # Pre-allocate register tensor reused across begin_loop calls
+        tDsV_sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
+        tDrV_cvt = cute.make_rmem_tensor(tDsV_sub.layout, gemm.acc_dtype)
         return [tDsV, tDrV_cvt]
 
 
@@ -492,24 +478,17 @@ class TileStore(EpiOp):
         return f"epi_tile_{self.name}"
 
     def param_fields(self):
-        from dataclasses import MISSING
-
+        # Defaults are None so EpilogueParams can be constructed when this op is
+        # filtered out (inactive). Active calls always set all four via to_params.
         return [
-            (self._tma_atom_key(), object, MISSING),
-            (self.name, object, MISSING),
-            (self._smem_layout_key(), object, MISSING),
-            (self._epi_tile_key(), object, MISSING),
+            (self._tma_atom_key(), object, None),
+            (self.name, object, None),
+            (self._smem_layout_key(), object, None),
+            (self._epi_tile_key(), object, None),
         ]
 
     def to_params(self, gemm, args):
-        tensor = getattr(args, self.name, None)
-        if tensor is None:
-            return {
-                self._tma_atom_key(): None,
-                self.name: None,
-                self._smem_layout_key(): None,
-                self._epi_tile_key(): None,
-            }
+        tensor = getattr(args, self.name)
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
             gemm, tensor, epi_tile=epi_tile
@@ -522,8 +501,6 @@ class TileStore(EpiOp):
         }
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
-        if arg_tensor is None:
-            return EpiSmemBytes()
         if self.epi_tile_fn is not None:
             epi_tile = self.epi_tile_fn(None, epi_tile)
         # epi_tile may contain Layout entries (from SM100's compute_epilogue_tile_shape
@@ -533,10 +510,7 @@ class TileStore(EpiOp):
         )
 
     def smem_struct_field(self, gemm, params):
-        smem_layout_key = self._smem_layout_key()
-        smem_layout = getattr(params, smem_layout_key, None)
-        if smem_layout is None:
-            return (f"s_{self.name}", cute.struct.MemRange[Float32, 0])
+        smem_layout = getattr(params, self._smem_layout_key())
         return (
             f"s_{self.name}",
             cute.struct.Align[
@@ -549,17 +523,14 @@ class TileStore(EpiOp):
         )
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        smem_layout = getattr(params, self._smem_layout_key(), None)
-        if smem_layout is None:
-            return None
+        smem_layout = getattr(params, self._smem_layout_key())
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
             smem_layout.outer,
             swizzle=smem_layout.inner,
         )
 
     def tma_atoms(self, gemm, params):
-        atom = getattr(params, self._tma_atom_key(), None)
-        return [] if atom is None else [atom]
+        return [getattr(params, self._tma_atom_key())]
 
 
 class _TileLoadState(NamedTuple):
@@ -615,26 +586,18 @@ class TileLoad(EpiOp):
         return f"{self.name}_dtype"
 
     def param_fields(self):
-        from dataclasses import MISSING
-
+        # Defaults are None so EpilogueParams can be constructed when this op is
+        # filtered out (inactive). Active calls always set all five via to_params.
         return [
-            (self._tma_atom_key(), object, MISSING),
-            (self.name, object, MISSING),
-            (self._smem_layout_key(), object, MISSING),
-            (self._epi_tile_key(), object, MISSING),
-            (self._dtype_field(), object, MISSING),
+            (self._tma_atom_key(), object, None),
+            (self.name, object, None),
+            (self._smem_layout_key(), object, None),
+            (self._epi_tile_key(), object, None),
+            (self._dtype_field(), object, None),
         ]
 
     def to_params(self, gemm, args):
-        tensor = getattr(args, self.name, None)
-        if tensor is None:
-            return {
-                self._tma_atom_key(): None,
-                self.name: None,
-                self._smem_layout_key(): None,
-                self._epi_tile_key(): None,
-                self._dtype_field(): None,
-            }
+        tensor = getattr(args, self.name)
         setattr(gemm, self._layout_gemm_attr(), cutlass.utils.LayoutEnum.from_tensor(tensor))
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
@@ -653,8 +616,6 @@ class TileLoad(EpiOp):
         return True
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
-        if arg_tensor is None:
-            return EpiSmemBytes()
         if self.epi_tile_fn is not None:
             epi_tile = self.epi_tile_fn(None, epi_tile)
         # epi_tile may contain Layout entries from SM100's compute_epilogue_tile_shape
@@ -664,10 +625,8 @@ class TileLoad(EpiOp):
         )
 
     def smem_struct_field(self, gemm, params):
-        smem_layout = getattr(params, self._smem_layout_key(), None)
-        dtype = getattr(params, self._dtype_field(), None)
-        if smem_layout is None or dtype is None:
-            return (f"s_{self.name}", cute.struct.MemRange[Float32, 0])
+        smem_layout = getattr(params, self._smem_layout_key())
+        dtype = getattr(params, self._dtype_field())
         return (
             f"s_{self.name}",
             cute.struct.Align[
@@ -677,17 +636,14 @@ class TileLoad(EpiOp):
         )
 
     def get_smem_tensor(self, gemm, params, storage_epi):
-        smem_layout = getattr(params, self._smem_layout_key(), None)
-        if smem_layout is None:
-            return None
+        smem_layout = getattr(params, self._smem_layout_key())
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
             smem_layout.outer,
             swizzle=smem_layout.inner,
         )
 
     def tma_atoms(self, gemm, params):
-        atom = getattr(params, self._tma_atom_key(), None)
-        return [] if atom is None else [atom]
+        return [getattr(params, self._tma_atom_key())]
 
     def load_g2s_copy_fn(
         self,
@@ -698,25 +654,20 @@ class TileLoad(EpiOp):
         varlen_manager,
         epi_pipeline,
     ):
-        tensor = getattr(params, self.name, None)
-        copy_tile = None
-        if const_expr(tensor is not None):
-            batch_idx = tile_coord_mnkl[3]
-            copy_tile_fn, _, _ = gemm.epilog_gmem_copy_and_partition(
-                getattr(params, self._tma_atom_key()),
-                varlen_manager.offset_batch_epi(tensor, batch_idx),
-                gemm.cta_tile_shape_mnk[:2],
-                getattr(params, self._epi_tile_key()),
-                smem_tensor,
-                tile_coord_mnkl,
-            )
-            copy_tile = copy_utils.tma_producer_copy_fn(copy_tile_fn, epi_pipeline)
-        return copy_tile
+        tensor = getattr(params, self.name)
+        batch_idx = tile_coord_mnkl[3]
+        copy_tile_fn, _, _ = gemm.epilog_gmem_copy_and_partition(
+            getattr(params, self._tma_atom_key()),
+            varlen_manager.offset_batch_epi(tensor, batch_idx),
+            gemm.cta_tile_shape_mnk[:2],
+            getattr(params, self._epi_tile_key()),
+            smem_tensor,
+            tile_coord_mnkl,
+        )
+        return copy_utils.tma_producer_copy_fn(copy_tile_fn, epi_pipeline)
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
-        if const_expr(param is None):
-            return None
         assert gemm.arch in (90, 100, 120), "TileLoad requires the SM90/SM100/SM120 epilogue path"
         assert ctx.tRS_rD_layout is not None
         smem_load_ref = ctx.tiled_copy_t2r if const_expr(gemm.arch == 100) else gemm.tiled_mma
@@ -734,17 +685,14 @@ class TileLoad(EpiOp):
 
     @cute.jit
     def load_s2r(self, gemm, param, state, stage_idx):
-        if const_expr(param is not None):
-            cute.copy(
-                state.tiled_copy_s2r,
-                state.tSR_sTile[None, None, None, stage_idx],
-                state.tSR_rTile,
-            )
+        cute.copy(
+            state.tiled_copy_s2r,
+            state.tSR_sTile[None, None, None, stage_idx],
+            state.tSR_rTile,
+        )
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
-        if const_expr(state is None):
-            return None
         return state.tRS_rTile
 
 
@@ -862,7 +810,7 @@ class VecReduce(EpiOp):
         return {self.name: assume_stride_divisibility(getattr(args, self.name))}
 
     def epi_m_major_score(self, arg_tensor, gemm):
-        return self.epi_m_major_preference if arg_tensor is not None else 0
+        return self.epi_m_major_preference
 
     def _tile_size(self, cta_tile_shape_mnk):
         return cta_tile_shape_mnk[self.dim]
@@ -880,23 +828,22 @@ class VecReduce(EpiOp):
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
         smem_warps = self._smem_warps(warp_shape_mnk)
-        if arg_tensor is None or smem_warps == 0:
+        if smem_warps == 0:
             return EpiSmemBytes()
         return EpiSmemBytes(
             unstaged=self._tile_size(cta_tile_shape_mnk) * smem_warps * (Float32.width // 8)
         )
 
     def smem_struct_field(self, gemm, params):
-        tensor = getattr(params, self.name, None)
         smem_warps = self._smem_warps(gemm.epi_smem_warp_shape_mnk())
-        if tensor is None or smem_warps == 0:
+        if smem_warps == 0:
             return None
         size = self._tile_size(gemm.cta_tile_shape_mnk) * smem_warps
         return (f"s_{self.name}", cute.struct.Align[cute.struct.MemRange[Float32, size], 16])
 
     def get_smem_tensor(self, gemm, params, storage_epi):
         smem_warps = self._smem_warps(gemm.epi_smem_warp_shape_mnk())
-        if getattr(params, self.name, None) is None or smem_warps == 0:
+        if smem_warps == 0:
             return None
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
             cute.make_layout((self._tile_size(gemm.cta_tile_shape_mnk), smem_warps))
@@ -904,26 +851,19 @@ class VecReduce(EpiOp):
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
-        result = None
-        if const_expr(param is not None):
-            vec_mma_layout = cute.make_layout(
-                (ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride()
-            )
-            tDrReduce_layout = ctx.partition_for_epilogue_fn(
-                cute.make_rmem_tensor(vec_mma_layout, Float32)
-            ).layout
-            tDrReduce = cute.make_rmem_tensor(tDrReduce_layout, Float32)
-            result = (tDrReduce, smem_tensor)
-        return result
+        vec_mma_layout = cute.make_layout((ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride())
+        tDrReduce_layout = ctx.partition_for_epilogue_fn(
+            cute.make_rmem_tensor(vec_mma_layout, Float32)
+        ).layout
+        tDrReduce = cute.make_rmem_tensor(tDrReduce_layout, Float32)
+        return (tDrReduce, smem_tensor)
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
-        result = None
-        if const_expr(state is not None):
-            tDrReduce = state[0]
-            result = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
-            if const_expr(epi_coord[self._reduce_dim()] == 0):
-                cute.filter_zeros(result).fill(0.0)
+        tDrReduce = state[0]
+        result = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
+        if const_expr(epi_coord[self._reduce_dim()] == 0):
+            cute.filter_zeros(result).fill(0.0)
         return result
 
 
@@ -954,93 +894,92 @@ class ColVecReduce(VecReduce):
         tidx,
     ):
         """Flush the current M stripe when the last N subtile has accumulated."""
-        if const_expr(param is not None):
-            epi_tile_shape = cute.zipped_divide(
-                cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
-            ).shape[1]
-            if const_expr(epi_coord[1] == epi_tile_shape[1] - 1):
-                tDrReduce, sDrReduce = state[0], state[1]
-                tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
-                tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
-                reference_src = tiled_copy_t2r is None
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        if const_expr(epi_coord[1] == epi_tile_shape[1] - 1):
+            tDrReduce, sDrReduce = state[0], state[1]
+            tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
+            tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
+            reference_src = tiled_copy_t2r is None
 
-                # ── Derive lane layout from tiled_copy ──
-                lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(tiled_copy, reference_src)
-                # For ColVecReduce: reduce across N lanes (lanes_in_N threads share same M row)
-                lanes_in_N = cute.size(lane_layout_MN, mode=[1])
-                is_lane_n_leader = cute.arch.lane_idx() % lanes_in_N == 0
-                # Typically lanes_in_N is 4 for Sm90
-                assert lanes_in_N == 1 << int(math.log2(lanes_in_N)), (
-                    "lanes_in_N must be a power of 2 for butterfly reduction"
-                )
+            # ── Derive lane layout from tiled_copy ──
+            lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(tiled_copy, reference_src)
+            # For ColVecReduce: reduce across N lanes (lanes_in_N threads share same M row)
+            lanes_in_N = cute.size(lane_layout_MN, mode=[1])
+            is_lane_n_leader = cute.arch.lane_idx() % lanes_in_N == 0
+            # Typically lanes_in_N is 4 for Sm90
+            assert lanes_in_N == 1 << int(math.log2(lanes_in_N)), (
+                "lanes_in_N must be a power of 2 for butterfly reduction"
+            )
 
-                # Intra-warp shuffle reduction across N lanes
-                if const_expr(lanes_in_N > 1):
-                    # Assumes threads for each M row are contiguous along N, so
-                    # warp_reduction over groups of lanes_in_N matches lane_layout_MN.
-                    assert lane_layout_MN.stride[1] == 1
-                    tDrReduce_flt = cute.filter_zeros(tDrReduce_cur)
-                    for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
-                        tDrReduce_flt[i] = cute.arch.warp_reduction(
-                            tDrReduce_flt[i], operator.add, threads_in_group=lanes_in_N
-                        )
-
-                warp_N = warp_layout_MN[1]
-                warps_in_N = const_expr(cute.size(warp_N))
-                partition_for_epilogue_fn = partial(
-                    partition_for_epilogue,
-                    epi_tile=epi_tile,
-                    tiled_copy=tiled_copy,
-                    tidx=tidx,
-                    reference_src=tiled_copy_t2r is None,
-                )
-                tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
-                tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-                tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
-                tDrReduce_m = layout_utils.convert_layout_zero_stride(
-                    tDrReduce_cur, tDrReduce_cur.layout
-                )[None, 0]
-                tDcD_m = layout_utils.convert_layout_zero_stride(tDcD_cur, tDrReduce_cur.layout)[
-                    None, 0
-                ]
-
-                # Inter-warp reduction through smem
-                warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
-                warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
-                if const_expr(warps_in_N > 1):
-                    if warp_n_idx > 0 and is_lane_n_leader:
-                        for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                            row_idx = tDcD_m[m][0]
-                            sDrReduce[row_idx, warp_n_idx - 1] = tDrReduce_m[m]
-                    gemm.epilogue_barrier.arrive_and_wait()
-                    if warp_n_idx == 0 and is_lane_n_leader:
-                        for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                            row_idx = tDcD_m[m][0]
-                            for warp_n in cutlass.range_constexpr(1, warps_in_N):
-                                tDrReduce_m[m] += sDrReduce[row_idx, warp_n - 1]
-
-                # Write to gmem
-                batch_idx = tile_coord_mnkl[3]
-                limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
-                limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
-                if const_expr(not varlen_manager.varlen_m):
-                    mColVec = param[batch_idx, None, tile_coord_mnkl[1]]
-                else:
-                    mColVec = cute.domain_offset(
-                        (varlen_manager.params.cu_seqlens_m[batch_idx],),
-                        param[None, tile_coord_mnkl[1]],
+            # Intra-warp shuffle reduction across N lanes
+            if const_expr(lanes_in_N > 1):
+                # Assumes threads for each M row are contiguous along N, so
+                # warp_reduction over groups of lanes_in_N matches lane_layout_MN.
+                assert lane_layout_MN.stride[1] == 1
+                tDrReduce_flt = cute.filter_zeros(tDrReduce_cur)
+                for i in cutlass.range(cute.size(tDrReduce_flt), unroll_full=True):
+                    tDrReduce_flt[i] = cute.arch.warp_reduction(
+                        tDrReduce_flt[i], operator.add, threads_in_group=lanes_in_N
                     )
-                gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
-                should_write_gmem = (
-                    is_lane_n_leader
-                    if const_expr(warps_in_N == 1)
-                    else warp_n_idx == 0 and is_lane_n_leader
-                )
-                if tile_coord_mnkl[1] < limit_n_tiles and should_write_gmem:
+
+            warp_N = warp_layout_MN[1]
+            warps_in_N = const_expr(cute.size(warp_N))
+            partition_for_epilogue_fn = partial(
+                partition_for_epilogue,
+                epi_tile=epi_tile,
+                tiled_copy=tiled_copy,
+                tidx=tidx,
+                reference_src=tiled_copy_t2r is None,
+            )
+            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
+            tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
+            tDrReduce_m = layout_utils.convert_layout_zero_stride(
+                tDrReduce_cur, tDrReduce_cur.layout
+            )[None, 0]
+            tDcD_m = layout_utils.convert_layout_zero_stride(tDcD_cur, tDrReduce_cur.layout)[
+                None, 0
+            ]
+
+            # Inter-warp reduction through smem
+            warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
+            warp_n_idx = warp_layout_MN.get_hier_coord(warp_idx)[1]
+            if const_expr(warps_in_N > 1):
+                if warp_n_idx > 0 and is_lane_n_leader:
                     for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
                         row_idx = tDcD_m[m][0]
-                        if row_idx < limit_m:
-                            gColVec[row_idx] = tDrReduce_m[m]
+                        sDrReduce[row_idx, warp_n_idx - 1] = tDrReduce_m[m]
+                gemm.epilogue_barrier.arrive_and_wait()
+                if warp_n_idx == 0 and is_lane_n_leader:
+                    for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                        row_idx = tDcD_m[m][0]
+                        for warp_n in cutlass.range_constexpr(1, warps_in_N):
+                            tDrReduce_m[m] += sDrReduce[row_idx, warp_n - 1]
+
+            # Write to gmem
+            batch_idx = tile_coord_mnkl[3]
+            limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
+            limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
+            if const_expr(not varlen_manager.varlen_m):
+                mColVec = param[batch_idx, None, tile_coord_mnkl[1]]
+            else:
+                mColVec = cute.domain_offset(
+                    (varlen_manager.params.cu_seqlens_m[batch_idx],),
+                    param[None, tile_coord_mnkl[1]],
+                )
+            gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
+            should_write_gmem = (
+                is_lane_n_leader
+                if const_expr(warps_in_N == 1)
+                else warp_n_idx == 0 and is_lane_n_leader
+            )
+            if tile_coord_mnkl[1] < limit_n_tiles and should_write_gmem:
+                for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                    row_idx = tDcD_m[m][0]
+                    if row_idx < limit_m:
+                        gColVec[row_idx] = tDrReduce_m[m]
 
 
 class RowVecReduce(VecReduce):
@@ -1069,95 +1008,94 @@ class RowVecReduce(VecReduce):
         tidx,
     ):
         """Flush the current N stripe when the last M subtile has accumulated."""
-        if const_expr(param is not None):
-            epi_tile_shape = cute.zipped_divide(
-                cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
-            ).shape[1]
-            if const_expr(epi_coord[0] == epi_tile_shape[0] - 1):
-                tDrReduce, sDrReduce = state[0], state[1]
-                tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
-                tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
-                reference_src = tiled_copy_t2r is None
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        if const_expr(epi_coord[0] == epi_tile_shape[0] - 1):
+            tDrReduce, sDrReduce = state[0], state[1]
+            tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
+            tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
+            reference_src = tiled_copy_t2r is None
 
-                # ── Derive lane layout from tiled_copy ──
-                lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(tiled_copy, reference_src)
-                # For RowVecReduce: reduce across M lanes (lanes_in_M threads share same N col)
-                lanes_in_M = cute.size(lane_layout_MN, mode=[0])
-                lanes_in_N = cute.size(lane_layout_MN, mode=[1])
-                is_lane_m_leader = cute.arch.lane_idx() < lanes_in_N
-                assert lanes_in_M == 1 << int(math.log2(lanes_in_M)), (
-                    "lanes_in_M must be a power of 2 for butterfly reduction"
+            # ── Derive lane layout from tiled_copy ──
+            lane_layout_MN, warp_layout_MN = _get_lane_warp_layouts(tiled_copy, reference_src)
+            # For RowVecReduce: reduce across M lanes (lanes_in_M threads share same N col)
+            lanes_in_M = cute.size(lane_layout_MN, mode=[0])
+            lanes_in_N = cute.size(lane_layout_MN, mode=[1])
+            is_lane_m_leader = cute.arch.lane_idx() < lanes_in_N
+            assert lanes_in_M == 1 << int(math.log2(lanes_in_M)), (
+                "lanes_in_M must be a power of 2 for butterfly reduction"
+            )
+            if const_expr(lanes_in_N > 1):
+                assert lane_layout_MN.stride[1] == 1, (
+                    "RowVecReduce assumes contiguous N lanes when lanes_in_N > 1"
                 )
-                if const_expr(lanes_in_N > 1):
-                    assert lane_layout_MN.stride[1] == 1, (
-                        "RowVecReduce assumes contiguous N lanes when lanes_in_N > 1"
-                    )
 
-                # Intra-warp shuffle reduction across M lanes. M lanes may be either contiguous
-                # (SM100 N-major output) or strided by N lanes (SM100 M-major output).
-                tDrReduce_n = layout_utils.convert_layout_zero_stride(
-                    tDrReduce_cur, tDrReduce_cur.layout
-                )[None, 0]
-                if const_expr(lanes_in_M > 1):
-                    for n in cutlass.range(cute.size(tDrReduce_n), unroll_full=True):
-                        reduction_rows = lanes_in_M // 2
-                        while reduction_rows > 0:
-                            tDrReduce_n[n] += cute.arch.shuffle_sync_bfly(
-                                tDrReduce_n[n],
-                                offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
-                            )
-                            reduction_rows = reduction_rows // 2
+            # Intra-warp shuffle reduction across M lanes. M lanes may be either contiguous
+            # (SM100 N-major output) or strided by N lanes (SM100 M-major output).
+            tDrReduce_n = layout_utils.convert_layout_zero_stride(
+                tDrReduce_cur, tDrReduce_cur.layout
+            )[None, 0]
+            if const_expr(lanes_in_M > 1):
+                for n in cutlass.range(cute.size(tDrReduce_n), unroll_full=True):
+                    reduction_rows = lanes_in_M // 2
+                    while reduction_rows > 0:
+                        tDrReduce_n[n] += cute.arch.shuffle_sync_bfly(
+                            tDrReduce_n[n],
+                            offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
+                        )
+                        reduction_rows = reduction_rows // 2
 
-                warp_M = warp_layout_MN[0]
-                warps_in_M = const_expr(cute.size(warp_M))
-                partition_for_epilogue_fn = partial(
-                    partition_for_epilogue,
-                    epi_tile=epi_tile,
-                    tiled_copy=tiled_copy,
-                    tidx=tidx,
-                    reference_src=tiled_copy_t2r is None,
-                )
-                tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
-                tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-                tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
-                tDcD_n = layout_utils.convert_layout_zero_stride(tDcD_cur, tDrReduce_cur.layout)[
-                    None, 0
-                ]
+            warp_M = warp_layout_MN[0]
+            warps_in_M = const_expr(cute.size(warp_M))
+            partition_for_epilogue_fn = partial(
+                partition_for_epilogue,
+                epi_tile=epi_tile,
+                tiled_copy=tiled_copy,
+                tidx=tidx,
+                reference_src=tiled_copy_t2r is None,
+            )
+            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
+            tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
+            tDcD_n = layout_utils.convert_layout_zero_stride(tDcD_cur, tDrReduce_cur.layout)[
+                None, 0
+            ]
 
-                # Inter-warp reduction through smem
-                warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
-                warp_m_idx = warp_layout_MN.get_hier_coord(warp_idx)[0]
-                if const_expr(warps_in_M > 1):
-                    if warp_m_idx > 0 and is_lane_m_leader:
-                        for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
-                            col_idx = tDcD_n[n][1]
-                            sDrReduce[col_idx, warp_m_idx - 1] = tDrReduce_n[n]
-                    gemm.epilogue_barrier.arrive_and_wait()
-                    if warp_m_idx == 0 and is_lane_m_leader:
-                        for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
-                            col_idx = tDcD_n[n][1]
-                            for warp_m in cutlass.range_constexpr(1, warps_in_M):
-                                tDrReduce_n[n] += sDrReduce[col_idx, warp_m - 1]
-
-                # Write to gmem
-                batch_idx = tile_coord_mnkl[3]
-                limit_m_tiles = param.shape[1] if not varlen_manager.varlen_m else param.shape[0]
-                if const_expr(not varlen_manager.varlen_m):
-                    mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
-                else:
-                    mRowVec = param[tile_coord_mnkl[0], None]
-                gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
-                limit_n = min(
-                    cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
-                    tile_N,
-                )
-                should_write_gmem = (
-                    is_lane_m_leader
-                    if const_expr(warps_in_M == 1)
-                    else warp_m_idx == 0 and is_lane_m_leader
-                )
-                if tile_coord_mnkl[0] < limit_m_tiles and should_write_gmem:
+            # Inter-warp reduction through smem
+            warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
+            warp_m_idx = warp_layout_MN.get_hier_coord(warp_idx)[0]
+            if const_expr(warps_in_M > 1):
+                if warp_m_idx > 0 and is_lane_m_leader:
                     for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
                         col_idx = tDcD_n[n][1]
-                        if col_idx < limit_n:
-                            gRowVec[col_idx] = tDrReduce_n[n]
+                        sDrReduce[col_idx, warp_m_idx - 1] = tDrReduce_n[n]
+                gemm.epilogue_barrier.arrive_and_wait()
+                if warp_m_idx == 0 and is_lane_m_leader:
+                    for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
+                        col_idx = tDcD_n[n][1]
+                        for warp_m in cutlass.range_constexpr(1, warps_in_M):
+                            tDrReduce_n[n] += sDrReduce[col_idx, warp_m - 1]
+
+            # Write to gmem
+            batch_idx = tile_coord_mnkl[3]
+            limit_m_tiles = param.shape[1] if not varlen_manager.varlen_m else param.shape[0]
+            if const_expr(not varlen_manager.varlen_m):
+                mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
+            else:
+                mRowVec = param[tile_coord_mnkl[0], None]
+            gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
+            limit_n = min(
+                cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
+                tile_N,
+            )
+            should_write_gmem = (
+                is_lane_m_leader
+                if const_expr(warps_in_M == 1)
+                else warp_m_idx == 0 and is_lane_m_leader
+            )
+            if tile_coord_mnkl[0] < limit_m_tiles and should_write_gmem:
+                for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
+                    col_idx = tDcD_n[n][1]
+                    if col_idx < limit_n:
+                        gRowVec[col_idx] = tDrReduce_n[n]

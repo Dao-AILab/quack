@@ -57,7 +57,7 @@ def make_tiled_mma(
     `acc_dtype` defaults to Float32."""
     if b_dtype is None:
         b_dtype = a_dtype
-    mode = {"K": warpgroup.OperandMajorMode.K, "MN": warpgroup.OperandMajorMode.MN}
+    mode = {"K": cute.nvgpu.OperandMajorMode.K, "MN": cute.nvgpu.OperandMajorMode.MN}
     a_mode, b_mode = mode[a_major], mode[b_major]
     if swap_AB:
         a_mode, b_mode = b_mode, a_mode

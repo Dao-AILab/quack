@@ -33,10 +33,10 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_gemm_tensors,
     compile_gemm_kernel,
 )
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.rounding import RoundingMode
-import quack.layout_utils as layout_utils
 from quack.activation import dact_fn_map, dgate_fn_map
+from quack import layout_utils
 
 
 class GemmDActMixin(GemmActMixin):
@@ -51,7 +51,7 @@ class GemmDActMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         assert tRS_rC is not None
         # We don't add C to the accumulator
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
@@ -74,7 +74,7 @@ class GemmDActMixin(GemmActMixin):
                     )
         else:
             tRS_rAuxOut = tRS_rC_acc
-        return tRS_rAuxOut
+        return (tRS_rAuxOut,)
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
@@ -138,9 +138,9 @@ class GemmDGatedMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
-        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
+    ) -> Tuple[cute.Tensor, ...]:
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
+        tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         assert tRS_rC is not None
         implicit_dtype = self.implicit_dtype
         assert implicit_dtype.width == 16, "GemmDGatedMixin only supports 16bit for now"
@@ -216,7 +216,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
-        return tRS_rOut
+        return (tRS_rOut,)
 
     # epi_end is inherited from ComposableEpiMixin → delegates to ColVecReduce.end()
 
@@ -481,9 +481,9 @@ def gemm_dact(
         use_tma_gather=use_tma_gather,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

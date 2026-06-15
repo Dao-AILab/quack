@@ -1394,8 +1394,8 @@ class GemmSm90(GemmTmaBase):
         """
         a_smem_shape = cute.slice_(cta_tile_shape_mnk, (None, 0, None))
 
-        a_is_k_major = a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
-        b_is_k_major = b_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
+        a_is_k_major = a_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K
+        b_is_k_major = b_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K
         a_major_mode_size = cta_tile_shape_mnk[2 if a_is_k_major else 0]
         a_smem_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils.get_smem_layout_atom(a_layout, a_dtype, a_major_mode_size),

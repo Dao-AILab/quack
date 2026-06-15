@@ -21,17 +21,24 @@ sub_packed_f32x2 = partial(
 
 
 @dsl_user_op
-def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "tanh.approx.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
+def tanh(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    @dsl_user_op
+    def impl(a: float | Float32, *, loc=None, ip=None) -> Float32:
+        return Float32(
+            llvm.inline_asm(
+                T.f32(),
+                [Float32(a).ir_value(loc=loc, ip=ip)],
+                "tanh.approx.f32 $0, $1;",
+                "=f,f",
+                has_side_effects=False,
+                is_align_stack=False,
+            )
         )
-    )
+
+    if const_expr(not isinstance(x, tuple)):
+        return impl(x, loc=loc, ip=ip)
+    else:
+        return (impl(x[0], loc=loc, ip=ip), impl(x[1], loc=loc, ip=ip))
 
 
 @dsl_user_op
@@ -727,6 +734,7 @@ act_fn_map = {
     "relu": relu,
     "relu_sq": relu_sq,
     "gelu_tanh_approx": gelu_tanh_approx,
+    "tanh": tanh,
 }
 
 dact_fn_map = {
@@ -736,6 +744,9 @@ dact_fn_map = {
     "relu": drelu,
     "relu_sq": drelu_sq,
     "gelu_tanh_approx": dgelu_tanh_approx,
+    # "tanh" is intentionally absent: only the forward epilogue exists. Adding a
+    # None entry would make gemm_dact silently skip the derivative (the identity
+    # path reserved for activation=None) instead of rejecting the activation.
 }
 
 gate_fn_map = {

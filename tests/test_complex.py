@@ -19,6 +19,16 @@ from quack.complex import (
     complex_storage,
     recast_to_complex64,
 )
+import quack.cache
+
+
+# Skip the whole module under ``pytest --compile-only`` — the direct TVM-FFI
+# compile path here does not warm quack's jit cache, so the tests add nothing
+# in phase 1. The marker is registered by ``quack.testing.pytest_plugin`` and
+# evaluated at test-setup time, so it is robust to xdist worksteal item-fetch
+# ordering (unlike ``pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``
+# which captures at decorator-application time).
+pytestmark = pytest.mark.compile_only_skip("direct TVM-FFI compile does not warm jit cache")
 
 
 class _ScaleByComplex:
@@ -76,9 +86,6 @@ def _compile_scale_by_complex(n: int):
 @pytest.mark.parametrize("n", [128, 256])
 @pytest.mark.parametrize("batch", [1, 4])
 def test_complex_scale_tvm_ffi(batch: int, n: int):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
     torch.manual_seed(0)
     x = torch.randn(batch, n, dtype=torch.complex64, device="cuda")
     out = torch.empty_like(x)
@@ -165,9 +172,6 @@ def _compile_smem_roundtrip():
 
 @pytest.mark.parametrize("batch", [1, 4])
 def test_smem_roundtrip_complex64(batch: int):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
     torch.manual_seed(0)
     x = torch.randn(batch, _SMEM_BLOCK_ELEMS, dtype=torch.complex64, device="cuda")
     out = torch.empty_like(x)
@@ -235,8 +239,6 @@ class _OneShot:
 
 def _run_oneshot(body_fn, n_outputs: int) -> list[complex]:
     """Compile a kernel that writes n_outputs Complex64 values, run it, return them."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
     out = torch.zeros(n_outputs, dtype=torch.complex64, device="cuda")
     out_fake = cute.runtime.make_fake_tensor(Complex64, (n_outputs,), stride=(1,), assumed_align=8)
     fn = cute.compile(
@@ -535,12 +537,11 @@ def test_complex_storage_passthrough_for_float64():
 
 def test_complex_storage_view_for_complex64():
     """Tier 5.24b -- complex_storage(complex64) returns a float64 view sharing memory."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required for view alignment")
     c = torch.zeros(4, dtype=torch.complex64, device="cuda")
     v = complex_storage(c)
     assert v.dtype == torch.float64
-    assert v.data_ptr() == c.data_ptr()
+    if not quack.cache.COMPILE_ONLY:
+        assert v.data_ptr() == c.data_ptr()
     assert v.numel() == c.numel()
 
 

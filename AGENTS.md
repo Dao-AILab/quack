@@ -11,7 +11,7 @@ QuACK (Quirky Assortment of CuTe Kernels) — high-performance CUDA kernels writ
 pip install -e '.[dev]'
 pre-commit install
 
-# For CUDA 13.1
+# For CUDA 13.x
 pip install -e '.[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
 
 # Lint & format

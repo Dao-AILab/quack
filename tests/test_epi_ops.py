@@ -18,11 +18,12 @@ def test_colvec_reduce_smem_bytes_default_to_direct_write_path():
 def test_colvec_reduce_smem_bytes_use_atom_layout_n_warp_staging():
     op = ColVecReduce("mColVecReduce")
 
+    # op.smem_bytes is only called for active (non-None) args by the framework;
+    # ComposableEpiMixin.epi_smem_bytes filters from `args` before calling.
     with ir.Context():
         assert op.smem_bytes(_ArgTensor(), (64, 128, 64), (64, 32), (4, 2, 1)) == EpiSmemBytes(
             unstaged=64 * 1 * 4
         )
-        assert op.smem_bytes(None, (64, 128, 64), (64, 32), (4, 2, 1)) == EpiSmemBytes()
 
 
 def test_vecload_smem_bytes_are_unstaged():
@@ -50,4 +51,3 @@ def test_tile_load_smem_accounting_is_c_stage():
         assert op.smem_bytes(_ArgTensor(), (64, 128, 64), (64, 32)) == EpiSmemBytes(
             c_stage=64 * 32 * 4
         )
-        assert op.smem_bytes(None, (64, 128, 64), (64, 32)) == EpiSmemBytes()

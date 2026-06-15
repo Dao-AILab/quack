@@ -9,7 +9,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_default_epi import (
@@ -255,9 +255,9 @@ def gemm(
         num_warps,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     def scalar_arg(scalar, mode, dtype=Float32):

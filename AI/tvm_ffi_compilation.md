@@ -159,4 +159,4 @@ cluster dims, activation, etc.). Same args → same compiled kernel.
 | `compile_utils.py` | `make_fake_tensor` — creates symbolic tensors |
 | `gemm_tvm_ffi_utils.py` | `make_fake_gemm_tensors`, `compile_gemm_kernel`, varlen/scheduler helpers |
 | `cute_dsl_utils.py` | `@mlir_namedtuple`, `ParamsBase`, Constexpr converter patch |
-| `cache_utils.py` | `@jit_cache` decorator — in-memory + filesystem `.o` caching |
+| `quack/cache/jit.py` | `@jit_cache` decorator — in-memory + filesystem `.o` caching |

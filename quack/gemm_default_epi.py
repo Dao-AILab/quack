@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -42,7 +42,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         self.rounding_mode = args.rounding_mode
         d = self._epi_ops_to_params_dict(args)
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
-            if key in self.concat_layout and key in d and d[key] is not None:
+            if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
@@ -53,11 +53,18 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         epi_loop_tensors,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        alpha = epi_loop_tensors["alpha"]
-        beta = epi_loop_tensors["beta"]
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+    ) -> Tuple[cute.Tensor, ...]:
+        """Return a tuple of register tensors (one per aux output).
+
+        The returned tuple must be the same length as the tuple returned
+        from :meth:`epi_setup_aux_out`. The default impl returns ``()`` —
+        no aux outputs.
+        """
+        # Use .get(): inactive ops are filtered out of epi_loop_tensors.
+        alpha = epi_loop_tensors.get("alpha")
+        beta = epi_loop_tensors.get("beta")
+        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         rD = tRS_rD.load()
         # Apply alpha scaling to accumulator if alpha is provided (not None)
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
@@ -78,7 +85,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         if const_expr(tDrColVec is not None):
             for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
                 tRS_rD[i] += tDrColVec[i]
-        return None
+        return ()
 
 
 class GemmDefaultSm80(GemmDefaultEpiMixin, GemmSm80):

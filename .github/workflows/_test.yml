@@ -16,8 +16,8 @@ on:
 
 env:
   # Bump these when pushing a new image; old SIFs are auto-pruned on the next CI run.
-  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.04.29
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.04.29
+  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.05.27
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.05.27
 
 jobs:
   lint:
@@ -65,9 +65,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The cu129 image with torch 2.12 no longer works with B300 (bc torch is installed
+          # with cu12.6).
           - { gpu: h100, cuda: cu129 }
           - { gpu: h100, cuda: cu132 }
-          - { gpu: b300, cuda: cu129 }
           - { gpu: b300, cuda: cu132 }
           - { gpu: h100, cuda: cu129, arch: '120' }
           - { gpu: h100, cuda: cu132, arch: '120' }
@@ -81,6 +82,7 @@ jobs:
       - uses: ./.github/actions/gpu-test
         with:
           cuda: ${{ matrix.cuda }}
+          gpu: ${{ matrix.gpu }}
           image_cu129: ${{ env.IMAGE_CU129 }}
           image_cu132: ${{ env.IMAGE_CU132 }}
           arch: ${{ matrix.arch }}

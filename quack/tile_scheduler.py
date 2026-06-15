@@ -204,8 +204,12 @@ class TileScheduler:
         ip=None,
     ) -> "TileScheduler":
         """is_scheduler_warp should only be true for one warp in the whole cluster"""
+        if const_expr(cute.size(params.cluster_shape_mnk, loc=loc, ip=ip) == 1):
+            cluster_idx = cute.arch.block_idx()
+        else:
+            cluster_idx = cute.arch.cluster_idx()
         current_work_idx, _ = TileScheduler._cluster_idx_to_work_idx_batch(
-            params, cute.arch.cluster_idx(), loc=loc, ip=ip
+            params, cluster_idx, loc=loc, ip=ip
         )
         stages = 0
         if const_expr(
@@ -294,7 +298,9 @@ class TileScheduler:
     def _cluster_id_to_cta_id(
         self, cid_m: Int32, cid_n: Int32, *, block_zero_only: bool = False, loc=None, ip=None
     ) -> Tuple[Int32, Int32]:
-        if const_expr(block_zero_only):
+        if const_expr(
+            block_zero_only or cute.size(self.params.cluster_shape_mnk, loc=loc, ip=ip) == 1
+        ):
             bidx_in_cluster = (Int32(0), Int32(0))
         else:
             # Get the pid from cluster id
@@ -326,7 +332,11 @@ class TileScheduler:
         if is_valid:
             if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
                 cluster_id_in_problem = work_idx
-                _, _, bidz_ = cute.arch.cluster_idx()
+                bidz_ = (
+                    cute.arch.block_idx()[2]
+                    if const_expr(cute.size(params.cluster_shape_mnk, loc=loc, ip=ip) == 1)
+                    else cute.arch.cluster_idx()[2]
+                )
             else:
                 bidz_, cluster_id_in_problem = divmod(work_idx, params.num_clusters_per_problem_fdd)
             if const_expr(bidz is not None):
@@ -380,7 +390,11 @@ class TileScheduler:
     def _fetch_next_work_idx(self, *, loc=None, ip=None) -> Int32 | Tuple[Int32, Int32, Boolean]:
         """should only be called by the scheduler warp"""
         params = self.params
-        num_persistent_clusters = cute.arch.cluster_dim()[2]
+        num_persistent_clusters = (
+            cute.arch.grid_dim()[2]
+            if const_expr(cute.size(params.cluster_shape_mnk, loc=loc, ip=ip) == 1)
+            else cute.arch.cluster_dim()[2]
+        )
         if const_expr(params.persistence_mode == PersistenceMode.STATIC):
             return self._current_work_idx + num_persistent_clusters
             # Serpentine: alternate wave direction for a bit better load balancing
@@ -641,8 +655,12 @@ class TriangularTileScheduler(TileScheduler):
         loc=None,
         ip=None,
     ) -> "TriangularTileScheduler":
+        if const_expr(cute.size(params.cluster_shape_mnk, loc=loc, ip=ip) == 1):
+            cluster_idx = cute.arch.block_idx()
+        else:
+            cluster_idx = cute.arch.cluster_idx()
         current_work_idx, _ = TileScheduler._cluster_idx_to_work_idx_batch(
-            params, cute.arch.cluster_idx(), loc=loc, ip=ip
+            params, cluster_idx, loc=loc, ip=ip
         )
         stages = 0
         if const_expr(
@@ -762,7 +780,11 @@ class TriangularTileScheduler(TileScheduler):
         if is_valid:
             if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
                 cluster_id_in_problem = work_idx
-                _, _, bidz_ = cute.arch.cluster_idx()
+                bidz_ = (
+                    cute.arch.block_idx()[2]
+                    if const_expr(cute.size(params.cluster_shape_mnk, loc=loc, ip=ip) == 1)
+                    else cute.arch.cluster_idx()[2]
+                )
             else:
                 bidz_, cluster_id_in_problem = divmod(work_idx, params.num_clusters_per_problem_fdd)
                 cluster_id_in_problem = Int32(cluster_id_in_problem)  # divmod returns IntValue
@@ -917,8 +939,12 @@ class VarlenMTileScheduler(TileScheduler):
         loc=None,
         ip=None,
     ) -> "VarlenMTileScheduler":
+        if const_expr(cute.size(params.cluster_shape_mnk, loc=loc, ip=ip) == 1):
+            cluster_idx = cute.arch.block_idx()
+        else:
+            cluster_idx = cute.arch.cluster_idx()
         current_work_idx, _ = VarlenMTileScheduler._cluster_idx_to_work_idx_batch(
-            params, cute.arch.cluster_idx(), loc=loc, ip=ip
+            params, cluster_idx, loc=loc, ip=ip
         )
         stages = 0
         if const_expr(

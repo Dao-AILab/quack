@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+from quack.testing.fake_compat import assert_aliased
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
 from quack.gemm_interface import (
@@ -464,7 +465,7 @@ def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre
     )
     out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx, concat_layout=concat_layout)
     if pre_allocate_out:
-        assert out.data_ptr() == out_buf.data_ptr()
+        assert_aliased(out, out_buf)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 

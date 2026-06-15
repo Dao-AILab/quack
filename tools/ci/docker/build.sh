@@ -5,13 +5,18 @@ set -e
 
 DATE=$(date +%y.%m.%d)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || cd "$SCRIPT_DIR/../../.." && pwd)"
+if REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+    :
+else
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+fi
 
 build_image() {
-    local tag=$1 torch_cuda=$2 quack_extras=$3
+    local tag=$1 torch_cuda=$2 quack_extras=$3 target=$4
     local image="quack-kernels:${tag}-${DATE}"
-    echo "=== Building $image (torch $torch_cuda, extras [$quack_extras]) ==="
+    echo "=== Building $image (torch $torch_cuda, extras [$quack_extras], target $target) ==="
     docker build \
+        --target "$target" \
         --build-arg "TORCH_CUDA=$torch_cuda" \
         --build-arg "QUACK_EXTRAS=$quack_extras" \
         -t "$image" \
@@ -20,16 +25,22 @@ build_image() {
     echo "Done: $image"
 }
 
-# Both variants pin torch to cu129 wheels: our CI host runs driver 575.x (CUDA
-# 12.9 max), which can't initialize cu130 torch ("driver too old, found 12090").
-# cute-dsl[cu13] still JIT-compiles fine to the local SM under a cu12.9 driver,
-# so the cu13.2 variant exercises the cu13 cute-dsl bundle while staying
-# runnable. Switch back to cu130 for either variant once the runner driver is
-# upgraded to >= 580.
+# cu12.9 image pins torch to cu126 wheels: PyTorch 2.12 skipped cu128/cu129
+# wheels, and our oldest runner (H100) is on driver 575.x which can't run
+# cu13 torch without the compat shim. cu126 is the newest 12.x torch index
+# that ships 2.12 and is runnable on driver 575+ unaided.
+#
+# cu13.2 image pins torch to cu132 wheels and adds the CUDA 13.x forward-
+# compatibility libs (the `cu13` Dockerfile target). The user-mode
+# libcuda.so.590.* shim from /usr/local/cuda/compat lets cu13 torch + cu13
+# cute-dsl JIT successfully on the H100 runner's 575 kernel driver, so
+# cu13.2 is a fully testable image — not driver-gated. Bonus: torch's cu13
+# wheel bundles all nvidia libs under a single nvidia/cu13/ tree (~1.5 GB
+# smaller than cu126's per-lib layout).
 case "${1:-all}" in
-    cu129)  build_image cu12.9 cu129 dev ;;
-    cu132)  build_image cu13.2 cu129 cu13,dev ;;
-    all)    build_image cu12.9 cu129 dev
-            build_image cu13.2 cu129 cu13,dev ;;
+    cu129)  build_image cu12.9 cu126 dev base ;;
+    cu132)  build_image cu13.2 cu132 cu13,dev cu13 ;;
+    all)    build_image cu12.9 cu126 dev base
+            build_image cu13.2 cu132 cu13,dev cu13 ;;
     *)      echo "Unknown variant: $1 (expected cu129, cu132, or all)" >&2; exit 1 ;;
 esac

@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import builtins
 import os
+import subprocess
+import sys
+import threading
 import time
 import inspect
 import base64
 import hashlib
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from functools import cached_property, partial
 from typing import Dict, Tuple, List, Optional, Any
+from quack.bench.bench_utils import (
+    _bench_cuda_graph_l2_rotate,
+    _clone_l2_rotate_inputs,
+    _pick_l2_rotate_count,
+)
 
 import torch
 from torch import Tensor
@@ -91,6 +100,164 @@ def _gpu_warmup(duration_ms=200):
         torch.cuda.synchronize()
 
 
+# ---------------------------------------------------------------------------
+# Async precompile handle (gaps 2 + 3 from the autotune-pool hardening pass)
+#
+# The legacy ``_precompile`` was a blocking barrier: spawn N workers, dispatch
+# all configs round-robin, collect-all-results, then return. Two consequences:
+#
+#   * If a worker died mid-compile (e.g. a config that trips an internal
+#     cute.compile assert), the configs it had not yet acknowledged were
+#     silently dropped. The autotuner then ran the eager body for those
+#     configs without a warm .o, paying ~500 ms of compile inside the bench
+#     measurement; the artificially-slow timing made that config never get
+#     picked even when it was the actual best one.
+#   * Total wall = parallel_compile + serial_bench. With ~10 configs at
+#     ~500 ms compile and ~100 ms bench each, that's (5s/pool) + 1s. With
+#     async overlap it drops to max(5s/pool, 1s) — a ~40 % win on cold
+#     autotune.
+#
+# :class:`_PrecompileHandle` returns immediately after spawning workers and
+# dispatching their initial round of tasks. Per-config :class:`threading.Event`
+# completion signals let the bench loop wait on the specific config it's
+# about to benchmark. A background reader thread per worker drains stdout
+# replies and sets the corresponding events; on worker crash (None from
+# ``_recv`` = EOF) every still-pending task assigned to that worker is
+# marked failed (and the event set) so callers don't deadlock.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PrecompileHandle:
+    """Per-config completion handle returned by :meth:`Autotuner._precompile`.
+
+    Empty / no-op when the subprocess pool was skipped (cache hit, disabled,
+    only 1 config). Calling ``wait_for(i)`` on a missing index returns
+    immediately as a no-op, so the bench loop can iterate uniformly.
+    """
+
+    events: Dict[int, threading.Event] = field(default_factory=dict)
+    failures: Dict[int, str] = field(default_factory=dict)
+    _workers: List[Any] = field(default_factory=list)  # subprocess.Popen
+    _reader_threads: List[threading.Thread] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def wait_for(self, config_idx: int, timeout: Optional[float] = None) -> None:
+        """Block until ``config_idx``'s compile completes (or failed).
+
+        No-op for indices that were never registered (e.g. the entire handle
+        is empty because precompile was skipped). The bench loop relies on
+        this to call ``wait_for`` unconditionally.
+        """
+        evt = self.events.get(config_idx)
+        if evt is not None:
+            evt.wait(timeout=timeout)
+
+    def is_failed(self, config_idx: int) -> bool:
+        """True if the subprocess pool failed to compile this config.
+
+        Use after :meth:`wait_for` returns. Failed configs need an in-process
+        jit_cache warm before benchmarking to avoid contaminating the timing
+        measurement with compile cost (see :meth:`Autotuner._bench_with_warm`).
+        """
+        with self._lock:
+            return config_idx in self.failures
+
+    def shutdown(self) -> None:
+        """Close stdins, wait for workers and reader threads to exit.
+
+        Idempotent. Safe to call even if ``__init__`` failed midway through
+        spawning workers.
+        """
+        for w in self._workers:
+            try:
+                if w.poll() is None and w.stdin is not None:
+                    w.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        for w in self._workers:
+            try:
+                w.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                w.kill()
+                try:
+                    w.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass  # process really stuck; give up rather than hang the bench
+        for t in self._reader_threads:
+            t.join(timeout=1.0)
+
+
+def _reader_thread_main(handle, worker, config_indices):
+    """Drain replies from one worker's stdout and signal per-config events.
+
+    Replies arrive in dispatch order (length-prefixed pickled strings:
+    ``"OK"`` or ``"ERR:..."``). On EOF (= worker crashed), every config
+    this worker still had pending is marked failed and its event set so
+    waiters don't deadlock.
+
+    Runs in its own daemon thread so the bench loop can interleave waiting
+    with kernel launches.
+    """
+    for pos, config_idx in enumerate(config_indices):
+        try:
+            r = _recv_from_worker(worker.stdout)
+        except (BrokenPipeError, EOFError, ConnectionResetError):
+            r = None
+        with handle._lock:
+            if r is None:
+                # Worker died; mark this config + all remaining ones failed.
+                # ``setdefault`` so we don't clobber a real ERR: reply that
+                # somehow raced (unlikely, but cheap to be safe).
+                for remaining_idx in config_indices[pos:]:
+                    handle.failures.setdefault(remaining_idx, "worker crashed during compile")
+                    handle.events[remaining_idx].set()
+                return
+            if isinstance(r, str) and r.startswith("ERR:"):
+                handle.failures[config_idx] = r
+            handle.events[config_idx].set()
+
+
+def _recv_from_worker(stream):
+    """Read a length-prefixed pickled message. Returns None on EOF or partial body.
+
+    Mirrors ``_compile_worker._recv`` so the parent and worker speak the
+    same protocol. Kept private to this module rather than re-imported from
+    the worker because the worker module isn't safe to import in the parent
+    (it pushes ``_COMPILE_ONLY_DEPTH`` at module load).
+
+    Returns ``None`` on both:
+
+    * clean EOF (header shorter than 4 bytes — pipe write side closed before
+      writing the header);
+    * truncated body (header read OK, but the body read returns fewer bytes
+      than the declared length — the worker was SIGKILL'd by its parent-death
+      watchdog, or by OOM-killer, *between* writing the header and writing
+      the body).
+
+    Without the truncated-body check, ``pickle.loads`` raises ``UnpicklingError``
+    on a short body. That exception would propagate out of the reader thread,
+    leaving the per-config events unset and deadlocking every ``wait_for(i)``
+    waiter in :meth:`Autotuner.__call__`'s ``benchmark()`` closure.
+    """
+    import pickle
+    import struct
+
+    header = stream.read(4)
+    if len(header) < 4:
+        return None
+    length = struct.unpack("<I", header)[0]
+    if length == 0:
+        return None
+    body = stream.read(length)
+    if len(body) < length:
+        # Pipe closed mid-message. Treat as EOF; the reader thread's caller
+        # ``_reader_thread_main`` will mark the rest of this worker's queue
+        # as failed and set the events so waiters wake up.
+        return None
+    return pickle.loads(body)
+
+
 class Autotuner:
     def __init__(
         self,
@@ -163,7 +330,7 @@ class Autotuner:
             return partial(triton.testing.do_bench, warmup=5, rep=25)
         return self._do_bench
 
-    def _precompile(self, *args, configs, **kwargs):
+    def _precompile(self, *args, configs, **kwargs) -> _PrecompileHandle:
         """Pre-compile all configs in parallel subprocesses to populate .o cache.
 
         cute.compile() is not thread-safe (MLIR thread-local state) and fork after
@@ -172,15 +339,28 @@ class Autotuner:
         metadata, and compiles with COMPILE_ONLY=True. Workers stay alive to amortize
         import overhead across multiple configs. The parent then loads instantly from
         the .o cache during benchmarking.
+
+        Returns a :class:`_PrecompileHandle` whose ``wait_for(i)`` blocks until
+        config ``i``'s compile completes; the bench loop interleaves
+        ``wait_for`` + benchmark to overlap the remaining compiles with GPU
+        work. Workers are equipped with a parent-death watchdog
+        (:func:`quack._compile_worker._install_parent_watchdog`) so an
+        orphaned worker self-terminates within ~60 s instead of lingering on
+        long-lived self-hosted CI runners.
+
+        The returned handle is also valid (empty but functional) when
+        precompilation is skipped — cache disabled, only 1 config, the
+        first-config warm-cache shortcut hit. Callers always call
+        ``wait_for`` + ``shutdown``; the no-op handle makes both fast.
         """
-        from quack.cache_utils import CACHE_ENABLED
+        from quack.cache import CACHE_ENABLED
 
         if not CACHE_ENABLED:
-            return
+            return _PrecompileHandle()
 
         max_workers = min(len(configs), int(os.getenv("QUACK_COMPILE_WORKERS", "8")))
         if max_workers <= 1:
-            return
+            return _PrecompileHandle()
 
         # Quick check: compile first config in-process. If it loads from .o cache
         # (<0.5s), the rest are likely cached too — skip spawning workers.
@@ -191,30 +371,20 @@ class Autotuner:
         except Exception:
             pass
         if time.time() - t_check < 0.5:
-            return
+            return _PrecompileHandle()
 
         verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
         if verbose:
             print(f"Pre-compiling {len(configs)} configs with {max_workers} workers")
-        t0 = time.time()
 
         import pickle
         import struct
-        import subprocess
-        import sys
 
         def _send(stream, msg):
             data = pickle.dumps(msg)
             stream.write(struct.pack("<I", len(data)))
             stream.write(data)
             stream.flush()
-
-        def _recv(stream):
-            header = stream.read(4)
-            if len(header) < 4:
-                return None
-            length = struct.unpack("<I", header)[0]
-            return pickle.loads(stream.read(length)) if length else None
 
         # Serialize tensor metadata
         tensor_meta = []
@@ -235,11 +405,14 @@ class Autotuner:
 
         # Restrict worker subprocesses to the parent's current CUDA device.
         # Without this, all workers default to cuda:0 and their CUDA context
-        # initialization can OOM when many ranks share a node.
+        # initialization can OOM when many ranks share a node. The parent-PID
+        # env arms each worker's watchdog so an orphaned worker self-SIGKILLs
+        # instead of lingering on long-lived self-hosted CI runners.
         worker_env = os.environ.copy()
         current_device = _get_current_cuda_device()
         if current_device is not None:
             worker_env["CUDA_VISIBLE_DEVICES"] = current_device
+        worker_env["QUACK_COMPILE_WORKER_PARENT_PID"] = str(os.getpid())
 
         # Launch persistent worker pool
         workers = []
@@ -251,43 +424,63 @@ class Autotuner:
                 stderr=subprocess.DEVNULL if not verbose else None,
                 env=worker_env,
             )
-            ready = _recv(p.stdout)
+            ready = _recv_from_worker(p.stdout)
             if ready != "READY":
                 p.kill()
                 continue
             workers.append(p)
 
         if not workers:
-            return
+            return _PrecompileHandle()
 
-        # Round-robin dispatch configs to workers
-        pending = [0] * len(workers)
+        # Round-robin dispatch + register per-config events. We do all sends
+        # up front (pipe buffers absorb the small pickled payloads) and let
+        # the per-worker reader threads drain replies asynchronously — the
+        # bench loop calls handle.wait_for(i) for each config it's about to
+        # benchmark, overlapping the still-pending compiles with GPU work.
+        handle = _PrecompileHandle()
+        handle._workers = workers
+        assignments: List[List[int]] = [[] for _ in workers]
         for i, config in enumerate(configs):
-            w = workers[i % len(workers)]
-            _send(
-                w.stdin,
-                {
-                    "fn_module": fn_module,
-                    "fn_qualname": fn_qualname,
-                    "tensor_meta": tensor_meta,
-                    "kwargs": kwargs,
-                    "config_kwargs": config.all_kwargs(),
-                },
-            )
-            pending[i % len(workers)] += 1
+            wi = i % len(workers)
+            try:
+                _send(
+                    workers[wi].stdin,
+                    {
+                        "fn_module": fn_module,
+                        "fn_qualname": fn_qualname,
+                        "tensor_meta": tensor_meta,
+                        "kwargs": kwargs,
+                        "config_kwargs": config.all_kwargs(),
+                    },
+                )
+            except (BrokenPipeError, OSError):
+                # Worker died before we even finished dispatching. Mark this
+                # config failed and continue to the next worker.
+                handle.events[i] = threading.Event()
+                handle.events[i].set()
+                handle.failures[i] = "worker died before dispatch"
+                continue
+            assignments[wi].append(i)
+            handle.events[i] = threading.Event()
 
-        # Collect all results
+        # Spawn one reader thread per worker. Each thread iterates the
+        # config_indices it was assigned in dispatch order and signals events
+        # as replies come back. ``daemon=True`` so a stuck reader doesn't
+        # block process exit.
         for wi, w in enumerate(workers):
-            for _ in range(pending[wi]):
-                _recv(w.stdout)
+            if not assignments[wi]:
+                continue
+            t = threading.Thread(
+                target=_reader_thread_main,
+                name=f"quack-precompile-reader-{wi}",
+                args=(handle, w, assignments[wi]),
+                daemon=True,
+            )
+            t.start()
+            handle._reader_threads.append(t)
 
-        # Shutdown workers (close stdin → worker exits)
-        for w in workers:
-            w.stdin.close()
-            w.wait()
-
-        if verbose:
-            print(f"Pre-compilation done in {time.time() - t0:.1f}s")
+        return handle
 
     def _bench(self, *args, config, **meta):
         verbose = os.environ.get(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
@@ -306,6 +499,45 @@ class Autotuner:
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
+        # Default path: L2-cold CUDA-graph round-robin bench. ``__call__``
+        # sets ``self._l2_cold_arg_sets`` / ``self._l2_cold_kwarg_sets`` to
+        # pre-cloned (args, kwargs) sets once per shape (reused across all
+        # configs). Round-robin over fresh sets keeps the kernel measured
+        # under the cache-cold conditions that match production access
+        # patterns, so the autotuner picks configs that win at the same
+        # workload the user actually runs.
+        l2_cold_arg_sets = getattr(self, "_l2_cold_arg_sets", None)
+        l2_cold_kwarg_sets = getattr(self, "_l2_cold_kwarg_sets", None)
+        has_hooks = self.pre_hook is not None or self.post_hook is not None
+        use_l2_cold = (
+            self._do_bench is None
+            and l2_cold_arg_sets is not None
+            and l2_cold_kwarg_sets is not None
+            and not has_hooks
+        )
+
+        if use_l2_cold:
+            try:
+                return _bench_cuda_graph_l2_rotate(
+                    self.fn,
+                    l2_cold_arg_sets,
+                    l2_cold_kwarg_sets,
+                    extra_kwargs=config.all_kwargs(),
+                    quantiles=(0.5, 0.2, 0.8),
+                )
+            except (RuntimeError, MemoryError) as e:
+                # Narrow catch: only swallow GPU-side failures (smem
+                # overflow, kernel launch errors, OOM). Programming errors
+                # (TypeError, AssertionError, ValueError from conflict check
+                # above) propagate so the user sees them.
+                if verbose:
+                    print(f"Autotuning failed with {type(e).__name__}: {e}")
+                return [float("inf"), float("inf"), float("inf")]
+
+        # Legacy path: triton.testing.do_bench or user-supplied do_bench.
+        # Used when (a) a custom do_bench was passed via the decorator's
+        # ``do_bench=`` arg, or (b) pre/post hooks are configured (the
+        # clone/restore inside hooks doesn't work under CUDA graph capture).
         def kernel_call():
             if self.pre_hook is not None:
                 self.pre_hook(full_nargs)
@@ -392,17 +624,98 @@ class Autotuner:
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
-                    self._precompile(*args, configs=pruned_configs, **kwargs)
-                    _gpu_warmup()
+                    # Two new mechanisms cooperate here:
+                    #   (a) ``_precompile`` returns a ``_PrecompileHandle``
+                    #       whose ``wait_for(i)`` blocks until config i is
+                    #       done compiling in the subprocess pool; remaining
+                    #       configs continue compiling in background reader
+                    #       threads, overlapping with this loop's GPU work.
+                    #       Total wall = max(parallel_compile, serial_bench).
+                    #   (b) The L2-cold ``_bench`` path needs pre-cloned
+                    #       (args, kwargs) sets attached to ``self`` once per
+                    #       shape so all configs share the same buffer set.
+                    # Both share one try/finally so handle.shutdown() and the
+                    # L2-cold set cleanup run even on exception (incl. OOM
+                    # inside ``_gpu_warmup``).
+                    handle = self._precompile(*args, configs=pruned_configs, **kwargs)
                     bench_start = time.time()
-                    timings = {
-                        config: self._bench(*args, config=config, **kwargs)
-                        for config in pruned_configs
-                    }
+                    verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+                    has_hooks = self.pre_hook is not None or self.post_hook is not None
+                    timings = {}
+                    try:
+                        _gpu_warmup()
+                        # Pre-allocate cloned (args, kwargs) sets once per
+                        # shape; the same sets are reused across all configs
+                        # to avoid ~400x re-cloning. Skipped when hooks are
+                        # present or a custom do_bench was supplied (legacy
+                        # fallback in _bench).
+                        if self._do_bench is None and not has_hooks:
+                            try:
+                                n_buffers = _pick_l2_rotate_count(args, kwargs)
+                                arg_sets, kwarg_sets = _clone_l2_rotate_inputs(
+                                    args, kwargs, n_buffers
+                                )
+                                self._l2_cold_arg_sets = arg_sets
+                                self._l2_cold_kwarg_sets = kwarg_sets
+                            except (RuntimeError, MemoryError):
+                                # Cloning failed (likely OOM at extreme N);
+                                # legacy do_bench path will be used by _bench.
+                                self._l2_cold_arg_sets = None
+                                self._l2_cold_kwarg_sets = None
+                        else:
+                            self._l2_cold_arg_sets = None
+                            self._l2_cold_kwarg_sets = None
+
+                        for i, config in enumerate(pruned_configs):
+                            # Block until this config's compile has finished
+                            # in the subprocess pool. The other configs keep
+                            # compiling in their reader threads while we
+                            # benchmark, giving us the parallel/serial overlap.
+                            handle.wait_for(i)
+                            # If the subprocess pool failed to compile this
+                            # config (worker crashed, ERR: reply, etc.), warm
+                            # jit_cache in-process FIRST so the bench time
+                            # below excludes the compile cost — otherwise the
+                            # artificially-slow timing would mask a config
+                            # that's actually the best.
+                            if handle.is_failed(i):
+                                if verbose:
+                                    print(
+                                        f"[autotune] config {i} subprocess "
+                                        f"compile failed ({handle.failures[i]}); "
+                                        f"falling back to in-process compile "
+                                        f"before benchmarking"
+                                    )
+                                try:
+                                    current = dict(kwargs, **config.all_kwargs())
+                                    self.fn(*args, **current)
+                                except Exception:
+                                    # _bench below will record float('inf')
+                                    # if the kernel raises during the run.
+                                    pass
+                            timings[config] = self._bench(*args, config=config, **kwargs)
+                    finally:
+                        # Free L2-cold sets before persisting the cache so the
+                        # user's subsequent .fn(...) call has full HBM.
+                        self._l2_cold_arg_sets = None
+                        self._l2_cold_kwarg_sets = None
+                        # Always shutdown to avoid orphan workers / dangling
+                        # reader threads, even if a bench raised.
+                        handle.shutdown()
                     bench_end = time.time()
-                    if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
+                    if verbose:
                         for config, time_ in timings.items():
                             print(f"[{config}] -> {time_[0]:.3f}ms")
+                    # Surface bench failures (configs returning inf timings)
+                    # so smem-overflow / launch errors aren't silently masked.
+                    n_failed = sum(1 for t in timings.values() if t[0] == float("inf"))
+                    if n_failed:
+                        print(
+                            f"quack autotune: {n_failed}/{len(timings)} configs "
+                            f"failed for {self.fn.__name__}{key}; "
+                            f"set {PACKAGE_NAME.upper()}_PRINT_AUTOTUNING=1 for details",
+                            file=sys.stderr,
+                        )
                     self.bench_time = bench_end - bench_start
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     self.configs_timings = timings

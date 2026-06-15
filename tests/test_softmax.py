@@ -18,14 +18,16 @@ TOLERANCES = {
 }
 
 
+# Grid-reduction rationale: M=37 shares the small-batch tile choice with M=199.
+# Dropped N values (512, 2048, 8192, 16384, 65536) are interior to regimes already
+# covered by their neighbors (single-stage / multi-stage / SMEM-edge).
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N",
-    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144],
-    # [32768]
+    [192, 256, 760, 1024, 1128, 4096, 32768, 131072, 262144],
 )
-@pytest.mark.parametrize("M", [1, 37, 199])
+@pytest.mark.parametrize("M", [1, 199])
 @pytest.mark.parametrize("use_compile", [False, True])
 # @pytest.mark.parametrize("M", [1])
 def test_softmax(M, N, input_dtype, use_compile):
@@ -45,23 +47,29 @@ def test_softmax(M, N, input_dtype, use_compile):
     x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     x_ref = x.detach().clone().requires_grad_(True)
 
+    # Order matters under `pytest --compile-only` (FakeTensorMode): we want both fwd
+    # and bwd kernels to be dispatched (and therefore compiled) for every (M, N, dtype)
+    # combination. `torch.testing.assert_close` raises on fake tensors, so we run all
+    # kernel calls (fwd + autograd.grad for bwd) FIRST and only then do the numerical
+    # / property assertions. Eager runs see no behavior change; --compile-only now
+    # honestly compiles the bwd instead of relying on a hidden side-effect inside the
+    # fwd op's register_fake.
     out = function(x)
     out_ref = F.softmax(x_ref, dim=-1)
+    dy = torch.randn_like(out)
+    torch.cuda.synchronize()  # without sync, torch.autograd gets wrong results
+    (dx,) = torch.autograd.grad(out, x, grad_outputs=dy)
+    (dx_ref,) = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
 
     assert out.shape == x.shape
     assert out.dtype == input_dtype
+    assert dx.shape == dy.shape
+    assert dx.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
     sums = torch.sum(out, dim=-1)
     torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-4, rtol=1e-4)
     assert (out >= 0).all()
     assert (out <= 1).all()
-
-    dy = torch.randn_like(out)
-    torch.cuda.synchronize()  # without sync, torch.autograd gets wrong results
-    (dx,) = torch.autograd.grad(out, x, grad_outputs=dy)
-    (dx_ref,) = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
-    assert dx.shape == dy.shape
-    assert dx.dtype == input_dtype
     torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)
 
 

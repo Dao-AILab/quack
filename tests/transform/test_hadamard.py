@@ -3,7 +3,11 @@ import math
 import pytest
 import torch
 
-from quack.hadamard import hadamard_transform, hadamard_transform_fwd, hadamard_transform_ref
+from quack.transform.hadamard import (
+    hadamard_transform,
+    hadamard_transform_fwd,
+    hadamard_transform_ref,
+)
 
 
 torch._dynamo.config.cache_size_limit = 1024
@@ -48,15 +52,14 @@ def test_hadamard_transform_correctness(N, dtype):
     out = hadamard_transform(x, scale=scale)
     out_ref = hadamard_transform_ref(x_ref, scale=scale)
 
-    assert out.shape == x.shape
-    assert out.dtype == dtype
-    atol, rtol = TOLERANCES[dtype]
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
-
     dy = torch.randn_like(out)
     out.backward(dy)
     out_ref.backward(dy)
 
+    assert out.shape == x.shape
+    assert out.dtype == dtype
+    atol, rtol = TOLERANCES[dtype]
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=rtol)
 
 
@@ -71,16 +74,20 @@ def test_hadamard_transform_non_power_of_two(N, dtype):
     out = hadamard_transform(x, scale=scale)
     out_ref = hadamard_transform_ref(x_ref, scale=scale)
 
-    atol, rtol = TOLERANCES[dtype]
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
-
     dy = torch.randn_like(out)
     out.backward(dy)
     out_ref.backward(dy)
 
+    atol, rtol = TOLERANCES[dtype]
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=rtol)
 
 
+@pytest.mark.compile_only_skip(
+    "torch.compile cannot trace through the outer FakeTensorMode that "
+    "--compile-only installs (Dynamo skips frames under non-infra dispatch modes); "
+    "the underlying hadamard kernel signature is warmed by test_hadamard_transform"
+)
 def test_hadamard_transform_compile():
     torch.manual_seed(3)
     dtype = torch.bfloat16

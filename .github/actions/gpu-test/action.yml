@@ -4,6 +4,15 @@ inputs:
   cuda:
     description: cu129 or cu132 — selects which image to run for this job
     required: true
+  gpu:
+    description: >-
+      Runner GPU label (h100, b300). Used to pick driver-version-specific
+      apptainer flags — the cu13.2 image bundles a CUDA 13.1 libcuda.so.590
+      compat shim that's needed on the h100 runner's 575 kernel driver but
+      mismatches the b300 runner's 595 kernel driver (CUDA error 803). On
+      b300 we override LD_LIBRARY_PATH so apptainer's host-injected libcuda
+      wins instead.
+    required: true
   image_cu129:
     description: Docker image for the cu129 variant (e.g. tridao/quack-kernels:cu12.9-DATE)
     required: true
@@ -14,9 +23,12 @@ inputs:
     description: >-
       Optional QUACK_ARCH override (e.g. "120"). When set, quack dispatches to
       that arch's kernel implementations while still compiling/running on the
-      host GPU. QUACK_CACHE_DIR is suffixed with both the cuda variant and the
-      arch (e.g. .quack_cache_cu132_sm120), so different (cuda, arch) pairs
-      don't share a cache directory on the same self-hosted runner.
+      host GPU. QUACK_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR, and TRITON_CACHE_DIR
+      are all suffixed with both the cuda variant and the arch (e.g.
+      .quack_cache_cu132_sm120), so different (cuda, arch) pairs don't share
+      a cache directory on the same self-hosted runner. See the in-line
+      comment near the cache exports for why TORCHINDUCTOR_/TRITON_ isolation
+      matters (cross-toolchain cubin collisions → cuModuleLoad SEGV).
     required: false
     default: ''
 
@@ -71,26 +83,62 @@ runs:
       env:
         ARCH: ${{ inputs.arch }}
         CUDA: ${{ inputs.cuda }}
+        GPU: ${{ inputs.gpu }}
       run: |
+        # The cu13.2 image's Dockerfile bakes LD_LIBRARY_PATH=/usr/local/cuda/compat
+        # so its libcuda.so.590 forward-compat shim wins over apptainer's
+        # host-injected libcuda in /.singularity.d/libs. That's correct on h100
+        # (driver 575, CUDA 12.9 — needs the 590 shim to run cu13 cute-dsl) but
+        # wrong on b300 (driver 595, CUDA 13.2 — the 590 shim is OLDER than the
+        # kernel module and triggers CUDA error 803). Override so b300 uses the
+        # host libcuda instead. cu129 image doesn't set LD_LIBRARY_PATH, so the
+        # override is a harmless no-op there.
+        EXTRA_APPTAINER_ENV=""
+        if [ "$GPU" = "b300" ]; then
+          EXTRA_APPTAINER_ENV="--env LD_LIBRARY_PATH=/.singularity.d/libs"
+        fi
         # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
         # this Python inside the SIF picks up packages from the runner user's
         # ~/.local/lib/python3.12/site-packages, shadowing the SIF's copies.
-        apptainer exec --nv --writable-tmpfs --env PYTHONNOUSERSITE=1 "$QUACK_SIF" bash -c "
+        apptainer exec --nv --writable-tmpfs --env PYTHONNOUSERSITE=1 $EXTRA_APPTAINER_ENV "$QUACK_SIF" bash -c "
           # Editable-install over the container's baked-in quack so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
-          uv pip install --system --break-system-packages --no-deps -q -e . &&
+          pip install --break-system-packages --no-deps -q -e . &&
+          # Per-leg cache directories. apptainer --writable-tmpfs does NOT
+          # isolate /tmp (the host /tmp is bind-mounted in), and HOME is
+          # bound by default too — so without explicit overrides every CI
+          # leg shares torch's defaults (/tmp/torchinductor_<user> and
+          # ~/.triton/cache) across all (cuda, arch, Python, Triton, torch)
+          # combinations. A stale Inductor entry pointing at a cubin that
+          # was compiled by a different toolchain produces a SIGSEGV inside
+          # cuModuleLoad (via Triton's cuda_utils.so) when the next leg
+          # loads it. Suffixing with the cuda variant (and sm-arch when set)
+          # gives each leg its own pair of caches so cross-toolchain
+          # collisions cannot happen; cache-warmup speedups within a leg are
+          # preserved.
           if [ -n '$ARCH' ]; then
             export QUACK_ARCH='$ARCH' &&
             export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}_sm$ARCH &&
-            echo \"Using QUACK_ARCH=\$QUACK_ARCH, QUACK_CACHE_DIR=\$QUACK_CACHE_DIR\"
+            export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA}_sm$ARCH &&
+            export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}_sm$ARCH &&
+            echo \"Using QUACK_ARCH=\$QUACK_ARCH, QUACK_CACHE_DIR=\$QUACK_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR=\$TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR=\$TRITON_CACHE_DIR\"
           else
-            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}
+            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA} &&
+            export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA} &&
+            export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}
           fi &&
-          pytest tests/ --compile-only -n 24 &&
+          mkdir -p \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
+          # --max-worker-restart N tolerates worker deaths (OOM-kill from
+          # the upstream cute.compile ir.Context retention leak, see
+          # tests/conftest.py:pytest_handlecrashitem for background). The
+          # conftest's pytest_handlecrashitem hook re-queues the in-flight
+          # test on the fresh worker and downgrades the failure to a skip;
+          # second crashes are NOT retried so real bugs still fail the run.
+          pytest tests/ --compile-only -n 24 --dist worksteal --max-worker-restart 24 &&
           FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 50000 {print \$1}' | paste -sd,) &&
           if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 50GB free memory'; exit 1; fi &&
           echo \"Running tests on GPUs: \$FREE_GPUS\" &&
           NUM_GPUS=\$(echo \"\$FREE_GPUS\" | tr ',' '\n' | wc -l) &&
-          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS
+          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS
         "
