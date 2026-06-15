@@ -24,16 +24,11 @@ import quack.cache
 
 # Skip the whole module under ``pytest --compile-only`` — the direct TVM-FFI
 # compile path here does not warm quack's jit cache, so the tests add nothing
-# in phase 1. The obvious ``pytestmark = pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``
-# does NOT work: ``pytest.mark.skipif`` captures the *value* of its first
-# argument at decorator-application time (module-import time), which on
-# xdist worksteal workers can be False before the plugin's ``pytest_configure``
-# has set ``COMPILE_ONLY = True``. Use an autouse fixture instead — fixtures
-# evaluate at test-setup time, unambiguously after ``pytest_configure``.
-@pytest.fixture(autouse=True)
-def _skip_under_compile_only():
-    if quack.cache.COMPILE_ONLY:
-        pytest.skip("skipped under --compile-only: direct TVM-FFI compile does not warm jit cache")
+# in phase 1. The marker is registered by ``quack.testing.pytest_plugin`` and
+# evaluated at test-setup time, so it is robust to xdist worksteal item-fetch
+# ordering (unlike ``pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``
+# which captures at decorator-application time).
+pytestmark = pytest.mark.compile_only_skip("direct TVM-FFI compile does not warm jit cache")
 
 
 class _ScaleByComplex:

@@ -594,8 +594,10 @@ def gemm_out(
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
-    alpha = alpha_tensor if alpha_tensor is not None else alpha
-    sr_seed_arg = sr_seed_tensor if sr_seed_tensor is not None else sr_seed
+    # Shared helpers: drift between this eager body and the register_fake side
+    # is structurally impossible because both call the same functions.
+    alpha = _merge_tensor(alpha, alpha_tensor)
+    sr_seed_arg = _merge_tensor(sr_seed, sr_seed_tensor)
     fn(
         A,
         B,
@@ -610,7 +612,7 @@ def gemm_out(
         dynamic_scheduler=dynamic_scheduler,
         rounding_mode=rounding_mode,
         sr_seed=sr_seed_arg,
-        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
+        concat_layout=_parse_concat_layout(concat_layout),
     )
 
 
@@ -732,8 +734,8 @@ def gemm_add(
     alpha = alpha if isinstance(alpha, float) else 1.0
     beta_tensor = beta if not isinstance(beta, float) else None
     beta = beta if isinstance(beta, float) else 1.0
-    alpha_arg = alpha_tensor if alpha_tensor is not None else alpha
-    beta_arg = beta_tensor if beta_tensor is not None else beta
+    alpha_arg = _merge_tensor(alpha, alpha_tensor)
+    beta_arg = _merge_tensor(beta, beta_tensor)
     concat_str = ",".join(concat_layout) if concat_layout else None
     if add_to_output:
         gemm_add_inplace(
@@ -801,8 +803,8 @@ def gemm_add_out(
 ) -> None:
     """GEMM with addition and pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
-    alpha = alpha_tensor if alpha_tensor is not None else alpha
-    beta = beta_tensor if beta_tensor is not None else beta
+    alpha = _merge_tensor(alpha, alpha_tensor)
+    beta = _merge_tensor(beta, beta_tensor)
     fn(
         A,
         B,
@@ -816,7 +818,7 @@ def gemm_add_out(
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
-        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
+        concat_layout=_parse_concat_layout(concat_layout),
     )
 
 
@@ -938,7 +940,7 @@ def gemm_add_inplace(
         return
     if A.numel() == 0:
         if beta != 1.0 or beta_tensor is not None:
-            out.mul_(beta_tensor if beta_tensor is not None else beta)
+            out.mul_(_merge_tensor(beta, beta_tensor))
         return
     gemm_add_inplace_op(
         A,
@@ -986,8 +988,8 @@ def gemm_add_inplace_op(
     concat_layout: Optional[str] = None,
 ) -> None:
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
-    alpha = alpha_tensor if alpha_tensor is not None else alpha
-    beta = beta_tensor if beta_tensor is not None else beta
+    alpha = _merge_tensor(alpha, alpha_tensor)
+    beta = _merge_tensor(beta, beta_tensor)
     add_to_output = isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None
     # Use out as both input bias and output
     fn(
@@ -1003,7 +1005,7 @@ def gemm_add_inplace_op(
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
-        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
+        concat_layout=_parse_concat_layout(concat_layout),
     )
 
 
@@ -1336,8 +1338,8 @@ def gemm_symmetric_out(
     beta_tensor: Optional[Tensor] = None,
 ) -> None:
     """GEMM with guaranteed symmetric output."""
-    alpha = alpha_tensor if alpha_tensor is not None else alpha
-    beta = beta_tensor if beta_tensor is not None else beta
+    alpha = _merge_tensor(alpha, alpha_tensor)
+    beta = _merge_tensor(beta, beta_tensor)
     if A.ndim == 2:
         A = A.unsqueeze(0)  # (1, M, K)
     B = B.mT  # (M, K) or (L, M, K)
@@ -1632,7 +1634,7 @@ def gemm_gated_out(
         cu_seqlens_m,
         A_idx,
         dynamic_scheduler,
-        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
+        concat_layout=_parse_concat_layout(concat_layout),
     )
 
 
@@ -1734,10 +1736,10 @@ def _precompile_default_config(autotuned_fn, *args, **kwargs):
     blanket swallow hooks (which exist to ignore expected FakeTensor errors
     *after* a successful kernel dispatch) can let it through.
     """
-    from quack.cache import COMPILE_ONLY, CompileOnlyStrictError
+    from quack.cache import CompileOnlyStrictError, is_compile_only
 
     A = args[0] if args else kwargs.get("A")
-    if not COMPILE_ONLY or A is None or isinstance(A.shape[0], torch.SymInt):
+    if not is_compile_only() or A is None or isinstance(A.shape[0], torch.SymInt):
         return
     try:
         autotuned_fn.fn(*args, config=None, **kwargs)
@@ -1765,8 +1767,11 @@ def gemm_add_inplace_fake(
     tuned: bool = True,
     concat_layout: Optional[str] = None,
 ) -> None:
-    alpha_val = alpha_tensor if alpha_tensor is not None else alpha
-    beta_val = beta_tensor if beta_tensor is not None else beta
+    # Mirror the eager body's schema-split rewrite via the shared helpers so
+    # this fake cannot drift from gemm_add_inplace's actual dispatch (see
+    # commit 290a6a4 for the previous drift bug).
+    alpha_val = _merge_tensor(alpha, alpha_tensor)
+    beta_val = _merge_tensor(beta, beta_tensor)
     add_to_output = isinstance(beta_val, float) and beta_val == 1.0 and cu_seqlens_m is None
     _precompile_default_config(
         gemm_tuned,
@@ -1782,21 +1787,127 @@ def gemm_add_inplace_fake(
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
-        concat_layout=tuple(concat_layout.split(",")) if concat_layout else None,
+        concat_layout=_parse_concat_layout(concat_layout),
     )
 
 
-def _register_precompile_fake(custom_op, autotuned_fn, rewrite=None):
-    """Register a fake that precompiles the default config in COMPILE_ONLY mode.
+# ---------------------------------------------------------------------------
+# Shared schema-split helpers.
+#
+# torch.library.custom_op requires a concrete type per arg, so union-typed
+# autotuned args (e.g. ``alpha: Union[float, Tensor]``, ``sr_seed: Union[int,
+# Tensor]``) are split into two fixed-typed schema kwargs at the custom_op
+# boundary (``alpha: float`` + ``alpha_tensor: Optional[Tensor]``). The eager
+# body then merges them back into the unified form before calling the
+# autotuned fn. The compile-only fake path has to perform the *exact same*
+# rewrite or the compile-key signature drifts and Phase 2 has to compile on
+# demand — the cause of commits 7acaadd (concat_layout) and 290a6a4
+# (alpha/beta on gemm_symmetric).
+#
+# To make drift structurally impossible:
+#
+# * Both the eager bodies AND the fake registrations call the same
+#   :func:`_merge_tensor` and :func:`_parse_concat_layout` helpers below.
+# * The fake registration auto-derives the split-merge spec from the
+#   custom_op's own signature — any parameter named ``<name>_tensor`` is
+#   treated as a split of ``<name>``. Adding a new ``*_tensor`` to the
+#   eager signature is automatically reflected on the fake side; nothing
+#   to forget.
+# * Tests in ``tests/test_cache.py`` (or a future ``tests/test_gemm_interface.py``)
+#   should assert this invariant for every registered op so a regression
+#   is caught at PR review.
+# ---------------------------------------------------------------------------
 
-    For custom_ops that forward args to their autotuned fn. Binds all args by name,
-    strips 'tuned', applies optional rewrite(kw), then calls _precompile_default_config.
-    PyTorch normalizes all custom_op args to positional, so we use inspect.signature
-    to recover keyword names.
+
+def _merge_tensor(value, tensor_value):
+    """Return ``tensor_value`` if non-None, else ``value``.
+
+    Single source of truth for the ``Union[scalar, Tensor]`` schema-split
+    merge. Used both inside eager bodies (where ``value = alpha,
+    tensor_value = alpha_tensor``) and inside the fake path (which derives
+    the split pairs from the custom_op signature).
+    """
+    return tensor_value if tensor_value is not None else value
+
+
+def _parse_concat_layout(value):
+    """Coerce ``concat_layout`` from schema form (``Optional[str]``) to
+    autotuned form (``Optional[tuple[str, ...]]``).
+
+    custom_op schemas can't express ``tuple[str, ...]``, so callers pass a
+    comma-separated string. The autotuned fn keys on a tuple (via
+    ``tuple(sorted(concat_layout))``); a stray string would be iterated
+    char-by-char and silently produce a wrong, never-used compile signature.
+    Single source of truth used by both eager bodies and the fake path.
+    """
+    if value is None or isinstance(value, tuple):
+        return value
+    return tuple(value.split(",")) if value else None
+
+
+def _derive_tensor_split_pairs(eager_fn):
+    """Auto-derive ``(*_tensor) → *`` split pairs from an eager signature.
+
+    Any parameter named ``<name>_tensor`` is taken as a schema split of
+    ``<name>``. This matches the project-wide naming convention
+    (``alpha_tensor`` splits ``alpha``, ``sr_seed_tensor`` splits
+    ``sr_seed``, etc.), so adding a new ``*_tensor`` arg on the eager side
+    is reflected on the fake side automatically.
+    """
+    import inspect
+
+    sig = inspect.signature(eager_fn)
+    return tuple(
+        (name, name[: -len("_tensor")]) for name in sig.parameters if name.endswith("_tensor")
+    )
+
+
+def _apply_schema_split_rewrite(kw, split_pairs, *, defaults=()):
+    """Apply the canonical schema-split rewrite in place.
+
+    Mutates ``kw`` from the custom_op schema form to the autotuned fn form:
+
+    * pop every ``*_tensor`` split listed in ``split_pairs`` and merge into
+      its unified name if non-None (driven by :func:`_derive_tensor_split_pairs`
+      so the eager signature is the single source of truth);
+    * coerce ``concat_layout`` via :func:`_parse_concat_layout`;
+    * apply any extra ``defaults`` (e.g. ``C=None`` for ``gemm_out``,
+      which the custom_op schema doesn't carry but the autotuned fn
+      requires).
+
+    ``split_pairs`` is computed once at registration time — see
+    :func:`_register_precompile_fake` — so we don't re-run
+    :func:`inspect.signature` on every fake invocation.
+    """
+    for split_name, unified_name in split_pairs:
+        tensor = kw.pop(split_name, None)
+        if tensor is not None:
+            kw[unified_name] = tensor
+    if "concat_layout" in kw:
+        kw["concat_layout"] = _parse_concat_layout(kw["concat_layout"])
+    for k, v in defaults:
+        kw.setdefault(k, v)
+
+
+def _register_precompile_fake(custom_op, autotuned_fn, *, defaults=()):
+    """Register a fake that precompiles the default config in compile-only mode.
+
+    Schema rewrite is auto-derived from ``custom_op._init_fn``'s signature
+    via :func:`_derive_tensor_split_pairs` — every ``*_tensor`` parameter
+    is merged into its unified name, ``concat_layout`` is coerced to a
+    tuple, and any ``defaults`` (e.g. ``C=None``) are applied.
+
+    Adding a new ``*_tensor`` arg to the custom_op's signature is reflected
+    on the fake side automatically; **drift is structurally impossible**.
+
+    Signature inspection and split-pair derivation both run once at
+    registration time and are captured by the closure; the per-call fake
+    body is just a dict rebuild + rewrite.
     """
     import inspect
 
     sig = inspect.signature(custom_op._init_fn)
+    split_pairs = _derive_tensor_split_pairs(custom_op._init_fn)
 
     @custom_op.register_fake
     def _fake(*args, **kwargs):
@@ -1804,59 +1915,15 @@ def _register_precompile_fake(custom_op, autotuned_fn, rewrite=None):
         bound.apply_defaults()
         kw = dict(bound.arguments)
         kw.pop("tuned", None)
-        # custom_op schemas declare `concat_layout: Optional[str]` (PyTorch
-        # custom_op requires fixed types per arg) but the autotuned fn
-        # expects `Optional[tuple[str, ...]]`. The real fn body parses the
-        # string via `tuple(concat_layout.split(","))` before forwarding;
-        # mirror that here so the precompile-fake hits the same compile-key
-        # signature as a real dispatch (otherwise the autotuned fn's
-        # `tuple(sorted(concat_layout))` would iterate the string char-by-char
-        # and produce a wrong, never-used compile signature).
-        cl = kw.get("concat_layout")
-        if isinstance(cl, str):
-            kw["concat_layout"] = tuple(cl.split(",")) if cl else None
-        if rewrite is not None:
-            rewrite(kw)
+        _apply_schema_split_rewrite(kw, split_pairs, defaults=defaults)
         _precompile_default_config(autotuned_fn, **kw)
 
 
-# Custom_ops like gemm_out are forced to split union-typed args (alpha,
-# sr_seed) into two fixed-typed kwargs (alpha + alpha_tensor, sr_seed +
-# sr_seed_tensor) because torch.library.custom_op requires a single concrete
-# type per arg. gemm_tuned accepts the unified form. The rewrite helpers below
-# pop every *_tensor split (so it doesn't leak as an unknown kwarg to
-# gemm_tuned) and, if non-None, merge it into the unified arg.
-_ALPHA_SPLIT_MERGE = (
-    ("alpha_tensor", "alpha"),
-    ("sr_seed_tensor", "sr_seed"),
-)
-_ALPHA_BETA_SPLIT_MERGE = (
-    ("alpha_tensor", "alpha"),
-    ("beta_tensor", "beta"),
-    ("sr_seed_tensor", "sr_seed"),
-)
-
-
-def _apply_split_merge(kwargs, pairs):
-    for split, merged in pairs:
-        t = kwargs.pop(split, None)
-        if t is not None:
-            kwargs[merged] = t
-
-
-def _rewrite_merge_alpha(kwargs):
-    """Merge {alpha,sr_seed}_tensor into the unified gemm_tuned kwargs; add C=None."""
-    _apply_split_merge(kwargs, _ALPHA_SPLIT_MERGE)
-    kwargs.setdefault("C", None)
-
-
-def _rewrite_merge_alpha_beta(kwargs):
-    """Merge {alpha,beta,sr_seed}_tensor into the unified gemm_tuned kwargs."""
-    _apply_split_merge(kwargs, _ALPHA_BETA_SPLIT_MERGE)
-
-
-_register_precompile_fake(gemm_out, gemm_tuned, rewrite=_rewrite_merge_alpha)
-_register_precompile_fake(gemm_add_out, gemm_tuned, rewrite=_rewrite_merge_alpha_beta)
+# ``gemm_out`` adds ``C=None`` because the unified ``gemm_tuned`` signature
+# has a ``C`` parameter that the schema-split ``gemm_out`` doesn't surface
+# (its semantic is "out-of-place gemm; no C buffer").
+_register_precompile_fake(gemm_out, gemm_tuned, defaults=(("C", None),))
+_register_precompile_fake(gemm_add_out, gemm_tuned)
 _register_precompile_fake(gemm_act_out, gemm_act_tuned)
 _register_precompile_fake(gemm_gated_out, gemm_gated_tuned)
 
@@ -1914,16 +1981,15 @@ def gemm_symmetric_out_fake(
     alpha_tensor: Optional[Tensor] = None,
     beta_tensor: Optional[Tensor] = None,
 ) -> None:
-    from quack.cache import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if not COMPILE_ONLY or isinstance(A.shape[0], torch.SymInt):
+    if not is_compile_only() or isinstance(A.shape[0], torch.SymInt):
         return
-    # Mirror the real body's *_tensor merge so the compile-key signature
-    # (which depends on alpha_mode = isinstance(alpha, Tensor) ? 2 : ...) matches
-    # what real-mode dispatches. Without this, tensor-alpha/beta tests silently
-    # skip precompile and Phase 2 has to compile them on demand.
-    alpha = alpha_tensor if alpha_tensor is not None else alpha
-    beta = beta_tensor if beta_tensor is not None else beta
+    # Mirror the eager body's schema-split rewrite via the shared helper so
+    # this fake cannot drift from gemm_symmetric's actual dispatch (commit
+    # 290a6a4 fixed exactly this drift the hard way).
+    alpha = _merge_tensor(alpha, alpha_tensor)
+    beta = _merge_tensor(beta, beta_tensor)
     # gemm_symmetric is not autotuned, compile the single fixed config directly
     sm = get_device_capacity(A.device)[0]
     try:

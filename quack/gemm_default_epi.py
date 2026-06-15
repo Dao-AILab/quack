@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -53,7 +53,13 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         epi_loop_tensors,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
+        """Return a tuple of register tensors (one per aux output).
+
+        The returned tuple must be the same length as the tuple returned
+        from :meth:`epi_setup_aux_out`. The default impl returns ``()`` —
+        no aux outputs.
+        """
         # Use .get(): inactive ops are filtered out of epi_loop_tensors.
         alpha = epi_loop_tensors.get("alpha")
         beta = epi_loop_tensors.get("beta")
@@ -79,7 +85,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         if const_expr(tDrColVec is not None):
             for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
                 tRS_rD[i] += tDrColVec[i]
-        return None
+        return ()
 
 
 class GemmDefaultSm80(GemmDefaultEpiMixin, GemmSm80):

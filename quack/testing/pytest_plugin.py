@@ -27,11 +27,11 @@ from quack.cache import CompileOnlyFakeTensorMode, CompileOnlyStrictError
 
 
 _fake_mode: CompileOnlyFakeTensorMode | None = None
-# Saved value of ``quack.cache.COMPILE_ONLY`` from before the plugin enabled
-# compile-only mode, so ``pytest_unconfigure`` restores it instead of
-# unconditionally setting False (which would clobber a downstream caller that
-# set it True out-of-band before pytest started).
-_prev_compile_only: bool | None = None
+# Token from ``_COMPILE_ONLY_DEPTH.set(...)`` so ``pytest_unconfigure`` pops
+# back to the exact prior depth. ContextVar token semantics guarantee leak-free
+# restoration even on exception, replacing the old save/restore-a-bool pattern
+# that could clobber an outer caller's value to False.
+_compile_only_token = None
 
 # Saved originals so ``pytest_unconfigure`` can restore pytest internals we
 # monkey-patched in ``pytest_configure``. Set to ``None`` when the
@@ -237,7 +237,22 @@ def _disable_unused_accelerator_lazy_call() -> None:
 
 def pytest_configure(config):
     """Enter the compile-only context for the duration of the test session."""
-    global _fake_mode, _prev_compile_only
+    global _fake_mode, _compile_only_token
+
+    # Register markers regardless of --compile-only, so a test file using
+    # ``pytestmark = pytest.mark.compile_only_skip("...")`` doesn't get a
+    # ``PytestUnknownMarkWarning`` even when the user runs without the flag.
+    config.addinivalue_line(
+        "markers",
+        "compile_only_skip(reason): skip this test when --compile-only is active. "
+        "The skip is evaluated at test-setup time (not collection or import "
+        "time), so it is xdist-worksteal-safe.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "compile_only_only(reason): skip this test when --compile-only is NOT "
+        "active. Use for tests that exercise the compile-only path itself.",
+    )
 
     # Speed up manual_seed in real (non-compile-only) runs by short-circuiting
     # the queued-seed path on unavailable accelerators. Harmless under
@@ -256,8 +271,9 @@ def pytest_configure(config):
 
     import quack.cache
 
-    _prev_compile_only = quack.cache.COMPILE_ONLY
-    quack.cache.COMPILE_ONLY = True
+    _compile_only_token = quack.cache._COMPILE_ONLY_DEPTH.set(
+        quack.cache._COMPILE_ONLY_DEPTH.get() + 1
+    )
     if torch.cuda.is_available():
         torch.cuda.init()
     _fake_mode = CompileOnlyFakeTensorMode()
@@ -266,7 +282,7 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     """Exit the compile-only context and undo any pytest-internal patches."""
-    global _fake_mode, _prev_compile_only
+    global _fake_mode, _compile_only_token
 
     # Always undo the global monkey-patches we installed, even if the
     # --compile-only branch below early-returns. This keeps the process clean
@@ -280,9 +296,50 @@ def pytest_unconfigure(config):
     _fake_mode = None
     import quack.cache
 
-    if _prev_compile_only is not None:
-        quack.cache.COMPILE_ONLY = _prev_compile_only
-        _prev_compile_only = None
+    if _compile_only_token is not None:
+        quack.cache._COMPILE_ONLY_DEPTH.reset(_compile_only_token)
+        _compile_only_token = None
+
+
+# --- compile_only_skip / compile_only_only marker evaluation ---------------
+#
+# Marker evaluation runs in ``pytest_runtest_setup`` at test-setup time, which
+# is unambiguously *after* the plugin's ``pytest_configure`` has pushed the
+# compile-only depth counter. This is the structural fix for the long-standing
+# xdist worksteal gotcha that affected ``pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``:
+# ``skipif`` evaluates its condition at decorator-application = module-import
+# time, and on worksteal workers the test module can import *before* the
+# plugin's configure runs, so the captured value was ``False`` and the skip
+# never fired. The marker below has no captured argument — the plugin reads
+# the live ContextVar at setup time — so the race is gone.
+#
+# ``tryfirst=True`` is important: it runs before the hookwrapper below that
+# swallows exceptions under --compile-only. ``pytest.skip.Exception`` is in
+# ``_should_swallow``'s explicit don't-swallow list, so even if the order
+# inverted the skip would still propagate; ``tryfirst`` is belt-and-suspenders
+# and also keeps the swallow path from running for legitimate skips.
+
+
+@pytest.hookimpl(tryfirst=True)
+def _apply_compile_only_markers(item):
+    """Evaluate ``compile_only_skip`` / ``compile_only_only`` at setup time."""
+    compile_only = _is_compile_only(item.config)
+    for marker in item.iter_markers(name="compile_only_skip"):
+        if compile_only:
+            reason = (
+                marker.kwargs.get("reason")
+                or (marker.args[0] if marker.args else None)
+                or "compile_only_skip: skipped under --compile-only"
+            )
+            pytest.skip(reason)
+    for marker in item.iter_markers(name="compile_only_only"):
+        if not compile_only:
+            reason = (
+                marker.kwargs.get("reason")
+                or (marker.args[0] if marker.args else None)
+                or "compile_only_only: requires --compile-only"
+            )
+            pytest.skip(reason)
 
 
 # --- Error swallowing under --compile-only --------------------------------
@@ -299,6 +356,10 @@ def pytest_unconfigure(config):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
+    # Evaluate compile_only markers first. If they call ``pytest.skip(...)``
+    # the raised exception propagates through ``yield`` below; ``_should_swallow``
+    # explicitly does not swallow ``pytest.skip.Exception``, so the skip wins.
+    _apply_compile_only_markers(item)
     if not _is_compile_only(item.config):
         yield
         return

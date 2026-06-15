@@ -55,7 +55,7 @@ class GemmNormActMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
         tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         # Load accumulator and apply alpha/beta/C
@@ -85,7 +85,7 @@ class GemmNormActMixin(GemmActMixin):
                     )
         else:
             tRS_rAuxOut = tRS_rD
-        return tRS_rAuxOut
+        return (tRS_rAuxOut,)
 
 
 class GemmNormActSm90(GemmNormActMixin, GemmSm90):
@@ -114,7 +114,7 @@ class GemmNormGatedMixin(GemmGatedMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
         tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         # Load accumulator and apply alpha/beta/C
@@ -143,7 +143,7 @@ class GemmNormGatedMixin(GemmGatedMixin):
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]),
                     (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3]),
                 )
-        return tRS_rAuxOut
+        return (tRS_rAuxOut,)
 
 
 class GemmNormGatedSm90(GemmNormGatedMixin, GemmSm90):
@@ -380,9 +380,9 @@ def gemm_norm_act_fn(
         sr_seed_mode=sr_seed_mode,
     )
 
-    from quack.cache import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

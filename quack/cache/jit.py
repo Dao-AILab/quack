@@ -5,10 +5,11 @@ Compiled kernels are exported as object files (``.o``) via ``export_to_c``. On
 subsequent runs the ``.o`` is loaded via tvm_ffi (~1 ms) instead of
 re-generating IR + re-JIT'ing (~500 ms per kernel).
 
-Mutable runtime flags (``COMPILE_ONLY``, ``CACHE_ENABLED``, ``CACHE_DIR``,
-``EXTRA_SOURCE_DIRS``) live in :mod:`quack.cache` (the package init), not
-here, so that ``import quack.cache as c; c.COMPILE_ONLY = True`` works without
-desyncing readers — see :mod:`quack.cache` for the rationale.
+Runtime config (``CACHE_ENABLED``, ``CACHE_DIR``, ``EXTRA_SOURCE_DIRS``) and
+the compile-only depth counter live in :mod:`quack.cache` (the package init).
+The compile-only state is read here via :func:`quack.cache.is_compile_only`
+(a ContextVar-backed live read); see :mod:`quack.cache` for the redesign
+rationale.
 """
 
 from __future__ import annotations
@@ -132,6 +133,25 @@ def jit_cache(fn):
 
     The decorated function should return a compiled kernel (i.e. call cute.compile).
     The disk cache key is (fn.__qualname__, *args, **sorted_kwargs).
+
+    Concurrency model
+    -----------------
+    The disk side uses a per-key ``{sha}.lock`` file (advisory ``flock``):
+
+    * **Fast path (warm cache).** If the ``.o`` file already exists, we take a
+      shared lock just long enough to ``load_module`` it. Many readers can
+      proceed concurrently.
+    * **Slow path (cold cache).** The actual ``fn(*args, **kwargs)`` compile
+      runs *under* the exclusive lock. This serializes redundant compilations
+      of the same key across xdist workers / processes: if N processes race
+      on a cold key, only one calls ``cute.compile``; the rest wait for the
+      lock, see the ``.o`` appear, and load it. (Previously the compile ran
+      *between* the shared-lock check and the exclusive-lock export, so all
+      N processes wasted CPU compiling the same key in parallel — wall time
+      was unchanged but compile-CPU pressure scaled with concurrency, which
+      starved other compiles when many keys were cold at once.)
+
+    The lock is per-key, so distinct keys never contend with each other.
     """
     cache = {}
     hits = 0
@@ -142,57 +162,95 @@ def jit_cache(fn):
         nonlocal hits, misses
         cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
 
-        # Snapshot mutable state once per call. The disk-write block at the
-        # bottom refers to locals (`sha`, `o_path`, `lock_path`) that are
-        # only defined when `enabled` was True at the top; re-reading
-        # `_state.CACHE_ENABLED` later would risk UnboundLocalError if a
-        # concurrent mutation flipped the flag mid-call.
+        # Snapshot mutable state once per call so a concurrent flip of
+        # ``_state.CACHE_ENABLED`` mid-call can't desync the disk-path branch.
+        # Sampling ``is_compile_only()`` once per call keeps the wrapper's
+        # in-memory-hit / disk-hit / compile / store branches consistent under
+        # async task switching (each ``asyncio.Task`` runs in its own copy of
+        # the parent's ``contextvars.Context``, but a single coroutine could
+        # otherwise observe both states if ``await`` landed between the in-mem
+        # check and the disk-hit branch). Note: ``ContextVar`` is per-thread,
+        # so a helper *thread* spawned inside ``compile_only_mode()`` will not
+        # observe ``True`` — a behavioral change vs. the old module-attribute
+        # design that the project's single-threaded ``_compile_worker`` and
+        # pytest workflows are unaffected by, but worth recording for future
+        # callers that might spawn worker threads inside compile-only.
         enabled = _state.CACHE_ENABLED
-        compile_only = _state.COMPILE_ONLY
+        compile_only = _state.is_compile_only()
 
-        # 1. In-memory hit
+        # 1. In-memory hit. Same process already compiled or loaded this key.
         if cache_key in cache:
             hits += 1
             return _noop_kernel if compile_only else cache[cache_key]
 
-        # 2. Disk hit
-        disk_key = (fn.__qualname__,) + cache_key
-        if enabled:
-            sha = _key_to_hash(disk_key)
-            cache_path = get_cache_path() / _compute_source_fingerprint()
-            cache_path.mkdir(parents=True, exist_ok=True)
-            o_path = cache_path / f"{sha}.o"
-            lock_path = cache_path / f"{sha}.lock"
+        # 2. Cache disabled: pure in-process compile, no disk side effects.
+        if not enabled:
+            misses += 1
+            compiled_fn = fn(*args, **kwargs)
+            cache[cache_key] = compiled_fn
+            return _noop_kernel if compile_only else compiled_fn
+
+        sha = _key_to_hash((fn.__qualname__,) + cache_key)
+        cache_path = get_cache_path() / _compute_source_fingerprint()
+        cache_path.mkdir(parents=True, exist_ok=True)
+        o_path = cache_path / f"{sha}.o"
+        lock_path = cache_path / f"{sha}.lock"
+
+        def _load_cached() -> object:
+            """Load the .o into a callable; caller guarantees existence."""
+            m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
+            return m[EXPORT_FUNC_NAME]
+
+        # 3. Fast path: optimistic existence check, then shared-lock load.
+        #    The unlocked ``.exists()`` is a no-cost short-circuit for warm
+        #    caches; the shared lock guards against reading a partial file
+        #    while a concurrent writer holds the exclusive lock.
+        if o_path.exists():
             try:
                 with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
                     if o_path.exists():
-                        m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
-                        loaded = m[EXPORT_FUNC_NAME]
+                        loaded = _load_cached()
                         cache[cache_key] = loaded
                         hits += 1
                         return _noop_kernel if compile_only else loaded
             except RuntimeError:
-                pass
+                pass  # lock timeout; fall through to slow path
 
-        # 3. Compile
-        misses += 1
-        compiled_fn = fn(*args, **kwargs)
+        # 4. Slow path: take EXCLUSIVE lock and compile under it. The recheck
+        #    inside the lock catches the race where another process compiled
+        #    while we were waiting; in that case we just load and return
+        #    without duplicating the compile.
+        try:
+            with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
+                if o_path.exists():
+                    loaded = _load_cached()
+                    cache[cache_key] = loaded
+                    hits += 1
+                    return _noop_kernel if compile_only else loaded
 
-        # 4. Store
-        cache[cache_key] = compiled_fn
-        if enabled:
-            try:
-                with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
-                    if not o_path.exists():
-                        o_path.parent.mkdir(parents=True, exist_ok=True)
-                        compiled_fn.export_to_c(
-                            object_file_path=str(o_path),
-                            function_name=EXPORT_FUNC_NAME,
-                        )
-            except Exception as e:
-                print(f"quack cache: export failed for key {sha}: {e}")
-
-        return _noop_kernel if compile_only else compiled_fn
+                misses += 1
+                compiled_fn = fn(*args, **kwargs)
+                try:
+                    compiled_fn.export_to_c(
+                        object_file_path=str(o_path),
+                        function_name=EXPORT_FUNC_NAME,
+                    )
+                except Exception as e:
+                    print(f"quack cache: export failed for key {sha}: {e}")
+                cache[cache_key] = compiled_fn
+                return _noop_kernel if compile_only else compiled_fn
+        except RuntimeError as e:
+            # Lock acquisition timed out (heavy contention or stuck holder).
+            # Fall back to in-process compile, no disk write. Better to do
+            # the work twice than to fail the test.
+            print(
+                f"quack cache: lock timeout for key {sha}: {e}; "
+                f"falling back to in-process compile without disk cache"
+            )
+            misses += 1
+            compiled_fn = fn(*args, **kwargs)
+            cache[cache_key] = compiled_fn
+            return _noop_kernel if compile_only else compiled_fn
 
     def cache_clear():
         nonlocal hits, misses

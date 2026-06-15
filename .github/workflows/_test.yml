@@ -16,8 +16,8 @@ on:
 
 env:
   # Bump these when pushing a new image; old SIFs are auto-pruned on the next CI run.
-  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.05.16
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.05.16
+  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.05.27
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.05.27
 
 jobs:
   lint:

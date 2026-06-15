@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from quack.cache import is_compile_only
+from quack.testing.fake_compat import assert_aliased
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
 from quack.gemm_interface import (
@@ -214,11 +214,10 @@ def test_gemm_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    # Aliasing assertions only meaningful with real storage. Under --compile-only
-    # (FakeTensorMode) data_ptr() emits a deprecation warning and the comparison
-    # is meaningless; the kernel body has already dispatched (cache warmed) above.
-    if pre_allocate_out and not is_compile_only():
-        assert out.data_ptr() == out_buf.data_ptr()
+    # Aliasing assertion is phase-2-only; ``assert_aliased`` short-circuits
+    # under compile-only mode where FakeTensor's data_ptr() is deprecated.
+    if pre_allocate_out:
+        assert_aliased(out, out_buf)
     A_f, B_f = A.float(), B.float()
     out_ref = gemm_ref(A_f, B_f, bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     del A_f, B_f
@@ -606,11 +605,9 @@ def test_gemm_gated_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    # Aliasing assertions are skipped under --compile-only (FakeTensor data_ptr
-    # is deprecated). Kernel cache warming still happens above.
-    if pre_allocate_out and not is_compile_only():
-        assert preact.data_ptr() == preact_buf.data_ptr()
-        assert postact.data_ptr() == postact_buf.data_ptr()
+    if pre_allocate_out:
+        assert_aliased(preact, preact_buf)
+        assert_aliased(postact, postact_buf)
     assert preact.shape == (total_m, n)
     assert postact.shape == (total_m, n // 2)
     # Compare with reference
@@ -698,11 +695,9 @@ def test_gemm_dgated_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    # Aliasing assertions are skipped under --compile-only (FakeTensor data_ptr
-    # is deprecated). Kernel cache warming still happens above.
-    if pre_allocate_out and not is_compile_only():
-        assert dx.data_ptr() == dx_buf.data_ptr()
-        assert postact.data_ptr() == postact_buf.data_ptr()
+    if pre_allocate_out:
+        assert_aliased(dx, dx_buf)
+        assert_aliased(postact, postact_buf)
     if colvec_reduce:
         colvec_reduce_out = rest[0]
     assert dx.shape == (total_m, 2 * n)
@@ -779,9 +774,8 @@ def test_gemm_varlen_m_concat(
         tuned=False,
         concat_layout=concat,
     )
-    # Aliasing check skipped under --compile-only (FakeTensor data_ptr deprecated).
-    if pre_allocate_out and not is_compile_only():
-        assert out.data_ptr() == out_buf.data_ptr()
+    if pre_allocate_out:
+        assert_aliased(out, out_buf)
     out_ref = gemm_ref(
         A.float(),
         B.float(),
@@ -844,10 +838,9 @@ def test_gemm_gated_varlen_m_concat(
         tuned=False,
         concat_layout=concat,
     )
-    # Aliasing assertions skipped under --compile-only (FakeTensor data_ptr deprecated).
-    if pre_allocate_out and not is_compile_only():
-        assert preact.data_ptr() == preact_buf.data_ptr()
-        assert postact.data_ptr() == postact_buf.data_ptr()
+    if pre_allocate_out:
+        assert_aliased(preact, preact_buf)
+        assert_aliased(postact, postact_buf)
     preact_ref, postact_ref = gemm_gated_ref(
         A.float(),
         B.float(),

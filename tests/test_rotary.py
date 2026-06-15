@@ -3,16 +3,16 @@ import math
 import pytest
 import torch
 
-from quack.cache import is_compile_only
 from quack.rotary import apply_rotary, apply_rotary_emb, apply_rotary_emb_kv_, apply_rotary_emb_qkv_
+from quack.testing.fake_compat import assert_aliased
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
-# Marker for tests whose entire point is a runtime invariant that FakeTensorMode
-# cannot represent:
+# Marker alias for tests whose entire point is a runtime invariant that
+# FakeTensorMode cannot represent:
 #   * data_ptr() aliasing (FakeTensor has no real storage; .data_ptr() emits a
 #     DeprecationWarning and will raise in PyTorch 2.5).
 #   * torch.profiler kernel counts (no real kernel launches under --compile-only).
@@ -22,23 +22,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is r
 # rotary kernel signatures are still warmed by other parametrized tests in this
 # file. Phase 2 (real GPU) runs them normally.
 #
-# Implementation note: this is a ``usefixtures`` mark, not the obvious
-# ``pytest.mark.skipif(is_compile_only(), ...)``. ``skipif`` captures its
-# first argument's *value* at decorator-application time (module-import
-# time), which on xdist worksteal workers can be False before the plugin's
-# ``pytest_configure`` has set ``COMPILE_ONLY = True``. ``usefixtures``
-# defers the check to fixture setup, which runs unambiguously after
-# ``pytest_configure``.
-_skip_under_compile_only = pytest.mark.usefixtures("_skip_if_compile_only")
-
-
-@pytest.fixture
-def _skip_if_compile_only():
-    if is_compile_only():
-        pytest.skip(
-            "runtime invariant (data_ptr aliasing / profiler kernel count / "
-            "torch.compile dispatch) cannot be validated under FakeTensorMode"
-        )
+# Backed by the ``compile_only_skip`` marker registered in
+# ``quack.testing.pytest_plugin``; evaluated at test-setup time so it is
+# robust to xdist worksteal item-fetch ordering.
+_skip_under_compile_only = pytest.mark.compile_only_skip(
+    "runtime invariant (data_ptr aliasing / profiler kernel count / "
+    "torch.compile dispatch) cannot be validated under FakeTensorMode"
+)
 
 
 def _rotary_grid_dim_pairs():
@@ -103,21 +93,10 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
 
 
 def unpad_input(x, padding_mask):
-    from quack.cache import is_compile_only
+    from quack.testing.fake_compat import fake_safe_nonzero
 
     batch, seqlen = padding_mask.shape
-    if is_compile_only():
-        # Under FakeTensorMode the `torch.nonzero` below raises
-        # ``DynamicOutputShapeException`` because the output shape depends on
-        # the input values. The test downstream uses ``indices`` only for the
-        # round-trip ``pad_input(out_unpad, indices, ...)``, whose numerical
-        # result the conftest plugin swallows anyway under ``--compile-only``.
-        # Build a fully-padded substitute that has the right dtypes / ranks /
-        # leading-dim contiguity so the rotary kernel still dispatches with
-        # the right compile-key signature.
-        indices = torch.arange(batch * seqlen, dtype=torch.int64, device=x.device)
-    else:
-        indices = torch.nonzero(padding_mask.reshape(-1), as_tuple=False).flatten()
+    indices = fake_safe_nonzero(padding_mask)
     x_unpad = x.reshape(batch * seqlen, *x.shape[2:])[indices]
     lengths = padding_mask.sum(dim=1, dtype=torch.int32)
     cu_seqlens = torch.cat(
@@ -626,9 +605,9 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
     out_pt.backward(grad_pt)
 
     # data_ptr() comparison is deprecated on FakeTensor; under --compile-only the
-    # inplace contract can't be verified anyway (no real storage to share).
-    if not is_compile_only():
-        assert out.data_ptr() == qkv.data_ptr()
+    # Aliasing assertion only meaningful with real storage; the helper
+    # short-circuits under compile-only mode.
+    assert_aliased(out, qkv)
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 

@@ -5,16 +5,88 @@
 # Stays alive to process multiple configs (amortizes import overhead).
 
 import importlib
+import os
 import pickle
+import signal
 import struct
 import sys
+import threading
+import time
 
 import torch
 
 import quack.cache
 from quack.cache import CompileOnlyFakeTensorMode
 
-quack.cache.COMPILE_ONLY = True
+
+# Watchdog poll interval. 60 s matches PyTorch Inductor's
+# ``_async_compile_initializer``; short enough that orphan workers don't
+# linger long, but long enough that the syscall cost is negligible.
+_WATCHDOG_POLL_SECS = 60.0
+
+
+def _install_parent_watchdog() -> None:
+    """Self-terminate if the spawning parent process dies.
+
+    Without this, a worker whose parent died (segfault, OOM-kill, the
+    cute.compile MLIR retention leak that ``conftest.pytest_handlecrashitem``
+    works around) gets reparented to init (PID 1) and lingers — consuming
+    CPU/memory until something else reaps it. Long-lived self-hosted CI
+    runners accumulate orphans across runs.
+
+    The parent's PID is passed via the ``QUACK_COMPILE_WORKER_PARENT_PID``
+    env var set by ``quack.autotuner._precompile`` before ``subprocess.Popen``.
+    A daemon thread polls ``os.getppid()`` every ``_WATCHDOG_POLL_SECS`` and
+    ``os.kill(self, SIGKILL)`` if the observed ppid no longer matches.
+
+    Also installs ``SIGINT → SIG_IGN`` so Ctrl-C in the parent doesn't spam
+    worker logs (the parent's pipe-close handles the orderly shutdown path).
+    """
+    raw = os.environ.get("QUACK_COMPILE_WORKER_PARENT_PID")
+    if raw is None:
+        # No env var — worker was launched outside of _precompile (e.g. by
+        # an external driver script). Skip silently; orphan risk is on the
+        # external caller.
+        return
+    try:
+        orig_ppid = int(raw)
+    except ValueError:
+        return
+
+    # Ignore SIGINT regardless of whether the watchdog poll is meaningful;
+    # this keeps worker logs clean on Ctrl-C in the parent shell.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    def _poll():
+        while True:
+            time.sleep(_WATCHDOG_POLL_SECS)
+            # ``os.getppid()`` returns 1 (init) once the original parent
+            # exits. Comparing against the recorded ``orig_ppid`` catches
+            # both the reparented-to-init case and the unusual case where
+            # ppid changes to some other PID.
+            if os.getppid() != orig_ppid:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+    t = threading.Thread(target=_poll, name="quack-compile-worker-watchdog", daemon=True)
+    t.start()
+
+
+# This subprocess lives in compile-only mode for its entire lifetime; push
+# the depth counter once at module load and let process exit pop it. We
+# deliberately reach into the underscore-prefixed ``_COMPILE_ONLY_DEPTH``
+# ContextVar instead of using ``compile_only_mode()`` because:
+#
+#   1. ``compile_only_mode()`` is a context manager that also enters a
+#      ``CompileOnlyFakeTensorMode``. The worker enters its own per-task
+#      ``CompileOnlyFakeTensorMode`` (see ``main()`` below) and doesn't want
+#      a long-lived outer one shadowing it.
+#   2. The depth is permanent for this process; there is nothing to ``.reset()``
+#      — the process terminates instead.
+#
+# This is an intentional internal exception to the rule documented in
+# ``quack/cache/__init__.py`` ("only :func:`compile_only_mode` mutates the
+# depth"). External callers should still use ``compile_only_mode()``.
+quack.cache._COMPILE_ONLY_DEPTH.set(quack.cache._COMPILE_ONLY_DEPTH.get() + 1)
 
 _dtype_map = {
     "torch.float16": torch.float16,
@@ -57,6 +129,10 @@ def _send(stream, msg):
 
 
 def main():
+    # Install the watchdog before doing any work so an orphaned worker that
+    # gets stuck in ``cute.compile`` self-terminates within the poll window.
+    _install_parent_watchdog()
+
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 

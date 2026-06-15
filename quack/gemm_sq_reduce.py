@@ -111,11 +111,12 @@ class GemmSqReduceMixin(GemmActMixin):
         if const_expr(getattr(params, "mAuxOut", None) is not None):
             tRS_rAuxOut = cute.make_rmem_tensor_like(tRS_rD)
             tRS_rAuxOut.store(tRS_rD.load())
+            tRS_rAuxOuts = (tRS_rAuxOut,)
         else:
-            tRS_rAuxOut = None
+            tRS_rAuxOuts = ()
         # Multiply by rowvec (norm_weight) AFTER sq_sum
         vec_multiply(self, tRS_rD, None, tDrRowVec)
-        return tRS_rAuxOut
+        return tRS_rAuxOuts
 
 
 class GemmSqReduceSm90(GemmSqReduceMixin, GemmSm90):
@@ -298,9 +299,9 @@ def gemm_sq_reduce(
         device_capacity,
     )
 
-    from quack.cache import COMPILE_ONLY
+    from quack.cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0

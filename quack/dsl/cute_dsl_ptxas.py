@@ -3,35 +3,61 @@ System ptxas replacement for CUTLASS DSL.
 
 Usage::
 
-    CUTE_DSL_KEEP_PTX=1 CUTE_DSL_PTXAS_PATH=/usr/local/cuda/bin/ptxas pytest tests/
+    CUTE_DSL_PTXAS_PATH=/usr/local/cuda/bin/ptxas pytest tests/
 
 Environment variables:
     CUTE_DSL_PTXAS_PATH    - Path to ptxas (e.g., /usr/local/cuda/bin/ptxas)
-    CUTE_DSL_KEEP_PTX      - Must be set to 1 before cutlass is imported
+    CUTE_DSL_KEEP=ptx      - Optional; keep PTX files instead of deleting them
     CUTE_DSL_PTXAS_VERBOSE - Set to 1 for verbose output
     CUTE_DSL_DUMP_DIR      - Directory for dumped PTX files (default: cwd)
-    CUTE_DSL_KEEP_CUBIN    - Set to 1 to save compiled cubin files
+    CUTE_DSL_KEEP_CUBIN    - Set to 1 to save system-ptxas cubin files
 """
 
-import os
-import sys
-import re
 import ctypes
+import os
+import re
 import subprocess
+import sys
 from pathlib import Path
-
-import cutlass
 
 
 CUTE_DSL_PTXAS_PATH = os.environ.get("CUTE_DSL_PTXAS_PATH", None)
 
+
+def _keep_tokens() -> set[str]:
+    keep = os.environ.get("CUTE_DSL_KEEP", "")
+    return {token.strip().lower() for token in keep.split(",") if token.strip()}
+
+
+def _env_requests_ptx() -> bool:
+    tokens = _keep_tokens()
+    return "all" in tokens or "ptx" in tokens or os.environ.get("CUTE_DSL_KEEP_PTX") == "1"
+
+
+_USER_WANTED_PTX = _env_requests_ptx()
+
+
+def _force_keep_ptx_env() -> None:
+    tokens = _keep_tokens()
+    if "all" not in tokens and "ptx" not in tokens:
+        tokens.add("ptx")
+        os.environ["CUTE_DSL_KEEP"] = ",".join(sorted(tokens))
+    # Keep the deprecated switch too so older CUTLASS DSL builds that do not
+    # understand CUTE_DSL_KEEP still dump PTX.
+    os.environ.setdefault("CUTE_DSL_KEEP_PTX", "1")
+
+
 if CUTE_DSL_PTXAS_PATH:
-    os.environ["CUTE_DSL_KEEP_PTX"] = "1"
+    # Must happen before CuTeDSL's EnvironmentVarManager is instantiated.
+    _force_keep_ptx_env()
+
+import cutlass  # noqa: E402
+
 VERBOSE = os.environ.get("CUTE_DSL_PTXAS_VERBOSE", "0") == "1"
 
 _original_load_cuda_library = None
 _original_create_tvm_ffi_function = None
-_user_wanted_ptx = False  # True if user originally set CUTE_DSL_KEEP_PTX=1
+_user_wanted_ptx = False  # True if user originally requested KEEP=ptx / KEEP_PTX=1
 
 
 def _log(msg: str):
@@ -201,18 +227,36 @@ def _patched_create_tvm_ffi_function(self):
     return _original_create_tvm_ffi_function(self)
 
 
+def _force_live_keep_ptx() -> None:
+    """Update already-created CuTe DSL environment managers, if any.
+
+    quack imports this module before importing its kernels, but keeping this
+    fallback makes direct/late calls to ``patch()`` less fragile.
+    """
+    for cls_name in ("CuTeDSL", "CuteExperimentalDSL"):
+        dsl_cls = getattr(cutlass.cutlass_dsl, cls_name, None)
+        if dsl_cls is None:
+            continue
+        try:
+            envar = dsl_cls._get_dsl().envar
+        except Exception:
+            continue
+        envar.keep_ptx = True
+        if hasattr(envar, "keep_tokens"):
+            envar.keep_tokens = frozenset(set(envar.keep_tokens) | {"ptx"})
+
+
 def patch():
-    """Install system ptxas hook. Call before importing cutlass."""
+    """Install system ptxas hook."""
     global _original_load_cuda_library, _original_create_tvm_ffi_function, _user_wanted_ptx
 
     assert CUTE_DSL_PTXAS_PATH is not None
     if not os.path.isfile(CUTE_DSL_PTXAS_PATH) or not os.access(CUTE_DSL_PTXAS_PATH, os.X_OK):
         raise RuntimeError(f"ptxas not found: {CUTE_DSL_PTXAS_PATH}")
 
-    _user_wanted_ptx = os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1"
-    assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", (
-        "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
-    )
+    _user_wanted_ptx = _USER_WANTED_PTX
+    _force_keep_ptx_env()
+    _force_live_keep_ptx()
 
     patched = False
     cuda_jit_function_cls = cutlass.cutlass_dsl.cuda_jit_executor.CudaDialectJitCompiledFunction

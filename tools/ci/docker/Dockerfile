@@ -24,10 +24,10 @@ RUN apt-get update -y && apt-get install -y \
 #
 # Note: build.sh pins TORCH_CUDA=cu126 for the cu12.9 image (PyTorch 2.12
 # skipped cu128/cu129 wheels; cu126 is the newest 12.x index that ships 2.12
-# and is runnable against any CUDA 12.x driver) and TORCH_CUDA=cu130 for the
+# and is runnable against any CUDA 12.x driver) and TORCH_CUDA=cu132 for the
 # cu13.2 image (matches the cu13 cute-dsl backend and the cu13.x compat
 # shim added by the `cu13` target). The cu13 target's compat libcuda.so
-# is what makes cu130 torch runnable on older kernel drivers like 575.x.
+# is what makes cu132 torch runnable on older kernel drivers like 575.x.
 RUN pip install --break-system-packages --no-cache-dir \
         "torch==2.12.*" \
         --index-url https://download.pytorch.org/whl/${TORCH_CUDA} && \

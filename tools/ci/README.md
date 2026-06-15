@@ -22,9 +22,9 @@ and on PRs.
 | `cu129` | `tridao/quack-kernels:cu12.9-DATE` | base cute-dsl |
 | `cu132` | `tridao/quack-kernels:cu13.2-DATE` | cute-dsl[cu13] |
 
-Both currently pin **torch cu129** because our runner driver is 575.x (CUDA 12.9
-max). Once the runner driver is upgraded to >= 580, switch the cu13.2 variant
-back to cu130 wheels in `tools/ci/docker/build.sh`.
+The cu12.9 variant uses torch cu126 wheels (newest CUDA 12.x PyTorch 2.12 index).
+The cu13.2 variant uses torch cu132 wheels plus the Dockerfile's CUDA 13 forward-
+compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 
 ## Test matrix
 
@@ -33,7 +33,7 @@ back to cu130 wheels in `tools/ci/docker/build.sh`.
 | GPU | Arch override | cu129 | cu132 |
 |-----|----------------|-------|-------|
 | h100 | (none, sm90) | ✓ | ✓ |
-| b300 | (none, sm100) | ✓ | ✓ |
+| b300 | (none, sm100) | — | ✓ |
 | h100 | sm120 | ✓ | ✓ |
 
 ## Two-pass test strategy

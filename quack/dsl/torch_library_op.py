@@ -100,7 +100,7 @@ def cute_op(
             # the op only mutates inputs (no fake output to produce) and the
             # body would otherwise raise for shape/dtype combos that the
             # kernel intentionally rejects.
-            if not quack.cache.COMPILE_ONLY:
+            if not quack.cache.is_compile_only():
                 return
             if _has_symint(args) or _has_symint(kw):
                 return

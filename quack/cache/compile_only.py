@@ -46,21 +46,26 @@ Pytest style — use the reusable plugin in your project's ``conftest.py``::
 
 …then run ``pytest --compile-only`` to populate the cache.
 
-Low-level style (only when neither of the above fits) — enter the mode
-manually::
+Low-level style (only when neither of the above fits) — push the depth
+counter manually::
 
     import quack.cache
     from quack.cache import CompileOnlyFakeTensorMode
 
-    prev = quack.cache.COMPILE_ONLY
-    quack.cache.COMPILE_ONLY = True
+    token = quack.cache._COMPILE_ONLY_DEPTH.set(
+        quack.cache._COMPILE_ONLY_DEPTH.get() + 1
+    )
     fake_mode = CompileOnlyFakeTensorMode()
     fake_mode.__enter__()
     try:
         # ... your code here ...
     finally:
         fake_mode.__exit__(None, None, None)
-        quack.cache.COMPILE_ONLY = prev
+        quack.cache._COMPILE_ONLY_DEPTH.reset(token)
+
+Direct assignment to ``quack.cache.COMPILE_ONLY`` is **forbidden** — the
+module's custom ``__setattr__`` raises :class:`AttributeError` to prevent
+the old leak-on-reset failure mode. See :mod:`quack.cache` for background.
 """
 
 from __future__ import annotations
@@ -153,9 +158,9 @@ def compile_only_mode() -> Iterator[CompileOnlyFakeTensorMode]:
 
     Inside the ``with`` block:
 
-    * :data:`quack.cache.COMPILE_ONLY` is set to ``True``, so the ``@cute_op``
-      ``register_fake`` hooks fire the underlying kernel body (which compiles
-      and exports ``.o``) and the launch path no-ops via
+    * :func:`is_compile_only` returns ``True`` (the depth counter is pushed),
+      so the ``@cute_op`` ``register_fake`` hooks fire the underlying kernel
+      body (which compiles and exports ``.o``) and the launch path no-ops via
       :func:`quack.cache._noop_kernel`.
     * A :class:`CompileOnlyFakeTensorMode` is active, so all tensor
       allocations are fake (no GPU memory) and ``.item()`` &c. return
@@ -163,6 +168,13 @@ def compile_only_mode() -> Iterator[CompileOnlyFakeTensorMode]:
 
     Yields the active :class:`CompileOnlyFakeTensorMode` so callers can
     inspect or augment it if needed.
+
+    Nested calls compose correctly: each ``with`` pushes the depth counter
+    one level deeper and pops back to the prior depth on exit, so callers
+    can compose the context inside outer compile-only regions without ever
+    leaking ``False`` back to the outer scope. The token-based push/pop is
+    structurally leak-free: even an exception inside the block pops to the
+    exact prior depth, never to ``0``.
 
     Example::
 
@@ -174,19 +186,31 @@ def compile_only_mode() -> Iterator[CompileOnlyFakeTensorMode]:
     """
     import quack.cache as _state
 
-    prev_compile_only = _state.COMPILE_ONLY
-    _state.COMPILE_ONLY = True
+    token = _state._COMPILE_ONLY_DEPTH.set(_state._COMPILE_ONLY_DEPTH.get() + 1)
     fake_mode = CompileOnlyFakeTensorMode()
     fake_mode.__enter__()
     try:
         yield fake_mode
     finally:
         fake_mode.__exit__(None, None, None)
-        _state.COMPILE_ONLY = prev_compile_only
+        _state._COMPILE_ONLY_DEPTH.reset(token)
 
 
 def is_compile_only() -> bool:
-    """Return ``True`` if the QuACK compile-only mode is currently active."""
+    """Return ``True`` if the QuACK compile-only mode is currently active.
+
+    Always returns the live stack depth as a bool; no capture-at-import
+    hazard at any callsite. Prefer this over ``quack.cache.COMPILE_ONLY``
+    in new code:
+
+    * ``quack.cache.COMPILE_ONLY`` attribute reads work via the legacy
+      ``__getattr__`` proxy and *are* live, but rely on PEP 562 module
+      hooks that don't survive ``from quack.cache import COMPILE_ONLY``
+      (that captures the value once at import time).
+    * :func:`is_compile_only` is a regular function call, so it's safe to
+      use anywhere — in decorator arguments, at module top level, inside
+      lazy imports, etc.
+    """
     import quack.cache as _state
 
-    return _state.COMPILE_ONLY
+    return _state._COMPILE_ONLY_DEPTH.get() > 0

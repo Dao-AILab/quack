@@ -194,21 +194,16 @@ def pytest_collection_modifyitems(config, items):
     if not _compile_only_enabled(config):
         return
 
+    # ``tests/test_cache.py`` is no longer special-cased here — R1 made the
+    # leak-on-reset bug impossible (no module-level ``COMPILE_ONLY`` attribute
+    # to assign to) and R2 added a ``compile_only_skip`` marker that
+    # ``test_cache.py`` uses as ``pytestmark``, evaluated at setup time. The
+    # belt-and-suspenders deselect that used to live here is no longer needed.
     deselected = [
         item
         for item in items
-        if (
-            getattr(item, "callspec", None) is not None
-            and item.callspec.params.get("use_compile") is True
-        )
-        # Belt-and-suspenders for ``tests/test_cache.py``'s autouse-fixture skip:
-        # those tests mutate the session-global ``quack.cache.COMPILE_ONLY`` flag
-        # and any one that slips through leaks ``False`` back, breaking the
-        # ``is_compile_only()`` data_ptr guards in every downstream test on the
-        # same xdist worker. Deselecting at collection time guarantees none of
-        # them ever reach the runtest protocol — independent of mark / fixture
-        # evaluation timing on the worker.
-        or item.nodeid.startswith("tests/test_cache.py")
+        if getattr(item, "callspec", None) is not None
+        and item.callspec.params.get("use_compile") is True
     ]
     if not deselected:
         return

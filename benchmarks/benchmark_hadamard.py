@@ -8,7 +8,7 @@ import torch
 from triton.testing import Benchmark, do_bench, perf_report
 
 from quack.bench.bench_utils import run_and_print
-from quack.hadamard import hadamard_transform, hadamard_transform_ref
+from quack.transform.hadamard import hadamard_transform, hadamard_transform_ref
 
 try:
     from fast_hadamard_transform import hadamard_transform as fast_hadamard_transform
@@ -33,6 +33,23 @@ DTYPE_MAP = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+
+
+def _parse_int_token(text: str) -> int:
+    token = text.strip().lower()
+    multiplier = 1024 if token.endswith("k") else 1
+    if multiplier != 1:
+        token = token[:-1]
+    try:
+        return int(token) * multiplier
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated integers, optionally using k suffix"
+        ) from exc
+
+
+def _parse_int_csv(text: str) -> list[int]:
+    return [_parse_int_token(item) for item in text.split(",") if item.strip()]
 
 
 def _result(num_bytes: int, ms: float) -> dict:
@@ -91,8 +108,18 @@ def hadamard_runner(M, N, provider, dtype_name):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Hadamard transform")
     parser.add_argument("--dtype", default="bfloat16", choices=list(DTYPE_MAP))
-    parser.add_argument("--M", type=int, default=None, help="Bench a single M (requires --N)")
-    parser.add_argument("--N", type=int, default=None, help="Bench a single N (requires --M)")
+    parser.add_argument(
+        "--M",
+        type=_parse_int_csv,
+        default=None,
+        help="M value(s), comma-separated. Defaults to 8192 when --N is provided.",
+    )
+    parser.add_argument(
+        "--N",
+        type=_parse_int_csv,
+        default=None,
+        help="N value(s), comma-separated, e.g. --N 1024,2048,4096.",
+    )
     parser.add_argument(
         "--include_torch_ref",
         action="store_true",
@@ -101,9 +128,13 @@ def main():
     parser.add_argument("--save_path", default=None)
     args = parser.parse_args()
 
-    if (args.M is None) != (args.N is None):
-        parser.error("--M and --N must be given together")
-    x_vals = [(args.M, args.N)] if args.M is not None else None
+    if args.M is not None and args.N is None:
+        parser.error("--M requires --N")
+    if args.N is None:
+        x_vals = None
+    else:
+        m_vals = args.M if args.M is not None else [8192]
+        x_vals = [(M, N) for M in m_vals for N in args.N]
 
     torch.manual_seed(0)
 

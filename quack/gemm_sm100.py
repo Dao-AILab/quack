@@ -1034,7 +1034,8 @@ class GemmSm100(GemmTmaBase):
         epi_load_barrier = None
         if const_expr(has_epi_load):
             epi_load_barrier = pipeline.NamedBarrier(
-                barrier_id=int(NamedBarrierGemm.EpilogueLoad), num_threads=2 * cute.arch.WARP_SIZE
+                barrier_id=int(NamedBarrierGemm.EpilogueLoad),
+                num_threads=(self.num_ab_load_warps + 1) * cute.arch.WARP_SIZE,
             )
 
         # Cluster wait before tensor memory alloc

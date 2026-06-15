@@ -60,10 +60,9 @@ def _make_op(op_name: str, *, unsupported_n: int | None = None):
     return op, call_log
 
 
-@pytest.mark.skipif(
-    quack.cache.COMPILE_ONLY,
-    reason="test precondition requires COMPILE_ONLY=False; under outer "
-    "--compile-only the FakeTensorMode also blocks Dynamo from compiling the frame",
+@pytest.mark.compile_only_skip(
+    "test precondition requires COMPILE_ONLY=False; under outer "
+    "--compile-only the FakeTensorMode also blocks Dynamo from compiling the frame"
 )
 def test_fake_is_noop_under_torch_compile():
     """torch.compile tracing must NOT execute the cute_op body.
@@ -111,25 +110,21 @@ def test_fake_is_noop_under_torch_compile():
 
 
 def test_fake_runs_body_when_compile_only():
-    """Under ``quack.cache.COMPILE_ONLY=True`` the fake body runs.
+    """Inside ``compile_only_mode()`` the fake body runs.
 
     This is the path the ``_compile_worker`` subprocess and
     ``pytest --compile-only`` rely on to populate the .o cache.
     """
     op, call_log = _make_op("runs_under_compile_only")
 
-    saved = quack.cache.COMPILE_ONLY
-    quack.cache.COMPILE_ONLY = True
-    try:
+    with quack.cache.compile_only_mode():
         with FakeTensorMode():
             x = torch.empty(8, 1024)
             out = torch.empty(8, 1024)
             op(x, out)
-    finally:
-        quack.cache.COMPILE_ONLY = saved
 
     assert call_log == [("fake", (8, 1024))], (
-        f"fake body must run when COMPILE_ONLY is True; saw {call_log}"
+        f"fake body must run when compile-only mode is active; saw {call_log}"
     )
 
 
@@ -167,12 +162,11 @@ def test_has_symint_unit():
     assert _has_symint({"x": t, "n": 5}) is False
 
 
-@pytest.mark.skipif(
-    quack.cache.COMPILE_ONLY,
-    reason="requires Dynamo to actually compile f() with dynamic=True to propagate "
+@pytest.mark.compile_only_skip(
+    "requires Dynamo to actually compile f() with dynamic=True to propagate "
     "SymInts through the op call; the outer FakeTensorMode that --compile-only "
     "installs causes Dynamo to skip the frame, so no SymInts are ever produced "
-    "and the test's invariant cannot be exercised",
+    "and the test's invariant cannot be exercised"
 )
 def test_fake_skips_symint_under_compile_only_strict():
     """SymInts in tensor shape OR scalar args must bypass the body.
@@ -218,9 +212,7 @@ def test_fake_skips_symint_under_compile_only_strict():
 
     op = getattr(getattr(torch.ops, _NS), "strict_symint").default
 
-    saved = quack.cache.COMPILE_ONLY
-    quack.cache.COMPILE_ONLY = True
-    try:
+    with quack.cache.compile_only_mode():
         # Tie the scalar ``n`` to a dynamic dim so it propagates as a
         # SymInt on the dynamic-shape compile. This exercises BOTH the
         # tensor-shape SymInt path (via ``x``) and the scalar-arg SymInt
@@ -235,8 +227,6 @@ def test_fake_skips_symint_under_compile_only_strict():
 
         f(torch.randn(8, 1024))
         f(torch.randn(16, 2048))
-    finally:
-        quack.cache.COMPILE_ONLY = saved
 
     # If any symbolic invocation slipped through, the body's asserts
     # would have raised and surfaced before reaching here. Records of

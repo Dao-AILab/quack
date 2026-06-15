@@ -12,33 +12,29 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64
 
-import quack.cache
-
-# The trace tests are the one place where tracing should be enabled by default:
-# CI runs this file as part of ``pytest tests/`` without setting QUACK_TRACE.
-# Keep compile-only skipped because these raw CuTe JIT kernels do not warm quack's jit_cache.
-if not quack.cache.COMPILE_ONLY:
-    os.environ.setdefault("QUACK_TRACE", "1")
+# The trace tests are the one place where tracing should be enabled by
+# default: CI runs this file as part of ``pytest tests/`` without setting
+# QUACK_TRACE. The unconditional ``setdefault`` is safe because the
+# ``compile_only_skip`` marker (see ``pytestmark`` below) skips every test
+# in this module under ``--compile-only`` anyway — the env-var is set but
+# nothing in this module reads it during a compile-only run. We avoid the
+# old ``if not quack.cache.COMPILE_ONLY: ...`` guard because at *import*
+# time on xdist worksteal workers the depth counter is still 0 (the plugin
+# pushes it in ``pytest_configure``, which can run after module import on
+# worksteal), so the guard never did what its comment claimed.
+os.environ.setdefault("QUACK_TRACE", "1")
 
 from quack.trace import TraceContext, TraceSession, enabled
 
-# QUACK_TRACE-not-set check stays as a pytestmark (it's a static
-# environment-variable check evaluated correctly at import time). The
-# compile-only skip can NOT be a ``pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``:
-# that captures the *value* at decorator-application time (module-import
-# time), which on xdist worksteal workers can be False before the plugin's
-# ``pytest_configure`` has set ``COMPILE_ONLY = True``. Use an autouse
-# fixture instead — fixtures evaluate at test-setup time, unambiguously
-# after ``pytest_configure``.
-pytestmark = pytest.mark.skipif(not enabled(), reason="QUACK_TRACE=1 not set")
-
-
-@pytest.fixture(autouse=True)
-def _skip_under_compile_only():
-    if quack.cache.COMPILE_ONLY:
-        pytest.skip(
-            "skipped under --compile-only: raw CuTe JIT trace kernels do not warm jit cache"
-        )
+# QUACK_TRACE-not-set check is a static environment-variable check evaluated
+# at import time, which is correct for that condition. The compile-only skip
+# uses the dedicated ``compile_only_skip`` marker (registered by
+# ``quack.testing.pytest_plugin``) and is evaluated at test-setup time so it
+# is robust to xdist worksteal item-fetch ordering.
+pytestmark = [
+    pytest.mark.skipif(not enabled(), reason="QUACK_TRACE=1 not set"),
+    pytest.mark.compile_only_skip("raw CuTe JIT trace kernels do not warm quack's jit_cache"),
+]
 
 
 # ---------------------------------------------------------------------------
