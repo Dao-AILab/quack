@@ -103,3 +103,33 @@ def test_mxfp8_grouped_gemm_eager_prepared_bitwise(route, group_sizes, k, n):
         f"eager vs prepared not bit-identical: "
         f"{(eager != prepared).sum().item()}/{eager.numel()} elems differ"
     )
+
+
+@pytest.mark.parametrize("k,n", [(512, 512), (4096, 4096)])
+@pytest.mark.parametrize(
+    "group_sizes",
+    [
+        (1792, 128, 128, 128),  # 128-aligned, heavy load imbalance -> varlen-M
+        (512, 0, 0, 0),  # 128-aligned, single non-empty expert
+        (256, 0, 256, 256),  # 128-aligned, empty middle expert
+        (0, 256, 256, 256),  # 128-aligned, empty first expert
+        (256, 256, 256, 0),  # 128-aligned, empty last expert
+        (100, 0, 200, 224),  # non-128, empty expert -> padded route
+        (500, 12, 8, 4),  # non-128, heavy imbalance -> padded route
+    ],
+)
+def test_mxfp8_grouped_gemm_skew_and_empty(group_sizes, k, n):
+    """Realistic MoE routing: heavy load imbalance and empty experts (size-0 groups).
+    Exercises the varlen-M route's dQaccum-padded SFA build and the padded route with
+    m_i == 0. Checks both APIs vs the dequant reference and that they agree bitwise."""
+    _skip_if_not_sm100()
+    from quack.mxfp8_grouped_gemm import make_mxfp8_grouped_gemm_runner, mxfp8_grouped_gemm
+
+    qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, k, n)
+    eager = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb)
+    prepared = make_mxfp8_grouped_gemm_runner(qa, b_disp, offs, sa, sb)()
+    assert eager.shape == (sum(group_sizes), n)
+    torch.testing.assert_close(
+        eager.float(), _ref_grouped(a_ref, b_ref, group_sizes), atol=1e-2, rtol=1e-2
+    )
+    assert torch.equal(eager, prepared)
