@@ -17,6 +17,45 @@ import quack.layout_utils as layout_utils
 import quack.utils as utils
 
 
+@cute.jit
+def apply_linear_epilogue(
+    tRS_rD: cute.Tensor,
+    tRS_rC: Optional[cute.Tensor],
+    alpha,
+    beta,
+    tDrRowVec: Optional[cute.Tensor],
+    tDrColVec: Optional[cute.Tensor],
+) -> None:
+    """The default (linear) epilogue math: D = alpha * D + beta * C + rowvec + colvec.
+
+    tRS_rD is mutated in place (acc dtype). alpha/beta are scalar-or-pointer params
+    (None means the term's default: alpha absent, beta = 1.0). The vec operands are
+    register fragments shaped like tRS_rD. Shared by GemmDefaultEpiMixin and the
+    split-K staged reduction kernel (quack/split_k_reduce.py) so the two apply
+    bitwise-identical math.
+    """
+    if const_expr(alpha is not None):
+        a = utils.load_scalar_or_pointer(alpha)
+        rD = tRS_rD.load() * a
+        tRS_rD.store(rD)
+    # Apply C with beta scaling
+    if const_expr(tRS_rC is not None):
+        rD = tRS_rD.load()
+        if const_expr(beta is None):
+            # beta is None, default behavior: add C (beta=1.0)
+            rD += tRS_rC.load().to(tRS_rD.element_type)
+        else:
+            b = utils.load_scalar_or_pointer(beta)
+            rD += b * tRS_rC.load().to(tRS_rD.element_type)
+        tRS_rD.store(rD)
+    if const_expr(tDrRowVec is not None):
+        for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
+            tRS_rD[i] += tDrRowVec[i]
+    if const_expr(tDrColVec is not None):
+        for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
+            tRS_rD[i] += tDrColVec[i]
+
+
 class GemmDefaultEpiMixin(ComposableEpiMixin):
     _epi_ops = (
         Scalar("alpha"),
@@ -24,6 +63,16 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         Scalar("sr_seed", dtype=Int32),
         RowVecLoad("mRowVecBroadcast"),
         ColVecLoad("mColVecBroadcast"),
+    )
+    # Split-K (serial/parallel): the epilogue runs only on the finalizing split, which
+    # needs the per-tile completion flag and the raw-f32-partials workspace. Both are
+    # CuTe tensors over the (cluster-rounded) tile domain; their layouts own the
+    # address computation. Flag: (ntile_m, ntile_n, L) Int32. Workspace:
+    # (cta_tile_m * cta_tile_n, ntile_m, ntile_n, L) Float32, each tile's region a
+    # flat (epi_subtile, thread, fragment)-striped dump of the accumulator fragments.
+    _extra_param_fields = (
+        ("split_k_semaphore", Optional[cute.Tensor], None),
+        ("split_k_workspace", Optional[cute.Tensor], None),
     )
 
     @mlir_namedtuple
@@ -35,6 +84,8 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         add_to_output: cutlass.Constexpr[bool] = False
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
+        split_k_semaphore: Optional[cute.Tensor] = None
+        split_k_workspace: Optional[cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops
 
@@ -44,6 +95,8 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
             if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
+        d["split_k_semaphore"] = getattr(args, "split_k_semaphore", None)
+        d["split_k_workspace"] = getattr(args, "split_k_workspace", None)
         return self.EpilogueParams(**d)
 
     @cute.jit
@@ -61,30 +114,16 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         no aux outputs.
         """
         # Use .get(): inactive ops are filtered out of epi_loop_tensors.
-        alpha = epi_loop_tensors.get("alpha")
-        beta = epi_loop_tensors.get("beta")
-        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
-        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
-        rD = tRS_rD.load()
-        # Apply alpha scaling to accumulator if alpha is provided (not None)
-        if const_expr(hasattr(params, "alpha") and params.alpha is not None):
-            alpha = utils.load_scalar_or_pointer(params.alpha)
-            rD *= alpha
-        # Apply C with beta scaling
-        if const_expr(tRS_rC is not None):
-            if const_expr(not hasattr(params, "beta") or params.beta is None):
-                # beta is None, default behavior: add C (beta=1.0)
-                rD += tRS_rC.load().to(tRS_rD.element_type)
-            else:
-                beta = utils.load_scalar_or_pointer(params.beta)
-                rD += beta * tRS_rC.load().to(tRS_rD.element_type)
-        tRS_rD.store(rD)
-        if const_expr(tDrRowVec is not None):
-            for i in cutlass.range(cute.size(tDrRowVec), unroll_full=True):
-                tRS_rD[i] += tDrRowVec[i]
-        if const_expr(tDrColVec is not None):
-            for i in cutlass.range(cute.size(tDrColVec), unroll_full=True):
-                tRS_rD[i] += tDrColVec[i]
+        # Under split-K this runs exactly once per output tile, on the finalizing
+        # entity, with the fully reduced accumulator in tRS_rD — no per-split gating.
+        apply_linear_epilogue(
+            tRS_rD,
+            tRS_rC,
+            params.alpha if const_expr(hasattr(params, "alpha")) else None,
+            params.beta if const_expr(hasattr(params, "beta")) else None,
+            epi_loop_tensors.get("mRowVecBroadcast"),
+            epi_loop_tensors.get("mColVecBroadcast"),
+        )
         return ()
 
 
