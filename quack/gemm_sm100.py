@@ -142,6 +142,7 @@ class GemmSm100(GemmTmaBase):
         use_clc_persistence: bool = True,
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
+        sfa_tile_aligned: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -168,6 +169,10 @@ class GemmSm100(GemmTmaBase):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.sf_vec_size = sf_vec_size
         self.blockscaled = sf_vec_size is not None
+        # When True, SFA is in natural (unpadded) packed layout and per-expert offsets
+        # are computed as cu_seqlens[b] // 128 (valid only for 128-aligned varlen_m
+        # boundaries); when False, SFA is dQaccum-padded (cu // 128 + b).
+        self.sfa_tile_aligned = sfa_tile_aligned
         assert len(mma_tiler_mnk) in [2, 3], "MMA tiler must be (M, N) or (M, N, K)"
         valid_2cta_m = (128, 256) if not self.blockscaled else (256,)
         self.use_2cta_instrs = cluster_shape_mnk[0] % 2 == 0 and mma_tiler_mnk[0] in valid_2cta_m
@@ -1115,7 +1120,9 @@ class GemmSm100(GemmTmaBase):
                     # the A-data offset — allows varlen_m seqlens that aren't
                     # multiples of 128.
                     gSFA_mkl = cute.local_tile(
-                        varlen_manager.offset_batch_SFA(mSFA_mkl, batch_idx),
+                        varlen_manager.offset_batch_SFA(
+                            mSFA_mkl, batch_idx, tile_aligned=self.sfa_tile_aligned
+                        ),
                         cute.select(self.mma_tiler, [0, 2]),
                         (mma_tile_coord_mnl[0], None),
                     )
