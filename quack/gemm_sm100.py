@@ -25,7 +25,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
-from quack.tile_scheduler import TileSchedulerOptions
+from quack.tile_scheduler import TileSchedulerOptions, params_has_split_k
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 from quack import layout_utils
@@ -565,6 +565,26 @@ class GemmSm100(GemmSm90):
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
 
+        if const_expr(scheduler_args.splitk_ws is not None):
+            if const_expr(scheduler_args.splitk_parallel):
+                # Parallel mode: the GEMM kernel only writes partials; D/C and all
+                # epilogue ops belong to the separate reduce kernel.
+                assert scheduler_args.splitk_flags is None
+                assert mD is None and mC is None, (
+                    "parallel split-K: pass D/C to the reduce kernel, not the GEMM"
+                )
+            else:
+                assert scheduler_args.splitk_flags is not None
+                assert mD is not None, "serial split-K requires an output tensor D"
+            assert not (varlen_m or varlen_k), "split-K does not support varlen"
+            assert not self.gather_A, "split-K does not support gather_A"
+            assert not self.blockscaled, "split-K does not support blockscaled GEMM"
+            assert not self.use_2cta_instrs, "split-K does not support 2-CTA MMA (tile_m=256)"
+            # CLC hands out work in no guaranteed order (breaks the serial turnstile) and
+            # its grid math isn't wired for the split work-index expansion.
+            assert not self.use_clc_persistence, "split-K requires the static/dynamic scheduler"
+            assert self.acc_dtype == Float32, "split-K workspace assumes f32 accumulators"
+
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
 
@@ -879,6 +899,17 @@ class GemmSm100(GemmSm90):
             assert varlen_m or varlen_k
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
+        has_split_k = const_expr(params_has_split_k(tile_sched_params))
+        splitk_parallel = const_expr(
+            has_split_k and getattr(tile_sched_params, "splitk_parallel", False)
+        )
+        if const_expr(has_split_k):
+            assert not (varlen_m or varlen_k) and not self.gather_A
+            if const_expr(splitk_parallel):
+                # D/C are written by the separate reduce kernel
+                assert not has_D and not has_C
+            else:
+                assert has_D
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1193,6 +1224,9 @@ class GemmSm100(GemmSm90):
                         mcast_mask=sfb_mcast_mask,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                k_tile_start, k_tile_cnt = self.splitk_k_tile_range(
+                    tile_sched_params, tile_scheduler.current_k_split, k_tile_cnt
+                )
                 tctx.b("tma_load")
                 if const_expr(not self.gather_A):
                     ab_producer_state = self.load_AB(
@@ -1203,6 +1237,7 @@ class GemmSm100(GemmSm90):
                         k_tile_cnt,
                         copy_SFA,
                         copy_SFB,
+                        k_tile_start=k_tile_start,
                     )
                 elif const_expr(self.use_tma_gather):
                     ab_producer_state, a_prefetch_consumer_state = self.load_AB_tma_gather(
@@ -1347,26 +1382,37 @@ class GemmSm100(GemmSm90):
                 while work_tile.is_valid_tile:
                     # Get tile coord from tile scheduler
                     tile_coord_mnkl = work_tile.tile_idx
-                    batch_idx = tile_coord_mnkl[3]
-                    copy_C_fn, _, bGS_gC = self.epilog_gmem_copy_and_partition(
-                        tma_atom_c,
-                        varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
-                        self.cta_tile_shape_mnk[:2],
-                        epi_tile,
-                        sC,
-                        tile_coord_mnkl,
-                    )
-                    copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
-                    if do_epi_load_barrier_wait:
-                        epi_load_barrier.arrive_and_wait()
-                        do_epi_load_barrier_wait = Boolean(False)
-                    epi_tile_num = const_expr(cute.size(bGS_gC, mode=[1]))
-                    for epi_idx in cutlass.range(epi_tile_num, unroll=1):
-                        epi_pipeline.producer_acquire(epi_producer_state)
-                        copy_C(src_idx=epi_idx, producer_state=epi_producer_state)
-                        # Epi pipeline's producer commit is a NOP
-                        epi_pipeline.producer_commit(epi_producer_state)
-                        epi_producer_state.advance()
+                    if const_expr(not has_split_k):
+                        epi_producer_state, do_epi_load_barrier_wait = self._epi_load_C_tile(
+                            tma_atom_c,
+                            mC_mnl,
+                            sC,
+                            epi_tile,
+                            epi_pipeline,
+                            epi_producer_state,
+                            epi_load_barrier,
+                            do_epi_load_barrier_wait,
+                            varlen_manager,
+                            tile_coord_mnkl,
+                        )
+                    else:
+                        # Only the final split runs the epilogue and consumes C
+                        if (
+                            tile_scheduler.current_k_split
+                            == tile_sched_params.split_k_fdd.divisor - 1
+                        ):
+                            epi_producer_state, do_epi_load_barrier_wait = self._epi_load_C_tile(
+                                tma_atom_c,
+                                mC_mnl,
+                                sC,
+                                epi_tile,
+                                epi_pipeline,
+                                epi_producer_state,
+                                epi_load_barrier,
+                                do_epi_load_barrier_wait,
+                                varlen_manager,
+                                tile_coord_mnkl,
+                            )
                     # Advance to next tile
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
@@ -1452,6 +1498,9 @@ class GemmSm100(GemmSm90):
                 batch_idx = tile_coord_mnkl[3]
                 k_len = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
+                _, k_tile_cnt = self.splitk_k_tile_range(
+                    tile_sched_params, tile_scheduler.current_k_split, k_tile_cnt
+                )
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
                 acc_stage_idx = (
@@ -1595,6 +1644,45 @@ class GemmSm100(GemmSm90):
                     cute.zipped_divide(cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile),
                     mode=[1],
                 )
+                clear_acc = varlen_k and k_len == 0
+                is_final_split = Boolean(True)
+                splitk_flag_ptr, splitk_tile_idx = None, None
+                if const_expr(has_split_k):
+                    # Workspace fragments must exactly tile the CTA tile (host allocates
+                    # tile_m * tile_n f32 per workspace slot)
+                    assert (
+                        epi_tile_num
+                        * self.num_epi_warps
+                        * cute.arch.WARP_SIZE
+                        * cute.size(tTR_rD.shape)
+                        == self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1]
+                    )
+                    k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
+                    _, k_tile_cnt = self.splitk_k_tile_range(
+                        tile_sched_params, tile_scheduler.current_k_split, k_tile_cnt
+                    )
+                    # Splits that got no k tiles (split_k > total k tiles) contribute zeros
+                    clear_acc = k_tile_cnt == 0
+                    splitk_tile_idx = self.splitk_tile_index(tile_coord_mnkl, mB_nkl)
+                    if const_expr(not splitk_parallel):
+                        # The epilogue rotates epi smem buffers by tile_scheduler
+                        # .num_tiles_executed * epi_tile_num, which counts skipped
+                        # (non-final-split) tiles while TMA store commits don't. The buffer
+                        # phase across skips is preserved iff epi_stage divides epi_tile_num;
+                        # otherwise a buffer could be overwritten while its TMA store is
+                        # still in flight. (Parallel mode never runs the epilogue here.)
+                        assert epi_tile_num % self.epi_stage == 0, (
+                            "split-K requires epi_tile_num divisible by epi_stage; "
+                            "use a tile_n whose epi subtile count is even (e.g. 128 or 256)"
+                        )
+                        is_final_split = (
+                            tile_scheduler.current_k_split
+                            == tile_sched_params.split_k_fdd.divisor - 1
+                        )
+                        splitk_flag_ptr = tile_sched_params.splitk_flags + splitk_tile_idx
+                        # Turnstile: wait until all preceding splits of this tile have
+                        # accumulated their partials into the workspace
+                        self.splitk_wait(splitk_flag_ptr, tile_scheduler.current_k_split, epi_tidx)
                 load_acc_subtile = partial(
                     self.epi_load_acc_subtile,
                     tiled_copy_t2r,
@@ -1606,36 +1694,102 @@ class GemmSm100(GemmSm90):
                     acc_release_idx=self.iter_acc_early_release
                     if const_expr(self.overlap_accum_sf)
                     else epi_tile_num - 1,
-                    clear_acc=varlen_k and k_len == 0,
+                    clear_acc=clear_acc,
                 )
 
                 tctx.b("epilogue")
-                epi_read_state, _ = self.epilogue(
-                    epilogue_params,
-                    epi_smem_tensors,
-                    epi_pipeline,
-                    epi_store_pipeline,
-                    epi_read_state,
-                    None,  # epi_producer_state
-                    epi_tile,
-                    load_acc_subtile,
-                    tRS_rD,
-                    tRS_rC,
-                    tiled_copy_t2r,
-                    tiled_copy_r2s,
-                    tRS_sD,
-                    tiled_copy_s2r,
-                    tSR_rC,
-                    tSR_sC,
-                    copy_D,
-                    copy_C,
-                    tile_coord_mnkl,
-                    varlen_manager,
-                    self.epilogue_barrier,
-                    tile_scheduler,
-                    epi_tidx,
-                    is_tma_warp,
-                )
+                if const_expr(not has_split_k):
+                    epi_read_state, _ = self.epilogue(
+                        epilogue_params,
+                        epi_smem_tensors,
+                        epi_pipeline,
+                        epi_store_pipeline,
+                        epi_read_state,
+                        None,  # epi_producer_state
+                        epi_tile,
+                        load_acc_subtile,
+                        tRS_rD,
+                        tRS_rC,
+                        tiled_copy_t2r,
+                        tiled_copy_r2s,
+                        tRS_sD,
+                        tiled_copy_s2r,
+                        tSR_rC,
+                        tSR_sC,
+                        copy_D,
+                        copy_C,
+                        tile_coord_mnkl,
+                        varlen_manager,
+                        self.epilogue_barrier,
+                        tile_scheduler,
+                        epi_tidx,
+                        is_tma_warp,
+                    )
+                elif const_expr(splitk_parallel):
+                    # Parallel split-K: every split stores raw partials to its own
+                    # workspace slot with no inter-CTA synchronization; the separate
+                    # reduce kernel sums slots and runs the epilogue.
+                    self.splitk_store_partials_parallel(
+                        tile_sched_params,
+                        splitk_tile_idx,
+                        tile_scheduler.current_k_split,
+                        load_acc_subtile,
+                        tRS_rD,
+                        tTR_rD,
+                        tiled_copy_t2r,
+                        epi_tile,
+                        epi_tile_num,
+                        epi_tidx,
+                    )
+                else:
+                    if is_final_split:
+                        epi_read_state, _ = self.epilogue(
+                            epilogue_params,
+                            epi_smem_tensors,
+                            epi_pipeline,
+                            epi_store_pipeline,
+                            epi_read_state,
+                            None,  # epi_producer_state
+                            epi_tile,
+                            load_acc_subtile,
+                            tRS_rD,
+                            tRS_rC,
+                            tiled_copy_t2r,
+                            tiled_copy_r2s,
+                            tRS_sD,
+                            tiled_copy_s2r,
+                            tSR_rC,
+                            tSR_sC,
+                            copy_D,
+                            copy_C,
+                            tile_coord_mnkl,
+                            varlen_manager,
+                            self.epilogue_barrier,
+                            tile_scheduler,
+                            epi_tidx,
+                            is_tma_warp,
+                            splitk_fixup=partial(
+                                self.splitk_fixup_acc_subtile,
+                                tile_sched_params,
+                                splitk_tile_idx,
+                                tTR_rD,
+                                epi_tidx,
+                            ),
+                        )
+                    else:
+                        # Non-final split: no epilogue; serialize partials into the
+                        # workspace and pass the turnstile to the next split.
+                        self.splitk_store_partials(
+                            tile_sched_params,
+                            splitk_tile_idx,
+                            tile_scheduler.current_k_split,
+                            load_acc_subtile,
+                            tRS_rD,
+                            tTR_rD,
+                            epi_tile_num,
+                            epi_tidx,
+                        )
+                        self.splitk_arrive(splitk_flag_ptr, epi_tidx)
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()
                 tctx.e("epilogue")
@@ -1654,6 +1808,89 @@ class GemmSm100(GemmSm90):
             tmem.free(acc_tmem_ptr)
 
         tctx.flush()
+
+    @cute.jit
+    def splitk_store_partials_parallel(
+        self,
+        params,
+        tile_idx: Int32,
+        k_split: Int32,
+        load_acc_subtile: Callable,
+        tRS_rD: cute.Tensor,
+        tTR_rD: cute.Tensor,
+        tiled_copy_t2r: cute.TiledCopy,
+        epi_tile: cute.Tile,
+        epi_tile_num: cutlass.Constexpr[int],
+        tidx: Int32,
+    ) -> None:
+        """Parallel split-K: store this split's raw fp32 partials to its own workspace
+        slot in row-major (m, n) order, with no inter-CTA synchronization.
+
+        Slot layout is (tile_idx * split_k + k_split) so a tile's slices are adjacent
+        for the reduce kernel. Fragments land at their true (m, n) via the same
+        partition_D(flat_divide(...)) mapping the epilogue uses for its identity
+        tensor (epilog_tmem_copy_and_partition), so the reduce kernel can address the
+        slot as a plain row-major tile. Edge-tile OOB lanes write padding inside the
+        slot; the reduce kernel predicates the final D store.
+        """
+        tile_m = const_expr(self.cta_tile_shape_mnk[0])
+        tile_n = const_expr(self.cta_tile_shape_mnk[1])
+        slot = tile_idx * params.split_k_fdd.divisor + k_split
+        mWS = cute.make_tensor(
+            params.splitk_ws.iterator + slot * const_expr(tile_m * tile_n),
+            cute.make_layout((tile_m, tile_n), stride=(tile_n, 1)),
+        )
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+        gWS_epi = cute.flat_divide(mWS, epi_tile)
+        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+        tTR_gWS = thr_copy_t2r.partition_D(gWS_epi)
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        # Same subtile-index -> (epi_m, epi_n) mapping as the epilogue's D store
+        epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
+        for epi_idx in cutlass.range_constexpr(epi_tile_num):
+            load_acc_subtile(tRS_rD, epi_idx)
+            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            cute.autovec_copy(tTR_rD, tTR_gWS[None, None, None, gmem_coord[0], gmem_coord[1]])
+
+    @cute.jit
+    def _epi_load_C_tile(
+        self,
+        tma_atom_c: cute.CopyAtom,
+        mC_mnl: cute.Tensor,
+        sC: cute.Tensor,
+        epi_tile: cute.Tile,
+        epi_pipeline: pipeline.PipelineAsync,
+        epi_producer_state: pipeline.PipelineState,
+        epi_load_barrier: Optional[pipeline.NamedBarrier],
+        do_epi_load_barrier_wait: Boolean,
+        varlen_manager: VarlenManager,
+        tile_coord_mnkl: cute.Coord,
+    ) -> Tuple[pipeline.PipelineState, Boolean]:
+        """One work tile's worth of TMA loads of C, issued by the epi load warp."""
+        batch_idx = tile_coord_mnkl[3]
+        copy_C_fn, _, bGS_gC = self.epilog_gmem_copy_and_partition(
+            tma_atom_c,
+            varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
+            self.cta_tile_shape_mnk[:2],
+            epi_tile,
+            sC,
+            tile_coord_mnkl,
+        )
+        copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
+        if do_epi_load_barrier_wait:
+            epi_load_barrier.arrive_and_wait()
+            do_epi_load_barrier_wait = Boolean(False)
+        epi_tile_num = const_expr(cute.size(bGS_gC, mode=[1]))
+        for epi_idx in cutlass.range(epi_tile_num, unroll=1):
+            epi_pipeline.producer_acquire(epi_producer_state)
+            copy_C(src_idx=epi_idx, producer_state=epi_producer_state)
+            # Epi pipeline's producer commit is a NOP
+            epi_pipeline.producer_commit(epi_producer_state)
+            epi_producer_state.advance()
+        return epi_producer_state, do_epi_load_barrier_wait
 
     @cute.jit
     def _make_gather_A_copy(
@@ -2361,8 +2598,13 @@ class GemmSm100(GemmSm90):
 
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
-        # Add remaining unused smem to epilogue
-        epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // (epi_bytes_per_stage)
+        # Add remaining unused smem to epilogue.
+        # Parallel split-K compiles the GEMM with no epilogue smem
+        # (epi_bytes_per_stage == 0): A/B already claimed all smem above (epi_bytes
+        # was 0), there are no epilogue stages to refine, and any A/B remainder is
+        # smaller than one A/B stage -- so skip this (otherwise zero-division) step.
+        if const_expr(epi_bytes_per_stage > 0):
+            epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // epi_bytes_per_stage
         return num_acc_stage, ab_stage, epi_stage, epi_c_stage
 
     @staticmethod

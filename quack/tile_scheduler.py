@@ -58,6 +58,18 @@ class TileSchedulerOptions(NamedTuple):
     max_swizzle_size: Int32 = Int32(8)
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
+    # Split-K: number of K splits per output tile (runtime value; > 1 only when the
+    # flags/workspace buffers below are provided).
+    split_k: Int32 = Int32(1)
+    # (num_tiles_m * num_tiles_n * L,) int32 turnstile counters, zero-initialized.
+    # Only used in serial (turnstile) mode; None in parallel mode.
+    splitk_flags: Optional[cute.Pointer] = None
+    # f32 partial-accumulator workspace. Serial mode: one tile_m*tile_n slot per output
+    # tile (fragment order). Parallel mode: split_k slots per output tile (row-major).
+    splitk_ws: Optional[cute.Tensor] = None
+    # Parallel split-K: all splits store partials to their own workspace slice with no
+    # inter-CTA synchronization; a separate reduce kernel sums them and runs the epilogue.
+    splitk_parallel: cutlass.Constexpr[bool] = False
 
 
 @dataclass
@@ -68,7 +80,20 @@ class TileSchedulerArguments:
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
+    split_k: Int32 = Int32(1)
+    splitk_flags: Optional[cute.Pointer] = None
+    splitk_ws: Optional[cute.Tensor] = None
+    splitk_parallel: cutlass.Constexpr[bool] = False
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.NONE
+
+
+def params_has_split_k(params) -> bool:
+    """Whether scheduler params carry split-K state (compile-time check).
+
+    Uses getattr since only TileScheduler.Params has the field; Triangular/VarlenM
+    scheduler Params don't support split-K.
+    """
+    return getattr(params, "splitk_ws", None) is not None
 
 
 class TileScheduler:
@@ -83,6 +108,10 @@ class TileScheduler:
         num_clusters_in_group_fdd: FastDivmod
         tile_count_semaphore: Optional[cute.Pointer]
         batch_idx_permute: Optional[cute.Tensor]
+        split_k_fdd: FastDivmod
+        splitk_flags: Optional[cute.Pointer]
+        splitk_ws: Optional[cute.Tensor]
+        splitk_parallel: cutlass.Constexpr[bool]
         cluster_shape_mn: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
 
@@ -90,6 +119,20 @@ class TileScheduler:
         @cute.jit
         def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "TileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
+            if const_expr(args.splitk_ws is not None):
+                if const_expr(args.splitk_parallel):
+                    # No inter-CTA synchronization in parallel mode, so no flags.
+                    assert args.splitk_flags is None
+                else:
+                    assert args.splitk_flags is not None
+                # Serial mode: forward progress of the turnstile requires that a work unit
+                # only ever waits on units with smaller work index; STATIC/DYNAMIC hand out
+                # work indices in increasing order per CTA, CLC/NONE do not guarantee any
+                # ordering. Parallel mode has no waits but its split work-index expansion
+                # is only wired up for the STATIC/DYNAMIC grid math.
+                assert args.persistence_mode in (PersistenceMode.STATIC, PersistenceMode.DYNAMIC), (
+                    "split-K requires STATIC or DYNAMIC persistence"
+                )
             cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
             problem_shape_ncluster_mn = cute.ceil_div(problem_shape_ntile_mn, cluster_shape_mn)
@@ -129,6 +172,10 @@ class TileScheduler:
                 if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC)
                 else None,
                 args.batch_idx_permute,
+                FastDivmod(args.split_k),
+                args.splitk_flags if const_expr(args.splitk_ws is not None) else None,
+                args.splitk_ws,
+                args.splitk_parallel,
                 cluster_shape_mn,
                 args.persistence_mode,
             )
@@ -139,6 +186,7 @@ class TileScheduler:
         num_tiles_executed: Int32,
         current_batch_idx: Int32,
         num_work_idx_before_cur_batch: Int32,
+        current_k_split: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         pipeline_state: PipelineStateWAdvance,
@@ -151,6 +199,11 @@ class TileScheduler:
         self.num_tiles_executed = num_tiles_executed
         self._current_batch_idx = current_batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
+        # K-split index of the current work tile (always 0 when split-K is disabled).
+        # Carried as scheduler state rather than in WorkTileInfo.tile_idx: the DSL's
+        # WorkTileInfo has a rigid pytree schema (3 coord leaves + validity) and asserts
+        # on reconstruction if the K slot holds a dynamic value.
+        self.current_k_split = current_k_split
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
@@ -222,6 +275,7 @@ class TileScheduler:
             Int32(0),  # num_tiles_executed
             Int32(0),  # current_batch_idx
             Int32(0),  # num_work_idx_before_cur_batch
+            Int32(0),  # current_k_split
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -246,9 +300,10 @@ class TileScheduler:
                 params.problem_shape_ncluster_mnl[2],
             )
         else:
-            num_ctas_in_problem = cute.size(
-                params.problem_shape_ncluster_mnl, loc=loc, ip=ip
-            ) * cute.size(params.cluster_shape_mn)
+            num_work_units = cute.size(params.problem_shape_ncluster_mnl, loc=loc, ip=ip)
+            if const_expr(params_has_split_k(params)):
+                num_work_units = num_work_units * params.split_k_fdd.divisor
+            num_ctas_in_problem = num_work_units * cute.size(params.cluster_shape_mn)
             num_ctas_per_cluster = cute.size(params.cluster_shape_mn, loc=loc, ip=ip)
             # Total ctas that can run in one wave
             num_ctas_per_wave = max_active_clusters * num_ctas_per_cluster
@@ -310,15 +365,27 @@ class TileScheduler:
         ip=None,
     ) -> cutlass.utils.WorkTileInfo:
         params = self.params
+        has_split_k = const_expr(params_has_split_k(params))
         if const_expr(is_valid is None):
             if const_expr(params.persistence_mode == PersistenceMode.NONE):
                 is_valid = self.num_tiles_executed == 0
             elif const_expr(params.persistence_mode == PersistenceMode.CLC):
                 is_valid = work_idx < cute.size(params.problem_shape_ncluster_mnl[:2])
             else:
-                is_valid = work_idx < cute.size(params.problem_shape_ncluster_mnl)
+                num_work = cute.size(params.problem_shape_ncluster_mnl)
+                if const_expr(has_split_k):
+                    num_work = num_work * params.split_k_fdd.divisor
+                is_valid = work_idx < num_work
         pid_m, pid_n, batch_idx = Int32(0), Int32(0), Int32(0)
+        if const_expr(has_split_k):
+            k_split = Int32(0)
         if is_valid:
+            if const_expr(has_split_k):
+                # k_split is the fastest-varying component of the work index, so all
+                # splits of a tile run concurrently in one wave and the turnstile only
+                # ever waits on units with strictly smaller work index.
+                tile_work_idx, k_split_dyn = divmod(work_idx, params.split_k_fdd)
+                work_idx, k_split = Int32(tile_work_idx), Int32(k_split_dyn)
             if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
                 cluster_id_in_problem = work_idx
                 _, _, bidz_ = cute.arch.block_idx()
@@ -335,12 +402,17 @@ class TileScheduler:
                 if const_expr(params.batch_idx_permute is None)
                 else params.batch_idx_permute[bidz_]
             )
+        if const_expr(has_split_k):
+            # The K slot of tile_coord_mnkl must stay statically None (WorkTileInfo's
+            # pytree schema is rigid), so k_split rides on the scheduler instead.
+            self.current_k_split = k_split
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
 
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         params = self.params
+        has_split_k = const_expr(params_has_split_k(params))
         pid_m, pid_n, batch_idx, is_valid = Int32(0), Int32(0), Int32(0), Boolean(False)
         if const_expr(params.persistence_mode == PersistenceMode.NONE):
             pass
@@ -359,7 +431,14 @@ class TileScheduler:
             with cute.arch.elect_one():
                 self._scheduler_pipeline.consumer_release(self._pipeline_state)
             self._pipeline_state.advance()
-            is_valid = Boolean(is_valid_i32)
+            if const_expr(has_split_k):
+                # k_split is packed into the upper bits of the validity word (the smem
+                # relay only carries 4 ints per stage) and rides on the scheduler, not
+                # in tile_coord_mnkl (WorkTileInfo's pytree schema is rigid).
+                is_valid = Boolean(is_valid_i32 & 1)
+                self.current_k_split = is_valid_i32 >> 1
+            else:
+                is_valid = Boolean(is_valid_i32)
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, Boolean(is_valid))
 
@@ -392,8 +471,11 @@ class TileScheduler:
                 # instead of atomic_inc, and at the end of the kernel must reset the semaphore to 0.
                 #                 # cute.printf("before atomicadd, tidx = {}, bidz = {}, idx = {}", cute.arch.thread_idx()[0], cute.arch.block_idx()[2], current_work_idx)
                 if const_expr(params.problem_shape_ncluster_mnl[0] is not None):
+                    num_work = cute.size(params.problem_shape_ncluster_mnl)
+                    if const_expr(params_has_split_k(params)):
+                        num_work = num_work * params.split_k_fdd.divisor
                     next_work_linear_idx = num_persistent_clusters + utils.atomic_inc_i32(
-                        cute.size(params.problem_shape_ncluster_mnl) - 1,
+                        num_work - 1,
                         params.tile_count_semaphore,
                     )
                 else:  # varlen_m
@@ -440,11 +522,16 @@ class TileScheduler:
                 self._pipeline_state.phase ^ 1,
             )
             self._scheduler_pipeline.producer_acquire(pipeline_state_producer)
+            valid_field = Int32(work_tile_info.is_valid_tile)
+            if const_expr(params_has_split_k(params)):
+                # Pack k_split (set by _delinearize_work_idx just before this call) into
+                # the upper bits of the validity word; unpacked in get_current_work.
+                valid_field = valid_field | (self.current_k_split << 1)
             sched_data = [
                 work_tile_info.tile_idx[0],
                 work_tile_info.tile_idx[1],
                 work_tile_info.tile_idx[3],
-                Int32(work_tile_info.is_valid_tile),
+                valid_field,
             ]
             lane_idx = cute.arch.lane_idx()
             if lane_idx < cute.size(params.cluster_shape_mn):
@@ -523,6 +610,7 @@ class TileScheduler:
             self.num_tiles_executed,
             self._current_batch_idx,
             self._num_work_idx_before_cur_batch,
+            self.current_k_split,
             self._sched_smem,
             self._scheduler_pipeline,
             self._pipeline_state,
@@ -541,6 +629,7 @@ class TileScheduler:
                 self.num_tiles_executed,
                 self._current_batch_idx,
                 self._num_work_idx_before_cur_batch,
+                self.current_k_split,
                 self._sched_smem,
                 self._scheduler_pipeline,
                 self._pipeline_state,
@@ -652,6 +741,7 @@ class TriangularTileScheduler(TileScheduler):
             Int32(0),  # num_tiles_executed
             Int32(0),  # current_batch_idx
             Int32(0),  # num_work_idx_before_cur_batch
+            Int32(0),  # current_k_split
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),
@@ -859,6 +949,7 @@ class VarlenMTileScheduler(TileScheduler):
         num_tiles_executed: Int32,
         current_batch_idx: Int32,
         num_work_idx_before_cur_batch: Int32,
+        current_k_split: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         pipeline_state: PipelineStateWAdvance,
@@ -871,6 +962,11 @@ class VarlenMTileScheduler(TileScheduler):
         self.num_tiles_executed = num_tiles_executed
         self._current_batch_idx = current_batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
+        # K-split index of the current work tile (always 0 when split-K is disabled).
+        # Carried as scheduler state rather than in WorkTileInfo.tile_idx: the DSL's
+        # WorkTileInfo has a rigid pytree schema (3 coord leaves + validity) and asserts
+        # on reconstruction if the K slot holds a dynamic value.
+        self.current_k_split = current_k_split
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
@@ -924,6 +1020,7 @@ class VarlenMTileScheduler(TileScheduler):
             Int32(0),  # num_tiles_executed
             Int32(0),  # current_batch_idx
             Int32(0),  # num_work_idx_before_cur_batch
+            Int32(0),  # current_k_split
             sched_smem,
             scheduler_pipeline,
             PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0)),

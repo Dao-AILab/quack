@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from quack.cute_dsl_utils import ParamsBase
 from quack import layout_utils
+import quack.utils as utils
 from quack.tile_scheduler import (
     TileSchedulerOptions,
     TileSchedulerArguments,
@@ -31,6 +32,7 @@ from quack.tile_scheduler import (
     VarlenMTileSchedulerArguments,
     VarlenMTileScheduler,
     PersistenceMode,
+    params_has_split_k,
 )
 from quack.varlen_utils import VarlenArguments, VarlenManager
 
@@ -427,6 +429,9 @@ class GemmSm90:
         assert (varlen_args.mAIdx is not None) == self.gather_A
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
+        # The split-K fixup (turnstile reduction through gmem workspace) is only wired up
+        # in the SM100 kernel for now.
+        assert scheduler_args.splitk_ws is None, "split-K is only implemented on SM100"
 
         self._setup_attributes(epilogue_args)
 
@@ -980,6 +985,8 @@ class GemmSm90:
         # These are for Sm100 blockscaled gemm
         copy_SFA: Optional[Callable] = None,
         copy_SFB: Optional[Callable] = None,
+        # For split-K: first k tile this work unit is responsible for
+        k_tile_start: Int32 = 0,
     ) -> cutlass.pipeline.PipelineState:
         blockscaled = const_expr(copy_SFA is not None)
         if const_expr(blockscaled):
@@ -996,11 +1003,11 @@ class GemmSm90:
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
             smem_idx = ab_producer_state.index
             if const_expr(copy_A is not None):
-                copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
-            copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                copy_A(k_tile_start + k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+            copy_B(k_tile_start + k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             if const_expr(blockscaled):
-                copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
-                copy_SFB(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                copy_SFA(k_tile_start + k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                copy_SFB(k_tile_start + k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             # Mainloop pipeline's producer commit is a NOP
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
@@ -1206,6 +1213,7 @@ class GemmSm90:
         tile_scheduler,
         tidx: Int32,
         is_tma_warp: Boolean,
+        splitk_fixup: Optional[Callable] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
         has_D = const_expr(copy_D is not None)
@@ -1255,6 +1263,10 @@ class GemmSm90:
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
+            # Split-K: the final split adds the turnstile-accumulated partials from the
+            # gmem workspace into its accumulator before any epilogue op (alpha/beta/C).
+            if const_expr(splitk_fixup is not None):
+                splitk_fixup(epi_idx)
             epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
@@ -1388,10 +1400,15 @@ class GemmSm90:
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 tile_count_semaphore=scheduler_args.tile_count_semaphore,
                 batch_idx_permute=scheduler_args.batch_idx_permute,
+                split_k=scheduler_args.split_k,
+                splitk_flags=scheduler_args.splitk_flags,
+                splitk_ws=scheduler_args.splitk_ws,
+                splitk_parallel=scheduler_args.splitk_parallel,
                 persistence_mode=persistence_mode,
             )
         else:
             assert (mD is not None) or (epilogue_args.mPostAct is not None) or (not self.gather_A)
+            assert scheduler_args.splitk_ws is None, "split-K does not support varlen_m"
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1]),
@@ -1409,6 +1426,127 @@ class GemmSm90:
                 persistence_mode=persistence_mode,
             )
         return tile_sched_args
+
+    # ── Split-K with turnstile reduction ─────────────────────────────────────────
+    # Each output tile is computed by `split_k` work units, each covering a contiguous
+    # range of k tiles. Non-final splits serialize their partial accumulators into a
+    # gmem workspace through a per-tile turnstile counter (deterministic, k-ascending
+    # reduction order); the final split adds the accumulated partials into its own
+    # accumulator and runs the regular epilogue. This mirrors the fixup of CUTLASS's
+    # stream-K schedulers (ReductionMode::Deterministic).
+
+    @cute.jit
+    def splitk_k_tile_range(
+        self, params, k_split: Optional[Int32], k_tile_total: Int32
+    ) -> Tuple[Int32, Int32]:
+        """[k_tile_start, k_tile_start + k_tile_cnt) of k tiles owned by this work unit.
+
+        Returns (0, k_tile_total) when split-K is disabled. The first `rem` splits get
+        one extra k tile; the ragged final k tile (K % tile_k != 0) stays in the last
+        split, whose OOB handling is TMA zero-fill as usual.
+        """
+        if const_expr(not params_has_split_k(params)):
+            return Int32(0), Int32(k_tile_total)
+        split_k = params.split_k_fdd.divisor
+        base = k_tile_total // split_k
+        rem = k_tile_total - base * split_k
+        k_tile_start = k_split * base + cutlass.min(k_split, rem)
+        k_tile_cnt = base
+        if k_split < rem:
+            k_tile_cnt += 1
+        return Int32(k_tile_start), Int32(k_tile_cnt)
+
+    @cute.jit
+    def splitk_tile_index(self, tile_coord_mnkl: cute.Coord, mB_nkl: cute.Tensor) -> Int32:
+        """Linear output-tile index for split-K workspace/flag addressing.
+
+        N and L are taken from B (N, K, L) rather than D so that this works in parallel
+        mode, where the GEMM kernel is compiled without D.
+        """
+        ntile_n = cute.ceil_div(cute.size(mB_nkl, mode=[0]), self.cta_tile_shape_mnk[1])
+        num_l = cute.size(mB_nkl, mode=[2])
+        return Int32(
+            (tile_coord_mnkl[0] * ntile_n + tile_coord_mnkl[1]) * num_l + tile_coord_mnkl[3]
+        )
+
+    @cute.jit
+    def splitk_wait(self, flag_ptr: cute.Pointer, expected: Int32, tidx: Int32) -> None:
+        """Turnstile wait: spin until the per-tile flag equals `expected` (the k_split
+        index), i.e. all preceding splits have accumulated into the workspace.
+
+        Must be called by all threads participating in self.epilogue_barrier; the
+        acquire load by thread 0 plus the barrier orders subsequent workspace reads.
+        """
+        if tidx == 0:
+            val = utils.ld_acquire_gpu_i32(flag_ptr)
+            while val != expected:
+                val = utils.ld_acquire_gpu_i32(flag_ptr)
+        self.epilogue_barrier.arrive_and_wait()
+
+    @cute.jit
+    def splitk_arrive(self, flag_ptr: cute.Pointer, tidx: Int32) -> None:
+        """Turnstile arrive: release-increment the per-tile flag.
+
+        The barrier makes all participating threads' workspace stores visible before
+        thread 0's release reduction, so the next split's acquire observes them.
+        """
+        self.epilogue_barrier.arrive_and_wait()
+        if tidx == 0:
+            utils.red_release_gpu_add_i32(1, flag_ptr)
+
+    @cute.jit
+    def splitk_ws_subtile(
+        self, params, tile_idx: Int32, tTR_rD: cute.Tensor, tidx: Int32, epi_idx
+    ) -> cute.Tensor:
+        """Gmem view of this thread's accumulator fragment for epi subtile `epi_idx`.
+
+        The workspace has no (M, N) layout: fragments are stored in register order at
+        (tile, subtile, thread) offsets. All splits of a tile use identical epilogue
+        partitioning, so writer/reader correspondence is positional; OOB lanes of edge
+        tiles round-trip garbage that only the final split's epilogue predicates away.
+        """
+        frag_size = const_expr(cute.size(tTR_rD.shape))
+        num_epi_threads = const_expr(self.num_epi_warps * cute.arch.WARP_SIZE)
+        tile_mn = const_expr(self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1])
+        offset = tile_idx * tile_mn + (epi_idx * num_epi_threads + tidx) * frag_size
+        return cute.make_tensor(params.splitk_ws.iterator + offset, tTR_rD.layout)
+
+    @cute.jit
+    def splitk_store_partials(
+        self,
+        params,
+        tile_idx: Int32,
+        k_split: Int32,
+        load_acc_subtile: Callable,
+        tRS_rD: cute.Tensor,
+        tTR_rD: cute.Tensor,
+        epi_tile_num: cutlass.Constexpr[int],
+        tidx: Int32,
+    ) -> None:
+        """Non-final split: accumulate this CTA's partials into the gmem workspace.
+
+        Caller must have passed the turnstile (splitk_wait) already. Split 0
+        initializes the workspace (no read), later splits read-add-write; the
+        workspace itself never needs zero-initialization.
+        """
+        for epi_idx in cutlass.range_constexpr(epi_tile_num):
+            load_acc_subtile(tRS_rD, epi_idx)
+            tWS = self.splitk_ws_subtile(params, tile_idx, tTR_rD, tidx, epi_idx)
+            if k_split == 0:
+                cute.autovec_copy(tTR_rD, tWS)
+            else:
+                tWS.store(tWS.load() + tTR_rD.load())
+
+    @cute.jit
+    def splitk_fixup_acc_subtile(
+        self, params, tile_idx: Int32, tTR_rD: cute.Tensor, tidx: Int32, epi_idx
+    ) -> None:
+        """Final split: add the turnstile-accumulated partials into this subtile's
+        accumulator registers (before any epilogue op). No-op when split_k == 1 at
+        runtime since the workspace then holds nothing."""
+        if params.split_k_fdd.divisor > 1:
+            tWS = self.splitk_ws_subtile(params, tile_idx, tTR_rD, tidx, epi_idx)
+            tTR_rD.store(tTR_rD.load() + tWS.load())
 
     def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s):
         """Retile accumulator for epilogue subtile access. SM90 uses flat_divide."""

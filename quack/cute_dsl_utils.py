@@ -67,6 +67,14 @@ def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
 
 
+@lru_cache
+def get_num_sms(device: torch.device = None) -> int:
+    """SM count for the device. Cached: `get_device_properties` walks a Python device-index
+    resolution chain that is ~µs-scale per call and a hot spot in the launch-bound split-K
+    path, but the value is constant per device."""
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
     """Parse arch string (e.g. 'sm_90', 'sm90', '90', 'sm_100a') to (major, minor) tuple."""
     match = re.match(r"^(?:sm_?)?(\d+)(\d)([af]?)$", arch_str.strip(), re.IGNORECASE)

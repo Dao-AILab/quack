@@ -275,9 +275,6 @@ def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
 
 
 @dsl_user_op
-
-
-@dsl_user_op
 def threadfence(*, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
@@ -287,6 +284,9 @@ def threadfence(*, loc=None, ip=None) -> None:
         has_side_effects=True,
         is_align_stack=False,
     )
+
+
+@dsl_user_op
 def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
     from cutlass import CUDA_VERSION
 
@@ -301,6 +301,40 @@ def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
         return nvvm.atomicrmw(
             op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
         )
+
+
+@dsl_user_op
+def ld_acquire_gpu_i32(gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    """Load an int32 from gmem with acquire semantics at GPU scope (for spin-waits)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [gmem_ptr.toint(loc=loc, ip=ip).ir_value()],
+            "ld.global.acquire.gpu.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+        )
+    )
+
+
+@dsl_user_op
+def red_release_gpu_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
+    """Reduction-add an int32 in gmem with release semantics at GPU scope.
+
+    Paired with ld_acquire_gpu_i32, this gives the same ordering guarantees as
+    CUTLASS's Barrier::arrive_inc / wait_eq (cutlass/barrier.h): a CTA-wide
+    barrier before the red makes all participating threads' prior gmem writes
+    visible to whoever observes the incremented value via an acquire load.
+    """
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.toint(loc=loc, ip=ip).ir_value(), Int32(a).ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
 
 
 @dsl_user_op
