@@ -153,3 +153,30 @@ def test_mxfp8_grouped_gemm_uniform_fastpath(group_sizes, k, n):
     )
     assert torch.equal(fast, routed)  # functional fast path == routed
     assert torch.equal(cls_fast, routed)  # class uniform path == routed
+
+
+@pytest.mark.parametrize("k,n", [(512, 512), (4096, 4096)])
+@pytest.mark.parametrize(
+    "group_sizes",
+    [
+        (128, 256, 384, 256),  # ragged 128-aligned
+        (256, 0, 256, 256),  # empty expert
+        (1792, 128, 128, 128),  # heavy skew
+    ],
+)
+def test_mxfp8_grouped_gemm_varlen_fastpath(group_sizes, k, n):
+    """The sync-free varlen fast path (varlen=True: natural SFA via the kernel's
+    sfa_tile_aligned path; offs consumed only on device) is correct vs the dequant
+    reference, agrees with the default offs-routed call, and the function and class
+    varlen paths are bit-identical to each other."""
+    _skip_if_not_sm100()
+    from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm, mxfp8_grouped_gemm
+
+    qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, k, n)
+    ref = _ref_grouped(a_ref, b_ref, group_sizes)
+    routed = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb)
+    fast = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb, varlen=True)
+    cls_fast = MXFP8GroupedGemm(b_disp, sb)(qa, offs, sa, varlen=True)
+    torch.testing.assert_close(fast.float(), ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(fast.float(), routed.float(), atol=1e-2, rtol=1e-2)
+    assert torch.equal(fast, cls_fast)  # function and class varlen paths agree exactly

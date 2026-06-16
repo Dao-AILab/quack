@@ -87,17 +87,21 @@ def _dqaccum_padded_sfa(sfa: Tensor, group_sizes: List[int], sf_k: int, e: int) 
 
 
 @lru_cache(maxsize=32)
-def _varlen_runner(n: int, k: int, e: int, tiler, cluster):
+def _varlen_runner(n: int, k: int, e: int, tiler, cluster, sfa_tile_aligned: bool = True):
     # Compile once; the kernel uses cute.sym_int for total_m so one compile serves
-    # all group configurations with the same (n, k, e, tiler, cluster).
+    # all group configurations with the same (n, k, e, tiler, cluster). With
+    # sfa_tile_aligned=True the kernel reads SFA in natural (unpadded) packed layout
+    # (cu // 128 offset); =False expects the dQaccum-padded layout (cu // 128 + b).
     dev = torch.device("cuda")
     sf_k = k // SF_VEC
     fake_mA = torch.empty(128 * e, k, dtype=torch.float8_e4m3fn, device=dev)
     fake_mB = torch.empty(e, n, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
     fake_mD = torch.empty(128 * e, n, dtype=torch.bfloat16, device=dev)
-    fake_sfa = _dqaccum_padded_sfa(
-        torch.zeros(128 * e, sf_k, dtype=torch.float8_e8m0fnu, device=dev), [128] * e, sf_k, e
-    )
+    z = torch.zeros(128 * e, sf_k, dtype=torch.float8_e8m0fnu, device=dev)
+    if sfa_tile_aligned:
+        fake_sfa = pack_scale_2d_to_blocked_contig(z.view(1, 128 * e, sf_k))
+    else:
+        fake_sfa = _dqaccum_padded_sfa(z, [128] * e, sf_k, e)
     fake_sfb = pack_scale_2d_to_blocked_contig(
         torch.zeros(e, n, sf_k, dtype=torch.float8_e8m0fnu, device=dev)
     )
@@ -114,7 +118,23 @@ def _varlen_runner(n: int, k: int, e: int, tiler, cluster):
         fake_sfa,
         fake_sfb,
         varlen_m=True,
+        sfa_tile_aligned=sfa_tile_aligned,
     )
+
+
+def _run_varlen_natural(a, offs, sfa, mB, mSFB, out, e, k, n, sf_k, tiler, cluster):
+    """Run the varlen-M kernel with NATURAL (unpadded) SFA -- packs SFA like torch's
+    to_blocked (no dQaccum scatter) and uses the sfa_tile_aligned kernel path. Requires
+    128-aligned per-expert boundaries (caller-checked). ``mB`` / ``mSFB`` are the (fixed)
+    B operand + packed B-scale; ``cu_seqlens`` is built on-device from ``offs``."""
+    total_m = a.shape[0]
+    mSFA = pack_scale_2d_to_blocked_contig(sfa.view(1, total_m, sf_k))
+    cu = torch.empty(e + 1, dtype=torch.int32, device=offs.device)
+    cu[0] = 0
+    cu[1:].copy_(offs.to(torch.int32))
+    runner = _varlen_runner(n, k, e, tiler, cluster, sfa_tile_aligned=True)
+    runner(a, mB, out, mSFA, mSFB, cu)
+    return out
 
 
 def mxfp8_grouped_gemm(
@@ -125,6 +145,7 @@ def mxfp8_grouped_gemm(
     sfb: Tensor,
     out: Optional[Tensor] = None,
     uniform: bool = False,
+    varlen: bool = False,
 ) -> Tensor:
     """Grouped MXFP8 GEMM. See module docstring for shape/layout contract.
 
@@ -133,10 +154,17 @@ def mxfp8_grouped_gemm(
     shapes alone, so ``offs`` is never read on the host -- no device->host sync,
     no launch bubble -- and the call runs the dense batched-L path directly. This
     is the sync-free path that stays >= torch._scaled_grouped_mm on uniform shapes.
+
+    If ``varlen=True`` the caller instead asserts ragged groups with 128-aligned
+    boundaries (e.g. capacity-padded MoE). ``offs`` is consumed only on device
+    (cu_seqlens), the SFA is packed in natural layout, and the varlen-M kernel uses
+    its sfa_tile_aligned path -- also sync-free, and >= torch on ragged shapes.
+    ``uniform`` and ``varlen`` are mutually exclusive.
     """
     assert a.dim() == 2 and b.dim() == 3 and sfa.dim() == 2 and sfb.dim() == 3
     assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
     assert sfa.dtype == torch.float8_e8m0fnu and sfb.dtype == torch.float8_e8m0fnu
+    assert not (uniform and varlen), "uniform and varlen are mutually exclusive"
     total_m, k = a.shape
     e, kb, n = b.shape
     assert kb == k and k % SF_VEC == 0, f"K mismatch a={k} b={kb} (or not %{SF_VEC})"
@@ -160,6 +188,27 @@ def mxfp8_grouped_gemm(
         )
         return out
 
+    # Sync-free varlen fast path: ragged groups with 128-aligned boundaries (caller-
+    # asserted). offs is consumed only on device -> no host sync; natural SFA via the
+    # sfa_tile_aligned kernel path (no dQaccum scatter).
+    if varlen:
+        assert total_m % 128 == 0, f"varlen=True needs total_m {total_m} % 128 == 0"
+        tiler, cluster = _default_tiler_cluster(total_m // e, n)
+        return _run_varlen_natural(
+            a,
+            offs,
+            sfa,
+            b.permute(2, 1, 0),
+            pack_scale_2d_to_blocked_contig(sfb),
+            out,
+            e,
+            k,
+            n,
+            sf_k,
+            tiler,
+            cluster,
+        )
+
     offsets_host = tuple(int(v) for v in offs.detach().cpu().tolist())
     assert len(offsets_host) == e, f"offs len {len(offsets_host)} != E {e}"
     assert offsets_host[-1] == total_m, f"offs[-1] {offsets_host[-1]} != total_m {total_m}"
@@ -174,19 +223,24 @@ def mxfp8_grouped_gemm(
         )
         return out
 
-    # Route 2: ragged, all boundaries 128-aligned -> varlen-M.
+    # Route 2: ragged, all boundaries 128-aligned -> varlen-M (natural SFA).
     if _boundaries_128_aligned(offsets_host):
         group_sizes = _group_sizes(offsets_host)
         tiler, cluster = _default_tiler_cluster(max(group_sizes), n)
-        mB = b.permute(2, 1, 0)  # (N, K, E) K-major
-        mSFA = _dqaccum_padded_sfa(sfa, group_sizes, sf_k, e)  # dQaccum-padded, direct contig
-        mSFB = pack_scale_2d_to_blocked_contig(sfb)  # (E, rn, rk, 512), direct contig
-        cu = torch.empty(e + 1, dtype=torch.int32, device=offs.device)
-        cu[0] = 0
-        cu[1:].copy_(offs.to(torch.int32))
-        runner = _varlen_runner(n, k, e, tiler, cluster)
-        runner(a, mB, out, mSFA, mSFB, cu)
-        return out
+        return _run_varlen_natural(
+            a,
+            offs,
+            sfa,
+            b.permute(2, 1, 0),
+            pack_scale_2d_to_blocked_contig(sfb),
+            out,
+            e,
+            k,
+            n,
+            sf_k,
+            tiler,
+            cluster,
+        )
 
     # Route 3: ragged non-128 -> pad each group to a 128 multiple, batched-L dense.
     group_sizes = _group_sizes(offsets_host)
@@ -270,8 +324,10 @@ class MXFP8GroupedGemm:
         sfa: Tensor,
         out: Optional[Tensor] = None,
         uniform: Optional[bool] = None,
+        varlen: bool = False,
     ) -> Tensor:
         uniform = self.uniform if uniform is None else uniform
+        assert not (uniform and varlen), "uniform and varlen are mutually exclusive"
         e, k, n, sf_k = self.e, self.k, self.n, self.sf_k
         total_m, ka = a.shape
         assert ka == k, f"K mismatch a={ka} vs b={k}"
@@ -289,6 +345,14 @@ class MXFP8GroupedGemm:
             assert g % 128 == 0, f"uniform=True needs (total_m // E) = {g} % 128 == 0"
             return self._dense(a, g, sfa, out)
 
+        # Sync-free varlen path: ragged 128-aligned groups; natural SFA, cached B-scale.
+        if varlen:
+            assert total_m % 128 == 0, f"varlen=True needs total_m {total_m} % 128 == 0"
+            tiler, cluster = _default_tiler_cluster(total_m // e, n)
+            return _run_varlen_natural(
+                a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
+            )
+
         # General route via offs (one host sync; B-scale already packed).
         offsets_host = tuple(int(v) for v in offs.detach().cpu().tolist())
         assert len(offsets_host) == e, f"offs len {len(offsets_host)} != E {e}"
@@ -299,12 +363,8 @@ class MXFP8GroupedGemm:
         if _boundaries_128_aligned(offsets_host):
             group_sizes = _group_sizes(offsets_host)
             tiler, cluster = _default_tiler_cluster(max(group_sizes), n)
-            cu = torch.empty(e + 1, dtype=torch.int32, device=offs.device)
-            cu[0] = 0
-            cu[1:].copy_(offs.to(torch.int32))
-            runner = _varlen_runner(n, k, e, tiler, cluster)
-            mSFA = _dqaccum_padded_sfa(sfa, group_sizes, sf_k, e)
-            runner(a, self._mB_varlen, out, mSFA, self._sfb_packed, cu)
-            return out
+            return _run_varlen_natural(
+                a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
+            )
         # non-128 padded: no clean prepacked hoist, fall back to the eager dispatcher.
         return mxfp8_grouped_gemm(a, self._b, offs, sfa, self._sfb_raw, out)
