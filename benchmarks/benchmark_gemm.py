@@ -5,6 +5,7 @@ import torch
 from triton.testing import do_bench
 
 from quack.gemm import gemm as quack_gemm
+from quack.gemm_interface import SplitKMode
 
 """
 GEMM benchmark using quack.gemm.gemm() for both the dense path and the SM100
@@ -119,6 +120,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--persistent", action="store_true", help="Persistent kernel")
     parser.add_argument("--dynamic_persistent", action="store_true", help="Dynamic persistent")
     parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
+    parser.add_argument(
+        "--split_k", type=int, default=1, help="Split the K dim over this many CTAs per tile"
+    )
+    parser.add_argument(
+        "--split_k_mode",
+        choices=["serial", "parallel", "staged"],
+        default="serial",
+        help="serial: turnstile-ordered f32 partial commits, last split finalizes "
+        "(deterministic); parallel: partial commits in arrival order (nondeterministic); "
+        "staged: f32 workspace + reduction kernel applying the epilogue",
+    )
     parser.add_argument("--varlen_m", action="store_true", help="Variable length M dimension")
     parser.add_argument("--varlen_k", action="store_true", help="Variable length K dimension")
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
@@ -515,7 +527,9 @@ def run(args):
     #   D: (l, m, n) or (total_m, n) if varlen_m — n-major
     cu_seqlens_m, cu_seqlens_k, A_idx = None, None, None
     tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=device) if args.dynamic_persistent else None
+        torch.zeros(1, dtype=torch.int32, device=device)
+        if args.dynamic_persistent and torch.cuda.get_device_capability()[0] == 9
+        else None
     )
 
     def _make_a_non_varlen(l_, m_, k_, major):
@@ -589,6 +603,8 @@ def run(args):
             cu_seqlens_k=cu_seqlens_k,
             A_idx=A_idx,
             use_tma_gather=args.use_tma_gather,
+            split_k=args.split_k,
+            split_k_mode=SplitKMode[args.split_k_mode.upper()],
         )
         if tile_count_semaphore is not None:
             tile_count_semaphore.zero_()

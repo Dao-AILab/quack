@@ -23,6 +23,7 @@ from quack.varlen_utils import VarlenManager
 from quack.pipeline import make_pipeline_state
 from quack import copy_utils
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
+from quack.gemm_config import SplitKMode
 from quack import sm80_utils
 
 
@@ -50,6 +51,8 @@ class GemmSm120(GemmSm90):
         gather_A: bool = False,
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
+        split_k: int = 1,
+        split_k_mode: int = SplitKMode.SERIAL,
     ):
         # Don't call super().__init__ — we set up our own config
         self.acc_dtype = acc_dtype
@@ -64,6 +67,7 @@ class GemmSm120(GemmSm90):
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         if gather_A:
             assert cluster_shape_mnk[1] == 1
+        self._init_split_k(split_k, split_k_mode)
 
         self.cluster_shape_mnk = cluster_shape_mnk
         assert len(tile_shape_mnk) in [2, 3], "CTA tile shape must be (M, N) or (M, N, K)"
@@ -210,7 +214,12 @@ class GemmSm120(GemmSm90):
         sched_pipeline = None
         sched_data = None
         if const_expr(self.is_persistent):
-            sched_pipeline = self.make_sched_pipeline(cluster_layout_mnk, varlen_k=varlen_k)
+            sched_pipeline = self.make_sched_pipeline(
+                cluster_layout_mnk,
+                # split_k > 1 makes per-tile k-tile counts dynamic, so pingpong consumes
+                # work tiles one at a time, exactly like varlen_k.
+                varlen_k=varlen_k or self.split_k > 1,
+            )
             # Keep scheduler scratch out of SharedStorage. A small buffer before
             # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
             # responses also use i128 copies, so this stays 16-byte aligned.
@@ -282,8 +291,9 @@ class GemmSm120(GemmSm90):
                 )
                 while work_tile.is_valid_tile:
                     iket.range_push("tma_load")
+                    # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                     tile_coord_mnkl = work_tile.tile_idx
-                    batch_idx = tile_coord_mnkl[3]
+                    batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None
                     if const_expr(not self.gather_A):
@@ -319,10 +329,17 @@ class GemmSm120(GemmSm90):
                         tma_multicast=b_tma_multicast,
                     )
                     len_k = varlen_manager.len_k(batch_idx)
-                    k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                    k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                    k_tile_start, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
+                        k_tile_total, split_idx
+                    )
                     if const_expr(not self.gather_A):
                         ab_producer_state = self.load_tma(
-                            ab_pipeline, ab_producer_state, [copy_A, copy_B], k_tile_cnt
+                            ab_pipeline,
+                            ab_producer_state,
+                            [copy_A, copy_B],
+                            k_tile_cnt,
+                            k_tile_start=k_tile_start,
                         )
                     else:
                         ab_producer_state = self.load_AB_gather_A(
@@ -338,7 +355,7 @@ class GemmSm120(GemmSm90):
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
-                if const_expr(self.pingpong and not varlen_k):
+                if const_expr(self.pingpong and not varlen_k and self.split_k == 1):
                     # Need to write the tile_idx to smem for the next WG in the pingpong mode
                     if is_scheduler_warp:
                         tile_scheduler.write_work_tile_to_smem(work_tile)
@@ -409,21 +426,41 @@ class GemmSm120(GemmSm90):
             if const_expr(self.pingpong):
                 if warp_idx >= 4:
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
-                    epi_read_state.advance_iters(c_tile_cnt)
-                    epi_producer_state.advance_iters(c_tile_cnt)
-                    if const_expr(not varlen_k):
+                    if const_expr(not varlen_k and self.split_k == 1):
+                        epi_read_state.advance_iters(c_tile_cnt)
+                        epi_producer_state.advance_iters(c_tile_cnt)
                         ab_read_state.advance_iters(k_tile_cnt_static)
                     else:
-                        len_k = varlen_manager.len_k(batch_idx=work_tile.tile_idx[3])
-                        k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                        # varlen_k and split_k > 1 both make the per-tile k-tile count dynamic
+                        batch_idx_pp, split_idx_pp = (
+                            work_tile.tile_idx[3],
+                            work_tile.tile_idx[2],
+                        )
+                        len_k = varlen_manager.len_k(batch_idx=batch_idx_pp)
+                        k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                        _, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
+                            k_tile_total, split_idx_pp
+                        )
                         ab_read_state.advance_iters(k_tile_cnt)
+                        # Under split-K, only finalizer tiles run the epilogue (and thus
+                        # produce/consume C stages); the peer advance must match.
+                        c_cnt = Int32(c_tile_cnt)
+                        if const_expr(
+                            self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE
+                        ):
+                            if split_idx_pp != self.split_k - 1:
+                                c_cnt = Int32(0)
+                        epi_read_state.advance_iters(c_cnt)
+                        epi_producer_state.advance_iters(c_cnt)
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
             while work_tile.is_valid_tile:
+                # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                 tile_coord_mnkl = work_tile.tile_idx
-                batch_idx = tile_coord_mnkl[3]
+                batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
                 len_k = varlen_manager.len_k(batch_idx)
-                k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                _, k_tile_cnt = tile_scheduler.get_split_k_tile_range(k_tile_total, split_idx)
                 acc.fill(0.0)
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
@@ -455,14 +492,20 @@ class GemmSm120(GemmSm90):
 
                 copy_D = None
                 if const_expr(has_D):
+                    # Staged split-K: D is the f32 partials workspace, whose batch mode is the
+                    # combined (l * split_k + split) index from the scheduler.
+                    d_batch_idx = batch_idx
+                    if const_expr(self.split_k > 1 and self.split_k_mode == SplitKMode.SEPARATE):
+                        d_batch_idx = tile_scheduler.get_combined_batch_idx(batch_idx, split_idx)
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
-                        varlen_manager.offset_batch_epi(mD_mnl, tile_coord_mnkl[3]),
+                        varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx),
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sD,
                         tile_coord_mnkl,
                     )
+
                 copy_C = None
                 if const_expr(has_C):
                     copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
@@ -500,7 +543,11 @@ class GemmSm120(GemmSm90):
 
                 self.epi_visit_acc(epilogue_params, acc, tiled_mma, tile_coord_mnkl, tidx)
 
-                epi_read_state, epi_producer_state = self.epilogue(
+                # Split-K (serial/parallel): non-finalizing splits commit raw f32 partials
+                # to the tile's workspace and skip the epilogue; the last split waits for
+                # the tile's completion flag and runs the full epilogue on the summed
+                # accumulator (CUTLASS-3.x stream-K fixup semantics).
+                epi_read_state, epi_producer_state = self.epilogue_split_k(
                     epilogue_params,
                     epi_smem_tensors,
                     epi_pipeline,
@@ -540,11 +587,10 @@ class GemmSm120(GemmSm90):
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
                 else:  # Skip a tile for pingpong
-                    # Update starting load/store pipeline states for the next tile
-                    epi_read_state.advance_iters(c_tile_cnt)
-                    epi_producer_state.advance_iters(c_tile_cnt)
-                    # Update starting mainloop pipeline state for the next tile
-                    if const_expr(not varlen_k):
+                    # Update starting load/store/mainloop pipeline states for the next tile
+                    if const_expr(not varlen_k and self.split_k == 1):
+                        epi_read_state.advance_iters(c_tile_cnt)
+                        epi_producer_state.advance_iters(c_tile_cnt)
                         ab_read_state.advance_iters(k_tile_cnt_static)
                         tile_scheduler.advance_to_next_work(advance_count=self.mma_warp_groups)
                         work_tile = tile_scheduler.get_current_work()
@@ -552,9 +598,26 @@ class GemmSm120(GemmSm90):
                         tile_scheduler.advance_to_next_work()
                         work_tile = tile_scheduler.get_current_work()
                         if work_tile.is_valid_tile:
-                            len_k = varlen_manager.len_k(batch_idx=work_tile.tile_idx[3])
-                            k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                            batch_idx_pp, split_idx_pp = (
+                                work_tile.tile_idx[3],
+                                work_tile.tile_idx[2],
+                            )
+                            len_k = varlen_manager.len_k(batch_idx=batch_idx_pp)
+                            k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
+                            _, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
+                                k_tile_total, split_idx_pp
+                            )
                             ab_read_state.advance_iters(k_tile_cnt)
+                            # Under split-K, only finalizer tiles run the epilogue (and
+                            # thus produce/consume C stages); the peer advance must match.
+                            c_cnt = Int32(c_tile_cnt)
+                            if const_expr(
+                                self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE
+                            ):
+                                if split_idx_pp != self.split_k - 1:
+                                    c_cnt = Int32(0)
+                            epi_read_state.advance_iters(c_cnt)
+                            epi_producer_state.advance_iters(c_cnt)
                             tile_scheduler.advance_to_next_work()
                             work_tile = tile_scheduler.get_current_work()
 

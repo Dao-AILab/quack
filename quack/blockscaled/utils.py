@@ -9,8 +9,11 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
+from cutlass import Int32, Float32
+
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from quack.gemm_config import SplitKMode
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
 from quack.blockscaled.quantize import (
@@ -710,6 +713,8 @@ def compile_blockscaled_gemm_tvm_ffi(
     use_clc_persistence: bool = True,
     varlen_m: bool = False,
     varlen_k: bool = False,
+    split_k: int = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> Callable:
     """Compile the SM100 blockscaled GEMM.
 
@@ -717,18 +722,54 @@ def compile_blockscaled_gemm_tvm_ffi(
     mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
     When varlen_k: mA is (m, total_k), mB is (n, total_k), mD is (m, n, l);
     run(...) takes an extra cu_seqlens_k tensor.
+
+    split_k > 1 (dense only): block-scaled composes with the dense finalizer-only
+    split-K device path with no kernel changes (the SF loads ride the same
+    k_tile_start-offset copy list as A/B; the accumulator is already descaled f32
+    before the epilogue). run(...) allocates the per-tile completion flag and the f32
+    partials workspace per call (mirroring quack.gemm.gemm) and threads them through.
+    SERIAL/PARALLEL only — SEPARATE needs a block-scaled reduction-kernel path.
     """
     device_capacity = get_device_capacity(mA.device)
     if device_capacity[0] not in (10, 11):
         raise RuntimeError("Blockscaled SM100 GEMM requires SM100/SM110")
     assert not (varlen_m and varlen_k), "Only one of varlen_m / varlen_k"
+    split_k_mode = SplitKMode(split_k_mode)
+    if split_k > 1:
+        if varlen_m or varlen_k:
+            raise ValueError("block-scaled split_k requires a dense GEMM (no varlen)")
+        if split_k_mode == SplitKMode.SEPARATE:
+            raise NotImplementedError(
+                "block-scaled split_k does not support SEPARATE yet; use SERIAL or PARALLEL"
+            )
 
     gemm = partial(
         GemmDefaultSm100,
         sf_vec_size=sf_vec_size,
         use_clc_persistence=use_clc_persistence,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
-    compile_epi_args = gemm.EpilogueArguments()
+    # Per-CTA tile shape (post 2-CTA halving): the workspace stripe is exactly
+    # cta_tile_m * cta_tile_n f32 elements per output tile. cta_tile_shape_mnk is only
+    # populated later in _setup_attributes, so derive from use_2cta_instrs + mma_tiler.
+    cta_tile_m = mma_tiler_mn[0] // (2 if gemm.use_2cta_instrs else 1)
+    cta_tile_n = mma_tiler_mn[1]
+    split_k_compile = split_k > 1  # SERIAL/PARALLEL reach the in-kernel finalize path
+    if split_k_compile:
+        compile_epi_args = gemm.EpilogueArguments(
+            split_k_semaphore=fake_tensor(
+                Int32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1
+            ),
+            split_k_workspace=fake_tensor(
+                Float32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                leading_dim=0,
+                divisibility=4,
+            ),
+        )
+    else:
+        compile_epi_args = gemm.EpilogueArguments()
     scheduler_args = make_scheduler_args(
         get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
         max_swizzle_size=8,
@@ -804,6 +845,58 @@ def compile_blockscaled_gemm_tvm_ffi(
         fake_mD = _make_fake_compact_tensor(
             mD.shape, d_dtype, leading_dim=_leading_dim_from_stride(mD)
         )
+
+    if split_k_compile:
+
+        @cute.jit
+        def runner(
+            a: cute.Tensor,
+            b: cute.Tensor,
+            d: cute.Tensor,
+            sfa: cute.Tensor,
+            sfb: cute.Tensor,
+            sem: cute.Tensor,
+            ws: cute.Tensor,
+            varlen_args,
+            stream,
+        ):
+            epi = compile_epi_args._replace(split_k_semaphore=sem, split_k_workspace=ws)
+            gemm(a, b, d, None, epi, scheduler_args, varlen_args, stream, sfa, sfb, None)
+
+        compiled = cute.compile(
+            runner,
+            fake_mA,
+            fake_mB,
+            fake_mD,
+            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+            compile_epi_args.split_k_semaphore,
+            compile_epi_args.split_k_workspace,
+            varlen_args_fake,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+
+        def run(a, b, d, sfa, sfb):
+            # Allocate the per-tile completion flag + f32 partials workspace per call,
+            # mirroring quack.gemm.gemm. d is (m, n, l) here.
+            num_l = d.shape[2]
+            ntile_m = ceil_div(d.shape[0], cta_tile_m)
+            ntile_n = ceil_div(d.shape[1], cta_tile_n)
+            ntile_m = ceil_div(ntile_m, cluster_shape_mn[0]) * cluster_shape_mn[0]
+            ntile_n = ceil_div(ntile_n, cluster_shape_mn[1]) * cluster_shape_mn[1]
+            sem = torch.zeros((num_l, ntile_m, ntile_n), dtype=torch.int32, device=d.device)
+            alloc = torch.empty if split_k_mode == SplitKMode.SERIAL else torch.zeros
+            ws = alloc(
+                (num_l, ntile_m, ntile_n, cta_tile_m * cta_tile_n),
+                dtype=torch.float32,
+                device=d.device,
+            )
+            compiled(
+                a, b, d, sfa, sfb, sem.permute(1, 2, 0), ws.permute(3, 1, 2, 0), VarlenArguments()
+            )
+
+        return run
 
     @cute.jit
     def runner(

@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao
+from dataclasses import replace
 from typing import Optional, Tuple, Literal
 from functools import partial
 
@@ -6,7 +7,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from quack.gemm_config import GemmConfig, get_all_configs
+# SplitKMode is re-exported here as its canonical public import path; it is *defined*
+# in the gemm_config leaf because the kernel layer needs it at import time and this
+# module sits above quack.gemm in the import graph (importing it from here would cycle).
+from quack.gemm_config import GemmConfig, SplitKMode, get_all_configs
 
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import get_device_capacity
@@ -105,6 +109,15 @@ Activation = Literal[
     "geglu",
     "glu",
 ]
+
+
+def _check_split_k_unsupported(name: str, split_k: int) -> None:
+    """For use in interface wrappers that do not support splitK yet."""
+    if split_k not in (None, 1):
+        raise NotImplementedError(
+            f"{name} does not support split_k > 1; split_k is currently supported by "
+            "gemm, gemm_add, and gemm_add_inplace."
+        )
 
 
 def _concat_interleave(t):
@@ -269,12 +282,44 @@ def nvmmh_config(A, B, device_capacity):
         return None
 
 
+def _expand_split_k_configs(configs, A, B, device_capacity):
+    """Add split_k > 1 variants of each surviving config for occupancy-starved shapes.
+
+    Only called when the user passed split_k=None ("let the autotuner choose the
+    factor"). Candidates are powers of two that lift the CTA count toward saturation
+    without over-decomposing K; the autotuner then picks by measurement. The split
+    MODE is never expanded (serial/parallel/staged differ in determinism semantics).
+    """
+    if A.ndim == 3:
+        L, M, K = A.shape
+    else:
+        (M, K), L = A.shape, 1
+    N = B.shape[-1]
+    sm_count = torch.cuda.get_device_properties(A.device).multi_processor_count
+    expanded = list(configs)
+    for conf in configs:
+        c = conf.kwargs["config"]
+        # SM100 2-CTA MMA halves the per-CTA tile M
+        cta_tile_m = (
+            c.tile_m // 2 if device_capacity in (10, 11) and c.cluster_m % 2 == 0 else c.tile_m
+        )
+        tile_m, tile_n = (cta_tile_m, c.tile_n) if not c.swap_ab else (c.tile_n, cta_tile_m)
+        ntiles = -(-M // tile_m) * -(-N // tile_n) * L
+        k_tiles = -(-K // (c.tile_k or 64))
+        for s in (2, 4, 8, 16):
+            starved = ntiles < sm_count and ntiles * s <= 4 * sm_count
+            if starved and 2 * s <= k_tiles:
+                expanded.append(AutotuneConfig(config=replace(c, split_k=s)))
+    return expanded
+
+
 def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
     device_capacity = get_device_capacity(kwargs["A"].device)[0]
     configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
+    varlen_k = kwargs.get("cu_seqlens_k", None) is not None
     if varlen_m or gather_A:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
@@ -302,12 +347,21 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
             )
 
         configs = [conf for conf in configs if _blockscaled_ok(conf.kwargs["config"])]
+    # Autotuned split-K: only the plain-gemm family exposes the knob; split_k=None means
+    # "tune the factor" (an explicit int is forced in gemm_tuned and needs no variants).
+    if (
+        "split_k" in kwargs
+        and kwargs["split_k"] is None
+        and not (varlen_m or varlen_k or gather_A)
+        and device_capacity in (9, 10, 11, 12)
+    ):
+        configs = _expand_split_k_configs(configs, kwargs["A"], kwargs["B"], device_capacity)
     return configs
 
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["dynamic_scheduler"],
+    key=["dynamic_scheduler", "split_k", "split_k_mode"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_tuned(
@@ -331,6 +385,8 @@ def gemm_tuned(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     SFA: Optional[Tensor] = None,  # (L, rm, rk, 32, 4, 4) blocked scale factors
     SFB: Optional[Tensor] = None,  # (L, rn, rk, 32, 4, 4)
+    split_k: Optional[int] = 1,  # None: let the autotuner choose the factor (config.split_k)
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
     blockscaled = SFA is not None
     if blockscaled:
@@ -354,6 +410,9 @@ def gemm_tuned(
                 config = nvmmh_config(A, B, device_capacity)
             if config is None:
                 config = default_config(A.device)
+    if split_k is None:
+        # Autotuned split-K: the factor comes from the (possibly split_k-expanded) config.
+        split_k = config.split_k
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
@@ -442,6 +501,8 @@ def gemm_tuned(
         tile_K=config.tile_k,
         SFA=SFA,
         SFB=SFB,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
 
@@ -617,6 +678,8 @@ def gemm(
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    split_k: Optional[int] = 1,  # K-dim CTAs per tile; None = let the autotuner choose
+    split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     A, SFA = _unpack_operand(A)
@@ -676,6 +739,8 @@ def gemm(
         concat_layout=concat_str,
         SFA=SFA,
         SFB=SFB,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     return out
 
@@ -711,6 +776,8 @@ def gemm_out(
     # schemas have no (Tensor, Tensor) argument type.
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
@@ -735,6 +802,8 @@ def gemm_out(
         concat_layout=_parse_concat_layout(concat_layout),
         SFA=SFA,
         SFB=SFB,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
 
@@ -856,6 +925,8 @@ def gemm_add(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    split_k: Optional[int] = 1,  # K-dim CTAs per tile; None = let the autotuner choose
+    split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
 ) -> Tensor:
     """GEMM with addition and optional output tensor."""
     A, SFA = _unpack_operand(A)
@@ -913,6 +984,8 @@ def gemm_add(
             dynamic_scheduler=dynamic_scheduler,
             tuned=tuned,
             concat_layout=concat_str,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
         )
     else:
         gemm_add_out(
@@ -934,6 +1007,8 @@ def gemm_add(
             concat_layout=concat_str,
             SFA=SFA,
             SFB=SFB,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
         )
     return out
 
@@ -966,6 +1041,8 @@ def gemm_add_out(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
     """GEMM with addition and pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
@@ -987,6 +1064,8 @@ def gemm_add_out(
         add_to_output=add_to_output,
         dynamic_scheduler=dynamic_scheduler,
         concat_layout=_parse_concat_layout(concat_layout),
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
 
@@ -1086,6 +1165,8 @@ def gemm_add_inplace(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    split_k: Optional[int] = 1,  # K-dim CTAs per tile; None = let the autotuner choose
+    split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
 ) -> None:
     """In-place GEMM with addition: out = alpha * A @ B + beta * out.
     Args:
@@ -1136,6 +1217,8 @@ def gemm_add_inplace(
         else concat_layout,
         SFA=SFA,
         SFB=SFB,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
 
@@ -1165,6 +1248,8 @@ def gemm_add_inplace_op(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = _merge_tensor(alpha, alpha_tensor)
@@ -1187,6 +1272,8 @@ def gemm_add_inplace_op(
         concat_layout=_parse_concat_layout(concat_layout),
         SFA=SFA,
         SFB=SFB,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
 
@@ -1210,8 +1297,11 @@ def gemm_act(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
+    _check_split_k_unsupported("gemm_act", split_k)
     A, SFA = _unpack_operand(A)
     B, SFB = _unpack_operand(B)
     assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
@@ -1378,8 +1468,11 @@ def gemm_dact(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ):
     """GEMM with activation (or gated activation) gradient and optional output tensors."""
+    _check_split_k_unsupported("gemm_dact", split_k)
     is_dgated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
@@ -1593,8 +1686,11 @@ def gemm_symmetric(
     dynamic_scheduler: bool = False,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with symmetric output."""
+    _check_split_k_unsupported("gemm_symmetric", split_k)
     out_dtype = A.dtype if out_dtype is None else out_dtype
     # Determine output shape based on gather_A
     if A.ndim == 2:
@@ -1958,6 +2054,8 @@ def gemm_add_inplace_fake(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
     # Pure no-op: the op only mutates ``out``; kernel compilation is owned
     # by jit_cache + the async compile pool at real execution time.
@@ -2202,6 +2300,8 @@ def gemm_rms(
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[Tensor, Tensor]:
     """GEMM + RMS statistics + optional rowvec scaling.
 
@@ -2209,6 +2309,7 @@ def gemm_rms(
     If premult_out is provided, D_raw (the pre-norm_weight value) is also written to it.
     Returns (D_out, rstd).
     """
+    _check_split_k_unsupported("gemm_rms", split_k)
     out_dtype = A.dtype if out_dtype is None else out_dtype
     N = B.shape[-1]
     if out is None:
@@ -2433,12 +2534,15 @@ def gemm_norm_act(
     store_preact: bool = False,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM + normalize + activation: PostAct = act((A @ B + C) * rstd).
 
     rstd is a column vector (M,).
     Returns (preact, postact) where preact is the normalized value before activation.
     """
+    _check_split_k_unsupported("gemm_norm_act", split_k)
     is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype

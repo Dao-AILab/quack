@@ -10,6 +10,7 @@ from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
@@ -313,20 +314,27 @@ def compile_gemm_kernel(
     concat_layout=None,
     num_warps=None,
     sf_vec_size=None,
+    split_k=1,
+    split_k_mode=SplitKMode.SERIAL,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
+    split_k_kwargs = {}
+    if split_k != 1:
+        assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
+        split_k_kwargs = {"split_k": split_k, "split_k_mode": split_k_mode}
     if device_capacity[0] == 8:
         sm8x_kwargs = {"is_persistent": persistent, "num_warps": num_warps}
         sm8x_kwargs["arch"] = device_capacity[0] * 10 + device_capacity[1]
         GemmCls = partial(GemmCls, **sm8x_kwargs)
     elif device_capacity[0] in [9, 12]:
-        GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+        GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
             GemmCls,
             use_clc_persistence=is_dynamic_persistent,
             use_tma_gather=use_tma_gather,
             sf_vec_size=sf_vec_size,
+            **split_k_kwargs,
         )
     gemm_obj = GemmCls(
         Float32,
