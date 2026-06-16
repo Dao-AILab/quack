@@ -118,9 +118,22 @@ def _varlen_runner(n: int, k: int, e: int, tiler, cluster):
 
 
 def mxfp8_grouped_gemm(
-    a: Tensor, b: Tensor, offs: Tensor, sfa: Tensor, sfb: Tensor, out: Optional[Tensor] = None
+    a: Tensor,
+    b: Tensor,
+    offs: Tensor,
+    sfa: Tensor,
+    sfb: Tensor,
+    out: Optional[Tensor] = None,
+    uniform: bool = False,
 ) -> Tensor:
-    """Grouped MXFP8 GEMM. See module docstring for shape/layout contract."""
+    """Grouped MXFP8 GEMM. See module docstring for shape/layout contract.
+
+    If ``uniform=True`` the caller asserts every group has the same size
+    ``total_m // E`` (e.g. fixed-capacity MoE). The route is then determined from
+    shapes alone, so ``offs`` is never read on the host -- no device->host sync,
+    no launch bubble -- and the call runs the dense batched-L path directly. This
+    is the sync-free path that stays >= torch._scaled_grouped_mm on uniform shapes.
+    """
     assert a.dim() == 2 and b.dim() == 3 and sfa.dim() == 2 and sfb.dim() == 3
     assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
     assert sfa.dtype == torch.float8_e8m0fnu and sfb.dtype == torch.float8_e8m0fnu
@@ -134,6 +147,19 @@ def mxfp8_grouped_gemm(
         out = torch.empty((total_m, n), dtype=torch.bfloat16, device=a.device)
     if total_m == 0:
         return out
+
+    # Sync-free uniform fast path: the route is shape-determined (g = total_m // E),
+    # so offs is never read on the host -> no device->host sync / launch bubble. The
+    # caller asserts the groups are equal & 128-aligned (e.g. fixed-capacity MoE).
+    if uniform:
+        assert total_m % e == 0, f"uniform=True needs total_m {total_m} % E {e} == 0"
+        g = total_m // e
+        assert g % 128 == 0, f"uniform=True needs (total_m // E) = {g} to be % 128 == 0"
+        mxfp8_gemm_out(
+            a.view(e, g, k), b, sfa.view(e, g, sf_k), sfb.transpose(1, 2), out.view(e, g, n)
+        )
+        return out
+
     offsets_host = tuple(int(v) for v in offs.detach().cpu().tolist())
     assert len(offsets_host) == e, f"offs len {len(offsets_host)} != E {e}"
     assert offsets_host[-1] == total_m, f"offs[-1] {offsets_host[-1]} != total_m {total_m}"

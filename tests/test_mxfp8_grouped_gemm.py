@@ -133,3 +133,21 @@ def test_mxfp8_grouped_gemm_skew_and_empty(group_sizes, k, n):
         eager.float(), _ref_grouped(a_ref, b_ref, group_sizes), atol=1e-2, rtol=1e-2
     )
     assert torch.equal(eager, prepared)
+
+
+@pytest.mark.parametrize("k,n", [(512, 512), (4096, 4096)])
+@pytest.mark.parametrize("group_sizes", [(256,) * 4, (128,) * 8])
+def test_mxfp8_grouped_gemm_uniform_fastpath(group_sizes, k, n):
+    """The sync-free uniform fast path (uniform=True derives g = total_m // E from
+    shapes and never reads offs) must be a pure shortcut of the default offs-routed
+    call -> bit-identical, and correct vs the dequant reference."""
+    _skip_if_not_sm100()
+    from quack.mxfp8_grouped_gemm import mxfp8_grouped_gemm
+
+    qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, k, n)
+    routed = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb)
+    fast = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb, uniform=True)
+    torch.testing.assert_close(
+        fast.float(), _ref_grouped(a_ref, b_ref, group_sizes), atol=1e-2, rtol=1e-2
+    )
+    assert torch.equal(fast, routed)
