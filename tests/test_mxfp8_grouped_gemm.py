@@ -65,13 +65,13 @@ def _ref_grouped(a_ref, b_ref, group_sizes):
 )
 def test_mxfp8_grouped_gemm(api, route, group_sizes, k, n):
     _skip_if_not_sm100()
-    from quack.mxfp8_grouped_gemm import make_mxfp8_grouped_gemm_runner, mxfp8_grouped_gemm
+    from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm, mxfp8_grouped_gemm
 
     qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, k, n)
     if api == "eager":
         out = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb)
     else:
-        out = make_mxfp8_grouped_gemm_runner(qa, b_disp, offs, sa, sb)()
+        out = MXFP8GroupedGemm(b_disp, sb)(qa, offs, sa)
     assert out.shape == (sum(group_sizes), n)
     ref = _ref_grouped(a_ref, b_ref, group_sizes)
     torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
@@ -94,11 +94,11 @@ def test_mxfp8_grouped_gemm_eager_prepared_bitwise(route, group_sizes, k, n):
     bitwise check vs torch._scaled_grouped_mm, this is robust -- it does not
     depend on neither side picking split-K.)"""
     _skip_if_not_sm100()
-    from quack.mxfp8_grouped_gemm import make_mxfp8_grouped_gemm_runner, mxfp8_grouped_gemm
+    from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm, mxfp8_grouped_gemm
 
     qa, b_disp, offs, sa, sb, _, _ = _make_grouped_mxfp8(group_sizes, k, n)
     eager = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb)
-    prepared = make_mxfp8_grouped_gemm_runner(qa, b_disp, offs, sa, sb)()
+    prepared = MXFP8GroupedGemm(b_disp, sb)(qa, offs, sa)
     assert torch.equal(eager, prepared), (
         f"eager vs prepared not bit-identical: "
         f"{(eager != prepared).sum().item()}/{eager.numel()} elems differ"
@@ -123,11 +123,11 @@ def test_mxfp8_grouped_gemm_skew_and_empty(group_sizes, k, n):
     Exercises the varlen-M route's dQaccum-padded SFA build and the padded route with
     m_i == 0. Checks both APIs vs the dequant reference and that they agree bitwise."""
     _skip_if_not_sm100()
-    from quack.mxfp8_grouped_gemm import make_mxfp8_grouped_gemm_runner, mxfp8_grouped_gemm
+    from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm, mxfp8_grouped_gemm
 
     qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, k, n)
     eager = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb)
-    prepared = make_mxfp8_grouped_gemm_runner(qa, b_disp, offs, sa, sb)()
+    prepared = MXFP8GroupedGemm(b_disp, sb)(qa, offs, sa)
     assert eager.shape == (sum(group_sizes), n)
     torch.testing.assert_close(
         eager.float(), _ref_grouped(a_ref, b_ref, group_sizes), atol=1e-2, rtol=1e-2
@@ -142,12 +142,14 @@ def test_mxfp8_grouped_gemm_uniform_fastpath(group_sizes, k, n):
     shapes and never reads offs) must be a pure shortcut of the default offs-routed
     call -> bit-identical, and correct vs the dequant reference."""
     _skip_if_not_sm100()
-    from quack.mxfp8_grouped_gemm import mxfp8_grouped_gemm
+    from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm, mxfp8_grouped_gemm
 
     qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, k, n)
     routed = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb)
     fast = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb, uniform=True)
+    cls_fast = MXFP8GroupedGemm(b_disp, sb, uniform=True)(qa, offs, sa)
     torch.testing.assert_close(
         fast.float(), _ref_grouped(a_ref, b_ref, group_sizes), atol=1e-2, rtol=1e-2
     )
-    assert torch.equal(fast, routed)
+    assert torch.equal(fast, routed)  # functional fast path == routed
+    assert torch.equal(cls_fast, routed)  # class uniform path == routed

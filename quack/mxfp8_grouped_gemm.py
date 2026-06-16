@@ -211,63 +211,100 @@ def mxfp8_grouped_gemm(
     return out
 
 
-def make_mxfp8_grouped_gemm_runner(
-    a: Tensor, b: Tensor, offs: Tensor, sfa: Tensor, sfb: Tensor, out: Optional[Tensor] = None
-):
-    """Build a CUDA-graph-capturable runner that hoists ALL host work (routing,
-    the offs host-sync, kernel compile, output alloc) and PRE-PACKS the fixed
-    B-scale once. The returned ``run()`` does only per-call GPU work (A-scale
-    pack + the kernel) on the SAME tensor objects: update ``a`` / ``sfa`` / ``out``
-    in place between calls (and capture under a CUDA graph for replay). Falls
-    back to the eager dispatcher for the non-128 padded route.
-    """
-    assert a.dim() == 2 and b.dim() == 3 and sfa.dim() == 2 and sfb.dim() == 3
-    total_m, k = a.shape
-    e, kb, n = b.shape
-    assert kb == k and k % SF_VEC == 0
-    sf_k = k // SF_VEC
-    if out is None:
-        out = torch.empty((total_m, n), dtype=torch.bfloat16, device=a.device)
-    offsets_host = tuple(int(v) for v in offs.detach().cpu().tolist())
-    assert len(offsets_host) == e and offsets_host[-1] == total_m
-    g = _uniform_group_size(offsets_host)
+class MXFP8GroupedGemm:
+    """Prepared grouped MXFP8 GEMM with the fixed B operand baked in.
 
-    if g is not None and g % 128 == 0:
-        mA = a.view(e, g, k).permute(1, 2, 0)  # (g,k,e) K-major view of a
-        mB = b.mT.permute(1, 2, 0)  # (n,k,e) K-major view of b
-        mD = out.view(e, g, n).permute(1, 2, 0)  # (g,n,e) view of out
-        sfb_view = scale_view_for_kernel(pack_scale_2d_to_blocked_contig(sfb), n, sf_k, e)
+    Pre-packs the B-scale and reuses the cached compiled kernel, so each call does
+    only per-step work (A-scale pack + the kernel). Call it like
+    ``torch._scaled_grouped_mm``::
+
+        gemm = MXFP8GroupedGemm(b, sfb)        # b/sfb are the fixed expert weights
+        out = gemm(a, offs, sfa)               # per step (offs may change per call)
+        out = gemm(a, offs, sfa, out=buf)      # reuse an output buffer
+
+    With ``uniform=True`` (at construction or per call) the route is derived from
+    shapes (g = total_m // E), so ``offs`` is never read on the host -- no
+    device->host sync / launch bubble. Combined with the pre-packed B-scale this
+    stays >= ``torch._scaled_grouped_mm`` across group sizes, including small g where
+    the plain function's per-call B-pack would otherwise dominate the kernel.
+
+    Per-call work is on fresh tensors; for CUDA-graph replay, call once on the
+    capture tensors then update ``a`` / ``sfa`` / ``out`` in place between replays.
+    """
+
+    def __init__(self, b: Tensor, sfb: Tensor, uniform: bool = False):
+        assert b.dim() == 3 and sfb.dim() == 3
+        assert b.dtype == torch.float8_e4m3fn and sfb.dtype == torch.float8_e8m0fnu
+        e, k, n = b.shape
+        assert k % SF_VEC == 0, f"K={k} not a multiple of {SF_VEC}"
+        sf_k = k // SF_VEC
+        assert tuple(sfb.shape) == (e, n, sf_k), f"sfb {tuple(sfb.shape)} != {(e, n, sf_k)}"
+        self.e, self.k, self.n, self.sf_k = e, k, n, sf_k
+        self.uniform = uniform
+        self._b = b  # kept for the non-128 padded fallback
+        self._sfb_raw = sfb  # ditto
+        # Pre-pack the fixed B-scale once; shared across calls and routes.
+        self._sfb_packed = pack_scale_2d_to_blocked_contig(sfb)  # varlen passes this directly
+        self._sfb_view_dense = scale_view_for_kernel(self._sfb_packed, n, sf_k, e)  # dense view
+        self._mB_dense = b.mT.permute(1, 2, 0)  # (n,k,e) K-major view (dense/uniform)
+        self._mB_varlen = b.permute(2, 1, 0)  # (n,k,e) K-major view (varlen)
+
+    def _dense(self, a: Tensor, g: int, sfa: Tensor, out: Tensor) -> Tensor:
+        e, k, n, sf_k = self.e, self.k, self.n, self.sf_k
+        mA = a.view(e, g, k).permute(1, 2, 0)
+        mD = out.view(e, g, n).permute(1, 2, 0)
         tiler, cluster = _default_tiler_cluster(g, n)
         runner = _compile_cached(
             g, n, k, e, tiler, cluster, torch.bfloat16, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
         )
-        sfa3 = sfa.view(e, g, sf_k)
+        sfa_view = scale_view_for_kernel(
+            pack_scale_2d_to_blocked_contig(sfa.view(e, g, sf_k)), g, sf_k, e
+        )
+        runner(mA, self._mB_dense, mD, sfa_view, self._sfb_view_dense)
+        return out
 
-        def run():
-            sfa_view = scale_view_for_kernel(pack_scale_2d_to_blocked_contig(sfa3), g, sf_k, e)
-            runner(mA, mB, mD, sfa_view, sfb_view)
+    def __call__(
+        self,
+        a: Tensor,
+        offs: Tensor,
+        sfa: Tensor,
+        out: Optional[Tensor] = None,
+        uniform: Optional[bool] = None,
+    ) -> Tensor:
+        uniform = self.uniform if uniform is None else uniform
+        e, k, n, sf_k = self.e, self.k, self.n, self.sf_k
+        total_m, ka = a.shape
+        assert ka == k, f"K mismatch a={ka} vs b={k}"
+        assert a.dtype == torch.float8_e4m3fn and sfa.dtype == torch.float8_e8m0fnu
+        assert tuple(sfa.shape) == (total_m, sf_k), f"sfa {tuple(sfa.shape)} != {(total_m, sf_k)}"
+        if out is None:
+            out = torch.empty((total_m, n), dtype=torch.bfloat16, device=a.device)
+        if total_m == 0:
             return out
 
-        return run
+        # Sync-free uniform path: shape-derived route + pre-packed B-scale.
+        if uniform:
+            assert total_m % e == 0, f"uniform=True needs total_m {total_m} % E {e} == 0"
+            g = total_m // e
+            assert g % 128 == 0, f"uniform=True needs (total_m // E) = {g} % 128 == 0"
+            return self._dense(a, g, sfa, out)
 
-    if _boundaries_128_aligned(offsets_host):
-        group_sizes = _group_sizes(offsets_host)
-        tiler, cluster = _default_tiler_cluster(max(group_sizes), n)
-        mB = b.permute(2, 1, 0)  # (N,K,E) K-major view of b
-        mSFB = pack_scale_2d_to_blocked_contig(sfb)  # packed once (fixed B weights)
-        cu = torch.empty(e + 1, dtype=torch.int32, device=offs.device)
-        cu[0] = 0
-        cu[1:].copy_(offs.to(torch.int32))
-        runner = _varlen_runner(n, k, e, tiler, cluster)
-
-        def run():
-            mSFA = _dqaccum_padded_sfa(sfa, group_sizes, sf_k, e)  # dQaccum-padded per call
-            runner(a, mB, out, mSFA, mSFB, cu)
+        # General route via offs (one host sync; B-scale already packed).
+        offsets_host = tuple(int(v) for v in offs.detach().cpu().tolist())
+        assert len(offsets_host) == e, f"offs len {len(offsets_host)} != E {e}"
+        assert offsets_host[-1] == total_m, f"offs[-1] {offsets_host[-1]} != total_m {total_m}"
+        g = _uniform_group_size(offsets_host)
+        if g is not None and g % 128 == 0:
+            return self._dense(a, g, sfa, out)
+        if _boundaries_128_aligned(offsets_host):
+            group_sizes = _group_sizes(offsets_host)
+            tiler, cluster = _default_tiler_cluster(max(group_sizes), n)
+            cu = torch.empty(e + 1, dtype=torch.int32, device=offs.device)
+            cu[0] = 0
+            cu[1:].copy_(offs.to(torch.int32))
+            runner = _varlen_runner(n, k, e, tiler, cluster)
+            mSFA = _dqaccum_padded_sfa(sfa, group_sizes, sf_k, e)
+            runner(a, self._mB_varlen, out, mSFA, self._sfb_packed, cu)
             return out
-
-        return run
-
-    def run():  # non-128 padded: no clean hoist, fall back to eager
-        return mxfp8_grouped_gemm(a, b, offs, sfa, sfb, out)
-
-    return run
+        # non-128 padded: no clean prepacked hoist, fall back to the eager dispatcher.
+        return mxfp8_grouped_gemm(a, self._b, offs, sfa, self._sfb_raw, out)
