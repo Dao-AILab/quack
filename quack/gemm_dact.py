@@ -51,7 +51,7 @@ class GemmDActMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         assert tRS_rC is not None
         # We don't add C to the accumulator
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
@@ -74,7 +74,7 @@ class GemmDActMixin(GemmActMixin):
                     )
         else:
             tRS_rAuxOut = tRS_rC_acc
-        return tRS_rAuxOut
+        return (tRS_rAuxOut,)
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
@@ -138,7 +138,7 @@ class GemmDGatedMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         assert tRS_rC is not None
@@ -216,7 +216,7 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
-        return tRS_rOut
+        return (tRS_rOut,)
 
     # epi_end is inherited from ComposableEpiMixin → delegates to ColVecReduce.end()
 

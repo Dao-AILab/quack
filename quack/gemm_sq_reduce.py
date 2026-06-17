@@ -111,11 +111,12 @@ class GemmSqReduceMixin(GemmActMixin):
         if const_expr(getattr(params, "mAuxOut", None) is not None):
             tRS_rAuxOut = cute.make_rmem_tensor_like(tRS_rD)
             tRS_rAuxOut.store(tRS_rD.load())
+            tRS_rAuxOuts = (tRS_rAuxOut,)
         else:
-            tRS_rAuxOut = None
+            tRS_rAuxOuts = ()
         # Multiply by rowvec (norm_weight) AFTER sq_sum
         vec_multiply(self, tRS_rD, None, tDrRowVec)
-        return tRS_rAuxOut
+        return tRS_rAuxOuts
 
 
 class GemmSqReduceSm90(GemmSqReduceMixin, GemmSm90):
