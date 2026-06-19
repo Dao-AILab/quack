@@ -4,24 +4,38 @@ import torch
 import cutlass
 
 from quack.blockscaled_gemm_utils import (
+    FP4_E2M1FN_VALUES,
     blockscaled_gemm_reference,
     compile_blockscaled_gemm_tvm_ffi,
     create_blockscaled_operand_quantized,
     create_blockscaled_operand_tensor,
     create_blockscaled_scale_tensor,
+    create_sm120_blockscaled_scale_tensor,
     create_blockscaled_varlen_k_operands,
     create_blockscaled_varlen_m_operands,
     scale_blocked_for_cublas,
     scale_view_for_kernel,
 )
-from quack.gemm_default_epi import GemmDefaultSm100
+from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.gemm_default_epi import GemmDefaultSm100, GemmDefaultSm120
+from quack.varlen_utils import VarlenArguments
 from quack.mx_utils import to_blocked
 
 
 def _skip_if_not_sm100():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
     major = torch.cuda.get_device_properties(0).major
-    if major < 10:
-        pytest.skip("SM100+ required")
+    if major not in (10, 11):
+        pytest.skip("SM100/SM110 required")
+
+
+def _skip_if_not_sm120():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    major = torch.cuda.get_device_properties(0).major
+    if major != 12:
+        pytest.skip("SM120 required")
 
 
 def _compile_blockscaled_gemm(
@@ -158,6 +172,99 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
+
+
+def test_sm120_blockscaled_validation():
+    assert GemmDefaultSm120.can_implement_blockscaled(
+        cutlass.Float4E2M1FN,
+        cutlass.Float8E4M3FN,
+        16,
+        cutlass.BFloat16,
+        (128, 128, 64),
+        (1, 1),
+        128,
+        128,
+        64,
+        1,
+        "k",
+        "k",
+        "n",
+    )
+    assert GemmDefaultSm120.can_implement_blockscaled(
+        cutlass.Float4E2M1FN,
+        cutlass.Float8E8M0FNU,
+        32,
+        cutlass.BFloat16,
+        (128, 128, 64),
+        (1, 1),
+        256,
+        256,
+        128,
+        1,
+        "k",
+        "k",
+        "n",
+    )
+    assert not GemmDefaultSm120.can_implement_blockscaled(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        32,
+        cutlass.BFloat16,
+        (128, 128, 64),
+        (1, 1),
+        128,
+        128,
+        64,
+        1,
+        "k",
+        "k",
+        "n",
+    )
+    assert not GemmDefaultSm120.can_implement_blockscaled(
+        cutlass.Int8,
+        cutlass.Float8E8M0FNU,
+        32,
+        cutlass.BFloat16,
+        (128, 128, 64),
+        (1, 1),
+        128,
+        128,
+        64,
+        1,
+        "k",
+        "k",
+        "n",
+    )
+    assert not GemmDefaultSm120.can_implement_blockscaled(
+        cutlass.Float4E2M1FN,
+        cutlass.Float8E4M3FN,
+        32,
+        cutlass.BFloat16,
+        (128, 128, 64),
+        (1, 1),
+        128,
+        128,
+        64,
+        1,
+        "k",
+        "k",
+        "n",
+    )
+    assert not GemmDefaultSm120.can_implement_blockscaled(
+        cutlass.Float4E2M1FN,
+        cutlass.Float8E4M3FN,
+        16,
+        cutlass.BFloat16,
+        (128, 128, 64),
+        (1, 1),
+        128,
+        128,
+        96,
+        1,
+        "k",
+        "k",
+        "n",
+    )
     assert not GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
@@ -233,6 +340,65 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
+
+
+def test_sm120_blockscaled_class_call_validation():
+    m = n = 128
+    k = 64
+    l = 1
+    gemm = GemmDefaultSm120(
+        cutlass.Float32,
+        cutlass.Float4E2M1FN,
+        (128, 128, 64),
+        (1, 1, 1),
+        is_persistent=False,
+        sf_vec_size=16,
+        sf_dtype=cutlass.Float8E4M3FN,
+    )
+    mA = fake_tensor(cutlass.Float4E2M1FN, (m, k, l), leading_dim=1, divisibility=4)
+    mB = fake_tensor(cutlass.Float4E2M1FN, (n, k, l), leading_dim=1, divisibility=4)
+    mD = fake_tensor(cutlass.BFloat16, (m, n, l), leading_dim=1, divisibility=8)
+    mSFA = fake_tensor(cutlass.Float8E4M3FN, (m, 16, l), leading_dim=1, divisibility=4)
+    mSFB = fake_tensor(cutlass.Float8E4M3FN, (n, 16, l), leading_dim=1, divisibility=4)
+
+    assert (
+        gemm._validate_blockscaled_call(
+            mA,
+            mB,
+            mD,
+            None,
+            mSFA,
+            mSFB,
+            gemm.EpilogueArguments(),
+            None,
+            None,
+            None,
+        )
+        == VarlenArguments()
+    )
+    with pytest.raises(ValueError, match="requires SFA and SFB"):
+        gemm._validate_blockscaled_call(
+            mA, mB, mD, None, None, mSFB, gemm.EpilogueArguments(), None, None, None
+        )
+    with pytest.raises(NotImplementedError, match="C/beta"):
+        gemm._validate_blockscaled_call(
+            mA, mB, mD, mD, mSFA, mSFB, gemm.EpilogueArguments(), None, None, None
+        )
+    packed_k_a = fake_tensor(cutlass.Float4E2M1FN, (m, k // 2, l), leading_dim=1, divisibility=4)
+    packed_k_b = fake_tensor(cutlass.Float4E2M1FN, (n, k // 2, l), leading_dim=1, divisibility=4)
+    with pytest.raises(ValueError, match="expects logical Float4E2M1FN K extent"):
+        gemm._validate_blockscaled_call(
+            packed_k_a,
+            packed_k_b,
+            mD,
+            None,
+            mSFA,
+            mSFB,
+            gemm.EpilogueArguments(),
+            None,
+            None,
+            None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -483,6 +649,228 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
         )
         ref = to_blocked(scale_2d[li])
         assert torch.equal(ours, ref), f"to_blocked mismatch at l={li}"
+
+
+@pytest.mark.parametrize(
+    "k,sf_vec_size,expected_cols",
+    [
+        (64, 16, 16),
+        (128, 16, 16),
+        (256, 16, 16),
+        (384, 16, 32),
+        (64, 32, 16),
+        (256, 32, 16),
+        (576, 32, 32),
+    ],
+)
+def test_sm120_blockscaled_padded_scale_layout(k, sf_vec_size, expected_cols):
+    _skip_if_not_sm120()
+    mn, l = 128, 1
+    sf_dtype = cutlass.Float8E4M3FN if sf_vec_size == 16 else cutlass.Float8E8M0FNU
+    ref, physical = create_sm120_blockscaled_scale_tensor(l, mn, k, sf_vec_size, sf_dtype)
+    assert tuple(physical.shape) == (mn, expected_cols, l)
+    assert tuple(ref.shape) == (mn, k, l)
+
+    logical_cols = (k + sf_vec_size - 1) // sf_vec_size
+    if expected_cols > logical_cols:
+        padding = physical[:, logical_cols:, :].view(torch.uint8)
+        assert torch.any(padding != 0)
+
+
+def test_sm120_blockscaled_scale_helper_validation():
+    _skip_if_not_sm120()
+    with pytest.raises(ValueError, match="K divisible by 64"):
+        create_sm120_blockscaled_scale_tensor(1, 128, 96, 16, cutlass.Float8E4M3FN)
+    with pytest.raises(ValueError, match="sf_vec_size 16 or 32"):
+        create_sm120_blockscaled_scale_tensor(1, 128, 64, 8, cutlass.Float8E4M3FN)
+    with pytest.raises(ValueError, match="sf_vec_size=16 requires"):
+        create_sm120_blockscaled_scale_tensor(1, 128, 64, 16, cutlass.Float8E8M0FNU)
+    with pytest.raises(ValueError, match="sf_vec_size=32 requires"):
+        create_sm120_blockscaled_scale_tensor(1, 128, 64, 32, cutlass.Float8E4M3FN)
+
+
+def _pack_sm120_fp4_codes(codes: torch.Tensor) -> torch.Tensor:
+    packed = torch.empty(
+        (codes.shape[0], codes.shape[1] // 2, 1),
+        device=codes.device,
+        dtype=torch.float4_e2m1fn_x2,
+    )
+    packed.view(torch.uint8).copy_(codes[:, 0::2, None] | (codes[:, 1::2, None] << 4))
+    return packed
+
+
+def _sm120_fp4_blockscaled_reference(
+    a_codes: torch.Tensor,
+    b_codes: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    sf_vec_size: int,
+) -> torch.Tensor:
+    table = torch.tensor(FP4_E2M1FN_VALUES, dtype=torch.float32, device=a_codes.device)
+    scale_k = torch.arange(a_codes.shape[1], device=a_codes.device) // sf_vec_size
+    a = table[a_codes.long()] * sfa.float()[:, scale_k, 0]
+    b = table[b_codes.long()] * sfb.float()[:, scale_k, 0]
+    return torch.einsum("mk,nk->mn", a, b).unsqueeze(-1)
+
+
+def _make_sm120_scales(mn, k, sf_vec_size, sf_dtype, row_or_col_sensitive=True):
+    _, scales = create_sm120_blockscaled_scale_tensor(1, mn, k, sf_vec_size, sf_dtype)
+    logical_cols = (k + sf_vec_size - 1) // sf_vec_size
+    if sf_dtype == cutlass.Float8E8M0FNU:
+        base = torch.tensor([1.0, 2.0], device="cuda", dtype=torch.float32)
+    else:
+        base = torch.tensor([1.0, 2.0, 0.5, 1.5], device="cuda", dtype=torch.float32)
+    for idx in range(mn):
+        values = base[torch.arange(logical_cols, device="cuda") % base.numel()]
+        if row_or_col_sensitive:
+            values = values * (1.0 + 0.125 * (idx % 4))
+        scales[idx, :logical_cols, 0] = values.to(scales.dtype)
+    return scales
+
+
+def _compile_sm120_blockscaled_gemm(ab_dtype, sf_dtype, sf_vec_size, m, n, k, mA, mB):
+    l = 1
+    _, mD = create_blockscaled_operand_tensor(l, m, n, False, cutlass.BFloat16, init="empty")
+    mSFA = _make_sm120_scales(m, k, sf_vec_size, sf_dtype)
+    mSFB = _make_sm120_scales(n, k, sf_vec_size, sf_dtype)
+    compiled = compile_blockscaled_gemm_tvm_ffi(
+        ab_dtype,
+        sf_dtype,
+        sf_vec_size,
+        cutlass.BFloat16,
+        (128, 128),
+        (1, 1),
+        mA,
+        mB,
+        mD,
+        mSFA,
+        mSFB,
+    )
+    return compiled, (mA, mB, mD, mSFA, mSFB)
+
+
+@pytest.mark.parametrize(
+    "sf_dtype,sf_vec_size,m,n,k",
+    [
+        (cutlass.Float8E4M3FN, 16, 128, 128, 64),
+        (cutlass.Float8E4M3FN, 16, 256, 128, 128),
+        (cutlass.Float8E4M3FN, 16, 128, 128, 320),
+        (cutlass.Float8E8M0FNU, 32, 128, 128, 64),
+    ],
+)
+def test_sm120_blockscaled_scale_correctness(sf_dtype, sf_vec_size, m, n, k):
+    _skip_if_not_sm120()
+    a_codes = torch.full((m, k), 0x2, device="cuda", dtype=torch.uint8)
+    b_codes = torch.full((n, k), 0x2, device="cuda", dtype=torch.uint8)
+    mA = _pack_sm120_fp4_codes(a_codes)
+    mB = _pack_sm120_fp4_codes(b_codes)
+    compiled, args = _compile_sm120_blockscaled_gemm(
+        cutlass.Float4E2M1FN, sf_dtype, sf_vec_size, m, n, k, mA, mB
+    )
+    _run_blockscaled_gemm(compiled, args)
+
+    _, _, d_torch, mSFA, mSFB = args
+    ref = _sm120_fp4_blockscaled_reference(a_codes, b_codes, mSFA, mSFB, sf_vec_size).to(
+        torch.bfloat16
+    )
+    err = (d_torch.float() - ref).abs().max().item()
+    assert err < 1e-1, f"max_err={err}"
+
+
+def test_sm120_blockscaled_k_loop_accumulates_before_bf16_store():
+    _skip_if_not_sm120()
+    m = n = 128
+    k = 384
+    sf_vec_size = 16
+    sf_dtype = cutlass.Float8E4M3FN
+    a_codes = torch.full((m, k), 0x2, device="cuda", dtype=torch.uint8)
+    b_codes = torch.full((n, k), 0x2, device="cuda", dtype=torch.uint8)
+    # Make the first K64 tile very large and the remaining K64 tiles small.
+    # Storing BF16 after each K tile loses the later small partials; true FP32
+    # accumulation keeps them until the final BF16 conversion.
+    a_codes[:, :64] = 0x7
+    b_codes[:, :64] = 0x7
+    mA = _pack_sm120_fp4_codes(a_codes)
+    mB = _pack_sm120_fp4_codes(b_codes)
+    compiled, args = _compile_sm120_blockscaled_gemm(
+        cutlass.Float4E2M1FN, sf_dtype, sf_vec_size, m, n, k, mA, mB
+    )
+    _, _, _, mSFA, mSFB = args
+    logical_cols = k // sf_vec_size
+    mSFA[:, :logical_cols, 0] = torch.tensor(1.0, device="cuda", dtype=mSFA.dtype)
+    mSFB[:, :logical_cols, 0] = torch.tensor(1.0, device="cuda", dtype=mSFB.dtype)
+    mSFA[:, :4, 0] = torch.tensor(3.0, device="cuda", dtype=mSFA.dtype)
+    mSFB[:, :4, 0] = torch.tensor(3.0, device="cuda", dtype=mSFB.dtype)
+    _run_blockscaled_gemm(compiled, args)
+
+    _, _, d_torch, mSFA, mSFB = args
+    ref = _sm120_fp4_blockscaled_reference(a_codes, b_codes, mSFA, mSFB, sf_vec_size).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(d_torch.float(), ref.float(), rtol=0, atol=0)
+
+
+def test_sm120_blockscaled_asymmetric_fp4_and_scale_page_crossing():
+    _skip_if_not_sm120()
+    m = n = 128
+    k = 320
+    sf_vec_size = 16
+    sf_dtype = cutlass.Float8E4M3FN
+    ks = torch.arange(k, device="cuda")[None, :]
+    a_codes = torch.where(
+        (ks % 4) < 2,
+        torch.tensor(0x2, device="cuda", dtype=torch.uint8),
+        torch.tensor(0x4, device="cuda", dtype=torch.uint8),
+    ).expand(m, k)
+    b_codes = torch.where(
+        (ks % 8) < 4,
+        torch.tensor(0x3, device="cuda", dtype=torch.uint8),
+        torch.tensor(0x5, device="cuda", dtype=torch.uint8),
+    ).expand(n, k)
+    mA = _pack_sm120_fp4_codes(a_codes)
+    mB = _pack_sm120_fp4_codes(b_codes)
+    compiled, args = _compile_sm120_blockscaled_gemm(
+        cutlass.Float4E2M1FN, sf_dtype, sf_vec_size, m, n, k, mA, mB
+    )
+    _run_blockscaled_gemm(compiled, args)
+
+    _, _, d_torch, mSFA, mSFB = args
+    logical_cols = k // sf_vec_size
+    assert mSFA.shape[1] == 32
+    assert torch.any(mSFA[:, logical_cols:, :].float() != 1.0)
+    ref = _sm120_fp4_blockscaled_reference(a_codes, b_codes, mSFA, mSFB, sf_vec_size).to(
+        torch.bfloat16
+    )
+    err = (d_torch.float() - ref.float()).abs().max().item()
+    assert err < 1e-1, f"max_err={err}"
+
+
+def test_sm120_blockscaled_rejects_compact_scale_layout():
+    _skip_if_not_sm120()
+    l, m, n, k, sf_vec_size = 1, 128, 128, 64, 16
+    ab_dtype = cutlass.Float4E2M1FN
+    sf_dtype = cutlass.Float8E4M3FN
+    _, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
+    _, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype)
+    _, mD = create_blockscaled_operand_tensor(l, m, n, False, cutlass.BFloat16, init="empty")
+    mSFA = torch.empty((m, k // sf_vec_size, l), device="cuda", dtype=torch.float8_e4m3fn)
+    mSFB = torch.empty((n, k // sf_vec_size, l), device="cuda", dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="SFA shape"):
+        runner = compile_blockscaled_gemm_tvm_ffi(
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
+            cutlass.BFloat16,
+            (128, 128),
+            (1, 1),
+            mA,
+            mB,
+            mD,
+            mSFA,
+            mSFB,
+        )
+        runner(mA, mB, mD, mSFA, mSFB)
 
 
 # ---------------------------------------------------------------------------

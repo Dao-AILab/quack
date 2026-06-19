@@ -11,7 +11,7 @@ import cutlass.cute as cute
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_default_epi import GemmDefaultSm100
+from quack.gemm_default_epi import GemmDefaultSm100, GemmDefaultSm120
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
 from quack.mx_utils import (
     to_mx_compiled,
@@ -225,6 +225,53 @@ def create_blockscaled_scale_tensor(
     packed_f32 = _pack_blockscaled_scales(ref_blocks)
     packed = torch.empty_like(packed_f32, dtype=torch_dtype_for_cutlass(dtype))
     packed.copy_(packed_f32)
+    ref = (
+        ref_blocks.permute(2, 0, 1)
+        .unsqueeze(-1)
+        .expand(l, mn, sf_k, sf_vec_size)
+        .reshape(l, mn, sf_k * sf_vec_size)
+        .permute(1, 2, 0)
+    )[:, :k, :]
+    return ref, packed
+
+
+def create_sm120_blockscaled_scale_tensor(
+    l: int,
+    mn: int,
+    k: int,
+    sf_vec_size: int,
+    dtype: Type[cutlass.Numeric],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create row-major padded SM120 blockscaled scale tensors.
+
+    SM120 TMA copies scale factors as 2D row-major pages. Physical scale columns
+    are padded to a multiple of 16; columns beyond ``ceil(k / sf_vec_size)`` are
+    padding and ignored by the kernel.
+    """
+    if k % 64 != 0:
+        raise ValueError("SM120 blockscaled scale helper requires K divisible by 64")
+    if sf_vec_size not in (16, 32):
+        raise ValueError("SM120 blockscaled scale helper supports sf_vec_size 16 or 32")
+    expected_dtype = cutlass.Float8E4M3FN if sf_vec_size == 16 else cutlass.Float8E8M0FNU
+    if dtype is not expected_dtype:
+        raise ValueError(f"SM120 sf_vec_size={sf_vec_size} requires {expected_dtype}, got {dtype}")
+    sf_k = ceil_div(k, sf_vec_size)
+    physical_sf_k = ceil_div(sf_k, 16) * 16
+    if dtype == cutlass.Float8E8M0FNU:
+        exponents = torch.randint(0, 2, (mn, sf_k, l), device="cuda", dtype=torch.int32)
+        ref_blocks = torch.pow(2.0, exponents.float())
+    else:
+        ref_blocks = torch.randint(1, 4, (mn, sf_k, l), device="cuda", dtype=torch.int32).float()
+    packed = torch.empty(
+        (mn, physical_sf_k, l), device="cuda", dtype=torch_dtype_for_cutlass(dtype)
+    )
+    packed[:, :sf_k, :].copy_(ref_blocks.to(packed.dtype))
+    if physical_sf_k > sf_k:
+        poison = torch.tensor([0.5, 1.5, 2.0, 3.0], device="cuda", dtype=torch.float32).to(
+            packed.dtype
+        )
+        cols = torch.arange(physical_sf_k - sf_k, device="cuda")
+        packed[:, sf_k:, :] = poison[cols % poison.numel()][None, :, None]
     ref = (
         ref_blocks.permute(2, 0, 1)
         .unsqueeze(-1)
@@ -609,7 +656,7 @@ def compile_blockscaled_gemm_tvm_ffi(
     varlen_m: bool = False,
     varlen_k: bool = False,
 ) -> Callable:
-    """Compile the SM100 blockscaled GEMM.
+    """Compile the blockscaled GEMM.
 
     When varlen_m: mA is (total_m, k) K-major, mD is (total_m, n) N-major,
     mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
@@ -617,15 +664,63 @@ def compile_blockscaled_gemm_tvm_ffi(
     run(...) takes an extra cu_seqlens_k tensor.
     """
     device_capacity = get_device_capacity(mA.device)
-    if device_capacity[0] not in (10, 11):
-        raise RuntimeError("Blockscaled SM100 GEMM requires SM100/SM110")
+    if device_capacity[0] not in (10, 11, 12):
+        raise RuntimeError("Blockscaled GEMM requires SM100/SM110 or SM120")
     assert not (varlen_m and varlen_k), "Only one of varlen_m / varlen_k"
 
-    gemm = partial(
-        GemmDefaultSm100,
-        sf_vec_size=sf_vec_size,
-        use_clc_persistence=use_clc_persistence,
-    )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
+    mma_tiler_mn_only = mma_tiler_mn[:2]
+    mma_tiler_k = mma_tiler_mn[2] if len(mma_tiler_mn) == 3 else 64
+
+    if device_capacity[0] == 12:
+        if varlen_m or varlen_k:
+            raise NotImplementedError("SM120 blockscaled GEMM does not support varlen")
+        if mma_tiler_k != 64:
+            raise NotImplementedError("SM120 blockscaled GEMM requires tile_K=64")
+        if len(mA.shape) != 3 or len(mB.shape) != 3 or len(mD.shape) != 3:
+            raise ValueError("SM120 blockscaled GEMM requires rank-3 A/B/D tensors")
+        logical_k = mA.shape[1] * (2 if ab_dtype is cutlass.Float4E2M1FN else 1)
+        physical_scale_cols = ceil_div(ceil_div(logical_k, sf_vec_size), 16) * 16
+        expected_sfa_shape = (mA.shape[0], physical_scale_cols, mA.shape[2])
+        expected_sfb_shape = (mB.shape[0], physical_scale_cols, mB.shape[2])
+        if tuple(mSFA.shape) != expected_sfa_shape:
+            raise ValueError(f"SFA shape must be {expected_sfa_shape}, got {tuple(mSFA.shape)}")
+        if tuple(mSFB.shape) != expected_sfb_shape:
+            raise ValueError(f"SFB shape must be {expected_sfb_shape}, got {tuple(mSFB.shape)}")
+        if not GemmDefaultSm120.can_implement_blockscaled(
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
+            d_dtype,
+            (*mma_tiler_mn_only, 64),
+            cluster_shape_mn,
+            mA.shape[0],
+            mB.shape[0],
+            logical_k,
+            mA.shape[2],
+            "k",
+            "k",
+            "n",
+        ):
+            raise RuntimeError(
+                "Unsupported SM120 blockscaled config; supported formats are MXFP4 "
+                "(Float4E2M1FN + Float8E8M0FNU + vec32) and NVFP4 "
+                "(Float4E2M1FN + Float8E4M3FN + vec16)"
+            )
+        gemm = GemmDefaultSm120(
+            cutlass.Float32,
+            ab_dtype,
+            (*mma_tiler_mn_only, 64),
+            (*cluster_shape_mn, 1),
+            is_persistent=False,
+            sf_vec_size=sf_vec_size,
+            sf_dtype=sf_dtype,
+        )
+    else:
+        gemm = partial(
+            GemmDefaultSm100,
+            sf_vec_size=sf_vec_size,
+            use_clc_persistence=use_clc_persistence,
+        )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
     compile_epi_args = gemm.EpilogueArguments()
     scheduler_args = make_scheduler_args(
         get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
@@ -709,7 +804,16 @@ def compile_blockscaled_gemm_tvm_ffi(
         varlen_args,
         stream,
     ):
-        gemm(a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb, None)
+        if cutlass.const_expr(device_capacity[0] == 12):
+            # SM120 FFI has already validated packed torch storage and compiles
+            # logical fake CuTe tensor views. Do not route through
+            # blockscaled_call, whose host validation expects logical class-call
+            # tensors rather than packed torch.float4_e2m1fn_x2 storage.
+            gemm._blockscaled_call_jit(a, b, d, varlen_args, stream, sfa, sfb, None)
+        else:
+            gemm(
+                a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb, None
+            )
 
     compiled = cute.compile(
         runner,

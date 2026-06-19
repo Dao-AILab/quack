@@ -17,12 +17,97 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Int32, Boolean, const_expr
+from cutlass.utils import LayoutEnum
 
-from quack.varlen_utils import VarlenManager
+from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.pipeline import make_pipeline_state
 from quack import copy_utils
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 from quack import sm80_utils
+
+
+def _round_up(x: int, multiple: int) -> int:
+    return ((x + multiple - 1) // multiple) * multiple
+
+
+@cute.jit
+def _sm120_blockscaled_scale_fragment(
+    dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    sf_vec_size: cutlass.Constexpr[int],
+    is_sfa: cutlass.Constexpr[bool],
+):
+    if const_expr(sf_vec_size == 16):
+        if const_expr(is_sfa):
+            return warp.make_mxf4nvf4_sfa_fragment(dtype)
+        return warp.make_mxf4nvf4_sfb_fragment(dtype)
+    return cute.make_rmem_tensor(cute.make_layout(((32, 2),), stride=((0, 1),)), dtype)
+
+
+@cute.jit
+def _load_sm120_blockscaled_selector0_scale_fragments(
+    sSFA: cute.Tensor,
+    sSFB: cute.Tensor,
+    stage: cutlass.Int32,
+    m_atom_base: cutlass.Int32,
+    n_atom_base: cutlass.Int32,
+    k_scale_base: cutlass.Int32,
+    sf_vec_size: cutlass.Constexpr[int],
+    sf_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+):
+    """Load selector-zero SM120 FP4 blockscaled scale packets from SMEM.
+
+    The tuple-lowered SM120 blockscaled MMA uses byte-id-a=byte-id-b=0. For
+    selector zero, SFA provider lanes map tid 0 to row group and tid 1 to row
+    group+8; SFB provider lanes map group 0..7 to logical N columns 0..7.
+    """
+    lane = cute.arch.lane_idx()
+    group = lane >> 2
+    tid = lane & 3
+    sfa_row = m_atom_base + group + 8 * (tid & 1)
+    sfb_col = n_atom_base + group
+    sfa = _sm120_blockscaled_scale_fragment(sf_dtype, sf_vec_size, True)
+    sfb = _sm120_blockscaled_scale_fragment(sf_dtype, sf_vec_size, False)
+    compact_sfa = cute.filter_zeros(sfa)
+    compact_sfb = cute.filter_zeros(sfb)
+    for kb in cutlass.range_constexpr(64 // sf_vec_size):
+        compact_sfa[kb] = sSFA[sfa_row, k_scale_base + kb, stage]
+        compact_sfb[kb] = sSFB[sfb_col, k_scale_base + kb, stage]
+    return sfa, sfb
+
+
+@cute.jit
+def _make_sm120_fp4_ldmatrix_smem_view(
+    smem: cute.Tensor,
+    mn: cutlass.Constexpr[int],
+):
+    return cute.make_tensor(
+        smem.iterator,
+        cute.make_layout((mn, (8, 4)), stride=(64, (1, 16))),
+    )
+
+
+@cute.jit
+def _expand_compact_fp4_to_sm120_ldmatrix_smem(
+    compact: cute.Tensor,
+    padded: cute.Tensor,
+    mn: cutlass.Constexpr[int],
+):
+    """Expand packed FP4 bytes into the padded SM120 ldmatrix SMEM layout."""
+    tidx, _, _ = cute.arch.thread_idx()
+
+    for i in cutlass.range((mn * 64 + 31) // 32, unroll_full=True):
+        flat = tidx + i * 32
+        if flat < mn * 64:
+            padded[flat // 64, flat % 64] = cutlass.Int8(0)
+
+    for i in cutlass.range((mn * 32 + 31) // 32, unroll_full=True):
+        flat = tidx + i * 32
+        if flat < mn * 32:
+            row = flat // 32
+            packed_k = flat - row * 32
+            group = packed_k // 8
+            in_group = packed_k - group * 8
+            padded[row, group * 16 + in_group] = compact[row, packed_k]
 
 
 class GemmSm120(GemmSm90):
@@ -49,6 +134,8 @@ class GemmSm120(GemmSm90):
         gather_A: bool = False,
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
+        sf_vec_size: int | None = None,
+        sf_dtype: Type[cutlass.Numeric] | None = None,
     ):
         # Don't call super().__init__ — we set up our own config
         self.acc_dtype = acc_dtype
@@ -59,6 +146,27 @@ class GemmSm120(GemmSm90):
         self.fp8_slow_accum = False
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
+        self.blockscaled = sf_vec_size is not None
+        self.sf_vec_size = sf_vec_size
+        self.sf_dtype = sf_dtype
+        if self.blockscaled:
+            if a_dtype is not cutlass.Float4E2M1FN:
+                raise ValueError("SM120 blockscaled path currently supports Float4E2M1FN A/B only")
+            if acc_dtype is not cutlass.Float32:
+                raise ValueError("SM120 blockscaled path requires Float32 accumulation")
+            if sf_vec_size not in (16, 32):
+                raise ValueError("SM120 blockscaled path supports sf_vec_size 16 or 32")
+            expected_sf_dtype = cutlass.Float8E4M3FN if sf_vec_size == 16 else cutlass.Float8E8M0FNU
+            if sf_dtype is not expected_sf_dtype:
+                raise ValueError(
+                    f"SM120 blockscaled sf_vec_size={sf_vec_size} requires {expected_sf_dtype}"
+                )
+            if pingpong:
+                raise NotImplementedError("SM120 blockscaled pingpong is not implemented")
+            if gather_A:
+                raise NotImplementedError("SM120 blockscaled gather_A is not implemented")
+            if cluster_shape_mnk != (1, 1, 1):
+                raise ValueError("SM120 blockscaled path requires cluster_shape_mnk=(1,1,1)")
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         if gather_A:
@@ -74,7 +182,7 @@ class GemmSm120(GemmSm90):
 
         # Pingpong: 2 warp groups each with (2,2,1) atom layout
         # Non-pingpong: 1 group of 8 warps with (4,2,1) atom layout
-        self.mma_inst_mnk = (16, 8, 16)
+        self.mma_inst_mnk = (16, 8, 64) if self.blockscaled else (16, 8, 16)
         self.atom_layout_mnk = (4, 2, 1) if not self.pingpong else (2, 2, 1)
         # num_mma_warps = total warps doing MMA (both warp groups in pingpong)
         self.num_mma_warps = math.prod(self.atom_layout_mnk) * (1 if not self.pingpong else 2)
@@ -129,7 +237,14 @@ class GemmSm120(GemmSm90):
 
     def _setup_tiled_mma(self):
         """Set up warp-level MMA (MmaF16BF16Op) and tile K dimension."""
-        op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
+        if const_expr(self.blockscaled):
+            if self.sf_vec_size == 16:
+                op = warp.MmaMXF4NVF4Op(self.a_dtype, self.acc_dtype, self.sf_dtype)
+            else:
+                op = warp.MmaMXF4Op(self.a_dtype, self.acc_dtype, self.sf_dtype)
+            self.mma_inst_mnk = (16, 8, 64)
+        else:
+            op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
         tC = cute.make_layout(self.atom_layout_mnk)
         atom_m, atom_n, atom_k = self.atom_layout_mnk
         # We want each warp to have 16 consecutive elements in the N direction, for STSM
@@ -152,8 +267,963 @@ class GemmSm120(GemmSm90):
         )
         self.cta_tile_shape_mnk = (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], tile_k)
 
-    # __call__, _setup_attributes, make_ab_pipeline, make_epi_store_pipeline,
-    # make_sched_pipeline, epilogue are all inherited from GemmSm90.
+    # Dense __call__, _setup_attributes, make_ab_pipeline, make_epi_store_pipeline,
+    # make_sched_pipeline, epilogue are inherited from GemmSm90.
+
+    @staticmethod
+    def padded_blockscale_cols(k: int, sf_vec_size: int) -> int:
+        if k % 64 != 0:
+            raise ValueError("SM120 blockscaled GEMM requires K divisible by 64")
+        return _round_up(k // sf_vec_size, 16)
+
+    @staticmethod
+    def can_implement_blockscaled(
+        ab_dtype: Type[cutlass.Numeric],
+        sf_dtype: Type[cutlass.Numeric],
+        sf_vec_size: int,
+        d_dtype: Type[cutlass.Numeric],
+        mma_tiler_mnk: Tuple[int, int] | Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+        m: int,
+        n: int,
+        k: int,
+        l: int,
+        a_major: str,
+        b_major: str,
+        d_major: str,
+    ) -> bool:
+        del d_major
+        if ab_dtype is not cutlass.Float4E2M1FN:
+            return False
+        if sf_vec_size == 16:
+            if sf_dtype is not cutlass.Float8E4M3FN:
+                return False
+        elif sf_vec_size == 32:
+            if sf_dtype is not cutlass.Float8E8M0FNU:
+                return False
+        else:
+            return False
+        if d_dtype is not cutlass.BFloat16:
+            return False
+        if a_major != "k" or b_major != "k":
+            return False
+        if cluster_shape_mn != (1, 1):
+            return False
+        if len(mma_tiler_mnk) == 3 and mma_tiler_mnk[2] != 64:
+            return False
+        if mma_tiler_mnk[0] != 128 or mma_tiler_mnk[1] != 128:
+            return False
+        return m % 128 == 0 and n % 128 == 0 and k % 64 == 0 and l == 1
+
+    @staticmethod
+    def _shape_tuple(tensor: cute.Tensor) -> tuple[int, ...]:
+        return tuple(int(dim) for dim in tensor.shape)
+
+    @staticmethod
+    def _is_empty_varlen(varlen_args: VarlenArguments) -> bool:
+        return (
+            varlen_args.mCuSeqlensM is None
+            and varlen_args.mCuSeqlensK is None
+            and varlen_args.mAIdx is None
+        )
+
+    def blockscaled_call(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mD: Optional[cute.Tensor],
+        mC: Optional[cute.Tensor],
+        epilogue_args: tuple,
+        scheduler_args,
+        varlen_args: Optional[VarlenArguments],
+        stream,
+        mSFA: Optional[cute.Tensor] = None,
+        mSFB: Optional[cute.Tensor] = None,
+        trace_ptr: Optional[cutlass.Int64] = None,
+    ):
+        varlen_args = self._validate_blockscaled_call(
+            mA, mB, mD, mC, mSFA, mSFB, epilogue_args, scheduler_args, varlen_args, trace_ptr
+        )
+        return self._blockscaled_call_jit(
+            mA,
+            mB,
+            mD,
+            varlen_args,
+            stream,
+            mSFA,
+            mSFB,
+            trace_ptr,
+        )
+
+    @cute.jit
+    def _blockscaled_call_jit(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mD: cute.Tensor,
+        varlen_args: Optional[VarlenArguments],
+        stream,
+        mSFA: cute.Tensor,
+        mSFB: cute.Tensor,
+        trace_ptr: Optional[cutlass.Int64] = None,
+    ):
+        if const_expr(varlen_args is None):
+            varlen_args = VarlenArguments()
+        return self._call_blockscaled(
+            mA,
+            mB,
+            mD,
+            varlen_args,
+            stream,
+            mSFA,
+            mSFB,
+            trace_ptr,
+        )
+
+    def _validate_blockscaled_call(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mD: cute.Tensor,
+        mC: Optional[cute.Tensor],
+        mSFA: Optional[cute.Tensor],
+        mSFB: Optional[cute.Tensor],
+        epilogue_args: tuple,
+        scheduler_args,
+        varlen_args: Optional[VarlenArguments],
+        trace_ptr: Optional[cutlass.Int64],
+    ) -> VarlenArguments:
+        if mSFA is None or mSFB is None:
+            raise ValueError("SM120 blockscaled GEMM requires SFA and SFB scale tensors")
+        if mD is None:
+            raise ValueError("SM120 blockscaled GEMM requires an output tensor")
+        if mC is not None:
+            raise NotImplementedError("SM120 blockscaled C/beta path is not implemented")
+        if epilogue_args not in (None, ()):
+            beta = getattr(epilogue_args, "beta", None)
+            add_to_output = getattr(epilogue_args, "add_to_output", False)
+            if beta not in (None, 0) or add_to_output:
+                raise NotImplementedError("SM120 blockscaled C/beta path is not implemented")
+        del scheduler_args
+        if trace_ptr is not None:
+            raise NotImplementedError("SM120 blockscaled trace path is not implemented")
+        if self.cta_tile_shape_mnk != (128, 128, 64):
+            raise NotImplementedError("SM120 blockscaled path currently supports 128x128x64 tiles")
+        if self.cluster_shape_mnk != (1, 1, 1):
+            raise NotImplementedError("SM120 blockscaled path requires cluster_shape_mnk=(1,1,1)")
+        if (
+            mA.element_type is not cutlass.Float4E2M1FN
+            or mB.element_type is not cutlass.Float4E2M1FN
+        ):
+            raise TypeError("SM120 blockscaled path requires Float4E2M1FN A/B")
+        if mSFA.element_type is not self.sf_dtype or mSFB.element_type is not self.sf_dtype:
+            raise TypeError(f"SM120 blockscaled path requires {self.sf_dtype} SFA/SFB")
+        if mD.element_type is not cutlass.BFloat16:
+            raise NotImplementedError("SM120 blockscaled path currently supports only BF16 D")
+
+        if varlen_args is None:
+            varlen_args = VarlenArguments()
+        if not self._is_empty_varlen(varlen_args):
+            raise NotImplementedError("SM120 blockscaled varlen GEMM is not implemented")
+
+        a_shape = self._shape_tuple(mA)
+        b_shape = self._shape_tuple(mB)
+        d_shape = self._shape_tuple(mD)
+        if len(a_shape) != 3 or len(b_shape) != 3 or len(d_shape) != 3:
+            raise ValueError("SM120 blockscaled tensors must use logical rank-3 shapes")
+        m, k, l = a_shape
+        n, kb, lb = b_shape
+        if k != kb or l != lb:
+            raise ValueError("SM120 blockscaled A/B K and L extents must match")
+        if k % 64 != 0:
+            if k * 2 % 64 == 0:
+                raise ValueError(
+                    "SM120 blockscaled class call expects logical Float4E2M1FN K extent; "
+                    "use compile_blockscaled_gemm_tvm_ffi for packed torch.float4_e2m1fn_x2 "
+                    "storage"
+                )
+            raise ValueError("SM120 blockscaled path requires logical K to be divisible by 64")
+        if d_shape != (m, n, l):
+            raise ValueError(f"SM120 blockscaled D shape must be {(m, n, l)}, got {d_shape}")
+        if m % 128 != 0 or n % 128 != 0:
+            raise NotImplementedError("SM120 blockscaled path requires M/N multiples of 128")
+        if l != 1:
+            raise NotImplementedError("SM120 blockscaled path currently supports L=1")
+        scale_cols = self.padded_blockscale_cols(k, self.sf_vec_size)
+        if self._shape_tuple(mSFA) != (m, scale_cols, l):
+            raise ValueError(
+                f"SFA shape must be {(m, scale_cols, l)}, got {self._shape_tuple(mSFA)}"
+            )
+        if self._shape_tuple(mSFB) != (n, scale_cols, l):
+            raise ValueError(
+                f"SFB shape must be {(n, scale_cols, l)}, got {self._shape_tuple(mSFB)}"
+            )
+        return varlen_args
+
+    @cute.jit
+    def _call_blockscaled(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mD: cute.Tensor,
+        varlen_args: Optional[VarlenArguments],
+        stream,
+        mSFA: cute.Tensor,
+        mSFB: cute.Tensor,
+        trace_ptr: Optional[cutlass.Int64] = None,
+    ):
+        del stream, trace_ptr
+
+        self.a_dtype = mA.element_type
+        self.b_dtype = mB.element_type
+        self.d_dtype = mD.element_type
+        self.c_dtype = None
+        self.sf_dtype = mSFA.element_type
+        self.a_layout = LayoutEnum.from_tensor(mA)
+        self.b_layout = LayoutEnum.from_tensor(mB)
+        self.d_layout = LayoutEnum.from_tensor(mD)
+        self.c_layout = None
+        self._setup_attributes(())
+        self.ab_stage = 1
+        tile_m, tile_n, tile_k = self.cta_tile_shape_mnk
+
+        self.a_smem_layout_staged = cute.make_layout(
+            (tile_m, tile_k, self.ab_stage), stride=(tile_k, 1, tile_m * tile_k)
+        )
+        self.b_smem_layout_staged = cute.make_layout(
+            (tile_n, tile_k, self.ab_stage), stride=(tile_k, 1, tile_n * tile_k)
+        )
+        scale_tile_k = 16
+        a_compact_smem_layout_staged = cute.make_layout(
+            (tile_m, tile_k // 2, self.ab_stage),
+            stride=(tile_k // 2, 1, tile_m * (tile_k // 2)),
+        )
+        b_compact_smem_layout_staged = cute.make_layout(
+            (tile_n, tile_k // 2, self.ab_stage),
+            stride=(tile_k // 2, 1, tile_n * (tile_k // 2)),
+        )
+        self.sfa_smem_layout_staged = cute.make_layout(
+            (tile_m, scale_tile_k, self.ab_stage),
+            stride=(scale_tile_k, 1, tile_m * scale_tile_k),
+        )
+        self.sfb_smem_layout_staged = cute.make_layout(
+            (tile_n, scale_tile_k, self.ab_stage),
+            stride=(scale_tile_k, 1, tile_n * scale_tile_k),
+        )
+        acc_smem_layout = cute.make_layout((tile_m, tile_n), stride=(tile_n, 1))
+
+        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
+        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
+        a_compact_smem_layout = cute.slice_(a_compact_smem_layout_staged, (None, None, 0))
+        b_compact_smem_layout = cute.slice_(b_compact_smem_layout_staged, (None, None, 0))
+        sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, 0))
+        sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, 0))
+
+        m_extent = cute.size(mA, mode=[0])
+        k_extent = cute.size(mA, mode=[1])
+        packed_k_extent = k_extent // 2
+        n_extent = cute.size(mB, mode=[0])
+        l_extent = cute.size(mA, mode=[2])
+        mA_u8 = cute.make_tensor(
+            cute.recast_ptr(mA.iterator, dtype=cutlass.Uint8),
+            cute.make_layout(
+                (m_extent, packed_k_extent, l_extent),
+                stride=(packed_k_extent, 1, m_extent * packed_k_extent),
+            ),
+        )
+        mB_u8 = cute.make_tensor(
+            cute.recast_ptr(mB.iterator, dtype=cutlass.Uint8),
+            cute.make_layout(
+                (n_extent, packed_k_extent, l_extent),
+                stride=(packed_k_extent, 1, n_extent * packed_k_extent),
+            ),
+        )
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+            op, mA_u8, a_compact_smem_layout, (tile_m, tile_k // 2)
+        )
+        tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
+            op, mB_u8, b_compact_smem_layout, (tile_n, tile_k // 2)
+        )
+        tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
+            mSFA, sfa_smem_layout, (tile_m, scale_tile_k), 1
+        )
+        tma_atom_sfb, tma_tensor_sfb = self._make_tma_atoms_and_tensors(
+            mSFB, sfb_smem_layout, (tile_n, scale_tile_k), 1
+        )
+        self.num_tma_load_bytes = (
+            cute.size_in_bytes(cutlass.Uint8, a_compact_smem_layout)
+            + cute.size_in_bytes(cutlass.Uint8, b_compact_smem_layout)
+            + cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
+            + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
+        )
+
+        a_compact_smem_size = cute.cosize(a_compact_smem_layout_staged)
+        b_compact_smem_size = cute.cosize(b_compact_smem_layout_staged)
+        sfa_smem_size = cute.cosize(self.sfa_smem_layout_staged)
+        sfb_smem_size = cute.cosize(self.sfb_smem_layout_staged)
+        acc_smem_size = cute.cosize(acc_smem_layout)
+
+        @cute.struct
+        class BlockscaledSharedStorage:
+            ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
+            sA: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, cute.cosize(self.a_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int8, cute.cosize(self.b_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ]
+            sACompact: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, a_compact_smem_size],
+                self.buffer_align_bytes,
+            ]
+            sBCompact: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, b_compact_smem_size],
+                self.buffer_align_bytes,
+            ]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[self.sf_dtype, sfa_smem_size],
+                self.buffer_align_bytes,
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[self.sf_dtype, sfb_smem_size],
+                self.buffer_align_bytes,
+            ]
+            # Correctness scratch: for K > 64, K64 partials stay in FP32 here
+            # until the final K tile writes BF16 D exactly once.
+            sAcc: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, acc_smem_size],
+                self.buffer_align_bytes,
+            ]
+
+        self.shared_storage = BlockscaledSharedStorage
+
+        if const_expr(self.sf_vec_size == 16):
+            mma_op = warp.MmaMXF4NVF4Op(cutlass.Float4E2M1FN, cutlass.Float32, self.sf_dtype)
+        else:
+            mma_op = warp.MmaMXF4Op(cutlass.Float4E2M1FN, cutlass.Float32, self.sf_dtype)
+        one_warp_mma = cute.make_tiled_mma(mma_op)
+        varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
+        self.blockscaled_kernel(
+            one_warp_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            tma_atom_sfa,
+            tma_tensor_sfa,
+            tma_atom_sfb,
+            tma_tensor_sfb,
+            mD,
+            varlen_params,
+            cute.make_layout((1, 1, 1)),
+            self.a_smem_layout_staged,
+            self.b_smem_layout_staged,
+            a_compact_smem_layout_staged,
+            b_compact_smem_layout_staged,
+            self.sfa_smem_layout_staged,
+            self.sfb_smem_layout_staged,
+            acc_smem_layout,
+        ).launch(
+            grid=[cute.ceil_div(m_extent, tile_m), cute.ceil_div(n_extent, tile_n), l_extent],
+            block=[64, 1, 1],
+            cluster=(1, 1, 1),
+        )
+
+    @cute.kernel
+    def blockscaled_kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mkl: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nkl: cute.Tensor,
+        tma_atom_sfa: cute.CopyAtom,
+        mSFA_mkl16: cute.Tensor,
+        tma_atom_sfb: cute.CopyAtom,
+        mSFB_nkl16: cute.Tensor,
+        mD_mnl: cute.Tensor,
+        varlen_params: VarlenManager.Params,
+        cluster_layout_mnk: cute.Layout,
+        a_smem_layout: cute.Layout,
+        b_smem_layout: cute.Layout,
+        a_compact_smem_layout: cute.Layout,
+        b_compact_smem_layout: cute.Layout,
+        sfa_smem_layout: cute.Layout,
+        sfb_smem_layout: cute.Layout,
+        acc_smem_layout: cute.Layout,
+    ):
+        del varlen_params
+
+        tidx, _, _ = cute.arch.thread_idx()
+        cta_m, cta_n, cta_l = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        if warp_idx == 1:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+            cpasync.prefetch_descriptor(tma_atom_sfa)
+            cpasync.prefetch_descriptor(tma_atom_sfb)
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+        ab_pipeline = self.make_ab_pipeline(
+            tiled_mma=tiled_mma,
+            cluster_layout_vmnk=cute.make_layout((1, *cluster_layout_mnk.shape)),
+            ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
+        )
+
+        pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+        sA = storage.sA.get_tensor(a_smem_layout)
+        sB = storage.sB.get_tensor(b_smem_layout)
+        sACompact = storage.sACompact.get_tensor(a_compact_smem_layout)
+        sBCompact = storage.sBCompact.get_tensor(b_compact_smem_layout)
+        sSFA = storage.sSFA.get_tensor(sfa_smem_layout)
+        sSFB = storage.sSFB.get_tensor(sfb_smem_layout)
+        sAcc = storage.sAcc.get_tensor(acc_smem_layout)
+        pipeline_init_wait(cluster_shape_mn=(1, 1))
+
+        k_tile_count = cute.size(mA_mkl, mode=[1]) // (self.cta_tile_shape_mnk[2] // 2)
+        scales_per_k_tile = 64 // self.sf_vec_size
+
+        if warp_idx == 1:
+            producer_state = make_pipeline_state(pipeline.PipelineUserType.Producer, self.ab_stage)
+            gA_mk = cute.local_tile(
+                mA_mkl[None, None, cta_l],
+                (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2] // 2),
+                (cta_m, None),
+            )
+            gB_nk = cute.local_tile(
+                mB_nkl[None, None, cta_l],
+                (self.cta_tile_shape_mnk[1], self.cta_tile_shape_mnk[2] // 2),
+                (cta_n, None),
+            )
+            gSFA_mk16 = cute.local_tile(
+                mSFA_mkl16[None, None, cta_l],
+                (self.cta_tile_shape_mnk[0], 16),
+                (cta_m, None),
+            )
+            gSFB_nk16 = cute.local_tile(
+                mSFB_nkl16[None, None, cta_l],
+                (self.cta_tile_shape_mnk[1], 16),
+                (cta_n, None),
+            )
+            if const_expr(k_tile_count == 1):
+                producer_state = self.load_blockscaled_tma_tile(
+                    ab_pipeline,
+                    producer_state,
+                    tma_atom_a,
+                    gA_mk,
+                    tma_atom_b,
+                    gB_nk,
+                    tma_atom_sfa,
+                    gSFA_mk16,
+                    tma_atom_sfb,
+                    gSFB_nk16,
+                    sACompact,
+                    sBCompact,
+                    sSFA,
+                    sSFB,
+                )
+            else:
+                for k_tile in cutlass.range(k_tile_count, unroll=1):
+                    scale_base = k_tile * scales_per_k_tile
+                    scale_page = scale_base // 16
+                    producer_state = self.load_blockscaled_tma_tile_indexed(
+                        ab_pipeline,
+                        producer_state,
+                        k_tile,
+                        scale_page,
+                        tma_atom_a,
+                        gA_mk,
+                        tma_atom_b,
+                        gB_nk,
+                        tma_atom_sfa,
+                        gSFA_mk16,
+                        tma_atom_sfb,
+                        gSFB_nk16,
+                        sACompact,
+                        sBCompact,
+                        sSFA,
+                        sSFB,
+                    )
+            ab_pipeline.producer_tail(producer_state)
+
+        if warp_idx == 0:
+            gD_mn = cute.local_tile(
+                mD_mnl[None, None, cta_l],
+                (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]),
+                (cta_m, cta_n),
+            )
+            read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
+            self.mma_blockscaled_kloop_store_bf16(
+                ab_pipeline,
+                read_state,
+                tiled_mma,
+                sA,
+                sB,
+                sACompact,
+                sBCompact,
+                sSFA,
+                sSFB,
+                sAcc,
+                gD_mn,
+                k_tile_count,
+                tidx,
+            )
+
+    @cute.jit
+    def load_blockscaled_tma_tile(
+        self,
+        ab_pipeline: pipeline.PipelineAsync,
+        producer_state: pipeline.PipelineState,
+        tma_atom_a: cute.CopyAtom,
+        gA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        gB_nk: cute.Tensor,
+        tma_atom_sfa: cute.CopyAtom,
+        gSFA_mk16: cute.Tensor,
+        tma_atom_sfb: cute.CopyAtom,
+        gSFB_nk16: cute.Tensor,
+        sACompact: cute.Tensor,
+        sBCompact: cute.Tensor,
+        sSFA: cute.Tensor,
+        sSFB: cute.Tensor,
+    ) -> pipeline.PipelineState:
+        copy_A, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_a,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gA_mk,
+            dst_tensor=sACompact,
+            mcast_mask=0,
+        )
+        copy_B, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_b,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gB_nk,
+            dst_tensor=sBCompact,
+            mcast_mask=0,
+        )
+        copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_sfa,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gSFA_mk16,
+            dst_tensor=sSFA,
+            mcast_mask=0,
+        )
+        copy_SFB, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_sfb,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gSFB_nk16,
+            dst_tensor=sSFB,
+            mcast_mask=0,
+        )
+        return self.load_tma(
+            ab_pipeline,
+            producer_state,
+            [copy_A, copy_B, copy_SFA, copy_SFB],
+            Int32(1),
+        )
+
+    @cute.jit
+    def load_blockscaled_tma_tile_indexed(
+        self,
+        ab_pipeline: pipeline.PipelineAsync,
+        producer_state: pipeline.PipelineState,
+        k_tile: cutlass.Int32,
+        scale_page: cutlass.Int32,
+        tma_atom_a: cute.CopyAtom,
+        gA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        gB_nk: cute.Tensor,
+        tma_atom_sfa: cute.CopyAtom,
+        gSFA_mk16: cute.Tensor,
+        tma_atom_sfb: cute.CopyAtom,
+        gSFB_nk16: cute.Tensor,
+        sACompact: cute.Tensor,
+        sBCompact: cute.Tensor,
+        sSFA: cute.Tensor,
+        sSFB: cute.Tensor,
+    ) -> pipeline.PipelineState:
+        copy_A, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_a,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gA_mk,
+            dst_tensor=sACompact,
+            mcast_mask=0,
+        )
+        copy_B, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_b,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gB_nk,
+            dst_tensor=sBCompact,
+            mcast_mask=0,
+        )
+        copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_sfa,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gSFA_mk16,
+            dst_tensor=sSFA,
+            mcast_mask=0,
+        )
+        copy_SFB, _, _ = copy_utils.tma_get_copy_fn(
+            tma_atom_sfb,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            src_tensor=gSFB_nk16,
+            dst_tensor=sSFB,
+            mcast_mask=0,
+        )
+        peek_empty_status = ab_pipeline.producer_try_acquire(producer_state)
+        ab_pipeline.producer_acquire(producer_state, peek_empty_status)
+        tma_bar_ptr = ab_pipeline.producer_get_barrier(producer_state)
+        smem_idx = producer_state.index
+        copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+        copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+        copy_SFA(scale_page, smem_idx, tma_bar_ptr=tma_bar_ptr)
+        copy_SFB(scale_page, smem_idx, tma_bar_ptr=tma_bar_ptr)
+        ab_pipeline.producer_commit(producer_state)
+        producer_state.advance()
+        return producer_state
+
+    @cute.jit
+    def mma_blockscaled_kloop_store_bf16(
+        self,
+        ab_pipeline: pipeline.PipelineAsync,
+        read_state: pipeline.PipelineState,
+        tiled_mma: cute.TiledMma,
+        sA: cute.Tensor,
+        sB: cute.Tensor,
+        sACompact: cute.Tensor,
+        sBCompact: cute.Tensor,
+        sSFA: cute.Tensor,
+        sSFB: cute.Tensor,
+        sAcc: cute.Tensor,
+        gD_mn: cute.Tensor,
+        k_tile_count: cutlass.Int32,
+        tidx: cutlass.Int32,
+    ) -> None:
+        thr_mma = tiled_mma.get_slice(tidx)
+        a_shape = tiled_mma.partition_shape_A((16, 64))
+        b_shape = tiled_mma.partition_shape_B((8, 64))
+        acc_shape = tiled_mma.partition_shape_C((16, 8))
+        accum_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float32)
+        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gD_mn.element_type)
+        scales_per_k_tile = 64 // self.sf_vec_size
+        if const_expr(k_tile_count == 1):
+            read_state = self.mma_blockscaled_one_k_tile_accumulate_smem(
+                ab_pipeline,
+                read_state,
+                tiled_mma,
+                sA,
+                sB,
+                sACompact,
+                sBCompact,
+                sSFA,
+                sSFB,
+                sAcc,
+                gD_mn,
+                tidx,
+                thr_mma,
+                a_shape,
+                b_shape,
+                acc_shape,
+                accum_atom,
+                store_atom,
+                scales_per_k_tile,
+                cutlass.Int32(0),
+                False,
+                True,
+            )
+        else:
+            read_state = self.mma_blockscaled_one_k_tile_accumulate_smem(
+                ab_pipeline,
+                read_state,
+                tiled_mma,
+                sA,
+                sB,
+                sACompact,
+                sBCompact,
+                sSFA,
+                sSFB,
+                sAcc,
+                gD_mn,
+                tidx,
+                thr_mma,
+                a_shape,
+                b_shape,
+                acc_shape,
+                accum_atom,
+                store_atom,
+                scales_per_k_tile,
+                cutlass.Int32(0),
+                False,
+                False,
+            )
+            for k_iter in cutlass.range(k_tile_count - 2, unroll=1):
+                k_tile = k_iter + 1
+                read_state = self.mma_blockscaled_one_k_tile_accumulate_smem(
+                    ab_pipeline,
+                    read_state,
+                    tiled_mma,
+                    sA,
+                    sB,
+                    sACompact,
+                    sBCompact,
+                    sSFA,
+                    sSFB,
+                    sAcc,
+                    gD_mn,
+                    tidx,
+                    thr_mma,
+                    a_shape,
+                    b_shape,
+                    acc_shape,
+                    accum_atom,
+                    store_atom,
+                    scales_per_k_tile,
+                    k_tile,
+                    True,
+                    False,
+                )
+            read_state = self.mma_blockscaled_one_k_tile_accumulate_smem(
+                ab_pipeline,
+                read_state,
+                tiled_mma,
+                sA,
+                sB,
+                sACompact,
+                sBCompact,
+                sSFA,
+                sSFB,
+                sAcc,
+                gD_mn,
+                tidx,
+                thr_mma,
+                a_shape,
+                b_shape,
+                acc_shape,
+                accum_atom,
+                store_atom,
+                scales_per_k_tile,
+                k_tile_count - 1,
+                True,
+                True,
+            )
+
+    @cute.jit
+    def mma_blockscaled_one_k_tile_accumulate_smem(
+        self,
+        ab_pipeline: pipeline.PipelineAsync,
+        read_state: pipeline.PipelineState,
+        tiled_mma: cute.TiledMma,
+        sA: cute.Tensor,
+        sB: cute.Tensor,
+        sACompact: cute.Tensor,
+        sBCompact: cute.Tensor,
+        sSFA: cute.Tensor,
+        sSFB: cute.Tensor,
+        sAcc: cute.Tensor,
+        gD_mn: cute.Tensor,
+        tidx: cutlass.Int32,
+        thr_mma: cute.TiledMmaThrVal,
+        a_shape: cute.Shape,
+        b_shape: cute.Shape,
+        acc_shape: cute.Shape,
+        accum_atom: cute.CopyAtom,
+        store_atom: cute.CopyAtom,
+        scales_per_k_tile: cutlass.Constexpr[int],
+        k_tile: cutlass.Int32,
+        add_existing: cutlass.Constexpr[bool],
+        store_final: cutlass.Constexpr[bool],
+    ) -> pipeline.PipelineState:
+        peek_ab_full_status = ab_pipeline.consumer_try_wait(read_state)
+        ab_pipeline.consumer_wait(read_state, peek_ab_full_status)
+        _expand_compact_fp4_to_sm120_ldmatrix_smem(
+            sACompact[None, None, read_state.index],
+            sA[None, None, read_state.index],
+            128,
+        )
+        _expand_compact_fp4_to_sm120_ldmatrix_smem(
+            sBCompact[None, None, read_state.index],
+            sB[None, None, read_state.index],
+            128,
+        )
+        cute.arch.sync_warp()
+        scale_base = k_tile * scales_per_k_tile
+        scale_page = scale_base // 16
+        scale_page_offset = scale_base - scale_page * 16
+        for m_atom in cutlass.range_constexpr(8):
+            for n_atom in cutlass.range_constexpr(16):
+                acc = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
+                acc.fill(0.0)
+                self.mma_blockscaled_tile_k64_accumulate(
+                    tiled_mma,
+                    acc,
+                    sA[None, None, read_state.index],
+                    sB[None, None, read_state.index],
+                    sSFA,
+                    sSFB,
+                    read_state.index,
+                    scale_page_offset,
+                    cutlass.Int32(m_atom * 16),
+                    cutlass.Int32(n_atom * 8),
+                    tidx,
+                    a_shape,
+                    b_shape,
+                )
+                self.store_blockscaled_accum_smem_atom(
+                    thr_mma,
+                    accum_atom,
+                    acc,
+                    sAcc,
+                    store_atom,
+                    gD_mn,
+                    m_atom,
+                    n_atom,
+                    add_existing,
+                    store_final,
+                )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        ab_pipeline.consumer_release(read_state)
+        read_state.advance()
+        return read_state
+
+    @cute.jit
+    def mma_blockscaled(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc: cute.Tensor,
+        sA_stage: cute.Tensor,
+        sB_stage: cute.Tensor,
+        sSFA: cute.Tensor,
+        sSFB: cute.Tensor,
+        stage: cutlass.Int32,
+        m_atom_base: cutlass.Int32,
+        n_atom_base: cutlass.Int32,
+        k_scale_base: cutlass.Int32,
+        tidx: cutlass.Int32,
+        a_shape: cute.Shape,
+        b_shape: cute.Shape,
+    ) -> None:
+        sA_atom = cute.domain_offset((m_atom_base, None), sA_stage)
+        sB_atom = cute.domain_offset((n_atom_base, None), sB_stage)
+        copy_atom = cute.make_copy_atom(
+            warp.LdMatrix8x16x8bOp(num_matrices=1, unpack_bits=4),
+            cutlass.Int8,
+        )
+        tiled_copy_a = cute.make_tiled_copy_A(copy_atom, tiled_mma)
+        tiled_copy_b = cute.make_tiled_copy_B(copy_atom, tiled_mma)
+        a0, a1, a2, a3 = warp.sm120_mxf4nvf4_ldmatrix_A_regs(
+            tiled_copy_a,
+            tidx,
+            _make_sm120_fp4_ldmatrix_smem_view(sA_atom, 16),
+        )
+        b0, b1 = warp.sm120_mxf4nvf4_ldmatrix_B_regs(
+            tiled_copy_b,
+            tidx,
+            _make_sm120_fp4_ldmatrix_smem_view(sB_atom, 8),
+        )
+        a = cute.make_rmem_tensor(a_shape, cutlass.Float4E2M1FN)
+        b = cute.make_rmem_tensor(b_shape, cutlass.Float4E2M1FN)
+        a_i32 = cute.recast_tensor(a, cutlass.Int32)
+        b_i32 = cute.recast_tensor(b, cutlass.Int32)
+        # The asymmetric SM120 blockscaled tests catch this placement.
+        a_i32[0] = a0
+        a_i32[1] = a2
+        a_i32[2] = a1
+        a_i32[3] = a3
+        b_i32[0] = b0
+        b_i32[1] = b1
+        sfa, sfb = _load_sm120_blockscaled_selector0_scale_fragments(
+            sSFA,
+            sSFB,
+            stage,
+            m_atom_base,
+            n_atom_base,
+            k_scale_base,
+            self.sf_vec_size,
+            self.sf_dtype,
+        )
+        cute.gemm(tiled_mma, acc, (a, sfa), (b, sfb), acc)
+
+    @cute.jit
+    def mma_blockscaled_tile_k64_accumulate(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc: cute.Tensor,
+        sA: cute.Tensor,
+        sB: cute.Tensor,
+        sSFA: cute.Tensor,
+        sSFB: cute.Tensor,
+        stage: cutlass.Int32,
+        scale_page_offset: cutlass.Int32,
+        m_atom_base: cutlass.Int32,
+        n_atom_base: cutlass.Int32,
+        tidx: cutlass.Int32,
+        a_shape: cute.Shape,
+        b_shape: cute.Shape,
+    ) -> None:
+        del tiled_mma
+        if const_expr(self.sf_vec_size == 16):
+            mma_op = warp.MmaMXF4NVF4Op(cutlass.Float4E2M1FN, cutlass.Float32, self.sf_dtype)
+        else:
+            mma_op = warp.MmaMXF4Op(cutlass.Float4E2M1FN, cutlass.Float32, self.sf_dtype)
+        local_tiled_mma = cute.make_tiled_mma(mma_op)
+        self.mma_blockscaled(
+            local_tiled_mma,
+            acc,
+            sA,
+            sB,
+            sSFA,
+            sSFB,
+            stage,
+            m_atom_base,
+            n_atom_base,
+            scale_page_offset,
+            tidx,
+            a_shape,
+            b_shape,
+        )
+
+    @cute.jit
+    def store_blockscaled_accum_smem_atom(
+        self,
+        thr_mma: cute.TiledMmaThrVal,
+        accum_atom: cute.CopyAtom,
+        acc: cute.Tensor,
+        sAcc: cute.Tensor,
+        store_atom: cute.CopyAtom,
+        mD_mn: cute.Tensor,
+        m_atom: cutlass.Constexpr[int],
+        n_atom: cutlass.Constexpr[int],
+        add_existing: cutlass.Constexpr[bool],
+        store_final: cutlass.Constexpr[bool],
+    ) -> None:
+        sAcc_atom = cute.local_tile(sAcc, (16, 8), (m_atom, n_atom))
+        tCsAcc = thr_mma.partition_C(sAcc_atom)
+        if const_expr(add_existing):
+            tCrPrev = cute.make_rmem_tensor(acc.layout, cutlass.Float32)
+            cute.copy(accum_atom, tCsAcc, tCrPrev)
+            acc.store(acc.load() + tCrPrev.load())
+        if const_expr(store_final):
+            gD_atom = cute.local_tile(mD_mn, (16, 8), (m_atom, n_atom))
+            tCgD = thr_mma.partition_C(gD_atom)
+            tCrD = cute.make_rmem_tensor(acc.layout, mD_mn.element_type)
+            tCrD.store(acc.load().to(mD_mn.element_type))
+            cute.copy(store_atom, tCrD, tCgD)
+        else:
+            cute.copy(accum_atom, acc, tCsAcc)
 
     @cute.kernel
     def kernel(
