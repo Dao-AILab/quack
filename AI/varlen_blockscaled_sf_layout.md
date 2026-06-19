@@ -152,7 +152,7 @@ a tile-unit offset integer.
 
 ## Tests
 
-`tests/test_gemm_sm100_blockscaled.py`:
+`tests/test_gemm_blockscaled.py`:
 - `test_blockscaled_mxfp8_varlen_m_nonaligned` — 4 seqlen patterns × 2 B-majors = 8 cases.
   Patterns include `[128, 128, 128]`, `[100, 200, 150]`, `[30, 300, 64, 200]`,
   `[1, 128, 127, 129]`.

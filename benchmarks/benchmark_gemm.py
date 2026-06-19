@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 
 import torch
@@ -7,8 +8,9 @@ from triton.testing import do_bench
 from quack.gemm import gemm as quack_gemm
 
 """
-GEMM benchmark using quack.gemm.gemm() (dense path) or the SM100 blockscaled
-path (MXFP8 / MXFP4 / NVFP4) via --blockscaled.
+GEMM benchmark using quack.gemm.gemm() (dense path) or the blockscaled
+path (MXFP8 / MXFP4 / NVFP4). The blockscaled path is selected by passing
+--sf_dtype and/or --sf_vec_size.
 
 Usage (dense):
     python benchmarks/benchmark_gemm.py --mnkl 512,7168,2048,256 \
@@ -17,18 +19,24 @@ Usage (dense):
 
 Usage (blockscaled MXFP8, with cuBLAS comparison):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
-        --blockscaled --ab_dtype Float8E4M3FN --sf_dtype Float8E8M0FNU \
-        --sf_vec_size 32 --init quant --compare_cublas
+        --ab_dtype Float8E4M3FN --sf_dtype Float8E8M0FNU --sf_vec_size 32
 
 Usage (blockscaled MXFP4):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
-        --blockscaled --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU \
-        --sf_vec_size 32 --d_dtype Float32
+        --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU \
+        --sf_vec_size 32 --d_dtype BFloat16
 
 Usage (blockscaled NVFP4):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
-        --blockscaled --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN \
-        --sf_vec_size 16 --d_dtype Float32
+        --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN \
+        --sf_vec_size 16 --d_dtype BFloat16
+
+Usage (SM120 packed-LDSM NVFP4 performance path):
+    QUACK_SM120_BLOCKSCALED_PACKED_LDSM=1 CUTE_DSL_ARCH=sm_120a \
+    python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
+        --tile_shape_mnk 64,64,128 --cluster_shape_mnk 1,1,1 \
+        --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN \
+        --sf_vec_size 16 --d_dtype BFloat16 --skip_ref_check
 """
 
 
@@ -196,19 +204,21 @@ def _run_blockscaled(args):
         compile_blockscaled_gemm_tvm_ffi,
         create_blockscaled_operand_quantized,
         create_blockscaled_operand_tensor,
+        create_sm120_blockscaled_scale_tensor,
         create_blockscaled_varlen_m_operands,
         scale_blocked_for_cublas,
         torch_dtype_for_cutlass,
     )
     from quack.cute_dsl_utils import get_device_capacity
-    from quack.gemm_default_epi import GemmDefaultSm100
+    from quack.gemm_default_epi import GemmDefaultSm100, GemmDefaultSm120
 
     sm_major = get_device_capacity(torch.device("cuda"))[0]
-    assert sm_major in (10, 11), (
-        f"Blockscaled GEMM requires SM100 (B200/B300) or SM110; got SM{sm_major}x. "
-        "MXFP8/MXFP4/NVFP4 use tcgen05 UMMA which is SM100+."
+    assert sm_major in (10, 11, 12), (
+        f"Blockscaled GEMM requires SM100/SM110 or SM120; got SM{sm_major}x."
     )
 
+    if sm_major == 12 and (args.varlen_m or args.varlen_k):
+        raise NotImplementedError("SM120 blockscaled benchmark path does not support varlen")
     if args.varlen_k or args.gather_A or args.pingpong:
         raise NotImplementedError(
             "blockscaled + varlen_k/gather/pingpong is not wired up yet. "
@@ -257,12 +267,28 @@ def _run_blockscaled(args):
         raise ValueError(
             f"MXFP4/NVFP4 require K-major for both A and B; got a_major={a_major}, b_major={b_major}"
         )
-    if not GemmDefaultSm100.can_implement_blockscaled(
+    GemmBlockscaledCls = GemmDefaultSm120 if sm_major == 12 else GemmDefaultSm100
+    mma_tiler_for_validation = (
+        tuple(mma_tiler_mnk) if len(mma_tiler_mnk) == 3 or sm_major != 12 else (*mma_tiler_mnk, 64)
+    )
+    if (
+        sm_major == 12
+        and len(mma_tiler_for_validation) == 3
+        and mma_tiler_for_validation[2] == 128
+        and os.environ.get("QUACK_SM120_BLOCKSCALED_PACKED_LDSM") != "1"
+    ):
+        raise NotImplementedError(
+            "SM120 blockscaled tile_K=128 requires the packed ldmatrix path. "
+            "Set QUACK_SM120_BLOCKSCALED_PACKED_LDSM=1, for example:\n"
+            "  QUACK_SM120_BLOCKSCALED_PACKED_LDSM=1 CUTE_DSL_ARCH=sm_120a "
+            "python benchmarks/benchmark_gemm.py --tile_shape_mnk 64,64,128 ..."
+        )
+    if not GemmBlockscaledCls.can_implement_blockscaled(
         ab_dtype,
         sf_dtype,
         sf_vec_size,
         d_dtype,
-        mma_tiler_mnk,
+        mma_tiler_for_validation,
         cluster_shape_mn,
         m,
         n,
@@ -322,28 +348,43 @@ def _run_blockscaled(args):
         def fn():
             runner(mA, mB, mD, mSFA, mSFB, cu_seqlens_m)
     else:
-        a_ref, mA, a_sc_contig = create_blockscaled_operand_quantized(
-            l,
-            m,
-            k,
-            a_major == "m",
-            sf_vec_size,
-            ab_dtype,
-            sf_dtype,
-        )
-        b_ref, mB, b_sc_contig = create_blockscaled_operand_quantized(
-            l,
-            n,
-            k,
-            b_major == "n",
-            sf_vec_size,
-            ab_dtype,
-            sf_dtype,
-        )
-        # (l, rm, rk, 512) contig scale — consumed directly by the kernel.
-        mSFA, mSFB = a_sc_contig, b_sc_contig
-        sfa_ref = torch.ones_like(a_ref)
-        sfb_ref = torch.ones_like(b_ref)
+        if sm_major == 12:
+            if ab_dtype is not cutlass.Float4E2M1FN or d_dtype is not cutlass.BFloat16:
+                raise TypeError(
+                    "SM120 blockscaled benchmark currently supports FP4 inputs and BF16 D"
+                )
+            _, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype, init="empty")
+            _, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype, init="empty")
+            mA.view(torch.uint8).fill_(0x22)
+            mB.view(torch.uint8).fill_(0x22)
+            a_ref = torch.ones((m, k, l), device="cuda", dtype=torch.float32)
+            b_ref = torch.ones((n, k, l), device="cuda", dtype=torch.float32)
+            sfa_ref, mSFA = create_sm120_blockscaled_scale_tensor(l, m, k, sf_vec_size, sf_dtype)
+            sfb_ref, mSFB = create_sm120_blockscaled_scale_tensor(l, n, k, sf_vec_size, sf_dtype)
+            a_sc_contig = b_sc_contig = None
+        else:
+            a_ref, mA, a_sc_contig = create_blockscaled_operand_quantized(
+                l,
+                m,
+                k,
+                a_major == "m",
+                sf_vec_size,
+                ab_dtype,
+                sf_dtype,
+            )
+            b_ref, mB, b_sc_contig = create_blockscaled_operand_quantized(
+                l,
+                n,
+                k,
+                b_major == "n",
+                sf_vec_size,
+                ab_dtype,
+                sf_dtype,
+            )
+            # (l, rm, rk, 512) contig scale — consumed directly by the kernel.
+            mSFA, mSFB = a_sc_contig, b_sc_contig
+            sfa_ref = torch.ones_like(a_ref)
+            sfb_ref = torch.ones_like(b_ref)
         _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
         runner = compile_blockscaled_gemm_tvm_ffi(
             ab_dtype,
@@ -374,10 +415,12 @@ def _run_blockscaled(args):
             torch.testing.assert_close(mD.float(), ref, atol=tol, rtol=1e-3)
         else:
             ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
+            if d_dtype != cutlass.Float32:
+                ref = ref.to(torch_dtype_for_cutlass(d_dtype)).float()
             torch.testing.assert_close(mD.float(), ref, atol=tol, rtol=1e-3)
         print("Ref check PASSED")
 
-    print("Running SM100 Blockscaled GEMM with:")
+    print(f"Running SM{sm_major}0 Blockscaled GEMM with:")
     print(f"mnkl: {args.mnkl}")
     print(f"tile_shape_mnk: {mma_tiler_mnk}, cluster_shape_mnk: {cluster_shape_mnk}")
     print(
@@ -396,6 +439,12 @@ def _run_blockscaled(args):
         # with per-group swizzled scales we don't build here. Looping F.scaled_mm per
         # batch would be an unfair comparison (hides batching potential), so skip.
         print("(skipping cuBLAS: batched blockscaled mm not supported via a single call)")
+        return
+    if sm_major == 12:
+        print(
+            "(skipping cuBLAS comparison: SM120 benchmark currently builds QuACK's "
+            "padded row-major scale tensors, not the cuBLAS/PyTorch scaled_mm scale layout)"
+        )
         return
     if a_major != "k" or b_major != "k":
         # F.scaled_mm requires A (M,K) row-major and B (K,N) col-major —
@@ -632,5 +681,8 @@ def run(args):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args)
+    try:
+        run(args)
+    except (NotImplementedError, TypeError, ValueError) as exc:
+        raise SystemExit(f"benchmark_gemm.py: error: {exc}") from None
     print("PASS")
