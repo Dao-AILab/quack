@@ -608,6 +608,7 @@ def compile_blockscaled_gemm_tvm_ffi(
     use_clc_persistence: bool = True,
     varlen_m: bool = False,
     varlen_k: bool = False,
+    sfa_tile_aligned: bool = False,
 ) -> Callable:
     """Compile the SM100 blockscaled GEMM.
 
@@ -625,6 +626,7 @@ def compile_blockscaled_gemm_tvm_ffi(
         GemmDefaultSm100,
         sf_vec_size=sf_vec_size,
         use_clc_persistence=use_clc_persistence,
+        sfa_tile_aligned=sfa_tile_aligned,
     )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
     compile_epi_args = gemm.EpilogueArguments()
     scheduler_args = make_scheduler_args(
