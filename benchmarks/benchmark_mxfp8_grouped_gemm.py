@@ -21,7 +21,6 @@ from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm
 
 SF_VEC = 32
 dev = torch.device("cuda")
-PEAK_BF16 = None  # filled empirically from the biggest bf16 run
 
 
 def make(group_sizes, k, n, seed=0):
@@ -91,40 +90,34 @@ def bench_quack(d, route):
 def bench_torch_bf16(d):
     a_hp, b_hp, offs = d["a_hp"], d["b_hp"], d["offs"]
     bt = b_hp.transpose(1, 2).contiguous()  # (E,K,N)
-    try:
-        call = lambda: torch._grouped_mm(a_hp, bt, offs=offs, out_dtype=torch.bfloat16)
-        call()
-        torch.cuda.synchronize()
-        ms = timed(call)
-        return ms, flops(d["gs"], d["k"], d["n"]) / (ms * 1e-3) / 1e12
-    except Exception as ex:
-        return None, repr(ex)[:60]
+    call = lambda: torch._grouped_mm(a_hp, bt, offs=offs, out_dtype=torch.bfloat16)
+    call()
+    torch.cuda.synchronize()
+    ms = timed(call)
+    return ms, flops(d["gs"], d["k"], d["n"]) / (ms * 1e-3) / 1e12
 
 
 def bench_torch_mxfp8(d):
-    """Best-effort: torch._scaled_grouped_mm with cutlass blocked mxfp8 scales."""
+    """torch._scaled_grouped_mm with cutlass blocked mxfp8 scales."""
     qa, b_disp, offs = d["qa"], d["b_disp"], d["offs"]
     e, k, n, sf_k = d["e"], d["k"], d["n"], d["sf_k"]
-    try:
-        # scale_b: per-group blocked pack of (E,N,sf_k) -> (E, rmN*rk*512) flattened
-        sb_blk = pack_scale_2d_to_blocked_contig(d["sb"])  # (E, rmN, rk, 512)
-        sb_t = sb_blk.reshape(e, -1)
-        # scale_a: blocked pack -> 2D (M_pad, Kb_pad) (swizzled buffer reshaped; torch's layout)
-        sa_blk = pack_scale_2d_to_blocked_contig(d["sa"].view(1, d["total_m"], sf_k))  # (1,rmM,rk,512)
-        rmM, rk = sa_blk.shape[1], sa_blk.shape[2]
-        sa_t = sa_blk.reshape(rmM * 128, rk * 4)
-        call = lambda: torch._scaled_grouped_mm(qa, b_disp, sa_t, sb_t, offs=offs,
-                                                out_dtype=torch.bfloat16)
-        out = call()
-        torch.cuda.synchronize()
-        ref = ref_grouped(d["a_ref"], d["b_ref"], d["gs"])
-        err = (out.float() - ref).abs().max().item() if ref.numel() else 1e9
-        if err > 5e-2:
-            return None, None, f"layout-wrong err={err:.2f}"
-        ms = timed(call)
-        return ms, flops(d["gs"], d["k"], d["n"]) / (ms * 1e-3) / 1e12, "ok"
-    except Exception as ex:
-        return None, None, repr(ex)[:70]
+    # scale_b: per-group blocked pack of (E,N,sf_k) -> (E, rmN*rk*512) flattened
+    sb_t = pack_scale_2d_to_blocked_contig(d["sb"]).reshape(e, -1)
+    # scale_a: blocked pack -> 2D (M_pad, Kb_pad) (swizzled buffer reshaped; torch's layout)
+    sa_blk = pack_scale_2d_to_blocked_contig(d["sa"].view(1, d["total_m"], sf_k))  # (1,rmM,rk,512)
+    rmM, rk = sa_blk.shape[1], sa_blk.shape[2]
+    sa_t = sa_blk.reshape(rmM * 128, rk * 4)
+    call = lambda: torch._scaled_grouped_mm(
+        qa, b_disp, sa_t, sb_t, offs=offs, out_dtype=torch.bfloat16
+    )
+    out = call()
+    torch.cuda.synchronize()
+    ref = ref_grouped(d["a_ref"], d["b_ref"], d["gs"])
+    if ref.numel():
+        err = (out.float() - ref).abs().max().item()
+        assert err < 5e-2, f"torch mxfp8 baseline wrong: err={err:.2f} (scale-layout mismatch?)"
+    ms = timed(call)
+    return ms, flops(d["gs"], d["k"], d["n"]) / (ms * 1e-3) / 1e12
 
 
 # ---------------- regime matrix ----------------
@@ -158,41 +151,20 @@ CASES.append(("moe E=256 g=128 (uniform)", "uniform", uni(128, 256)))
 
 
 def main():
-    global PEAK_BF16
     print(f"{'regime':<46}{'KN':<13}{'route':<8}{'q_ms':>8}{'q_TFLOPS':>10}"
           f"{'bf16_TF':>9}{'fp8_TF':>9}{'q/bf16':>7}{'q/fp8':>7}{'ok':>4}")
     print("-" * 130)
-    rows = []
     for (regime, route, gs) in CASES:
         for (k, n) in KN:
-            try:
-                d = make(gs, k, n)
-            except Exception as ex:
-                print(f"{regime:<46}{f'{k}x{n}':<13} make FAIL {repr(ex)[:40]}")
-                continue
-            try:
-                q_ms, q_tf, ok, err = bench_quack(d, route)
-            except Exception as ex:
-                print(f"{regime:<46}{f'{k}x{n}':<13}{route:<8} quack FAIL {repr(ex)[:50]}")
-                continue
+            d = make(gs, k, n)
+            q_ms, q_tf, ok, _ = bench_quack(d, route)
             bf_ms, bf_tf = bench_torch_bf16(d)
-            fp_ms, fp_tf, fp_msg = bench_torch_mxfp8(d)
-            if isinstance(bf_tf, float):
-                PEAK_BF16 = max(PEAK_BF16 or 0, bf_tf)
-            spdup = (bf_ms / q_ms) if (isinstance(bf_ms, float) and q_ms) else float("nan")
-            qfp = (fp_ms / q_ms) if (isinstance(fp_ms, float) and q_ms) else float("nan")
-            bf_s = f"{bf_tf:.0f}" if isinstance(bf_tf, float) else "-"
-            fp_s = f"{fp_tf:.0f}" if isinstance(fp_tf, float) else "-"
-            qfp_s = f"{qfp:.2f}" if qfp == qfp else "-"
+            fp_ms, fp_tf = bench_torch_mxfp8(d)
+            spdup = bf_ms / q_ms
+            qfp = fp_ms / q_ms
             print(f"{regime:<46}{f'{k}x{n}':<13}{route:<8}{q_ms:>8.3f}{q_tf:>10.0f}"
-                  f"{bf_s:>9}{fp_s:>9}{spdup:>7.2f}{qfp_s:>7}{('Y' if ok else 'N!'):>4}")
-            rows.append((regime, k, n, route, q_ms, q_tf, bf_tf, fp_tf, ok, err, fp_msg))
-    print("-" * 122)
-    print(f"empirical bf16 peak (max observed) = {PEAK_BF16:.0f} TFLOPS  "
-          f"-> implied fp8 peak ~ {2*PEAK_BF16:.0f} TFLOPS")
-    # mxfp8 baseline status
-    msgs = set(r[10] for r in rows if r[7] is None)
-    print("torch mxfp8 baseline status samples:", list(msgs)[:4])
+                  f"{bf_tf:>9.0f}{fp_tf:>9.0f}{spdup:>7.2f}{qfp:>7.2f}{('Y' if ok else 'N!'):>4}")
+    print("-" * 130)
 
 
 if __name__ == "__main__":

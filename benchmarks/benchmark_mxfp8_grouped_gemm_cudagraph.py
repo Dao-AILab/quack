@@ -100,33 +100,25 @@ def run(label, gs, k, n, mode):
         qfn = lambda: gemm(qa, offs, sa, varlen=True)
     # correctness (eager, once) + JIT compile
     out = qfn(); torch.cuda.synchronize()
-    err = (out.float() - ref_grouped(a_ref, b_ref, gs)).abs().max().item()
-    ok = err < 5e-2
+    ok = (out.float() - ref_grouped(a_ref, b_ref, gs)).abs().max().item() < 5e-2
     q_ms = capture_and_time(qfn)
 
     # torch baseline (graphed)
-    t_ms, t_ok = None, None
-    try:
-        sa_t, sb_t = torch_scales(sa, sb, total_m, sf_k, e)
-        tfn = lambda: torch._scaled_grouped_mm(qa, b_disp, sa_t, sb_t, offs=offs,
-                                               out_dtype=torch.bfloat16)
-        o = tfn(); torch.cuda.synchronize()
-        t_err = (o.float() - ref_grouped(a_ref, b_ref, gs)).abs().max().item()
-        t_ok = t_err < 5e-2
-        t_ms = capture_and_time(tfn)
-    except Exception as ex:
-        t_ms = None; t_err_msg = repr(ex)[:50]
+    sa_t, sb_t = torch_scales(sa, sb, total_m, sf_k, e)
+    tfn = lambda: torch._scaled_grouped_mm(
+        qa, b_disp, sa_t, sb_t, offs=offs, out_dtype=torch.bfloat16
+    )
+    o = tfn(); torch.cuda.synchronize()
+    t_err = (o.float() - ref_grouped(a_ref, b_ref, gs)).abs().max().item()
+    assert t_err < 5e-2, f"torch mxfp8 baseline wrong: err={t_err:.2f}"
+    t_ms = capture_and_time(tfn)
 
     fl = flops(gs, k, n)
     q_tf = fl / (q_ms * 1e-3) / 1e12
-    if t_ms:
-        t_tf = fl / (t_ms * 1e-3) / 1e12
-        ratio = t_ms / q_ms  # >1 => quack faster
-        print(f"{label:<28}{f'{k}x{n}':<11}{q_ms*1e3:>9.1f}{q_tf:>9.0f}{t_ms*1e3:>9.1f}{t_tf:>9.0f}"
-              f"{ratio:>8.2f}{('Y' if (ok and t_ok) else 'N!'):>4}")
-    else:
-        print(f"{label:<28}{f'{k}x{n}':<11}{q_ms*1e3:>9.1f}{q_tf:>9.0f}{'-':>9}{'-':>9}{'-':>8}"
-              f"{('Y' if ok else 'N!'):>4}  (torch: {t_err_msg})")
+    t_tf = fl / (t_ms * 1e-3) / 1e12
+    ratio = t_ms / q_ms  # >1 => quack faster
+    print(f"{label:<28}{f'{k}x{n}':<11}{q_ms*1e3:>9.1f}{q_tf:>9.0f}{t_ms*1e3:>9.1f}{t_tf:>9.0f}"
+          f"{ratio:>8.2f}{('Y' if ok else 'N!'):>4}")
 
 
 def main():
@@ -136,17 +128,11 @@ def main():
     print("-" * 92)
     for k, n in KN:
         for label, gs in UNIFORM:
-            try:
-                run(label, gs, k, n, "uniform")
-            except Exception as ex:
-                print(f"{label:<28}{f'{k}x{n}':<11} FAIL {repr(ex)[:50]}")
+            run(label, gs, k, n, "uniform")
         for label, gs in VARLEN:
-            try:
-                run(label, gs, k, n, "varlen")
-            except Exception as ex:
-                print(f"{label:<28}{f'{k}x{n}':<11} FAIL {repr(ex)[:50]}")
+            run(label, gs, k, n, "varlen")
         print("-" * 92)
-    print("q_us/torch_us = per-replay microseconds; tch/q > 1 => quack faster than cuBLAS under graphs")
+    print("q_us/torch_us = per-replay microseconds; tch/q > 1 => quack faster than cuBLAS")
 
 
 if __name__ == "__main__":
