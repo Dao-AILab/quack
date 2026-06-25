@@ -119,6 +119,7 @@ def test_mxfp8_grouped_gemm_cuda_graph_capturable(mode):
     )
 
 
+@pytest.mark.parametrize("builder", ["device", "triton"])
 @pytest.mark.parametrize("k", [256, 160])  # 160 -> sf_k=5 (not a multiple of 4): partial K-block
 @pytest.mark.parametrize(
     "group_sizes",
@@ -131,13 +132,18 @@ def test_mxfp8_grouped_gemm_cuda_graph_capturable(mode):
         (128, 128),  # total_m exact multiple of 128
     ],
 )
-def test_dqaccum_padded_sfa_device_byte_identical(group_sizes, k):
-    """The device SFA builder must be byte-identical to the host scatter -- the unchanged
+def test_dqaccum_padded_sfa_byte_identical(group_sizes, k, builder):
+    """Both device SFA builders must be byte-identical to the host scatter -- the unchanged
     kernel reads this exact layout. Guards the cu//128+i placement and the blocked swizzle."""
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    from quack.mxfp8_grouped_gemm import _dqaccum_padded_sfa, _dqaccum_padded_sfa_device
+    from quack.mxfp8_grouped_gemm import (
+        _dqaccum_padded_sfa,
+        _dqaccum_padded_sfa_device,
+        _dqaccum_padded_sfa_triton,
+    )
 
+    build = {"device": _dqaccum_padded_sfa_device, "triton": _dqaccum_padded_sfa_triton}[builder]
     torch.manual_seed(0)
     e = len(group_sizes)
     total_m = sum(group_sizes)
@@ -148,9 +154,9 @@ def test_dqaccum_padded_sfa_device_byte_identical(group_sizes, k):
     )
     offs = torch.tensor(list(itertools.accumulate(group_sizes)), dtype=torch.int32, device=dev)
     host = _dqaccum_padded_sfa(sfa, list(group_sizes), sf_k, e)
-    device = _dqaccum_padded_sfa_device(sfa, offs, sf_k, e)
-    assert device.shape == host.shape, f"shape {tuple(device.shape)} != {tuple(host.shape)}"
-    assert torch.equal(device.view(torch.uint8), host.view(torch.uint8))
+    got = build(sfa, offs, sf_k, e)
+    assert got.shape == host.shape, f"shape {tuple(got.shape)} != {tuple(host.shape)}"
+    assert torch.equal(got.view(torch.uint8), host.view(torch.uint8))
 
 
 @pytest.mark.parametrize(

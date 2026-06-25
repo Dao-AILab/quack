@@ -38,6 +38,14 @@ from quack.gemm_blockscaled_interface import (
     mxfp8_gemm_out,
 )
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # triton ships with torch on CUDA; fall back to the torch builder if absent
+    _HAS_TRITON = False
+
 SF_VEC = 32
 
 
@@ -120,6 +128,62 @@ def _dqaccum_padded_sfa_device(sfa: Tensor, offs: Tensor, sf_k: int, e: int) -> 
     return pack_scale_2d_to_blocked_contig(sa_padded.view(1, total_padded_m, sf_k))
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _dqaccum_sfa_swizzle_kernel(
+        in_ptr,  # (total_m, sf_k) uint8, row-major
+        offs_ptr,  # (e,) int32 cumulative end offsets
+        out_ptr,  # flat uint8, zero-initialized, length rm * rk * 512
+        in_stride_m,  # row stride of in_ptr (= sf_k for contiguous)
+        sf_k,  # number of real scale columns
+        rk: tl.constexpr,  # ceil(sf_k, 4)
+        TILE: tl.constexpr,  # 128
+        KB: tl.constexpr,  # 4 (K-blocks packed per 512-byte atom)
+    ):
+        gid = tl.program_id(0)  # expert
+        cb = tl.program_id(1)  # k-block (0 .. rk-1)
+        in_start = tl.load(offs_ptr + gid - 1, mask=gid > 0, other=0).to(tl.int64)
+        in_end = tl.load(offs_ptr + gid).to(tl.int64)
+        out_start_tile = in_start // TILE + gid
+        r = tl.arange(0, TILE)
+        c = tl.arange(0, KB)
+        # 32x4x4 blocked swizzle within the 512-byte atom; matches pack_scale_2d_to_blocked_contig
+        # ((r%32)*16 + (r//32)*4 + col) == its (128,4)->(4,32,4)->transpose(3,4)->512 reshuffle.
+        dest = ((r % 32)[:, None] * 16 + (r // 32)[:, None] * 4 + c[None, :]).to(tl.int64)
+        col = cb * KB + c
+        col_mask = col < sf_k
+        cur = in_start
+        while cur < in_end:  # one 128-row tile per iteration; partial last tile masked to zero
+            in_rows = cur + r
+            mask = (in_rows < in_end)[:, None] & col_mask[None, :]
+            in_off = in_rows[:, None].to(tl.int64) * in_stride_m + col[None, :].to(tl.int64)
+            vals = tl.load(in_ptr + in_off, mask=mask, other=0)
+            rb = out_start_tile + (cur - in_start) // TILE
+            tl.store(out_ptr + rb * (rk * 512) + cb * 512 + dest, vals, mask=mask)
+            cur += TILE
+
+
+def _dqaccum_padded_sfa_triton(sfa: Tensor, offs: Tensor, sf_k: int, e: int) -> Tensor:
+    """Fused single-pass equivalent of _dqaccum_padded_sfa_device: one Triton kernel does the
+    per-expert scatter + 32x4x4 swizzle, replacing searchsorted + index_copy_ + pack (~4-6
+    kernels). Byte-identical output, same syncless / CUDA-graph-capturable property. Falls back
+    to the torch builder if Triton is unavailable."""
+    if not _HAS_TRITON:
+        return _dqaccum_padded_sfa_device(sfa, offs, sf_k, e)
+    tile = 128
+    total_m = sfa.shape[0]
+    total_padded_m = ((total_m + tile - 1) // tile + (e - 1)) * tile
+    rm = total_padded_m // tile
+    rk = (sf_k + 3) // 4
+    out = torch.zeros(rm * rk * 512, dtype=torch.uint8, device=sfa.device)
+    in_u8 = sfa.view(torch.uint8)
+    _dqaccum_sfa_swizzle_kernel[(e, rk)](
+        in_u8, offs.to(torch.int32), out, in_u8.stride(0), sf_k, rk, tile, 4
+    )
+    return out.view(torch.float8_e8m0fnu).view(1, rm, rk, 512)
+
+
 @lru_cache(maxsize=32)
 def _varlen_runner(n: int, k: int, e: int, tiler, cluster, sfa_tile_aligned: bool = True):
     # Compile once; the kernel uses cute.sym_int for total_m so one compile serves
@@ -184,7 +248,7 @@ def _run_varlen_dqaccum(a, offs, sfa, mB, mSFB, out, e, k, n, sf_k, tiler, clust
     dQaccum-padded SFA on device and use the sfa_tile_aligned=False kernel path. A and the
     output are passed NATURALLY (no full-A pad/copy, no gather-back -- only the small SFA is
     padded). Everything is derived from shapes + device offs, so this path is sync-free."""
-    mSFA = _dqaccum_padded_sfa_device(sfa, offs, sf_k, e)
+    mSFA = _dqaccum_padded_sfa_triton(sfa, offs, sf_k, e)
     cu = torch.zeros(e + 1, dtype=torch.int32, device=offs.device)
     cu[1:].copy_(offs.to(torch.int32))
     runner = _varlen_runner(n, k, e, tiler, cluster, sfa_tile_aligned=False)
