@@ -117,3 +117,91 @@ def test_mxfp8_grouped_gemm_cuda_graph_capturable(mode):
     torch.testing.assert_close(
         out.float(), _ref_grouped(a_ref, b_ref, group_sizes), atol=1e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize("k", [256, 160])  # 160 -> sf_k=5 (not a multiple of 4): partial K-block
+@pytest.mark.parametrize(
+    "group_sizes",
+    [
+        (100, 200, 156),  # ragged non-128
+        (128, 256, 384),  # all 128-aligned
+        (256, 0, 256, 256),  # empty expert (middle)
+        (0, 128, 100, 28),  # empty expert (first) + non-128
+        (100, 300, 200, 400),  # non-128, total_m % 128 != 0
+        (128, 128),  # total_m exact multiple of 128
+    ],
+)
+def test_dqaccum_padded_sfa_device_byte_identical(group_sizes, k):
+    """The device SFA builder must be byte-identical to the host scatter -- the unchanged
+    kernel reads this exact layout. Guards the cu//128+i placement and the blocked swizzle."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from quack.mxfp8_grouped_gemm import _dqaccum_padded_sfa, _dqaccum_padded_sfa_device
+
+    torch.manual_seed(0)
+    e = len(group_sizes)
+    total_m = sum(group_sizes)
+    sf_k = k // SF_VEC
+    dev = torch.device("cuda")
+    sfa = torch.randint(0, 256, (total_m, sf_k), dtype=torch.uint8, device=dev).view(
+        torch.float8_e8m0fnu
+    )
+    offs = torch.tensor(list(itertools.accumulate(group_sizes)), dtype=torch.int32, device=dev)
+    host = _dqaccum_padded_sfa(sfa, list(group_sizes), sf_k, e)
+    device = _dqaccum_padded_sfa_device(sfa, offs, sf_k, e)
+    assert device.shape == host.shape, f"shape {tuple(device.shape)} != {tuple(host.shape)}"
+    assert torch.equal(device.view(torch.uint8), host.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "group_sizes",
+    [
+        (100, 300, 200, 424),  # non-128 boundaries, total_m % 128 == 0
+        (256, 0, 256, 256),  # empty expert
+        (100, 300, 200, 400),  # non-128 boundaries AND total_m % 128 != 0
+    ],
+)
+def test_mxfp8_grouped_gemm_varlen_nonaligned(group_sizes):
+    """varlen_nonaligned=True: arbitrary (non-128) ragged groups via the device-built
+    dQaccum SFA, matching a per-group dequant reference; eager and prepared are identical."""
+    _skip_if_not_sm100()
+    from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm, mxfp8_grouped_gemm
+
+    qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, 512, 512)
+    ref = _ref_grouped(a_ref, b_ref, group_sizes)
+    eager = mxfp8_grouped_gemm(qa, b_disp, offs, sa, sb, varlen_nonaligned=True)
+    prepared = MXFP8GroupedGemm(b_disp, sb, varlen_nonaligned=True)(qa, offs, sa)
+    torch.testing.assert_close(eager.float(), ref, atol=1e-2, rtol=1e-2)
+    assert torch.equal(eager, prepared)
+
+
+@pytest.mark.parametrize("group_sizes", [(100, 300, 200, 424), (256, 0, 256, 256)])
+def test_mxfp8_grouped_gemm_varlen_nonaligned_capturable(group_sizes):
+    """The non-128 path with varlen_nonaligned=True captures + replays under a CUDA graph.
+    torch.cuda.graph raises on any host<->device sync -- the empirical syncless proof
+    (a source grep can't see a sync hidden inside an ATen op)."""
+    _skip_if_not_sm100()
+    from quack.mxfp8_grouped_gemm import MXFP8GroupedGemm
+
+    qa, b_disp, offs, sa, sb, a_ref, b_ref = _make_grouped_mxfp8(group_sizes, 512, 512)
+    gemm = MXFP8GroupedGemm(b_disp, sb, varlen_nonaligned=True)
+    out = torch.empty(sum(group_sizes), 512, dtype=torch.bfloat16, device=qa.device)
+    call = lambda: gemm(qa, offs, sa, out=out)
+
+    call()  # compile outside capture
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):  # raises if the path does any host<->device copy / sync
+        call()
+    g.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out.float(), _ref_grouped(a_ref, b_ref, group_sizes), atol=1e-2, rtol=1e-2
+    )

@@ -53,14 +53,6 @@ def _uniform_group_size(offsets_host: Tuple[int, ...]) -> Optional[int]:
     return g
 
 
-def _group_sizes(offsets_host: Tuple[int, ...]) -> List[int]:
-    prev, out = 0, []
-    for cur in offsets_host:
-        out.append(cur - prev)
-        prev = cur
-    return out
-
-
 def _boundaries_128_aligned(offsets_host: Tuple[int, ...]) -> bool:
     prev = 0
     for cur in offsets_host:
@@ -98,6 +90,33 @@ def _dqaccum_padded_sfa(sfa: Tensor, group_sizes: List[int], sf_k: int, e: int) 
         off_padded = (off // tile + i) * tile
         sa_padded[off_padded : off_padded + m_i] = sfa[off : off + m_i]
         off += m_i
+    return pack_scale_2d_to_blocked_contig(sa_padded.view(1, total_padded_m, sf_k))
+
+
+def _dqaccum_padded_sfa_device(sfa: Tensor, offs: Tensor, sf_k: int, e: int) -> Tensor:
+    """Device-only equivalent of _dqaccum_padded_sfa: builds the byte-identical padded
+    blocked SFA from natural sfa + device offs, so the non-128 route stays CUDA-graph
+    capturable (no host group sizes). Expert i's rows land at padded tile (cu[i] // 128 + i),
+    the same floor-cumulative placement the kernel reads via offset_batch_SFA (cu // 128 + b).
+
+    All ops are shape-derived / fixed-shape (searchsorted + index_copy_, no data-dependent
+    output shapes), so the builder itself captures under a CUDA graph. ``searchsorted`` with
+    right=True naturally skips empty experts.
+    """
+    tile = 128
+    total_m = sfa.shape[0]
+    total_padded_m = ((total_m + tile - 1) // tile + (e - 1)) * tile
+    dev = sfa.device
+    cu = torch.zeros(e + 1, dtype=torch.int64, device=dev)
+    cu[1:].copy_(offs)
+    rows = torch.arange(total_m, dtype=torch.int64, device=dev)
+    row_expert = torch.searchsorted(cu[1:], rows, right=True)
+    starts = cu[:-1]  # per-expert un-padded cumulative start (cu[i])
+    off_padded = (starts // tile + torch.arange(e, dtype=torch.int64, device=dev)) * tile
+    dest = rows + (off_padded - starts)[row_expert]
+    sa_padded = sfa.new_zeros(total_padded_m, sf_k)
+    # index_copy_ isn't implemented for e8m0; write through a uint8 view (shared 1-byte storage).
+    sa_padded.view(torch.uint8).index_copy_(0, dest, sfa.view(torch.uint8))
     return pack_scale_2d_to_blocked_contig(sa_padded.view(1, total_padded_m, sf_k))
 
 
@@ -161,13 +180,11 @@ def _default_tiler_cluster_for(total_m: int, e: int, n: int):
 
 
 def _run_varlen_dqaccum(a, offs, sfa, mB, mSFB, out, e, k, n, sf_k, tiler, cluster):
-    """Run the varlen-M kernel for ARBITRARY (incl. non-128) ragged boundaries: pack SFA in
-    dQaccum-padded layout and use the sfa_tile_aligned=False kernel path. A and the output are
-    passed NATURALLY (no full-A pad/copy, no gather-back -- only the small SFA is padded).
-    cu_seqlens is built on device from offs; group sizes (host) are needed only for the SFA pack."""
-    total_m = a.shape[0]
-    group_sizes = _group_sizes(tuple(int(v) for v in offs.detach().cpu().tolist()))
-    mSFA = _dqaccum_padded_sfa(sfa, group_sizes, sf_k, e)
+    """Run the varlen-M kernel for ARBITRARY (incl. non-128) ragged boundaries: build the
+    dQaccum-padded SFA on device and use the sfa_tile_aligned=False kernel path. A and the
+    output are passed NATURALLY (no full-A pad/copy, no gather-back -- only the small SFA is
+    padded). Everything is derived from shapes + device offs, so this path is sync-free."""
+    mSFA = _dqaccum_padded_sfa_device(sfa, offs, sf_k, e)
     cu = torch.zeros(e + 1, dtype=torch.int32, device=offs.device)
     cu[1:].copy_(offs.to(torch.int32))
     runner = _varlen_runner(n, k, e, tiler, cluster, sfa_tile_aligned=False)
@@ -184,6 +201,7 @@ def mxfp8_grouped_gemm(
     out: Optional[Tensor] = None,
     uniform: bool = False,
     varlen: bool = False,
+    varlen_nonaligned: bool = False,
 ) -> Tensor:
     """Grouped MXFP8 GEMM. See module docstring for shape/layout contract.
 
@@ -196,13 +214,19 @@ def mxfp8_grouped_gemm(
     boundaries (e.g. capacity-padded MoE). ``offs`` is consumed only on device
     (cu_seqlens) and the varlen-M kernel uses its natural (sfa_tile_aligned) SFA path.
 
-    Both flag paths read ``offs`` only on device, so they are CUDA-graph capturable.
-    ``uniform`` and ``varlen`` are mutually exclusive.
+    If ``varlen_nonaligned=True`` the caller asserts ragged groups with ARBITRARY (incl.
+    non-128) boundaries. ``offs`` is consumed only on device and the dQaccum-padded SFA is
+    built on device, so this path is also CUDA-graph capturable.
+
+    All three flag paths read ``offs`` only on device, so they are CUDA-graph capturable;
+    they are mutually exclusive.
     """
     assert a.dim() == 2 and b.dim() == 3 and sfa.dim() == 2 and sfb.dim() == 3
     assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
     assert sfa.dtype == torch.float8_e8m0fnu and sfb.dtype == torch.float8_e8m0fnu
-    assert not (uniform and varlen), "uniform and varlen are mutually exclusive"
+    assert sum([uniform, varlen, varlen_nonaligned]) <= 1, (
+        "uniform/varlen/varlen_nonaligned are mutually exclusive"
+    )
     total_m, k = a.shape
     e, kb, n = b.shape
     assert kb == k and k % SF_VEC == 0, f"K mismatch a={k} b={kb} (or not %{SF_VEC})"
@@ -231,6 +255,25 @@ def mxfp8_grouped_gemm(
         assert total_m % 128 == 0, f"varlen=True needs total_m {total_m} % 128 == 0"
         tiler, cluster = _default_tiler_cluster(total_m // e, n)
         return _run_varlen_natural(
+            a,
+            offs,
+            sfa,
+            b.permute(2, 1, 0),
+            pack_scale_2d_to_blocked_contig(sfb),
+            out,
+            e,
+            k,
+            n,
+            sf_k,
+            tiler,
+            cluster,
+        )
+
+    # Ragged groups with ARBITRARY (incl. non-128) boundaries (caller-asserted). offs is
+    # consumed only on device; dQaccum-padded SFA built on device via the sync-free builder.
+    if varlen_nonaligned:
+        tiler, cluster = _default_tiler_cluster_for(total_m, e, n)
+        return _run_varlen_dqaccum(
             a,
             offs,
             sfa,
@@ -282,7 +325,9 @@ class MXFP8GroupedGemm:
     capture tensors then update ``a`` / ``sfa`` / ``out`` in place between replays.
     """
 
-    def __init__(self, b: Tensor, sfb: Tensor, uniform: bool = False):
+    def __init__(
+        self, b: Tensor, sfb: Tensor, uniform: bool = False, varlen_nonaligned: bool = False
+    ):
         assert b.dim() == 3 and sfb.dim() == 3
         assert b.dtype == torch.float8_e4m3fn and sfb.dtype == torch.float8_e8m0fnu
         e, k, n = b.shape
@@ -291,6 +336,7 @@ class MXFP8GroupedGemm:
         assert tuple(sfb.shape) == (e, n, sf_k), f"sfb {tuple(sfb.shape)} != {(e, n, sf_k)}"
         self.e, self.k, self.n, self.sf_k = e, k, n, sf_k
         self.uniform = uniform
+        self.varlen_nonaligned = varlen_nonaligned
         # Pre-pack the fixed B-scale once; shared across calls and routes.
         self._sfb_packed = pack_scale_2d_to_blocked_contig(sfb)  # varlen passes this directly
         self._sfb_view_dense = scale_view_for_kernel(self._sfb_packed, n, sf_k, e)  # dense view
@@ -319,9 +365,15 @@ class MXFP8GroupedGemm:
         out: Optional[Tensor] = None,
         uniform: Optional[bool] = None,
         varlen: bool = False,
+        varlen_nonaligned: Optional[bool] = None,
     ) -> Tensor:
         uniform = self.uniform if uniform is None else uniform
-        assert not (uniform and varlen), "uniform and varlen are mutually exclusive"
+        varlen_nonaligned = (
+            self.varlen_nonaligned if varlen_nonaligned is None else varlen_nonaligned
+        )
+        assert sum([uniform, varlen, varlen_nonaligned]) <= 1, (
+            "uniform/varlen/varlen_nonaligned are mutually exclusive"
+        )
         e, k, n, sf_k = self.e, self.k, self.n, self.sf_k
         total_m, ka = a.shape
         assert ka == k, f"K mismatch a={ka} vs b={k}"
@@ -344,6 +396,13 @@ class MXFP8GroupedGemm:
             assert total_m % 128 == 0, f"varlen=True needs total_m {total_m} % 128 == 0"
             tiler, cluster = _default_tiler_cluster(total_m // e, n)
             return _run_varlen_natural(
+                a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
+            )
+
+        # Sync-free non-128 path: arbitrary ragged groups; device-built dQaccum SFA.
+        if varlen_nonaligned:
+            tiler, cluster = _default_tiler_cluster_for(total_m, e, n)
+            return _run_varlen_dqaccum(
                 a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
             )
 
