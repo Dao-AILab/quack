@@ -176,11 +176,8 @@ class GemmSm120(GemmSm90):
         epi_c_smem_layout: cute.ComposedLayout,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
-        trace_ptr: Optional[cutlass.Int64] = None,
     ):
-        from quack.trace import TraceContext
-
-        tctx = TraceContext.create(trace_ptr)
+        from cutlass.cute.experimental import iket
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -282,7 +279,7 @@ class GemmSm120(GemmSm90):
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
                 while work_tile.is_valid_tile:
-                    tctx.b("tma_load")
+                    iket.range_push("tma_load")
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
                     # Local_tile partition global tensors
@@ -343,7 +340,7 @@ class GemmSm120(GemmSm90):
                             k_tile_cnt,
                             varlen_m=varlen_m,
                         )
-                    tctx.e("tma_load")
+                    iket.range_pop()
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
@@ -436,7 +433,7 @@ class GemmSm120(GemmSm90):
                 acc.fill(0.0)
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
-                tctx.b("mma")
+                iket.range_push("mma")
                 ab_read_state = self.mma(
                     ab_pipeline,
                     ab_read_state,
@@ -453,14 +450,14 @@ class GemmSm120(GemmSm90):
                 if const_expr(self.pingpong):
                     # Cue for next WG's MMA to start
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
-                tctx.e("mma")
+                iket.range_pop()
 
                 # ============================================================
                 # EPILOGUE — reuse SM90's epilogue flow
                 # ============================================================
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
-                tctx.b("epilogue")
+                iket.range_push("epilogue")
 
                 copy_D = None
                 if const_expr(has_D):
@@ -543,7 +540,7 @@ class GemmSm120(GemmSm90):
                     if is_tma_warp:
                         epi_store_pipeline.producer_tail()
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
-                tctx.e("epilogue")
+                iket.range_pop()
 
                 if const_expr(not self.pingpong):
                     tile_scheduler.advance_to_next_work()
@@ -571,8 +568,6 @@ class GemmSm120(GemmSm90):
             if const_expr(not self.pingpong):
                 if is_tma_warp:
                     epi_store_pipeline.producer_tail()
-
-        tctx.flush()
 
     @cute.jit
     def mma(

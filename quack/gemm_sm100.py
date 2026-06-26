@@ -523,7 +523,6 @@ class GemmSm100(GemmTmaBase):
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
-        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -838,7 +837,6 @@ class GemmSm100(GemmTmaBase):
             self.epi_tile,
             tile_sched_params,
             TileSchedulerCls,
-            trace_ptr,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -881,15 +879,12 @@ class GemmSm100(GemmTmaBase):
         epi_tile: cute.Tile,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
-        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
 
-        from quack.trace import TraceContext
-
-        tctx = TraceContext.create(trace_ptr)
+        from cutlass.cute.experimental import iket
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -1221,7 +1216,7 @@ class GemmSm100(GemmTmaBase):
                         mcast_mask=sfb_mcast_mask,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                tctx.b("tma_load")
+                iket.range_push("tma_load")
                 if const_expr(not self.gather_A):
                     ab_producer_state = self.load_tma(
                         ab_pipeline,
@@ -1249,7 +1244,7 @@ class GemmSm100(GemmTmaBase):
                         copy_B,
                         k_tile_cnt,
                     )
-                tctx.e("tma_load")
+                iket.range_pop()
                 if const_expr(epi_load_barrier is not None):
                     # In the first work tile, the epi load warp will wait for the signal
                     # from the mainloop load warp to start loading C, to avoid interfering
@@ -1510,7 +1505,7 @@ class GemmSm100(GemmTmaBase):
                 if const_expr(self.blockscaled):
                     copy_s2t_sfa = copy_utils.s2t_get_copy_fn(sSFA, tCtSFA, self.cta_group)
                     copy_s2t_sfb = copy_utils.s2t_get_copy_fn(sSFB, tCtSFB, self.cta_group)
-                tctx.b("mma")
+                iket.range_push("mma")
                 ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
                     ab_pipeline,
                     acc_pipeline,
@@ -1546,7 +1541,7 @@ class GemmSm100(GemmTmaBase):
                         )
                         for mT in [tCtSFA, tCtSFB]
                     ]
-                tctx.e("mma")
+                iket.range_pop()
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
@@ -1650,7 +1645,7 @@ class GemmSm100(GemmTmaBase):
                     clear_acc=(varlen_k and k_len == 0),
                 )
 
-                tctx.b("epilogue")
+                iket.range_push("epilogue")
                 epi_read_state, _ = self.epilogue(
                     epilogue_params,
                     epi_smem_tensors,
@@ -1679,7 +1674,7 @@ class GemmSm100(GemmTmaBase):
                 )
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()
-                tctx.e("epilogue")
+                iket.range_pop()
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
@@ -1693,8 +1688,6 @@ class GemmSm100(GemmTmaBase):
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
-
-        tctx.flush()
 
     @cute.jit
     def _make_gather_A_copy(
