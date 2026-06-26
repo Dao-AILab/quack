@@ -178,14 +178,9 @@ class GemmActMixin(ComposableEpiMixin):
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
             tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            if const_expr(self.arch != 100):
-                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
-                    tRS_rAuxOut[i] = params.act_fn(tRS_rD[i])
-            else:
-                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
-                    tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
-                        (tRS_rD[2 * i], tRS_rD[2 * i + 1])
-                    )
+            vectorize = const_expr(self.arch == 100)
+            for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True, vectorize=vectorize):
+                tRS_rAuxOut[i] = params.act_fn(tRS_rD[i])
         else:
             tRS_rAuxOut = tRS_rD
         return (tRS_rAuxOut,)
@@ -262,14 +257,12 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         # If we don't have .shape here, the compiler generates local stores and loads
         tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
-        if const_expr(self.arch != 100):
-            for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
-                tRS_rAuxOut[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
-        else:
-            for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
-                tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
-                    (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
-                )
+        tRS_rD_pair = cute.flat_divide(tRS_rD, cute.make_layout(2))
+        tRS_rGate = tRS_rD_pair[0, ...]
+        tRS_rUp = tRS_rD_pair[1, ...]
+        vectorize = const_expr(self.arch == 100)
+        for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True, vectorize=vectorize):
+            tRS_rAuxOut[i] = params.act_fn(tRS_rGate[i], tRS_rUp[i])
         return (tRS_rAuxOut,)
 
     @cute.jit
@@ -610,9 +603,9 @@ def gemm_act(
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
 
 
 gemm_gated = gemm_act
