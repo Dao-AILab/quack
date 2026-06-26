@@ -63,6 +63,7 @@ act_to_pytorch_fn_map = {
     "relu": F.relu,
     "relu_sq": lambda x: F.relu(x).square(),
     "gelu_tanh_approx": partial(F.gelu, approximate="tanh"),
+    "tanh": torch.tanh,
 }
 
 
@@ -79,7 +80,7 @@ gated_to_pytorch_fn_map = {
 }
 
 
-ActActivation = Literal[None, "silu", "silu-tanh", "relu", "relu_sq", "gelu_tanh_approx"]
+ActActivation = Literal[None, "silu", "silu-tanh", "relu", "relu_sq", "gelu_tanh_approx", "tanh"]
 GatedActivation = Literal[
     "swiglu",
     "swiglu-tanh",
@@ -96,6 +97,7 @@ Activation = Literal[
     "relu",
     "relu_sq",
     "gelu_tanh_approx",
+    "tanh",
     "swiglu",
     "swiglu-tanh",
     "swiglu_oai",
@@ -1152,8 +1154,7 @@ def gemm_dact(
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
     # Empty-input fast path: M=0 / N=0 → outputs are empty; K=0 (A.numel()==0)
-    # makes preact contribution zero. dact at preact=0 is also 0 for every
-    # supported activation, so we can zero outputs and skip the kernel.
+    # makes the upstream GEMM gradient zero, so dx is zero regardless of activation.
     if dx_out.numel() == 0 or A.numel() == 0:
         _empty_k_matmul_into(dx_out)
         _empty_k_matmul_into(postact_out)
