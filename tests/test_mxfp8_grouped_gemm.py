@@ -130,6 +130,7 @@ def test_mxfp8_grouped_gemm_cuda_graph_capturable(mode):
         (0, 128, 100, 28),  # empty expert (first) + non-128
         (100, 300, 200, 400),  # non-128, total_m % 128 != 0
         (128, 128),  # total_m exact multiple of 128
+        (1024, 128, 128, 128),  # hot-expert skew: 8-tile expert -- the tile-parallel builder
     ],
 )
 def test_dqaccum_padded_sfa_byte_identical(group_sizes, k, builder):

@@ -137,15 +137,33 @@ if _HAS_TRITON:
         out_ptr,  # flat uint8, zero-initialized, length rm * rk * 512
         in_stride_m,  # row stride of in_ptr (= sf_k for contiguous)
         sf_k,  # number of real scale columns
+        e,  # number of experts (runtime)
         rk: tl.constexpr,  # ceil(sf_k, 4)
         TILE: tl.constexpr,  # 128
         KB: tl.constexpr,  # 4 (K-blocks packed per 512-byte atom)
     ):
-        gid = tl.program_id(0)  # expert
-        cb = tl.program_id(1)  # k-block (0 .. rk-1)
-        in_start = tl.load(offs_ptr + gid - 1, mask=gid > 0, other=0).to(tl.int64)
-        in_end = tl.load(offs_ptr + gid).to(tl.int64)
-        out_start_tile = in_start // TILE + gid
+        # One program per (output tile p, k-block cb). The dQaccum placement puts expert g's
+        # tiles at [offs[g-1]//TILE + g, ...); each program scans the experts to find the one
+        # owning tile p (branch-free via tl.where; s_g is strictly increasing), loads that
+        # 128-row input tile, swizzles, and stores it to tile p. Slack tiles (no owner) keep
+        # the zero-init.
+        p = tl.program_id(0).to(tl.int64)  # output tile index (0 .. rm-1)
+        cb = tl.program_id(1)  # k-block
+        found_gid = -1
+        found_start = tl.cast(0, tl.int64)
+        found_end = tl.cast(0, tl.int64)
+        for g in tl.range(e):
+            g_start = tl.load(offs_ptr + g - 1, mask=g > 0, other=0).to(tl.int64)
+            g_end = tl.load(offs_ptr + g).to(tl.int64)
+            s_g = g_start // TILE + g  # first output tile of expert g
+            n_g = (g_end - g_start + TILE - 1) // TILE  # 128-row tiles in expert g
+            owns = (p >= s_g) & (p < s_g + n_g)
+            found_gid = tl.where(owns, g, found_gid)
+            found_start = tl.where(owns, g_start, found_start)
+            found_end = tl.where(owns, g_end, found_end)
+        valid = found_gid >= 0  # False on slack tiles -> fully masked, output stays zero
+        s_gid = found_start // TILE + found_gid
+        cur = found_start + (p - s_gid) * TILE  # input-row start of this tile (garbage if !valid)
         r = tl.arange(0, TILE)
         c = tl.arange(0, KB)
         # 32x4x4 blocked swizzle within the 512-byte atom; matches pack_scale_2d_to_blocked_contig
@@ -153,15 +171,12 @@ if _HAS_TRITON:
         dest = ((r % 32)[:, None] * 16 + (r // 32)[:, None] * 4 + c[None, :]).to(tl.int64)
         col = cb * KB + c
         col_mask = col < sf_k
-        cur = in_start
-        while cur < in_end:  # one 128-row tile per iteration; partial last tile masked to zero
-            in_rows = cur + r
-            mask = (in_rows < in_end)[:, None] & col_mask[None, :]
-            in_off = in_rows[:, None].to(tl.int64) * in_stride_m + col[None, :].to(tl.int64)
-            vals = tl.load(in_ptr + in_off, mask=mask, other=0)
-            rb = out_start_tile + (cur - in_start) // TILE
-            tl.store(out_ptr + rb * (rk * 512) + cb * 512 + dest, vals, mask=mask)
-            cur += TILE
+        in_rows = cur + r
+        # !valid masks the whole tile, so the garbage `cur` is never dereferenced (masked load).
+        mask = valid & (in_rows < found_end)[:, None] & col_mask[None, :]
+        in_off = in_rows[:, None].to(tl.int64) * in_stride_m + col[None, :].to(tl.int64)
+        vals = tl.load(in_ptr + in_off, mask=mask, other=0)
+        tl.store(out_ptr + p * (rk * 512) + cb * 512 + dest, vals, mask=mask)
 
 
 def _dqaccum_padded_sfa_triton(sfa: Tensor, offs: Tensor, sf_k: int, e: int) -> Tensor:
@@ -178,8 +193,9 @@ def _dqaccum_padded_sfa_triton(sfa: Tensor, offs: Tensor, sf_k: int, e: int) -> 
     rk = (sf_k + 3) // 4
     out = torch.zeros(rm * rk * 512, dtype=torch.uint8, device=sfa.device)
     in_u8 = sfa.view(torch.uint8)
-    _dqaccum_sfa_swizzle_kernel[(e, rk)](
-        in_u8, offs.to(torch.int32), out, in_u8.stride(0), sf_k, rk, tile, 4
+    # Grid over output tiles (rm) x k-blocks; see the kernel docstring.
+    _dqaccum_sfa_swizzle_kernel[(rm, rk)](
+        in_u8, offs.to(torch.int32), out, in_u8.stride(0), sf_k, e, rk, tile, 4
     )
     return out.view(torch.float8_e8m0fnu).view(1, rm, rk, 512)
 
