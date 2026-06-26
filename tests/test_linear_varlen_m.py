@@ -523,6 +523,87 @@ def test_gemm_dact_varlen_m(
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("gather_A", [False, True])
+@pytest.mark.parametrize("activation", ["relu_sq", "relu"])
+@pytest.mark.parametrize("dynamic_scheduler", [False])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("colvec_reduce", [False, True])
+@pytest.mark.parametrize("has_colvec_scale", [False, True])
+@pytest.mark.parametrize("n", [1024])
+@pytest.mark.parametrize("k", [512])
+@pytest.mark.parametrize("num_groups", [2, 4])
+def test_gemm_dact_colvec_varlen_m(
+    num_groups,
+    k,
+    n,
+    has_colvec_scale,
+    colvec_reduce,
+    input_dtype,
+    dynamic_scheduler,
+    activation,
+    gather_A,
+):
+    """Non-gated gemm_dact with colvec scale/reduce and variable length M (grouped GEMM) —
+    the MoE router-score-gradient path for non-gated experts (e.g. squared-ReLU)."""
+    device = "cuda"
+    if get_device_capacity(torch.device(device))[0] == 8:
+        pytest.skip("SM8x dactivation GEMM colvec epilogue is not yet supported")
+    torch.random.manual_seed(42)
+    seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
+    total_m = seq_lens.sum().item()
+    cu_seqlens_m = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
+    ).to(device)
+    A, A_idx = generate_A_with_gather(total_m, k, device, input_dtype, gather_A)
+    B = torch.randn((num_groups, k, n), device=device, dtype=input_dtype) / math.sqrt(k)
+    PreAct = torch.randn((total_m, n), device=device, dtype=input_dtype) * 0.1
+    colvec_scale = torch.randn(total_m, device=device) if has_colvec_scale else None
+    dx, postact, *rest = gemm_dact(
+        A,
+        B,
+        PreAct,
+        activation=activation,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=False,
+    )
+    if colvec_reduce:
+        colvec_reduce_out = rest[0]
+    assert dx.shape == (total_m, n)
+    assert postact.shape == (total_m, n)
+    A_f, B_f, P_f = A.float(), B.float(), PreAct.float()
+    dx_ref, postact_ref = gemm_dact_ref(
+        A_f, B_f, P_f, activation=activation, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    del P_f
+    dx_pt, postact_pt = gemm_dact_ref(
+        A, B, PreAct, activation=activation, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    # The colvec reduce is over the *unscaled* dout, so compute it before scaling the ref.
+    if colvec_reduce:
+        colvec_reduce_ref = (
+            postact_ref * gemm_ref(A_f, B_f, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        ).sum(dim=-1)
+        colvec_reduce_pt = (
+            postact_pt * gemm_ref(A, B, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        ).sum(dim=-1)
+    del A_f, B_f
+    if has_colvec_scale:
+        dx_ref *= colvec_scale.float()[:, None]
+        postact_ref *= colvec_scale.float()[:, None]
+        dx_pt *= colvec_scale[:, None]
+        postact_pt *= colvec_scale[:, None]
+    assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+    if colvec_reduce:
+        assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
+            colvec_reduce_pt - colvec_reduce_ref
+        ).abs().max() + 1e-5
+
+
 @pytest.mark.parametrize("pre_allocate_out", [False, True])
 @pytest.mark.parametrize("gather_A", [False, True])
 @pytest.mark.parametrize("activation", ["swiglu", "geglu"])

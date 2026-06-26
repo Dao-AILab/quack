@@ -12,7 +12,6 @@ from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
-from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_act import GemmActMixin
 from quack.epi_ops import ColVecLoad, ColVecReduce, Scalar, TileStore, colvec_reduce_accumulate
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -40,9 +39,24 @@ from quack import layout_utils
 
 
 class GemmDActMixin(GemmActMixin):
-    # Different from GemmActSm90, here act_bwd_fn must take in 2 arguments (x, dout)
-    # and return 2 arguments (dx, out)
-    EpilogueArguments = GemmActMixin.EpilogueArguments
+    # Different from GemmActSm90, here act_fn (the backward fn) must take in 2 arguments
+    # (x, dout) and return 2 arguments (dx, out).
+    # Adds ColVecReduce on top of GemmActMixin's ops so the non-gated backward can also
+    # do optional colvec scaling (e.g. router score) and a colvec reduction (e.g. the
+    # router-score gradient ds = <act(x), dout>), mirroring GemmDGatedMixin.
+    _epi_ops = GemmActMixin._epi_ops + (ColVecReduce("mColVecReduce"),)
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mAuxOut: cute.Tensor
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None  # multiplicative colvec scale (not additive)
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     @cute.jit
     def epi_visit_subtile(
@@ -52,20 +66,63 @@ class GemmDActMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Tensor, ...]:
+        # tRS_rD = upstream GEMM gradient (dout, e.g. da); tRS_rC = PreAct (x). We do NOT add
+        # C to the accumulator, and (unlike the default epilogue) treat mColVecBroadcast as a
+        # multiplicative scale rather than an additive bias.
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
+        tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         assert tRS_rC is not None
-        # We don't add C to the accumulator
-        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
         tRS_rC_acc = cute.make_rmem_tensor_like(tRS_rC, self.acc_dtype)
         tRS_rC_acc.store(tRS_rC.load().to(self.acc_dtype))
-        # If we don't have .shape here, the compiler generates local stores and loads
-        if const_expr(params.act_fn is not None):
-            tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            vectorize = const_expr(self.arch == 100)
-            for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True, vectorize=vectorize):
-                tRS_rD[i], tRS_rAuxOut[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
+        # Scale dout by the colvec into a separate buffer, keeping tRS_rD as the *unscaled*
+        # gradient that the colvec reduce needs. Without a colvec this is just a copy.
+        tRS_rD_scaled = cute.make_rmem_tensor_like(tRS_rD)
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch != 100):
+                tRS_rD_scaled.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
+                tRS_rD_scaled_mn = layout_utils.convert_layout_zero_stride(
+                    tRS_rD_scaled, tDrColVec.layout
+                )
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    scale = tDrColVec_mn[m, 0]
+                    for n in cutlass.range(
+                        cute.size(tDrColVec_mn, mode=[1]), unroll_full=True, vectorize=True
+                    ):
+                        tRS_rD_scaled_mn[m, n] = tRS_rD_mn[m, n] * scale
         else:
-            tRS_rAuxOut = tRS_rC_acc
-        return (tRS_rAuxOut,)
+            tRS_rD_scaled.store(tRS_rD.load())
+        # dactivation: dx = dact(x) * dout_scaled (written back into tRS_rD_scaled); out = act(x).
+        # If we don't have .shape here, the compiler generates local stores and loads
+        tRS_rOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
+        if const_expr(params.act_fn is not None):
+            vectorize = const_expr(self.arch == 100)
+            for i in cutlass.range(cute.size(tRS_rOut), unroll_full=True, vectorize=vectorize):
+                tRS_rD_scaled[i], tRS_rOut[i] = params.act_fn(tRS_rC_acc[i], tRS_rD_scaled[i])
+        else:
+            tRS_rOut.store(tRS_rC_acc.load())
+        # Colvec reduce (e.g. router-score gradient): reduce[m] += sum_n(out[m,n] * dout[m,n]),
+        # using the *unscaled* dout (tRS_rD) so the reduction is independent of the colvec scale.
+        if const_expr(tDrColVecReduce is not None):
+            colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rOut, rScale=tRS_rD)
+        # Scale the activation output by the colvec (e.g. out' = s * act(x)).
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch != 100):
+                tRS_rOut.store(tRS_rOut.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    scale = tDrColVec_mn[m, 0]
+                    for n in cutlass.range(
+                        cute.size(tDrColVec_mn, mode=[1]), unroll_full=True, vectorize=True
+                    ):
+                        tRS_rOut_mn[m, n] = tRS_rOut_mn[m, n] * scale
+        # Write dx into the accumulator register that becomes the D (dx) output.
+        tRS_rD.store(tRS_rD_scaled.load())
+        return (tRS_rOut,)
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
@@ -274,30 +331,26 @@ def _compile_gemm_dact(
     pa_shape = (m, n) if varlen_m else (m, n, l)
     mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading, divisibility=div_pa)
 
+    # Colvec scale (e.g. router score) and colvec reduce (e.g. router-score gradient) are
+    # supported by both the gated and non-gated backward paths.
+    mColVec = None
+    if colvec_scale_ndim == 2:
+        mColVec = fake_tensor(colvec_scale_dtype, (l, m), leading_dim=1, divisibility=4)
+    elif colvec_scale_ndim == 1:
+        mColVec = fake_tensor(colvec_scale_dtype, (m,), leading_dim=0, divisibility=4)
+    mColVecReduce = None
+    n_tiles = cute.sym_int()
+    if colvec_reduce_ndim == 3:
+        mColVecReduce = fake_tensor(
+            colvec_reduce_dtype, (l, m, n_tiles), leading_dim=2, divisibility=1
+        )
+    elif colvec_reduce_ndim == 2:
+        mColVecReduce = fake_tensor(
+            colvec_reduce_dtype, (m, n_tiles), leading_dim=1, divisibility=1
+        )
+
     if is_dgated:
         act_fn = dgate_fn_map[activation]
-
-        mColVec = None
-        if colvec_scale_ndim == 2:
-            mColVec = fake_tensor(colvec_scale_dtype, (l, m), leading_dim=1, divisibility=4)
-        elif colvec_scale_ndim == 1:
-            mColVec = fake_tensor(colvec_scale_dtype, (m,), leading_dim=0, divisibility=4)
-        mColVecReduce = None
-        n_tiles = cute.sym_int()
-        if colvec_reduce_ndim == 3:
-            mColVecReduce = fake_tensor(
-                colvec_reduce_dtype,
-                (l, m, n_tiles),
-                leading_dim=2,
-                divisibility=1,
-            )
-        elif colvec_reduce_ndim == 2:
-            mColVecReduce = fake_tensor(
-                colvec_reduce_dtype,
-                (m, n_tiles),
-                leading_dim=1,
-                divisibility=1,
-            )
         epi_args = GemmCls.EpilogueArguments(
             mAuxOut,
             act_fn,
@@ -311,7 +364,12 @@ def _compile_gemm_dact(
         post_init = _set_implicit_dtype
     else:
         act_fn = dact_fn_map[activation]
-        epi_args = GemmCls.EpilogueArguments(mAuxOut, act_fn)
+        epi_args = GemmCls.EpilogueArguments(
+            mAuxOut,
+            act_fn,
+            mColVecBroadcast=mColVec,
+            mColVecReduce=mColVecReduce,
+        )
         post_init = None
 
     scheduler_args = make_fake_scheduler_args(
@@ -367,8 +425,6 @@ def gemm_dact(
     is_dgated = activation in dgate_fn_map
     if not is_dgated:
         assert activation in dact_fn_map, f"Unsupported activation {activation}"
-        assert colvec_scale is None, "colvec_scale is only supported for gated activations"
-        assert colvec_reduce is None, "colvec_reduce is only supported for gated activations"
     gemm_cls_name = "dgated" if is_dgated else "dact"
 
     varlen_m = cu_seqlens_m is not None
@@ -472,7 +528,9 @@ def gemm_dact(
     else:
         epi_args = GemmDActMixin.EpilogueArguments(
             PostAct_p,
-            None,
+            None,  # act_fn is Constexpr
+            mColVecBroadcast=colvec_scale,
+            mColVecReduce=colvec_reduce,
             rounding_mode=None,
             sr_seed=None,
         )

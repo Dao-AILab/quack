@@ -395,10 +395,18 @@ def gemm_act_tuned(
     )
 
 
+def prune_invalid_gemm_dact_configs(configs, named_args: dict, **kwargs):
+    kwargs = named_args | kwargs
+    # colvec_scale / colvec_reduce (non-gated backward) are not supported with swap_ab
+    if kwargs.get("colvec_scale", None) is not None or kwargs.get("colvec_reduce", False):
+        configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
+    return prune_invalid_gemm_configs(configs, named_args, **kwargs)
+
+
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["activation", "dynamic_scheduler"],
-    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
+    key=["activation", "colvec_reduce", "dynamic_scheduler"],
+    prune_configs_by={"early_config_prune": prune_invalid_gemm_dact_configs},
 )
 def gemm_dact_tuned(
     # (M, K) or or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -408,16 +416,20 @@ def gemm_dact_tuned(
     dx_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, N, N) or (total_M, N) if varlen_m
     activation: ActActivation = None,
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
+    # whether to do colvec reduction (sum_n out*dout), returning (M,)/(L,M)/(total_M,) if varlen_m
+    colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     config: Optional[GemmConfig] = None,
-) -> None:
+) -> Optional[Tensor]:
     if config is None:
         config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
+    og_ndim_2 = A.ndim == 2 and not varlen_m
     if A.ndim == 2 and not varlen_m:
         A = A.unsqueeze(0)  # (1, M, K)
     B = B.mT  # (N, K) or (L, N, K)
@@ -433,6 +445,21 @@ def gemm_dact_tuned(
         PostAct = postact_out.unsqueeze(0)
     else:
         PostAct = postact_out
+    if colvec_scale is not None and colvec_scale.ndim == 1 and not varlen_m:
+        colvec_scale = colvec_scale.unsqueeze(0)  # (1, M)
+    if colvec_scale is not None:
+        assert not config.swap_ab, "colvec_scale not supported with swap_ab"
+    if colvec_reduce:
+        tile_n = config.tile_n
+        shape_n = (B.shape[-2] + tile_n - 1) // tile_n
+        if varlen_m:
+            total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
+            colvec_shape = (total_m, shape_n)
+        else:
+            colvec_shape = (A.shape[0], A.shape[-2], shape_n)
+        colvec_reduce_partial = torch.empty(colvec_shape, dtype=torch.float32, device=A.device)
+    else:
+        colvec_reduce_partial = None
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
@@ -456,10 +483,19 @@ def gemm_dact_tuned(
         persistent=True,
         is_dynamic_persistent=dynamic_scheduler,
         max_swizzle_size=config.max_swizzle_size,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce_partial,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
     )
+    if colvec_reduce:
+        colvec_reduce_final = colvec_reduce_partial.sum(dim=-1)
+        if og_ndim_2:
+            colvec_reduce_final = colvec_reduce_final.squeeze(0)
+    else:
+        colvec_reduce_final = None
+    return colvec_reduce_final
 
 
 def gemm(
@@ -1128,8 +1164,8 @@ def gemm_dact(
     postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
-    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m (dgated only)
-    colvec_reduce: bool = False,  # dgated only
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
+    colvec_reduce: bool = False,  # reduce sum_n(out*dout) -> e.g. router-score grad (gated or not)
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
@@ -1183,19 +1219,23 @@ def gemm_dact(
             results.append(colvec_reduce_final)
         return tuple(results)
     else:
-        gemm_dact_out(
+        colvec_reduce_final = gemm_dact_out(
             A,
             B,
             PreAct,
             dx_out,
             postact_out,
             activation,
+            colvec_scale,
+            colvec_reduce,
             cu_seqlens_m,
             A_idx,
             dynamic_scheduler,
             tuned,
         )
         results = [dx_out, postact_out]
+        if colvec_reduce:
+            results.append(colvec_reduce_final)
         return tuple(results)
 
 
@@ -1206,7 +1246,7 @@ gemm_dgated = gemm_dact
     "quack::gemm_dact_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, str? activation=None, Tensor? colvec_scale=None, bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor",
 )
 def gemm_dact_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1215,14 +1255,77 @@ def gemm_dact_out(
     dx_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     activation: ActActivation = None,
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
+    colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-) -> None:
-    """GEMM with activation gradient and pre-allocated output tensors."""
+) -> Tensor:
+    """GEMM with activation gradient and pre-allocated output tensors.
+
+    Returns the (M,)/(L,M)/(total_M,) colvec reduction (sum_n out*dout) when colvec_reduce is
+    set, else an empty tensor (kept a Tensor, not None, to play nicely with torch.compile).
+    """
     fn = gemm_dact_tuned if tuned else partial(gemm_dact_tuned.fn, config=None)
-    fn(A, B, PreAct, dx_out, postact_out, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
+    result = fn(
+        A,
+        B,
+        PreAct,
+        dx_out,
+        postact_out,
+        activation,
+        colvec_scale,
+        colvec_reduce,
+        cu_seqlens_m,
+        A_idx,
+        dynamic_scheduler,
+    )
+    if result is None:  # Have to return a tensor, not None, to make torch compile happy
+        return torch.empty(0, device=A.device, dtype=torch.float32)
+    return result
+
+
+@torch.library.register_fake("quack::gemm_dact_out")
+def gemm_dact_out_fake(
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    dx_out: Tensor,
+    postact_out: Tensor,
+    activation: ActActivation = None,
+    colvec_scale: Optional[Tensor] = None,
+    colvec_reduce: bool = False,
+    cu_seqlens_m: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+    dynamic_scheduler: bool = True,
+    tuned: bool = True,
+) -> Tensor:
+    _precompile_default_config(
+        gemm_dact_tuned,
+        A,
+        B,
+        PreAct,
+        dx_out,
+        postact_out,
+        activation=activation,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+    )
+    if not colvec_reduce:
+        return torch.empty(0, dtype=torch.float32, device=A.device)
+    else:
+        if cu_seqlens_m is not None:
+            total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
+            out_shape = (total_m,)
+        elif A.ndim == 2:
+            out_shape = (A.shape[0],)
+        else:
+            out_shape = (A.shape[0], A.shape[-2])
+        return torch.empty(out_shape, dtype=torch.float32, device=A.device)
 
 
 def gemm_dact_ref(
@@ -1897,7 +2000,8 @@ def _register_precompile_fake(custom_op, autotuned_fn, *, defaults=()):
 _register_precompile_fake(gemm_out, gemm_tuned, defaults=(("C", None),))
 _register_precompile_fake(gemm_add_out, gemm_tuned)
 _register_precompile_fake(gemm_act_out, gemm_act_tuned)
-_register_precompile_fake(gemm_dact_out, gemm_dact_tuned)
+# gemm_dact_out has a hand-written register_fake (like gemm_dgated_out) because it returns the
+# colvec-reduce tensor, whose shape the generic precompile-fake can't express.
 _register_precompile_fake(gemm_gated_out, gemm_gated_tuned)
 
 

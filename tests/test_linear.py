@@ -546,6 +546,59 @@ def test_gemm_dgated(n, k, has_colvec_scale, colvec_reduce, input_dtype, activat
         ).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("activation", ["relu_sq", "relu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("colvec_reduce", [False, True])
+@pytest.mark.parametrize("has_colvec_scale", [False, True])
+@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("n", [1504])
+def test_gemm_dact_colvec(n, k, has_colvec_scale, colvec_reduce, input_dtype, activation):
+    """Non-gated gemm_dact with a multiplicative colvec scale and/or a colvec reduction
+    (sum_n out*dout) — the MoE router-score-gradient path for non-gated experts (e.g.
+    squared-ReLU). Mirrors test_gemm_dgated but for the single-activation backward."""
+    device = "cuda"
+    if torch.cuda.is_available() and get_device_capacity(torch.device(device))[0] == 8:
+        pytest.skip("SM8x dactivation GEMM colvec epilogue is not yet supported")
+    torch.random.manual_seed(0)
+    m = 960
+    dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
+    weight = torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)
+    preact = torch.randn((m, n), device=device, dtype=input_dtype)
+    colvec_scale = torch.randn(m, device=device) if has_colvec_scale else None
+    dx, postact, *rest = gemm_dact(
+        dout_input,
+        weight.T,
+        preact,
+        activation=activation,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce,
+        tuned=False,
+    )
+    if colvec_reduce:
+        colvec_reduce_out = rest[0]
+    dx_ref, postact_ref = gemm_dact_ref(
+        dout_input.float(), weight.float().T, preact.float(), activation=activation
+    )
+    dx_pt, postact_pt = gemm_dact_ref(dout_input, weight.T, preact, activation=activation)
+    # The colvec reduce is over the *unscaled* dout, so compute it before scaling the ref.
+    if colvec_reduce:
+        colvec_reduce_ref = (postact_ref * gemm_ref(dout_input.float(), weight.float().T)).sum(
+            dim=-1
+        )
+        colvec_reduce_pt = (postact_pt * gemm_ref(dout_input, weight.T)).sum(dim=-1)
+    if has_colvec_scale:
+        dx_ref *= colvec_scale.float()[:, None]
+        postact_ref *= colvec_scale.float()[:, None]
+        dx_pt *= colvec_scale[:, None]
+        postact_pt *= colvec_scale[:, None]
+    assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+    if colvec_reduce:
+        assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
+            colvec_reduce_pt - colvec_reduce_ref
+        ).abs().max() + 1e-5
+
+
 @pytest.mark.parametrize("activation", ["gelu_tanh_approx", "swiglu"])
 @pytest.mark.parametrize("freeze", ["x", "weight"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
