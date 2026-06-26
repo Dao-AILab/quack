@@ -63,7 +63,6 @@ def _compile_gemm(
     device_capacity,
     rounding_mode,
     sr_seed_mode,
-    has_trace_ptr,
     num_warps,
 ):
     sm_to_cls = {
@@ -135,7 +134,6 @@ def _compile_gemm(
         epi_args,
         scheduler_args,
         varlen_args,
-        has_trace_ptr=has_trace_ptr,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
         num_warps=num_warps,
@@ -172,7 +170,6 @@ def gemm(
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
-    trace_ptr=None,  # Optional Int64 from TraceSession.ptr
     num_warps: Optional[int] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
@@ -251,7 +248,6 @@ def gemm(
         device_capacity,
         rounding_mode,
         sr_seed_mode,
-        trace_ptr is not None,
         num_warps,
     )
 
@@ -291,8 +287,6 @@ def gemm(
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(
-            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, trace_ptr
-        )
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, trace_ptr)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
