@@ -465,6 +465,8 @@ def test_gemm_act_varlen_m(
 # @pytest.mark.parametrize("dynamic_scheduler", [False])
 @pytest.mark.parametrize("B_major", ["k", "n"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("colvec_reduce", [False, True])
+@pytest.mark.parametrize("has_colvec_scale", [False, True])
 @pytest.mark.parametrize("n", [1024, 1504])
 @pytest.mark.parametrize("k", [512, 768])
 @pytest.mark.parametrize("num_groups", [2, 4])
@@ -472,6 +474,8 @@ def test_gemm_dact_varlen_m(
     num_groups,
     k,
     n,
+    has_colvec_scale,
+    colvec_reduce,
     input_dtype,
     B_major,
     dynamic_scheduler,
@@ -492,17 +496,22 @@ def test_gemm_dact_varlen_m(
     PreAct = torch.randn((total_m, n), device=device, dtype=input_dtype) * 0.1
     if B_major == "k":
         B = B.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    colvec_scale = torch.randn(total_m, device=device) if has_colvec_scale else None
     # Test with kernel
-    dx, postact = gemm_dact(
+    dx, postact, *rest = gemm_dact(
         A,
         B,
         PreAct,
+        colvec_scale=colvec_scale,
         activation=activation,
+        colvec_reduce=colvec_reduce,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
+    if colvec_reduce:
+        colvec_reduce_out = rest[0]
     assert dx.shape == (total_m, n)
     assert postact.shape == (total_m, n)
     # Compare with reference
@@ -515,12 +524,29 @@ def test_gemm_dact_varlen_m(
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
-    del A_f, B_f, P_f
+    del P_f
     dx_pt, postact_pt = gemm_dact_ref(
         A, B, PreAct, activation=activation, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
+    if colvec_reduce:
+        colvec_reduce_ref = (
+            postact_ref * gemm_ref(A_f, B_f, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        ).sum(dim=-1)
+        colvec_reduce_pt = (
+            postact_pt * gemm_ref(A, B, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+        ).sum(dim=-1)
+    del A_f, B_f
+    if has_colvec_scale:
+        dx_ref *= colvec_scale.float()[:, None]
+        postact_ref *= colvec_scale.float()[:, None]
+        dx_pt *= colvec_scale[:, None]
+        postact_pt *= colvec_scale[:, None]
     assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+    if colvec_reduce:
+        assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
+            colvec_reduce_pt - colvec_reduce_ref
+        ).abs().max() + 1e-5
 
 
 @pytest.mark.parametrize("pre_allocate_out", [False, True])
