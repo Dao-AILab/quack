@@ -1,0 +1,75 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "dtype": "mxfp8->bf16",
+  "results": [
+    {
+      "mode": "varlen_m",
+      "seqlens": [
+        512,
+        512,
+        512,
+        512
+      ],
+      "n": 2048,
+      "k": 2048,
+      "us": 193.2,
+      "tflops": 88.9
+    },
+    {
+      "mode": "varlen_m",
+      "seqlens": [
+        256,
+        768,
+        512,
+        1024
+      ],
+      "n": 2048,
+      "k": 2048,
+      "us": 187.4,
+      "tflops": 114.6
+    },
+    {
+      "mode": "varlen_m",
+      "seqlens": [
+        1024,
+        1024,
+        1024,
+        1024,
+        1024,
+        1024,
+        1024,
+        1024
+      ],
+      "n": 4096,
+      "k": 4096,
+      "us": 815.6,
+      "tflops": 337.0
+    },
+    {
+      "mode": "varlen_k",
+      "seqlens": [
+        512,
+        512,
+        512,
+        512
+      ],
+      "m": 2048,
+      "n": 2048,
+      "us": 255.8,
+      "tflops": 67.2
+    },
+    {
+      "mode": "varlen_k",
+      "seqlens": [
+        256,
+        768,
+        512,
+        1024
+      ],
+      "m": 2048,
+      "n": 2048,
+      "us": 237.3,
+      "tflops": 90.5
+    }
+  ]
+}
