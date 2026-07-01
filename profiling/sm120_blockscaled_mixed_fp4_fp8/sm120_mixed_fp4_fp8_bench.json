@@ -1,0 +1,42 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "note": "SM120 mixed FP4xFP8 blockscaled, e8m0 vec32 -> bf16",
+  "results": [
+    {
+      "tag": "A=FP4 B=FP8",
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "us": 252.73,
+      "tflops": 543.8,
+      "rel": 0.0031
+    },
+    {
+      "tag": "A=FP8 B=FP4",
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "us": 259.95,
+      "tflops": 528.7,
+      "rel": 0.00305
+    },
+    {
+      "tag": "A=FP4 B=FP8",
+      "m": 8192,
+      "n": 8192,
+      "k": 8192,
+      "us": 1984.71,
+      "tflops": 554.0,
+      "rel": 0.00289
+    },
+    {
+      "tag": "A=FP8 B=FP4",
+      "m": 8192,
+      "n": 8192,
+      "k": 8192,
+      "us": 2036.73,
+      "tflops": 539.8,
+      "rel": 0.00295
+    }
+  ]
+}

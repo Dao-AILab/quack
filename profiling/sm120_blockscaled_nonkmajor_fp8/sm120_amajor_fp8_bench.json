@@ -1,0 +1,42 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "note": "SM120 MXFP8 blockscaled, A K-major vs M-major -> bf16",
+  "results": [
+    {
+      "a_major": "k",
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "us": 276.58,
+      "tflops": 496.9,
+      "rel": 0.00214
+    },
+    {
+      "a_major": "m",
+      "m": 4096,
+      "n": 4096,
+      "k": 4096,
+      "us": 276.08,
+      "tflops": 497.8,
+      "rel": 0.00225
+    },
+    {
+      "a_major": "k",
+      "m": 8192,
+      "n": 8192,
+      "k": 8192,
+      "us": 2021.45,
+      "tflops": 543.9,
+      "rel": 0.00317
+    },
+    {
+      "a_major": "m",
+      "m": 8192,
+      "n": 8192,
+      "k": 8192,
+      "us": 2018.92,
+      "tflops": 544.6,
+      "rel": 0.00315
+    }
+  ]
+}
