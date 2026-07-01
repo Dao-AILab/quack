@@ -488,6 +488,46 @@ def test_gemm_gated_pingpong_configs(pingpong):
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
 
 
+@pytest.mark.parametrize("activation", ["swiglu", "reglu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
+def test_gemm_gated_sm100_22_warp_shape(input_dtype, activation):
+    """Regression test: SM100 2-CTA tile_m=128 (2,2) epilogue warp shape.
+
+    With tile_m=128 and cluster_m=2 on SM100, the per-CTA M tile is 64 and
+    use_2cta_instrs=True, which gives a (2,2) epilogue warp layout. The gated
+    postact smem is half-N, so make_tiled_copy_S(aux_atom, tiled_copy_r2s)
+    previously over-emitted by 2x, corrupting warp 1's smem with warp 0's data.
+    """
+    device = "cuda"
+    device_capacity = get_device_capacity(torch.device(device))[0]
+    if device_capacity not in (10, 11):
+        pytest.skip("SM100 (2,2) warp shape only applies to SM100/SM110")
+
+    torch.random.manual_seed(42)
+    m, in_features, out_features = 1024, 256, 512
+    x = torch.randn((m, in_features), device=device, dtype=input_dtype)
+    w = torch.randn((2 * out_features, in_features), device=device, dtype=input_dtype) / math.sqrt(
+        in_features
+    )
+    B = w.T
+    preact = torch.empty((m, 2 * out_features), device=device, dtype=input_dtype)
+    postact = torch.empty((m, out_features), device=device, dtype=input_dtype)
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        cluster_m=2,
+        cluster_n=1,
+        pingpong=False,
+        is_dynamic_persistent=True,
+        device_capacity=10,
+    )
+    gemm_gated_tuned.fn(x, B, preact, postact, None, None, activation, None, None, False, config=config)
+    preact_ref, postact_ref = gemm_gated_ref(x.float(), B.float(), activation=activation, store_preact=True)
+    preact_pt, postact_pt = gemm_gated_ref(x, B, activation=activation, store_preact=True)
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
+
+
 @pytest.mark.parametrize(
     "activation", ["swiglu", "swiglu_oai", "swiglu_oai-tanh", "reglu", "geglu", "glu"]
 )

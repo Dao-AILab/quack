@@ -218,6 +218,44 @@ class GemmGatedMixin(GemmActMixin):
         TileStore("mAuxOut", epi_tile_fn=_gated_epi_tile_fn),
     )
 
+    def epi_make_aux_out_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+        """Build the register-to-shared tiled copy used by gated aux outputs.
+
+        Unlike the non-gated path, the gated postact tile has half the N elements
+        of D (via `_gated_epi_tile_fn`'s `recast_layout(2, 1, ...)`). The
+        straightforward `make_tiled_copy_S(aux_atom, tiled_copy_r2s)` inherits D's
+        full-N tiler MN, which over-emits by 2x when applied to the half-N aux
+        smem. For the (4, 1) epi-warp shape (cta_tile_m != 64 or 1-CTA) this is
+        harmless because the over-emission has stride 0 in smem (a phantom
+        N-warp dim), but for the (2, 2) shape (cta_tile_m=64 + 2-CTA on SM100)
+        the over-emission has the warp-N stride and corrupts warp 1's smem
+        region with a duplicate of warp 0's data.
+
+        Build the aux r2s tiled copy explicitly to match aux's
+        (cta_tile_aux_m, size(epi_tile_aux_n)) tile: 1 thread per (M, N-warp)
+        position, each thread holding `size(epi_tile_aux_n) / num_n_warps`
+        values along N. That places every thread's writes into a single warp's
+        smem region with no aliasing across warps. Only applied for SM100 (the
+        (2, 2) layout is SM100-specific).
+        """
+        if self.arch != 100:
+            return super().epi_make_aux_out_tiled_copy_r2s(
+                params, tiled_copy_r2s, tiled_copy_t2r
+            )
+        copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(params, tiled_copy_t2r)
+        cta_tile_aux_m, _ = self.cta_tile_shape_aux_out_mn
+        _, num_n_warps, _ = self.epi_smem_warp_shape_mnk()
+        # epi_tile_aux_n size: the N mode of epi_tile_mAuxOut may be a Layout
+        # (e.g. (16,2):(1,64)) when the (2, 2) warp shape is in effect, or an int
+        # otherwise. cute.size() handles both.
+        epi_tile_aux_n = cute.size(params.epi_tile_mAuxOut[1])
+        vals_per_thread_n = epi_tile_aux_n // num_n_warps
+        thr_layout = cute.make_layout(
+            (cta_tile_aux_m, num_n_warps), stride=(1, cta_tile_aux_m)
+        )
+        val_layout = cute.make_layout((1, vals_per_thread_n))
+        return cute.make_tiled_copy_tv(copy_atom_aux_out_r2s, thr_layout, val_layout)
+
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
