@@ -960,21 +960,19 @@ def cpasync_bulk_get_copy_fn(
     def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
         assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        with cute.arch.elect_one():
-            cute.copy(
-                atom,
-                src[None, src_idx],
-                dst[None, dst_idx],
-                mbar_ptr=tma_bar_ptr,
-                **new_kwargs,
-                **kwargs,
-            )
+        cute.copy(
+            atom,
+            src[None, src_idx],
+            dst[None, dst_idx],
+            mbar_ptr=tma_bar_ptr,
+            **new_kwargs,
+            **kwargs,
+        )
 
     def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
         assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        with cute.arch.elect_one():
-            cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
+        cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
 
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 
