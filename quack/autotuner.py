@@ -400,6 +400,17 @@ class Autotuner:
             else:
                 tensor_meta.append(arg)
 
+        tensor_meta_kwargs = {}
+        for k, v in kwargs.items():
+            if isinstance(v, Tensor):
+                tensor_meta_kwargs[k] = {
+                    "shape": list(v.shape),
+                    "stride": list(v.stride()),
+                    "dtype": str(v.dtype),
+                }
+            else:
+                tensor_meta_kwargs[k] = v
+
         fn_module = self.fn.__module__
         fn_qualname = self.fn.__qualname__
 
@@ -450,7 +461,7 @@ class Autotuner:
                         "fn_module": fn_module,
                         "fn_qualname": fn_qualname,
                         "tensor_meta": tensor_meta,
-                        "kwargs": kwargs,
+                        "kwargs": tensor_meta_kwargs,
                         "config_kwargs": config.all_kwargs(),
                     },
                 )
