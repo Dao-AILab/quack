@@ -739,6 +739,162 @@ def compile_blockscaled_gemm_tvm_ffi(
     return run
 
 
+def compile_blockscaled_gemm_gated_tvm_ffi(
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    postact_dtype: Type[cutlass.Numeric],
+    activation: str,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    mA: torch.Tensor,
+    mB: torch.Tensor,
+    mSFA: torch.Tensor,
+    mSFB: torch.Tensor,
+    mAuxOut: torch.Tensor,
+    *,
+    use_clc_persistence: bool = True,
+) -> Callable:
+    device_capacity = get_device_capacity(mA.device)
+    if device_capacity[0] not in (10, 11):
+        raise RuntimeError("Blockscaled gated GEMM requires SM100/SM110")
+    # Local import avoids a module-load cycle (gemm_act imports gemm_tvm_ffi_utils,
+    # which this module also uses).
+    from quack.gemm_act import GemmGatedBlockscaledSm100
+    from quack.activation import gate_fn_map
+
+    gemm = partial(
+        GemmGatedBlockscaledSm100,
+        sf_vec_size=sf_vec_size,
+        use_clc_persistence=use_clc_persistence,
+    )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
+    gate_fn = gate_fn_map[activation]
+
+    scheduler_args = make_scheduler_args(
+        get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        max_swizzle_size=8,
+        tile_count_semaphore=None,
+        batch_idx_permute=None,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    fake_mA = _make_fake_compact_tensor(
+        mA.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mA)
+    )
+    fake_mB = _make_fake_compact_tensor(
+        mB.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mB)
+    )
+    fake_mAuxOut = _make_fake_compact_tensor(
+        mAuxOut.shape, postact_dtype, leading_dim=_leading_dim_from_stride(mAuxOut)
+    )
+
+    @cute.jit
+    def runner(a, b, sfa, sfb, aux, stream):
+        # act_fn (gate_fn) is a compile-time Constexpr captured from the closure.
+        epi = gemm.EpilogueArguments(aux, gate_fn)
+        # mD=None: only the post-activation aux output is stored.
+        gemm(a, b, None, None, epi, scheduler_args, VarlenArguments(), stream, sfa, sfb, None)
+
+    compiled = cute.compile(
+        runner,
+        fake_mA,
+        fake_mB,
+        _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+        _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+        fake_mAuxOut,
+        stream,
+        options="--enable-tvm-ffi",
+    )
+
+    def run(a, b, sfa, sfb, aux):
+        compiled(a, b, sfa, sfb, aux)
+
+    return run
+
+
+def compile_blockscaled_gemm_dgated_tvm_ffi(
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    implicit_dtype: Type[cutlass.Numeric],
+    postact_dtype: Type[cutlass.Numeric],
+    activation: str,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    mA: torch.Tensor,
+    mB: torch.Tensor,
+    mC: torch.Tensor,
+    mD: torch.Tensor,
+    mSFA: torch.Tensor,
+    mSFB: torch.Tensor,
+    mAuxOut: torch.Tensor,
+    *,
+    use_clc_persistence: bool = True,
+) -> Callable:
+    device_capacity = get_device_capacity(mA.device)
+    if device_capacity[0] not in (10, 11):
+        raise RuntimeError("Blockscaled dgated GEMM requires SM100/SM110")
+    from quack.gemm_dact import GemmDGatedBlockscaledSm100
+    from quack.activation import dgate_fn_map
+
+    gemm = partial(
+        GemmDGatedBlockscaledSm100,
+        sf_vec_size=sf_vec_size,
+        use_clc_persistence=use_clc_persistence,
+    )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
+    gemm.implicit_dtype = implicit_dtype  # matches gemm_dact's post_init
+    act_bwd_fn = dgate_fn_map[activation]
+
+    scheduler_args = make_scheduler_args(
+        get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
+        max_swizzle_size=8,
+        tile_count_semaphore=None,
+        batch_idx_permute=None,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    fake_mA = _make_fake_compact_tensor(
+        mA.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mA)
+    )
+    fake_mB = _make_fake_compact_tensor(
+        mB.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mB)
+    )
+    # C (PreAct) and D (dPreAct) are passed as 32-bit (packed bf16x2) tensors.
+    fake_mC = _make_fake_compact_tensor(
+        mC.shape, cutlass.Float32, leading_dim=_leading_dim_from_stride(mC)
+    )
+    fake_mD = _make_fake_compact_tensor(
+        mD.shape, cutlass.Float32, leading_dim=_leading_dim_from_stride(mD)
+    )
+    fake_mAuxOut = _make_fake_compact_tensor(
+        mAuxOut.shape, postact_dtype, leading_dim=_leading_dim_from_stride(mAuxOut)
+    )
+
+    @cute.jit
+    def runner(a, b, c, d, sfa, sfb, aux, stream):
+        epi = gemm.EpilogueArguments(aux, act_bwd_fn)
+        # __call__(mA, mB, mD, mC, ...): Out is D, PreAct is C.
+        gemm(a, b, d, c, epi, scheduler_args, VarlenArguments(), stream, sfa, sfb, None)
+
+    compiled = cute.compile(
+        runner,
+        fake_mA,
+        fake_mB,
+        fake_mC,
+        fake_mD,
+        _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
+        _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
+        fake_mAuxOut,
+        stream,
+        options="--enable-tvm-ffi",
+    )
+
+    def run(a, b, c, d, sfa, sfb, aux):
+        compiled(a, b, c, d, sfa, sfb, aux)
+
+    return run
+
+
 def blockscaled_gemm_reference(
     a_ref: torch.Tensor,
     b_ref: torch.Tensor,

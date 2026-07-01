@@ -303,6 +303,10 @@ class GemmGatedSm100(GemmGatedMixin, GemmSm100):
     pass
 
 
+class GemmGatedBlockscaledSm100(GemmGatedSm100):
+    pass
+
+
 class GemmGatedSm120Mixin:
     @staticmethod
     def _compute_tile_shape_or_override(
