@@ -94,6 +94,12 @@ class GemmDGatedMixin(GemmActMixin):
     )
     _extra_param_fields = (("act_bwd_fn", cutlass.Constexpr, None),)
 
+    def _valid_2cta_m(self):
+        # See GemmGatedMixin._valid_2cta_m: the (2, 2) epilogue warp shape that
+        # mma_tiler_m=128 + 2-CTA produces breaks the gated/dgated postact path
+        # on SM100. Restrict 2-CTA to mma_tiler_m=256 here too.
+        return (256,)
+
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mAuxOut: cute.Tensor
