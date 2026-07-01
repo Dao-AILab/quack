@@ -122,23 +122,38 @@ class VarlenManager:
             mAIdx_mk = params.mAIdx[None, batch_idx]
         return mAIdx_mk
 
-    def offset_batch_SFA(self, mSFA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
-        """Offset SFA by padded per-expert offset (dQaccum-style).
+    def offset_batch_SFA(
+        self,
+        mSFA_mkl: cute.Tensor,
+        batch_idx: Int32,
+        tile_aligned: cutlass.Constexpr[bool] = False,
+    ) -> cute.Tensor:
+        """Offset SFA to expert ``batch_idx``'s scale tile.
 
-        The padded offset, in tile units (128 source-M or source-K per tile),
-        is simply `cu_seqlens[b] // 128 + b`. (Algebraically identical to
-        `(cu_seqlens[b] + b*128) // 128 * 128` / 128.) We pass it as a
-        compound coord `(0, offset_tile)` to `domain_offset` so the outer
-        rm/rk mode is shifted in tile units — no `* 128` needed, and the
-        compiler sees the tile alignment natively.
+        The default offset, in tile units (128 source-M or source-K per tile), is
+        ``cu_seqlens[b] // 128 + b`` (dQaccum-style). The ``+ b`` slack lets
+        per-expert seqlens be arbitrary: each rounds up to a whole 128-tile, and ``b``
+        tiles of cumulative padding keep every expert tile-aligned. SFA must then be
+        stored in that padded layout.
+
+        When the caller guarantees 128-aligned per-expert boundaries
+        (``tile_aligned=True``), each expert already starts on a tile boundary, so the
+        natural offset ``cu_seqlens[b] // 128`` is exact and SFA can be passed in
+        natural (unpadded) packed layout -- no dQaccum scatter/padding needed. We pass
+        the offset as a compound coord ``(0, offset_tile)`` to ``domain_offset`` so the
+        outer rm/rk mode is shifted in tile units (no ``* 128`` needed).
         """
         params = self.params
         tile = 128
         if const_expr(self.varlen_m):
-            offset_tile = params.cu_seqlens_m[batch_idx] // tile + batch_idx
+            offset_tile = params.cu_seqlens_m[batch_idx] // tile
+            if const_expr(not tile_aligned):
+                offset_tile = offset_tile + batch_idx
             return cute.domain_offset(((0, offset_tile), None), mSFA_mkl)
         elif const_expr(self.varlen_k):
-            offset_tile = params.cu_seqlens_k[batch_idx] // tile + batch_idx
+            offset_tile = params.cu_seqlens_k[batch_idx] // tile
+            if const_expr(not tile_aligned):
+                offset_tile = offset_tile + batch_idx
             return cute.domain_offset((None, (0, offset_tile)), mSFA_mkl)
         else:
             return mSFA_mkl[None, None, batch_idx]

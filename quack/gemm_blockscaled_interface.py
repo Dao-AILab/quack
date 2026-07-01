@@ -43,7 +43,14 @@ _TORCH_TO_CUTLASS_D = {
 
 
 def _default_tiler_cluster(m: int, n: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-    """Pick a reasonable default (mma_tiler_mn, cluster_shape_mn)."""
+    """Pick a reasonable default (mma_tiler_mn, cluster_shape_mn).
+
+    Compute-bound shapes (large m, n>=256) use BN=256, which makes _compute_stages set
+    num_acc_stage==1 and thereby enable ``overlap_accum_sf`` (a 2nd accumulator stage at
+    BN=256).
+    """
+    if m >= 512 and n >= 256:
+        return (256, 256), (2, 1)
     if m >= 512 and n >= 128:
         return (256, 128), (2, 1)
     return (128, 128), (1, 1)

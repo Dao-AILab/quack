@@ -757,6 +757,111 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
 
 
 @pytest.mark.parametrize(
+    "seqlens_m",
+    [
+        [128, 128, 128, 128],  # uniform
+        [128, 256, 384, 256],  # ragged, 128-aligned
+        [256, 0, 256, 256],  # empty expert
+        [1792, 128, 128, 128],  # heavy skew
+    ],
+)
+def test_blockscaled_mxfp8_varlen_m_sfa_tile_aligned(seqlens_m):
+    """sfa_tile_aligned=True: with 128-aligned per-expert boundaries, SFA is passed in
+    NATURAL (unpadded) packed layout and the kernel offsets per expert by
+    cu_seqlens[b] // 128 (no dQaccum +b padding -> no scatter). Must (a) match the
+    dequant reference and (b) be bit-identical to the default dQaccum-padded path --
+    same kernel math, only the SFA addressing differs."""
+    _skip_if_not_sm100()
+    from quack.blockscaled_gemm_utils import pack_scale_2d_to_blocked_contig
+    from quack.mx_utils import to_mx_compiled
+
+    e = len(seqlens_m)
+    n, k, sf_vec = 256, 256, 32
+    sf_k = k // sf_vec
+    mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 1)
+    assert all(m % 128 == 0 for m in seqlens_m), "this path requires 128-aligned seqlens"
+    total_m = sum(seqlens_m)
+    dev = "cuda"
+
+    torch.manual_seed(0)
+    qa, sa = to_mx_compiled(
+        (torch.randn(total_m, k, dtype=torch.bfloat16, device=dev) * k**-0.5).contiguous(), sf_vec
+    )
+    qbf, sb = to_mx_compiled(
+        (torch.randn(e, n, k, dtype=torch.bfloat16, device=dev) * k**-0.5)
+        .contiguous()
+        .view(e * n, k),
+        sf_vec,
+    )
+    qb = qbf.view(e, n, k)
+    sb = sb.view(e, n, sf_k)
+    mB = qb.transpose(1, 2).permute(2, 1, 0)  # (n, k, e)
+    mSFB = pack_scale_2d_to_blocked_contig(sb)
+    seq = torch.tensor(seqlens_m, dtype=torch.int32, device=dev)
+    cu = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=dev), torch.cumsum(seq, 0).to(torch.int32)]
+    )
+
+    a_ref = qa.float() * sa.float().repeat_interleave(sf_vec, -1)
+    b_ref = qbf.float().view(e, n, k) * sb.float().repeat_interleave(sf_vec, -1)
+    cul = cu.tolist()
+    ref = torch.cat(
+        [a_ref[cul[i] : cul[i + 1]] @ b_ref[i].T for i in range(e) if cul[i + 1] > cul[i]]
+    )
+
+    # (a) natural (unpadded) SFA + sfa_tile_aligned=True
+    mSFA_nat = pack_scale_2d_to_blocked_contig(sa.view(1, total_m, sf_k))
+    out_nat = torch.empty(total_m, n, dtype=torch.bfloat16, device=dev)
+    compile_blockscaled_gemm_tvm_ffi(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        sf_vec,
+        cutlass.BFloat16,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        qa,
+        mB,
+        out_nat,
+        mSFA_nat,
+        mSFB,
+        varlen_m=True,
+        sfa_tile_aligned=True,
+    )(qa, mB, out_nat, mSFA_nat, mSFB, cu)
+
+    # (b) dQaccum-padded SFA + default path (per-expert +i*128 tile gap)
+    tile = 128
+    total_padded = ((total_m + tile - 1) // tile + (e - 1)) * tile
+    sa_pad = sa.new_zeros(total_padded, sf_k)
+    off = 0
+    for i, m_i in enumerate(seqlens_m):
+        dst = (off // tile + i) * tile
+        sa_pad[dst : dst + m_i] = sa[off : off + m_i]
+        off += m_i
+    mSFA_pad = pack_scale_2d_to_blocked_contig(sa_pad.view(1, total_padded, sf_k))
+    out_pad = torch.empty(total_m, n, dtype=torch.bfloat16, device=dev)
+    compile_blockscaled_gemm_tvm_ffi(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        sf_vec,
+        cutlass.BFloat16,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        qa,
+        mB,
+        out_pad,
+        mSFA_pad,
+        mSFB,
+        varlen_m=True,
+        sfa_tile_aligned=False,
+    )(qa, mB, out_pad, mSFA_pad, mSFB, cu)
+    torch.cuda.synchronize()
+
+    err = (out_nat.float() - ref).abs().max().item()
+    assert err < 5e-3, f"natural-SFA seqlens_m={seqlens_m} max_err={err}"
+    assert torch.equal(out_nat, out_pad), f"natural != dQaccum for seqlens_m={seqlens_m}"
+
+
+@pytest.mark.parametrize(
     "seqlens_k",
     [
         [128, 128, 128],  # all aligned to 128
