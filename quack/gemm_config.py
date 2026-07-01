@@ -1,8 +1,36 @@
 # Copyright (C) 2025, Tri Dao.
 import itertools
+from enum import IntEnum
 from typing import Optional, List
 from functools import partial
 from dataclasses import dataclass
+
+
+class SplitKMode(IntEnum):
+    """How split-K partial results are combined into the output.
+
+    The canonical public import path is ``from quack.gemm_interface import SplitKMode``
+    (re-exported there next to the gemm entry points that take it). The definition has
+    to live in this leaf module: the kernel layer (gemm_base / gemm_sm*) consumes it at
+    import time, and gemm_interface sits above quack.gemm in the import graph, so
+    defining it there would be a circular import.
+
+    IntEnum (like RoundingMode) so values cross the torch.library custom-op schema
+    boundary as plain ints and pickle stably for the jit-cache key.
+    """
+
+    # All modes commit raw f32 partials; the full epilogue runs exactly once, on the
+    # entity that owns the completed sum (f32 accumulation in every mode).
+    # Per-output-tile turnstile orders the partial commits in split order; the last
+    # split finalizes: bitwise deterministic run to run.
+    SERIAL = 0
+    # Partials commit in arrival order (no waiting); the last split finalizes after an
+    # arrival counter fills: lowest latency, NOT deterministic run to run.
+    PARALLEL = 1
+    # Each split stores f32 partials to its own workspace slice; a separate reduction
+    # kernel (quack/split_k_reduce.py) sums them in a deterministic order and applies
+    # the epilogue.
+    SEPARATE = 2
 
 
 @dataclass(frozen=True)
@@ -17,6 +45,7 @@ class GemmConfig:
     cluster_m: int = 2
     cluster_n: int = 1
     cluster_k: int = 1
+    split_k: int = 1
     swap_ab: bool = False
     # raster_order: int = 1
     max_swizzle_size: int = 8

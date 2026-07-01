@@ -903,3 +903,65 @@ def test_mxfp8_interface_preallocated_out():
     out_pre = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
     mxfp8_gemm(A_q, B_q, A_sc, B_sc, out=out_pre)
     assert torch.equal(out_alloc, out_pre)
+
+
+# ---------------------------------------------------------------------------
+# Split-K (MXFP8 block-scaled)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("split_k_mode", ["serial", "parallel"])
+@pytest.mark.parametrize("split_k", [2, 4])
+@pytest.mark.parametrize("batched", [False, True])
+def test_mxfp8_split_k(batched, split_k, split_k_mode):
+    """MXFP8 block-scaled split-K: the dense finalizer-only split-K device path composes
+    with block-scaled as-is (the SF loads ride the same k_tile_start-offset copy list as
+    A/B; the accumulator is already descaled f32 before the epilogue). split-K must match
+    the plain (split_k=1) MXFP8 kernel to within ~1 bf16 ULP and stay deterministic for
+    serial."""
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import mxfp8_gemm, mxfp8_gemm_ref, mxfp8_quantize
+    from quack.gemm_config import SplitKMode
+
+    mode = SplitKMode[split_k_mode.upper()]
+    # Small M/N, large K -> the regime split-K targets. K a multiple of 32 (sf_vec).
+    M, N, K = 256, 256, 8192
+    L = 2 if batched else 1
+    torch.manual_seed(0)
+    shape_A = (L, M, K) if batched else (M, K)
+    shape_W = (L, N, K) if batched else (N, K)
+    A_hp = torch.randn(*shape_A, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    W_hp = torch.randn(*shape_W, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    A_q, A_sc = mxfp8_quantize(A_hp)
+    W_q, W_sc = mxfp8_quantize(W_hp)
+    B_q, B_sc = W_q.mT, W_sc.mT  # (..., K, N) / (..., K/32, N) K-contig views
+
+    ref = mxfp8_gemm_ref(A_q, B_q, A_sc, B_sc)
+    base = mxfp8_gemm(A_q, B_q, A_sc, B_sc)  # plain (split_k=1) MXFP8 kernel
+    out = mxfp8_gemm(A_q, B_q, A_sc, B_sc, split_k=split_k, split_k_mode=mode)
+    assert out.shape == ((L, M, N) if batched else (M, N))
+
+    # f32 partials accumulation -> split-K is no less accurate than the plain kernel.
+    err = (out.float() - ref.float()).abs().max().item()
+    base_err = (base.float() - ref.float()).abs().max().item()
+    assert err < 2 * base_err + 5e-3, f"split-K err={err} vs base_err={base_err}"
+    # Differs from the plain kernel only by f32 reassociation (~1 bf16 ULP at O(1)).
+    assert (out.float() - base.float()).abs().max().item() < 1e-2
+
+    if mode != SplitKMode.PARALLEL:  # arrival-order reduction is not deterministic
+        for _ in range(3):
+            out2 = mxfp8_gemm(A_q, B_q, A_sc, B_sc, split_k=split_k, split_k_mode=mode)
+            assert torch.equal(out, out2), "serial split-K is not bitwise deterministic"
+
+
+def test_mxfp8_split_k_staged_rejected():
+    """SEPARATE needs a block-scaled-reachable reduction kernel (not yet wired); it must
+    raise a clear error rather than silently misconfigure."""
+    _skip_if_not_sm100()
+    from quack.gemm_blockscaled_interface import mxfp8_gemm, mxfp8_quantize
+    from quack.gemm_config import SplitKMode
+
+    M, N, K = 256, 256, 2048
+    torch.manual_seed(0)
+    A_q, A_sc = mxfp8_quantize(torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5)
+    W_q, W_sc = mxfp8_quantize(torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5)
+    with pytest.raises(NotImplementedError, match="SEPARATE"):
+        mxfp8_gemm(A_q, W_q.mT, A_sc, W_sc.mT, split_k=2, split_k_mode=SplitKMode.SEPARATE)

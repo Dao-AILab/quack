@@ -31,6 +31,7 @@ from quack.blockscaled_gemm_utils import (
     scale_blocked_for_cublas,
     scale_view_for_kernel,
 )
+from quack.gemm_config import SplitKMode
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.mx_utils import to_mx
 
@@ -60,6 +61,8 @@ def _compile_cached(
     out_torch_dtype,
     ab_dtype_cutlass,
     sf_dtype_cutlass,
+    split_k: int = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ):
     """Compile kernel for a given (shape, dtype, tiler, cluster) and cache it."""
     dev = torch.device("cuda")
@@ -87,6 +90,8 @@ def _compile_cached(
         fake_mD,
         fake_mSFA,
         fake_mSFB,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
 
@@ -162,8 +167,15 @@ def mxfp8_gemm_out(
     *,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    split_k: int = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
-    """MXFP8 blockscaled GEMM with pre-allocated output. See module doc for shape conventions."""
+    """MXFP8 blockscaled GEMM with pre-allocated output. See module doc for shape conventions.
+
+    split_k > 1 partitions the K dim across split_k CTAs per output tile (SERIAL =
+    deterministic, PARALLEL = fastest); see SplitKMode. Recovers occupancy for
+    small-M/N, large-K shapes.
+    """
     m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
     out_dtype = out.dtype
     assert out_dtype in _TORCH_TO_CUTLASS_D, f"unsupported out dtype: {out_dtype}"
@@ -208,6 +220,8 @@ def mxfp8_gemm_out(
         out_dtype,
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
+        split_k,
+        SplitKMode(split_k_mode),
     )
     runner(mA, mB, mD, sfa, sfb)
 
@@ -222,6 +236,8 @@ def mxfp8_gemm(
     *,
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    split_k: int = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tensor:
     """MXFP8 blockscaled GEMM. Allocates output if not provided."""
     if out is None:
@@ -239,6 +255,8 @@ def mxfp8_gemm(
         out,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     return out
 
