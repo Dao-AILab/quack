@@ -47,13 +47,8 @@ def test_softmax(M, N, input_dtype, use_compile):
     x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     x_ref = x.detach().clone().requires_grad_(True)
 
-    # Order matters under `pytest --compile-only` (FakeTensorMode): we want both fwd
-    # and bwd kernels to be dispatched (and therefore compiled) for every (M, N, dtype)
-    # combination. `torch.testing.assert_close` raises on fake tensors, so we run all
-    # kernel calls (fwd + autograd.grad for bwd) FIRST and only then do the numerical
-    # / property assertions. Eager runs see no behavior change; --compile-only now
-    # honestly compiles the bwd instead of relying on a hidden side-effect inside the
-    # fwd op's register_fake.
+    # Run all kernel calls (fwd + autograd.grad for bwd) first, then do the
+    # numerical / property assertions.
     out = function(x)
     out_ref = F.softmax(x_ref, dim=-1)
     dy = torch.randn_like(out)

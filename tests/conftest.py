@@ -1,23 +1,21 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 """pytest configuration for quack kernel tests.
 
-Supports:
-  --compile-only    Compile all kernels (populating .o cache), skip actual execution.
-                    Uses FakeTensorMode (no GPU memory) so you can use many xdist workers.
-                    Works without a GPU if QUACK_ARCH and CUTE_DSL_ARCH are set.
-                    Implemented by the reusable `quack.testing.pytest_plugin`
-                    plugin (loaded below) — downstream projects can opt into the
-                    same workflow by adding the same `pytest_plugins =` line.
+Kernel-compile workflow (implemented by the reusable
+`quack.testing.pytest_plugin` plugin loaded below — downstream projects opt
+in with the same `pytest_plugins =` line):
 
-Two-pass workflow (after changing kernel source):
-  pytest tests/test_softmax.py --compile-only -n 64   # parallel compile, no GPU memory
-  pytest tests/test_softmax.py                         # instant .o loads
+  --async-compile[=N]  Single-pass workflow: on a kernel-compile cache miss,
+                       the compile is shipped to a pool of N CPU workers
+                       (forkserver sidecar: ~0.1 s/worker, GPU-blind), the
+                       test is deferred, other tests run meanwhile, and the
+                       deferred test retries once its .o is exported.
+                       Zero overhead when the cache is warm. Works with and
+                       without xdist.
 
-CPU-only compilation (no GPU needed):
-  QUACK_ARCH=90 CUTE_DSL_ARCH=sm_90a pytest tests/ --compile-only -n 64
-
-Single-pass workflow (cache already warm):
-  pytest tests/test_softmax.py                         # all .o cache hits
+Single-pass workflow (cold or warm cache, after changing kernel source):
+  pytest tests/test_softmax.py --async-compile=16      # compiles overlap tests
+  pytest tests/ -n 8 --async-compile=32
 
 Multi-GPU with xdist:
   pytest tests/ -n 4                                   # workers round-robin across GPUs
@@ -32,13 +30,6 @@ from pathlib import Path
 from getpass import getuser
 
 import pytest
-
-
-def _compile_only_enabled(config) -> bool:
-    try:
-        return bool(config.getoption("--compile-only", default=False))
-    except (ValueError, AttributeError):
-        return False
 
 
 def _get_gpu_ids():
@@ -100,8 +91,8 @@ def _assign_xdist_worker_gpu():
 
 _PRECONFIGURED_WORKER_GPU = _assign_xdist_worker_gpu()
 
-# `--compile-only` flag, FakeTensorMode setup, and the per-phase error-swallow
-# hooks live in the reusable plugin. We defer to it only after xdist workers
+# The `--async-compile` pool and defer-and-retry loop
+# live in the reusable plugin. We defer to it only after xdist workers
 # have been narrowed to a single GPU, because importing the `quack` package can
 # touch CUDA via CUTLASS/PyTorch.
 pytest_plugins = ["quack.testing.pytest_plugin"]
@@ -177,41 +168,6 @@ def pytest_configure(config):
             )
 
 
-def pytest_collection_modifyitems(config, items):
-    """Deselect ``use_compile=True`` parametrizations under ``--compile-only``.
-
-    Compile-only runs exist to populate the cute kernel .o cache via FakeTensorMode.
-    The ``use_compile=True`` parametrizations wrap the kernel entry point in
-    ``torch.compile(...)``, but the cute kernel is already an opaque ``cute_op``
-    (see ``quack/dsl/torch_library_op.py``), so Dynamo+Inductor add no cache
-    coverage — both branches hit the same ``cute.compile`` path through the fake
-    impl. Inductor's pre-codegen alignment check (``_inductor/utils.py:tensor_is_aligned``)
-    also calls ``data_ptr()`` on the FakeTensor input, which emits a noisy
-    deprecation warning. Deselecting these parametrizations removes the warning and
-    saves the redundant Inductor compile work. The real GPU pass (no
-    ``--compile-only``) still exercises ``torch.compile`` for coverage.
-    """
-    if not _compile_only_enabled(config):
-        return
-
-    # ``tests/test_cache.py`` is no longer special-cased here — R1 made the
-    # leak-on-reset bug impossible (no module-level ``COMPILE_ONLY`` attribute
-    # to assign to) and R2 added a ``compile_only_skip`` marker that
-    # ``test_cache.py`` uses as ``pytestmark``, evaluated at setup time. The
-    # belt-and-suspenders deselect that used to live here is no longer needed.
-    deselected = [
-        item
-        for item in items
-        if getattr(item, "callspec", None) is not None
-        and item.callspec.params.get("use_compile") is True
-    ]
-    if not deselected:
-        return
-    config.hook.pytest_deselected(items=deselected)
-    deselected_ids = {id(item) for item in deselected}
-    items[:] = [item for item in items if id(item) not in deselected_ids]
-
-
 def pytest_collection_finish(session):
     """Print a summary of collected tests grouped by file and function."""
     if not session.items:
@@ -247,10 +203,7 @@ def _is_oom(exc_type, exc_val):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """Retry once on CUDA OOM after freeing GPU memory. No-op under --compile-only."""
-    if _compile_only_enabled(item.config):
-        yield
-        return
+    """Retry once on CUDA OOM after freeing GPU memory."""
     outcome = yield
     if outcome.excinfo is not None and _is_oom(*outcome.excinfo[:2]):
         import gc

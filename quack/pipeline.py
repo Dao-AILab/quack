@@ -13,6 +13,7 @@ from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
 from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
+from cutlass.pipeline import PipelineTmaStore as PipelineTmaStoreOg
 from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 from cutlass.pipeline import PipelineUmmaAsync as PipelineUmmaAsyncOg
 from cutlass.pipeline import PipelineAsyncUmma as PipelineAsyncUmmaOg
@@ -289,7 +290,7 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
             loc=loc,
             ip=ip,
         )
-        if const_expr(extra_tx_count == 0):
+        if const_expr(isinstance(extra_tx_count, int) and extra_tx_count == 0):
             self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
@@ -297,6 +298,31 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
 
 
 PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
+
+
+# ── PipelineTmaStore ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PipelineTmaStore(PipelineTmaStoreOg):
+    """PipelineTmaStore with configurable cp.async.bulk wait read flag."""
+
+    _read: bool = True
+
+    @staticmethod
+    def create(*args, read: bool = True, **kwargs):
+        obj = PipelineTmaStoreOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineTmaStore)
+        object.__setattr__(obj, "_read", read)
+        return obj
+
+    @dsl_user_op
+    def producer_acquire(self, *, loc=None, ip=None) -> None:
+        cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=self._read, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def producer_tail(self, *, loc=None, ip=None) -> None:
+        cute.arch.cp_async_bulk_wait_group(0, read=self._read, loc=loc, ip=ip)
 
 
 # ── PipelineTmaUmma ─────────────────────────────────────────────────────────
@@ -357,10 +383,56 @@ PipelineTmaUmma.create = _override_create(PipelineTmaUmmaOg, PipelineTmaUmma)
 
 @dataclass(frozen=True)
 class PipelineUmmaAsync(_PipelineIndexPhaseMixin, PipelineUmmaAsyncOg):
-    pass
+    """
+    PipelineUmmaAsync with optional elect_one for producer_commit and
+    consumer_release, mirroring PipelineAsync.
+    """
 
+    _elect_one_commit: bool = False
+    _syncwarp_before_commit: bool = True
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
 
-PipelineUmmaAsync.create = _override_create(PipelineUmmaAsyncOg, PipelineUmmaAsync)
+    @staticmethod
+    def create(
+        *args,
+        elect_one_commit: bool = False,
+        syncwarp_before_commit: bool = True,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineUmmaAsyncOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineUmmaAsync)
+        object.__setattr__(obj, "_elect_one_commit", elect_one_commit)
+        object.__setattr__(obj, "_syncwarp_before_commit", syncwarp_before_commit)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
+
+    @dsl_user_op
+    def producer_commit(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineUmmaAsyncOg.producer_commit,
+            self,
+            state,
+            self._elect_one_commit,
+            self._syncwarp_before_commit,
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineUmmaAsyncOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
 
 
 # ── PipelineAsyncUmma ───────────────────────────────────────────────────────
@@ -368,10 +440,56 @@ PipelineUmmaAsync.create = _override_create(PipelineUmmaAsyncOg, PipelineUmmaAsy
 
 @dataclass(frozen=True)
 class PipelineAsyncUmma(_PipelineIndexPhaseMixin, PipelineAsyncUmmaOg):
-    pass
+    """
+    PipelineAsyncUmma with optional elect_one for producer_commit and
+    consumer_release, mirroring PipelineAsync.
+    """
 
+    _elect_one_commit: bool = False
+    _syncwarp_before_commit: bool = True
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
 
-PipelineAsyncUmma.create = _override_create(PipelineAsyncUmmaOg, PipelineAsyncUmma)
+    @staticmethod
+    def create(
+        *args,
+        elect_one_commit: bool = False,
+        syncwarp_before_commit: bool = True,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineAsyncUmmaOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineAsyncUmma)
+        object.__setattr__(obj, "_elect_one_commit", elect_one_commit)
+        object.__setattr__(obj, "_syncwarp_before_commit", syncwarp_before_commit)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
+
+    @dsl_user_op
+    def producer_commit(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineAsyncUmmaOg.producer_commit,
+            self,
+            state,
+            self._elect_one_commit,
+            self._syncwarp_before_commit,
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineAsyncUmmaOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
 
 
 # ── PipelineTmaCpAsync ──────────────────────────────────────────────────────

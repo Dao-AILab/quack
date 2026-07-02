@@ -36,14 +36,16 @@ compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 | b300 | (none, sm100) | — | ✓ |
 | h100 | sm120 | ✓ | ✓ |
 
-## Two-pass test strategy
+## Test strategy
 
-Per `gpu-test/action.yml`:
+Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
-- **Pass 1** — `pytest tests/ --compile-only -n 24 --dist worksteal` (compile-only
-  flag, no GPU memory needed; warms the persistent kernel cache).
-- **Pass 2** — `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal`
-  on real GPUs (free-memory threshold 50 GB).
+- `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24`
+  (free-memory threshold 50 GB). Cold kernel-compile misses are shipped to a
+  pool of 24 CPU workers (forkserver sidecar, GPU-blind) while the affected
+  tests defer and retry once their `.o` lands; warm runs pay nothing. The
+  persistent kernel cache (`QUACK_CACHE_DIR`) carries `.o` files across runs
+  on the same runner.
 
 ## SIF caching on runners
 

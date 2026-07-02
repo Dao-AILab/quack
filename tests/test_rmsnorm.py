@@ -66,7 +66,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
     # Compile ref for large inputs to avoid OOMs.
     compile_ref = N >= 256 * 1024 and M >= 8 * 1024
     ref_function = torch.compile(rmsnorm_ref) if compile_ref else rmsnorm_ref
-    # Order matters under `pytest --compile-only` (FakeTensorMode): we want both fwd
+    # Run all kernel calls (fwd + bwd) first, then do numerical assertions.
     # and bwd kernels to be dispatched (and therefore compiled). `assert_close` raises
     # on fake tensors, so run all kernel calls FIRST, then do numerical assertions.
     out = function(x, weight, eps=eps)
@@ -117,11 +117,6 @@ def test_rmsnorm_noncontiguous_grad(input_dtype, use_compile):
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
 
 
-@pytest.mark.compile_only_skip(
-    "torch.compile cannot trace through the outer FakeTensorMode that "
-    "--compile-only installs (Dynamo skips frames under non-infra dispatch modes); "
-    "the underlying rmsnorm kernel signatures are warmed by other parametrized tests"
-)
 def test_rmsnorm_compile_2d_then_4d():
     """Regression test: torch.compile(rmsnorm) must work when called first with 2D input
     (standard) then 4D input (per-head), without dynamo.reset() in between."""
@@ -283,12 +278,8 @@ def test_rmsnorm_large_tensor(M, N, input_dtype, eps, use_compile):
     )
 
 
-def test_rmsnorm_input_validation(request):
+def test_rmsnorm_input_validation():
     """Test input validation and error handling."""
-    # Validation runs eagerly in the op body and raises *before* dispatch under
-    # FakeTensorMode, so `with pytest.raises(...)` cannot fire under --compile-only.
-    if request.config.getoption("--compile-only", default=False):
-        pytest.skip("validation paths are not exercised under --compile-only / FakeTensorMode")
     device = "cuda"
 
     # Test 3D input (should now work since rmsnorm was updated to accept 3D inputs)

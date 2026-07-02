@@ -266,8 +266,7 @@ class RotaryKernel:
             cute.arch.sync_threads()
         else:
             for h in cutlass.range_constexpr(self.tile_h):
-                tCrX_f32 = cute.make_rmem_tensor(tXrX_g2r[None, None, None, 0].shape, Float32)
-                tCrX_f32.store(tXrX_g2r[None, None, None, h].load().to(Float32))
+                tCrX_f32 = tXrX_g2r[None, None, None, h].to(Float32)
                 assert cute.size(tCrX_f32.shape) == cute.size(rCos) * 2
                 for i in cutlass.range(cute.size(tCrX_f32.shape) // 2, unroll_full=True):
                     x0, x1 = tCrX_f32[2 * i], tCrX_f32[2 * i + 1]

@@ -250,7 +250,6 @@ class CrossEntropy(ReductionBase):
             probs = exp_x * denom_inv
             gdX = cute.local_tile(mdX, tiler_mn, (bidx, cluster_y))
             tXgdX = thr_copy.partition_D(gdX)
-            tXrdX = cute.make_rmem_tensor_like(tXgdX)
             tXcFull = thr_copy.partition_S(cX)
             # Compute gradient: probs for all classes, (probs - 1) for target class
             # If ignored, gradient is already zero
@@ -261,7 +260,7 @@ class CrossEntropy(ReductionBase):
                     tXrdX_f32[i] = tXrdX_f32[i] if tXcFull[i][1] != target else tXrdX_f32[i] - 1.0
             if const_expr(mWeight is not None):
                 tXrdX_f32.store(tXrdX_f32.load() * target_weight)
-            tXrdX.store(tXrdX_f32.load().to(tXrdX.element_type))
+            tXrdX = tXrdX_f32.to(tXgdX.element_type)
             if row < shape[0]:
                 copy(tXrdX, tXgdX)
 

@@ -237,7 +237,7 @@ class GemmBase:
                 cute.copy(
                     tiled_copy_aux_out_r2s,
                     # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-                    copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i])),
+                    tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
                     tRS_sAuxOut[None, None, None, epi_buffer],
                 )
             if const_expr(use_tma_epi):

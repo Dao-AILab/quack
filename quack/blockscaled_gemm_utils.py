@@ -709,7 +709,7 @@ def compile_blockscaled_gemm_tvm_ffi(
         varlen_args,
         stream,
     ):
-        gemm(a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb, None)
+        gemm(a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb)
 
     compiled = cute.compile(
         runner,

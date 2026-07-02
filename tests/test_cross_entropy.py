@@ -44,9 +44,7 @@ def test_cross_entropy(M, N, input_dtype, has_weight, use_compile):
     weight = (torch.rand(N, device=device, dtype=torch.float32) + 0.1) if has_weight else None
     x_ref = x.detach().clone().float().requires_grad_()
     target_ref = target.detach().clone()
-    # Order matters under `pytest --compile-only` (FakeTensorMode): we want both fwd
-    # and bwd kernels to be dispatched (and therefore compiled). `assert_close` raises
-    # on fake tensors, so run all kernel calls FIRST, then do numerical assertions.
+    # Run all kernel calls (fwd + bwd) first, then do numerical assertions.
     function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
     # --- No ignore_index ---
     loss = function(x, target, weight=weight, reduction="none")
@@ -107,8 +105,7 @@ def test_cross_entropy_lse_partial(M, N, input_dtype, use_compile):
         lse_partial = x.view(M, N // 128, 128).float().logsumexp(dim=-1)
     x_ref = x.detach().clone().requires_grad_()
     target_ref = target.detach().clone()
-    # Order matters under `pytest --compile-only` (FakeTensorMode): dispatch fwd + bwd
-    # before any numerical asserts (which raise on fake tensors).
+    # Dispatch fwd + bwd before any numerical asserts.
     function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
     loss = function(x, target, lse_partial=lse_partial, reduction="none")
     loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction="none")

@@ -5,11 +5,13 @@ Compiled kernels are exported as object files (``.o``) via ``export_to_c``. On
 subsequent runs the ``.o`` is loaded via tvm_ffi (~1 ms) instead of
 re-generating IR + re-JIT'ing (~500 ms per kernel).
 
-Runtime config (``CACHE_ENABLED``, ``CACHE_DIR``, ``EXTRA_SOURCE_DIRS``) and
-the compile-only depth counter live in :mod:`quack.cache` (the package init).
-The compile-only state is read here via :func:`quack.cache.is_compile_only`
-(a ContextVar-backed live read); see :mod:`quack.cache` for the redesign
-rationale.
+Runtime config (``CACHE_ENABLED``, ``CACHE_DIR``, ``EXTRA_SOURCE_DIRS``)
+lives in :mod:`quack.cache` (the package init).
+
+When an async compile pool is active (see :mod:`quack.cache.async_compile`),
+a cold miss is shipped to a CPU worker and :class:`CompilePending` is raised
+instead of compiling in-process; the caller (pytest defer loop, autotune
+bench loop) retries once the ``.o`` lands.
 """
 
 from __future__ import annotations
@@ -39,10 +41,6 @@ import quack.cache as _state  # noqa: E402  (intentional partial-import; see __i
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
-
-
-def _noop_kernel(*args, **kwargs):
-    pass
 
 
 def get_cache_path() -> Path:
@@ -162,33 +160,21 @@ def jit_cache(fn):
         nonlocal hits, misses
         cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
 
-        # Snapshot mutable state once per call so a concurrent flip of
-        # ``_state.CACHE_ENABLED`` mid-call can't desync the disk-path branch.
-        # Sampling ``is_compile_only()`` once per call keeps the wrapper's
-        # in-memory-hit / disk-hit / compile / store branches consistent under
-        # async task switching (each ``asyncio.Task`` runs in its own copy of
-        # the parent's ``contextvars.Context``, but a single coroutine could
-        # otherwise observe both states if ``await`` landed between the in-mem
-        # check and the disk-hit branch). Note: ``ContextVar`` is per-thread,
-        # so a helper *thread* spawned inside ``compile_only_mode()`` will not
-        # observe ``True`` — a behavioral change vs. the old module-attribute
-        # design that the project's single-threaded ``_compile_worker`` and
-        # pytest workflows are unaffected by, but worth recording for future
-        # callers that might spawn worker threads inside compile-only.
+        # Snapshot once per call so a concurrent flip of ``_state.CACHE_ENABLED``
+        # mid-call can't desync the disk-path branch.
         enabled = _state.CACHE_ENABLED
-        compile_only = _state.is_compile_only()
 
         # 1. In-memory hit. Same process already compiled or loaded this key.
         if cache_key in cache:
             hits += 1
-            return _noop_kernel if compile_only else cache[cache_key]
+            return cache[cache_key]
 
         # 2. Cache disabled: pure in-process compile, no disk side effects.
         if not enabled:
             misses += 1
             compiled_fn = fn(*args, **kwargs)
             cache[cache_key] = compiled_fn
-            return _noop_kernel if compile_only else compiled_fn
+            return compiled_fn
 
         sha = _key_to_hash((fn.__qualname__,) + cache_key)
         cache_path = get_cache_path() / _compute_source_fingerprint()
@@ -212,9 +198,48 @@ def jit_cache(fn):
                         loaded = _load_cached()
                         cache[cache_key] = loaded
                         hits += 1
-                        return _noop_kernel if compile_only else loaded
+                        return loaded
             except RuntimeError:
                 pass  # lock timeout; fall through to slow path
+
+        # 3b. Async-compile pool: on a cold miss with a pool
+        #     active, ship the key to a CPU subprocess and raise
+        #     CompilePending instead of compiling in-process. The test runner
+        #     defers the test and retries once the worker has exported the
+        #     .o. Pool failures fall through to the in-process compile below
+        #     so the real exception surfaces with a local traceback.
+        from quack.cache import async_compile as _async
+
+        pool = _async.get_active_pool()
+        if pool is not None:
+            state, err = pool.poll(sha)
+            if state == "new":
+                # If another process (e.g. a different xdist worker's pool)
+                # holds the exclusive per-key flock, it is compiling this key
+                # right now: defer on it instead of submitting a duplicate.
+                if _async._flock_held_exclusively(str(lock_path)):
+                    pool.mark_external(sha, str(o_path), str(lock_path))
+                    raise _async.CompilePending(sha, fn.__qualname__)
+                if pool.submit(sha, fn, args, kwargs, o_path):
+                    raise _async.CompilePending(sha, fn.__qualname__)
+                # unpicklable key / <locals> qualname: compile in-process
+            elif state == "pending":
+                raise _async.CompilePending(sha, fn.__qualname__)
+            elif state == "done":
+                try:
+                    with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
+                        if o_path.exists():
+                            loaded = _load_cached()
+                            cache[cache_key] = loaded
+                            hits += 1
+                            return loaded
+                except RuntimeError:
+                    pass  # lock timeout; fall through to slow path
+            else:  # "failed"
+                print(
+                    f"quack cache: async compile failed for {fn.__qualname__} "
+                    f"[{sha[:12]}]: {err}; recompiling in-process for a real traceback"
+                )
 
         # 4. Slow path: take EXCLUSIVE lock and compile under it. The recheck
         #    inside the lock catches the race where another process compiled
@@ -226,7 +251,7 @@ def jit_cache(fn):
                     loaded = _load_cached()
                     cache[cache_key] = loaded
                     hits += 1
-                    return _noop_kernel if compile_only else loaded
+                    return loaded
 
                 misses += 1
                 compiled_fn = fn(*args, **kwargs)
@@ -238,7 +263,7 @@ def jit_cache(fn):
                 except Exception as e:
                     print(f"quack cache: export failed for key {sha}: {e}")
                 cache[cache_key] = compiled_fn
-                return _noop_kernel if compile_only else compiled_fn
+                return compiled_fn
         except RuntimeError as e:
             # Lock acquisition timed out (heavy contention or stuck holder).
             # Fall back to in-process compile, no disk write. Better to do
@@ -250,7 +275,7 @@ def jit_cache(fn):
             misses += 1
             compiled_fn = fn(*args, **kwargs)
             cache[cache_key] = compiled_fn
-            return _noop_kernel if compile_only else compiled_fn
+            return compiled_fn
 
     def cache_clear():
         nonlocal hits, misses

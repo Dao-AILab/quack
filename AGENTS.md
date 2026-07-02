@@ -24,6 +24,12 @@ pytest tests/
 # Run a single test
 pytest tests/test_rmsnorm.py -x
 pytest tests/test_rmsnorm.py::test_rmsnorm_fwd -x -k "bfloat16"
+
+# After editing kernel source (cold .o cache): overlap compiles with tests.
+# Misses are compiled by a pool of N CPU workers (forkserver sidecar) while
+# deferred tests retry once their .o lands. No-op when the cache is warm.
+pytest tests/test_rmsnorm.py --async-compile=16
+pytest tests/ -n 8 --async-compile=32
 ```
 
 ## CuTe DSL Conventions

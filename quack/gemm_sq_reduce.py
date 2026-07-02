@@ -299,11 +299,6 @@ def gemm_sq_reduce(
         device_capacity,
     )
 
-    from quack.cache import is_compile_only
-
-    if is_compile_only():
-        return
-
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     epi_args = GemmSqReduceMixin.EpilogueArguments(
         mRowVecBroadcast=rowvec,
@@ -318,6 +313,6 @@ def gemm_sq_reduce(
     varlen_args = make_varlen_args(None, None, None)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)

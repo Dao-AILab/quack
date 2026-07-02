@@ -107,8 +107,7 @@ class TopK:
 
         if tXcX[0][0] < shape[0]:
             copy(tXgX, tXrX)
-        tXrX_f32 = cute.make_rmem_tensor(tXrX.shape, Float32)
-        tXrX_f32.store(tXrX.load().to(Float32))
+        tXrX_f32 = tXrX.to(Float32)
 
         # Encode the indices into the bottom bits of values.
         log_N = int(math.log2(self.N))
@@ -187,8 +186,7 @@ class TopK:
             topk_vals_split.store(exp_x * cute.arch.rcp_approx(denom))
 
         # Convert cleaned values to output type
-        topk_vals_out = cute.make_rmem_tensor_like(topk_vals_split, mValues.element_type)
-        topk_vals_out.store(topk_vals_split.load().to(mValues.element_type))
+        topk_vals_out = topk_vals_split.to(mValues.element_type)
 
         row = tXcX[0][0]
         # # Only the 1st thread in this row writes the top-k values and indices

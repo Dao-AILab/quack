@@ -10,7 +10,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Float64, Int32, const_expr
-from cutlass._mlir import ir
 from cutlass._mlir.extras import types as T
 
 from quack.complex import (
@@ -19,16 +18,7 @@ from quack.complex import (
     complex_storage,
     recast_to_complex64,
 )
-import quack.cache
-
-
-# Skip the whole module under ``pytest --compile-only`` — the direct TVM-FFI
-# compile path here does not warm quack's jit cache, so the tests add nothing
-# in phase 1. The marker is registered by ``quack.testing.pytest_plugin`` and
-# evaluated at test-setup time, so it is robust to xdist worksteal item-fetch
-# ordering (unlike ``pytest.mark.skipif(quack.cache.COMPILE_ONLY, ...)``
-# which captures at decorator-application time).
-pytestmark = pytest.mark.compile_only_skip("direct TVM-FFI compile does not warm jit cache")
+from quack.testing.trace import run_traced
 
 
 class _ScaleByComplex:
@@ -499,9 +489,14 @@ def test_complex64_class_attributes():
 
 def test_complex64_mlir_type_is_f64():
     """Tier 4.19 -- mlir_type query needs an MLIR context."""
-    with ir.Context() as ctx, ir.Location.unknown():
-        ctx.allow_unregistered_dialects = True
+
+    # run_traced, not `with ir.Context()`: raw contexts corrupt the process
+    # (see quack.testing.trace). The DSL context also has all dialects
+    # registered, so allow_unregistered_dialects is no longer needed.
+    def check():
         assert Complex64.mlir_type == T.f64()
+
+    run_traced(check)
 
 
 # ---------------------------------------------------------------------------
@@ -540,8 +535,7 @@ def test_complex_storage_view_for_complex64():
     c = torch.zeros(4, dtype=torch.complex64, device="cuda")
     v = complex_storage(c)
     assert v.dtype == torch.float64
-    if not quack.cache.COMPILE_ONLY:
-        assert v.data_ptr() == c.data_ptr()
+    assert v.data_ptr() == c.data_ptr()
     assert v.numel() == c.numel()
 
 

@@ -7,7 +7,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, const_expr, Int32
 from cutlass.utils import TensorMapUpdateMode, TensorMapManager
-from cutlass._mlir.dialects import llvm
 
 
 @dataclass(frozen=True)
@@ -75,18 +74,15 @@ class TensorMapManagerSm90(TensorMapManager):
         if is_manager_warp:
             if const_expr(self.tensormap_update_mode == TensorMapUpdateMode.SMEM):
                 for smem_ptr, shape, order in zip(tensormap_smem_ptr, shapes, orders):
-                    smem_ptr_i32 = smem_ptr.toint().ir_value()
-                    llvm.inline_asm(
-                        None,
-                        [smem_ptr_i32, Int32(shape).ir_value()],
+                    smem_ptr_i32 = smem_ptr.toint()
+                    cute.arch.inline_ptx(
                         "{\n\t"
                         ".reg .b64 smem_ptr_i64;\n\t"
-                        "cvt.u64.u32 smem_ptr_i64, $0;\n\t"
-                        f"tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [smem_ptr_i64], {order}, $1;\n\t"
+                        "cvt.u64.u32 smem_ptr_i64, {$r0};\n\t"
+                        f"tensormap.replace.tile.global_dim.shared::cta.b1024.b32 "
+                        f"[smem_ptr_i64], {order}, {{$r1}};\n\t"
                         "}\n",
-                        "r,r",
-                        has_side_effects=True,
-                        is_align_stack=False,
+                        read_only_args=[smem_ptr_i32, Int32(shape)],
                     )
             # wait until it's safe to update tensormap in global memory
             with cute.arch.elect_one():
@@ -100,14 +96,11 @@ class TensorMapManagerSm90(TensorMapManager):
             else:
                 assert len(shapes) == len(orders) == len(tensormap_gmem_ptr)
                 for gmem_ptr, shape, order in zip(tensormap_gmem_ptr, shapes, orders):
-                    gmem_ptr_i64 = gmem_ptr.toint().ir_value()
-                    llvm.inline_asm(
-                        None,
-                        [gmem_ptr_i64, Int32(shape).ir_value()],
-                        f"tensormap.replace.tile.global_dim.global.b1024.b32 [$0], {order}, $1;",
-                        "l,r",
-                        has_side_effects=True,
-                        is_align_stack=False,
+                    gmem_ptr_i64 = gmem_ptr.toint()
+                    cute.arch.inline_ptx(
+                        f"tensormap.replace.tile.global_dim.global.b1024.b32 "
+                        f"[{{$r0}}], {order}, {{$r1}};",
+                        read_only_args=[gmem_ptr_i64, Int32(shape)],
                     )
                 cute.arch.sync_warp()
                 cute.nvgpu.cpasync.fence_tma_desc_release()

@@ -192,7 +192,7 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
         assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
 
 
-@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
+@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx", "tanh"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("colvec_reduce", [False, True])
 @pytest.mark.parametrize("has_colvec_scale", [False, True])

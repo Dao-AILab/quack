@@ -7,6 +7,7 @@ from enum import IntEnum
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass._mlir.dialects import nvvm
 
 import quack.utils as utils
 from quack.fast_math import FastDivmod
@@ -411,13 +412,18 @@ class TileScheduler:
                 # instead of atomic_inc, and at the end of the kernel must reset the semaphore to 0.
                 #                 # cute.printf("before atomicadd, tidx = {}, bidz = {}, idx = {}", cute.arch.thread_idx()[0], cute.arch.block_idx()[2], current_work_idx)
                 if const_expr(params.problem_shape_ncluster_mnl[0] is not None):
-                    next_work_linear_idx = num_persistent_clusters + utils.atomic_inc_i32(
-                        cute.size(params.problem_shape_ncluster_mnl) - 1,
-                        params.tile_count_semaphore,
+                    next_work_linear_idx = num_persistent_clusters + Int32(
+                        nvvm.atomicrmw(
+                            op=nvvm.AtomicOpKind.INC,
+                            ptr=params.tile_count_semaphore.llvm_ptr,
+                            a=Int32(cute.size(params.problem_shape_ncluster_mnl) - 1).ir_value(),
+                            loc=loc,
+                            ip=ip,
+                        )
                     )
                 else:  # varlen_m
-                    next_work_linear_idx = num_persistent_clusters + utils.atomic_add_i32(
-                        1, params.tile_count_semaphore
+                    next_work_linear_idx = num_persistent_clusters + cute.arch.atomic_add(
+                        params.tile_count_semaphore, Int32(1), loc=loc, ip=ip
                     )
                 # cute.printf("after atomicadd, tidx = {}, bidz = {}, idx = {}", cute.arch.thread_idx()[0], cute.arch.block_idx()[2], current_work_idx)
             return cute.arch.shuffle_sync(next_work_linear_idx, 0)
@@ -427,7 +433,9 @@ class TileScheduler:
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(mbarrier_addr, 16, loc=loc, ip=ip)
-                utils.issue_clc_query_nomulticast(mbarrier_addr, clc_response_ptr, loc=loc, ip=ip)
+                cute.arch.issue_clc_query(
+                    mbarrier_addr, clc_response_ptr, multicast=False, loc=loc, ip=ip
+                )
             cute.arch.sync_warp()
             cute.arch.mbarrier_wait(mbarrier_addr, self._pipeline_state.phase, loc=loc, ip=ip)
             bidx, bidy, bidz, valid = cute.arch.clc_response(clc_response_ptr, loc=loc, ip=ip)
@@ -579,7 +587,7 @@ def triangular_idx_to_coord(idx: Int32) -> Tuple[Int32, Int32]:
     Convert a triangular index to 2D coordinates.
     This is used to convert the linear index to 2D coordinates for triangular matrices.
     """
-    row = utils.ceil((utils.sqrt(2 * idx + 2.25) - 0.5)) - 1
+    row = Int32(cute.math.ceil(cute.math.sqrt(2 * idx + 2.25, approx=True) - 0.5)) - 1
     col = idx - (row * (row + 1)) // 2
     return row, col
 
@@ -724,8 +732,11 @@ class TriangularTileScheduler(TileScheduler):
         params = self.params
         group_size = params.group_size_fdd.divisor
         group_id = (
-            utils.ceil(
-                (utils.sqrt(2 * cluster_id_in_problem + 2.25) - 0.5) * params.group_size_inv_f32
+            Int32(
+                cute.math.ceil(
+                    (cute.math.sqrt(2 * cluster_id_in_problem + 2.25, approx=True) - 0.5)
+                    * params.group_size_inv_f32
+                )
             )
             - 1
         )

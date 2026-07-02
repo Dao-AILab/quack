@@ -29,7 +29,7 @@ RUN apt-get update -y && apt-get install -y \
 # shim added by the `cu13` target). The cu13 target's compat libcuda.so
 # is what makes cu132 torch runnable on older kernel drivers like 575.x.
 RUN pip install --break-system-packages --no-cache-dir \
-        "torch==2.12.*" \
+        "torch==2.12.1" \
         --index-url https://download.pytorch.org/whl/${TORCH_CUDA} && \
     rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cusolver \
            /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcusolver*.so.*

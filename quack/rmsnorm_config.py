@@ -342,12 +342,24 @@ def _bump_cluster_n_for_smem(
 def _detect_arch_major() -> int:
     """Return the major device capability of the current CUDA device.
 
+    Honors the ``QUACK_ARCH`` override (via ``get_device_capacity``) so
+    GPU-blind processes — compile-pool workers, CPU-only boxes — never
+    initialize CUDA here. This function runs at ``import quack`` time (the
+    module-level ``get_all_fwd_configs()`` call in ``rmsnorm.py``), so a raw
+    ``torch.cuda.current_device()`` would create a CUDA context on import,
+    which both slows imports and poisons forked children (torch's
+    "Cannot re-initialize CUDA in forked subprocess" guard).
+
     Falls back to 0 (no-cluster, no-TMA) when CUDA is unavailable so the
     autotune search space stays well-defined for CPU-only imports.
     """
-    if not torch.cuda.is_available():
+    import os
+
+    if os.environ.get("QUACK_ARCH") is None and not torch.cuda.is_available():
         return 0
-    return torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+    from quack.cute_dsl_utils import get_device_capacity
+
+    return get_device_capacity()[0]
 
 
 def _max_cluster_for(arch_major: int) -> int:

@@ -162,11 +162,5 @@ def rms_final_reduce(
     assert x.ndim == 2
     M = x.shape[0]
     rstd = torch.empty(M, dtype=torch.float32, device=x.device)
-    # Dispatch unconditionally through the cute_op so register_fake fires under
-    # --compile-only / FakeTensorMode and populates the .o cache. The cute_op's
-    # register_fake handles the COMPILE_ONLY short-circuit internally AFTER
-    # invoking _compile_rms_final_reduce (which is what we want cached).
-    # jit_cache returns _noop_kernel under COMPILE_ONLY so the launch in
-    # _rms_final_reduce_out is a no-op without us gating it here.
     _rms_final_reduce_out(x, rstd, scale, eps)
     return rstd

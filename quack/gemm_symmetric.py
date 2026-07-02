@@ -218,7 +218,7 @@ class GemmSymmetricMixin(GemmActMixin):
                 cute.copy(
                     tiled_copy_aux_out_r2s,
                     # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-                    copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i])),
+                    tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
                     tRS_sAuxOut[None, None, None, epi_buffer],
                 )
             if const_expr(use_tma_epi):
@@ -425,11 +425,6 @@ def gemm_symmetric(
         device_capacity,
     )
 
-    from quack.cache import is_compile_only
-
-    if is_compile_only():
-        return
-
     cluster_size = cluster_M * cluster_N
     max_active_clusters = (
         get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
@@ -459,6 +454,6 @@ def gemm_symmetric(
     varlen_args = None
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)

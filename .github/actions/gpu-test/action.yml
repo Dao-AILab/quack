@@ -135,10 +135,15 @@ runs:
           # conftest's pytest_handlecrashitem hook re-queues the in-flight
           # test on the fresh worker and downgrades the failure to a skip;
           # second crashes are NOT retried so real bugs still fail the run.
-          pytest tests/ --compile-only -n 24 --dist worksteal --max-worker-restart 24 &&
+          #
+          # --async-compile=24: single-pass workflow. Cold kernel-compile
+          # misses are shipped to a pool of CPU workers (24 total, split
+          # across the xdist workers) while the tests defer and retry; warm
+          # runs pay nothing. Replaces the old two-pass
+          # \"--compile-only then real run\" strategy.
           FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 50000 {print \$1}' | paste -sd,) &&
           if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 50GB free memory'; exit 1; fi &&
           echo \"Running tests on GPUs: \$FREE_GPUS\" &&
           NUM_GPUS=\$(echo \"\$FREE_GPUS\" | tr ',' '\n' | wc -l) &&
-          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS
+          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24
         "

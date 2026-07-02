@@ -2,21 +2,10 @@
 """``cute_op``: ``torch.library.custom_op`` for CuTe DSL kernels.
 
 Same trick as ``torch.library.triton_op`` (register the impl as the fake/meta
-kernel too), specialized for our setup:
-
-* Under ``torch.compile`` we stay a complete no-op. Dynamo / AOT autograd
-  only need to know the op's shape effect, and our ops only mutate inputs,
-  so the fake has nothing to compute. Running the body here would also
-  pay compile latency at dynamo trace time and (more importantly) crash
-  for configs whose ``_compile_*`` constructors raise on unsupported
-  shape/dtype combinations.
-* Under ``FakeTensorMode`` with SymInt shapes (dynamic-shape tracing), skip:
-  ``@jit_cache`` is an ``lru_cache`` and SymInts are unhashable.
-* In the ``COMPILE_ONLY`` scenario (``pytest --compile-only`` or the
-  ``_compile_worker`` subprocess) ``quack.cache.COMPILE_ONLY`` is already
-  True on entry, so ``@jit_cache`` returns ``_noop_kernel`` for every
-  ``_compile_*(...)`` it populates. The body runs end-to-end, the .o
-  cache is filled, and no kernel is actually launched.
+kernel too), specialized for our setup: the fake is a pure no-op. Our ops
+only mutate their inputs, so Dynamo / AOT autograd need no shape effect from
+the fake, and kernel compilation is owned entirely by ``jit_cache`` (plus
+the async compile pool) at real execution time.
 
 This removes the need for hand-written ``_*_fake`` twins on each op.
 
@@ -33,38 +22,7 @@ from typing import Any, Callable, Iterable, Optional, Union
 
 import torch
 
-import quack.cache
-
-
 __all__ = ["cute_op"]
-
-
-def _has_symint(value: Any) -> bool:
-    """Return True if ``value`` carries any ``torch.SymInt`` that would poison
-    ``@jit_cache`` keys or ``_compile_*`` SymInt-hostile paths downstream.
-
-    Walks direct scalar SymInt args, tensor ``.shape``/``.stride()`` SymInts,
-    and nested ``tuple``/``list``/``dict``. We deliberately do not gate on
-    tensor identity alone: a scalar ``int`` schema arg (e.g. ``sm_count``,
-    ``max_seqlen``, ``num_heads_q``) can arrive as a SymInt computed from a
-    fake tensor that is not in this op's args.
-    """
-    if isinstance(value, torch.SymInt):
-        return True
-    if isinstance(value, torch.Tensor):
-        if any(isinstance(s, torch.SymInt) for s in value.shape):
-            return True
-        try:
-            strides = value.stride()
-        except (RuntimeError, NotImplementedError):
-            # Some fake/meta tensors may not expose strides; shape is enough.
-            return False
-        return any(isinstance(s, torch.SymInt) for s in strides)
-    if isinstance(value, (tuple, list)):
-        return any(_has_symint(v) for v in value)
-    if isinstance(value, dict):
-        return any(_has_symint(v) for v in value.values())
-    return False
 
 
 def cute_op(
@@ -94,17 +52,13 @@ def cute_op(
 
         @op.register_fake
         def _fake(*args, **kw):
-            # Only populate the .o cache in the explicit COMPILE_ONLY scenario
-            # (pytest --compile-only or quack._compile_worker). Under regular
-            # torch.compile / AOT autograd tracing the body must stay a no-op:
-            # the op only mutates inputs (no fake output to produce) and the
-            # body would otherwise raise for shape/dtype combos that the
-            # kernel intentionally rejects.
-            if not quack.cache.is_compile_only():
-                return
-            if _has_symint(args) or _has_symint(kw):
-                return
-            fn(*args, **kw)
+            # Pure no-op: our ops only mutate their input tensors, so under
+            # torch.compile / AOT autograd tracing there is no fake output to
+            # produce, and running the body would pay compile latency at
+            # dynamo trace time (or crash for shape/dtype combos the kernel
+            # intentionally rejects). Kernel compilation is handled by
+            # jit_cache + the async compile pool at real execution time.
+            return
 
         return op
 
