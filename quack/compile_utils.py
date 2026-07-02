@@ -14,6 +14,5 @@ def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1) -> Optional[c
         cute.sym_int64(divisibility=divisibility) if i != leading_dim else 1
         for i in range(len(shape))
     )
-    return cute.runtime.make_fake_tensor(
-        dtype, shape, stride=stride, assumed_align=divisibility * dtype.width // 8
-    )
+    assumed_align = divisibility * max(dtype.width // 8, 1)
+    return cute.runtime.make_fake_tensor(dtype, shape, stride=stride, assumed_align=assumed_align)

@@ -29,6 +29,11 @@ def _copy_if_present(mOut: cute.Tensor, mSrc: cute.Tensor):
 
 
 @cute.jit
+def accepts_bool_tensor(mMask: cute.Tensor):
+    assert mMask.element_type == cutlass.Boolean
+
+
+@cute.jit
 def copy_from_varlen(mOut: cute.Tensor, args: VarlenArguments):
     if const_expr(args.mCuSeqlensM is not None):
         _copy_if_present(mOut, args.mCuSeqlensM).launch(grid=(1, 1, 1), block=(128, 1, 1))
@@ -40,6 +45,15 @@ def _compile_copy_from_varlen():
     cu_seqlens_fake = fake_tensor(cute.Int32, (n,), divisibility=1)
     varlen_args = VarlenArguments(mCuSeqlensM=cu_seqlens_fake)
     return cute.compile(copy_from_varlen, out_fake, varlen_args, options="--enable-tvm-ffi")
+
+
+def test_boolean_fake_tensor_tvm_ffi_alignment():
+    n = cute.sym_int()
+    cute.compile(
+        accepts_bool_tensor,
+        fake_tensor(cutlass.Boolean, (n,), divisibility=4),
+        options="--enable-tvm-ffi",
+    )
 
 
 @pytest.mark.parametrize("N", [8, 32, 64])
