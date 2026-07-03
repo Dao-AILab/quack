@@ -145,7 +145,7 @@ def _create_fp4_operand_tensor(
     )
     tensor.view(torch.uint8).zero_()
     if init == "empty":
-        return None, tensor
+        return None, _to_k_major_fp4(tensor)
     if init != "normal":
         raise ValueError(f"Unsupported init: {init}")
 
@@ -155,7 +155,19 @@ def _create_fp4_operand_tensor(
     codes = magnitudes | signs
     tensor.copy_(_pack_fp4_e2m1fn_codes(codes))
     ref = _fp4_e2m1fn_value_table(tensor.device)[codes.long()]
-    return ref, tensor
+    return ref, _to_k_major_fp4(tensor)
+
+
+def _to_k_major_fp4(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a (mode0, k_packed, l) FP4 tensor that is K-major (stride 1 on the
+    packed-K axis, L outermost), matching the FP8 operand layout. The natural
+    contiguous (mode0, k_packed, l) tensor is L-innermost (K stride = l), which
+    is not K-major for l>1. Round-trip through (l, mode0, k_packed) contiguous —
+    each packed byte holds 2 FP4 along K, so byte-level reorder preserves the
+    2-per-byte K packing."""
+    if tensor.shape[2] == 1:
+        return tensor  # l==1: already K-major (K stride 1)
+    return tensor.permute(2, 0, 1).contiguous().permute(1, 2, 0)
 
 
 def create_blockscaled_operand_tensor(
@@ -592,6 +604,268 @@ def create_blockscaled_varlen_k_operands(
     return a_ref_list, b_ref_list, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_k
 
 
+def _compile_blockscaled_gemm_sm120_varlen(
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    d_dtype: Type[cutlass.Numeric],
+    mA: torch.Tensor,
+    mB: torch.Tensor,
+    mD: torch.Tensor,
+    mSFA: torch.Tensor,
+    mSFB: torch.Tensor,
+    *,
+    varlen_m: bool,
+    varlen_k: bool,
+) -> Callable:
+    """SM120 varlen block-scaled GEMM via per-expert dense dispatch.
+
+    The geforce kernel has no grouped/cu_seqlens scheduler, so each expert is
+    launched as its own dense GEMM (the dense kernel already handles arbitrary,
+    non-128-aligned M and K). One dense kernel is compiled and reused across
+    experts via dynamic layouts.
+
+    Scale factors use the dQaccum-padded BlockScaledBasicChunk layout
+    (l, rm, rk, 512); each expert i occupies a contiguous run of rm tiles
+    (varlen_m) or rk tiles (varlen_k) starting at tile `cu[i] // 128 + i`.
+
+    Operand / output conventions (mirroring the SM100 path):
+      varlen_m: mA (total_m, k) K-major, mB (n, k, L) K-major, mD (total_m, n);
+                SFA (1, total_padded_rm, rk, 512), SFB (L, rn, rk, 512).
+      varlen_k: mA (m, total_k) M-major, mB (n, total_k) N-major, mD (m, n, L);
+                SFA (1, rm, total_padded_rk, 512), SFB (1, rn, total_padded_rk, 512).
+    """
+    if ab_dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2):
+        raise NotImplementedError(
+            f"SM120 varlen block-scaled GEMM currently supports MXFP8 only "
+            f"(matches the SM100 varlen operand builders); got ab_dtype={ab_dtype}."
+        )
+    if d_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
+        raise NotImplementedError(
+            f"SM120 varlen block-scaled GEMM supports f16/bf16/f32 output, got {d_dtype}."
+        )
+
+    tile = 128
+
+    def _expert_sf(sf_blocked: torch.Tensor, offset_tile: int, n_tiles: int, axis: str):
+        # sf_blocked: (1, rm, rk, 512). Slice the rm (axis='m') or rk (axis='k')
+        # tiles for one expert and return a contiguous (1, rm_i, rk_i, 512) view.
+        if axis == "m":
+            sl = sf_blocked[:, offset_tile : offset_tile + n_tiles, :, :]
+        else:
+            sl = sf_blocked[:, :, offset_tile : offset_tile + n_tiles, :]
+        return sl.contiguous()
+
+    # One dense kernel, compiled lazily from the first expert's actual slices and
+    # reused across experts (the geforce kernel uses dynamic layouts, so varying
+    # M/K per expert needs no recompile — verified correct incl. larger-than-seed).
+    _state: dict = {"runner": None}
+
+    def _dense_runner(a_i, b_i, d_i, sfa_i, sfb_i):
+        if _state["runner"] is None:
+            _state["runner"] = _compile_blockscaled_gemm_sm120(
+                ab_dtype,
+                sf_dtype,
+                sf_vec_size,
+                d_dtype,
+                (128, 128),
+                (1, 1),
+                a_i,
+                b_i,
+                d_i,
+                sfa_i,
+                sfb_i,
+            )
+        return _state["runner"]
+
+    if varlen_m:
+
+        def run(a, b, d, sfa, sfb, cu_seqlens):
+            cu = cu_seqlens.tolist()
+            num_experts = len(cu) - 1
+            for i in range(num_experts):
+                m0, m1 = cu[i], cu[i + 1]
+                m_i = m1 - m0
+                if m_i == 0:
+                    continue
+                a_i = a[m0:m1].contiguous().unsqueeze(-1)  # (m_i, k, 1) K-major
+                b_i = b[:, :, i].contiguous().unsqueeze(-1)  # (n, k, 1) K-major
+                d_i = d[m0:m1].unsqueeze(-1)  # (m_i, n, 1)
+                rm_i = (m_i + tile - 1) // tile
+                off_tile = m0 // tile + i
+                sfa_i = _expert_sf(sfa, off_tile, rm_i, "m")
+                sfb_i = sfb[i : i + 1].contiguous() if sfb.dim() == 4 else sfb
+                _dense_runner(a_i, b_i, d_i, sfa_i, sfb_i)(a_i, b_i, d_i, sfa_i, sfb_i)
+    else:  # varlen_k
+
+        def run(a, b, d, sfa, sfb, cu_seqlens):
+            cu = cu_seqlens.tolist()
+            num_experts = len(cu) - 1
+            for i in range(num_experts):
+                k0, k1 = cu[i], cu[i + 1]
+                k_i = k1 - k0
+                if k_i == 0:
+                    continue
+                # a (m, total_k) M-major; slice K and make K-major for the kernel.
+                a_i = a[:, k0:k1].contiguous().unsqueeze(-1)  # (m, k_i, 1) K-major
+                b_i = b[:, k0:k1].contiguous().unsqueeze(-1)  # (n, k_i, 1) K-major
+                # d[:, :, i] is N-major but not contiguous; write into a fresh
+                # (m, n, 1) buffer, then copy back into the strided output slice.
+                d_i = torch.empty(d.shape[0], d.shape[1], 1, dtype=d.dtype, device=d.device)
+                rk_i = (k_i + tile - 1) // tile
+                off_tile = k0 // tile + i
+                sfa_i = _expert_sf(sfa, off_tile, rk_i, "k")
+                sfb_i = _expert_sf(sfb, off_tile, rk_i, "k")
+                _dense_runner(a_i, b_i, d_i, sfa_i, sfb_i)(a_i, b_i, d_i, sfa_i, sfb_i)
+                d[:, :, i] = d_i.squeeze(-1)
+
+    return run
+
+
+def _compile_blockscaled_gemm_sm120(
+    ab_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    sf_vec_size: int,
+    d_dtype: Type[cutlass.Numeric],
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    mA: torch.Tensor,
+    mB: torch.Tensor,
+    mD: torch.Tensor,
+    mSFA: torch.Tensor,
+    mSFB: torch.Tensor,
+    *,
+    b_dtype: Optional[Type[cutlass.Numeric]] = None,
+    varlen_m: bool = False,
+    varlen_k: bool = False,
+) -> Callable:
+    """Compile the SM120 (Blackwell GeForce) warp-level block-scaled GEMM.
+
+    SM120 has no tcgen05/TMEM, so it cannot share the SM100 blockscaled path.
+    Instead it uses warp-level mma.sync.kind::mxf8f6f4 (vendored cooperative
+    kernel in quack.gemm_sm120_blockscaled). The SF packed layout (l, rm, rk,
+    512 BlockScaledBasicChunk) is identical, so mSFA/mSFB are consumed as-is.
+
+    SM120 uses CTA tile (128, 128, 128) with epi (128, 128) and cluster (1, 1);
+    the requested mma_tiler_mn / cluster_shape_mn hints are mapped onto that.
+    Supports dense, K-major MXFP8 / MXFP4 / NVFP4 (same-dtype A/B) and mixed
+    FP4xFP8 (one operand FP4, the other FP8 + e8m0 scales, vec32) with
+    f16/bf16/f32 output, plus varlen_m / varlen_k via per-expert dense dispatch.
+    Non-K-major operands remain SM100/SM110-only.
+    """
+    a_dtype = ab_dtype
+    if b_dtype is None:
+        b_dtype = ab_dtype
+    if varlen_m or varlen_k:
+        return _compile_blockscaled_gemm_sm120_varlen(
+            ab_dtype,
+            sf_dtype,
+            sf_vec_size,
+            d_dtype,
+            mA,
+            mB,
+            mD,
+            mSFA,
+            mSFB,
+            varlen_m=varlen_m,
+            varlen_k=varlen_k,
+        )
+    # SM120 capability boundary (warp-level block-scaled MMA + ldmatrix, 16-bit
+    # STMatrix / universal-copy epilogue). Mirrors the NVIDIA geforce reference.
+    # Same-dtype: MXFP8 (e4m3/e5m2 + e8m0, vec32), MXFP4 (e2m1 + e8m0, vec32),
+    # NVFP4 (e2m1 + e4m3, vec16). Mixed: {FP4, FP8} pair + e8m0 scales, vec32.
+    _fp8 = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+    _fp4 = (cutlass.Float4E2M1FN,)
+    mixed = a_dtype != b_dtype
+    if mixed:
+        pair = {a_dtype, b_dtype}
+        is_fp4_fp8 = any(d in _fp4 for d in pair) and any(d in _fp8 for d in pair)
+        if not is_fp4_fp8:
+            raise NotImplementedError(
+                f"SM120 mixed block-scaled GEMM supports only FP4xFP8 pairs, "
+                f"got a_dtype={a_dtype}, b_dtype={b_dtype}."
+            )
+        if sf_dtype != cutlass.Float8E8M0FNU or sf_vec_size != 32:
+            raise NotImplementedError(
+                f"SM120 mixed FP4xFP8 requires sf_dtype=Float8E8M0FNU and "
+                f"sf_vec_size=32, got sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}."
+            )
+    elif a_dtype not in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+        cutlass.Float4E2M1FN,
+    ):
+        raise NotImplementedError(
+            f"SM120 block-scaled GEMM supports same-dtype MXFP8/MXFP4/NVFP4 "
+            f"(e4m3/e5m2/e2m1), got ab_dtype={a_dtype}."
+        )
+    if d_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
+        raise NotImplementedError(
+            f"SM120 block-scaled GEMM supports Float16/BFloat16/Float32 output, got {d_dtype}."
+        )
+    # Operand major support on SM120:
+    #   - B must be K-major. The warp MMA is m16n8k32: the N fragment is only 8
+    #     wide, below the 16 elements ldmatrix.m16n16.trans.b8 needs to transpose
+    #     8-bit data, so N-major B cannot feed the transpose path.
+    #   - A may be K-major or M-major *for FP8* (m16 fragment >= 16, so
+    #     ldmatrix.m16n16.trans.b8 works). FP4 A must stay K-major (no 4-bit
+    #     ldmatrix transpose primitive).
+    # K-major check: K (mode 1 of (mn, k, l)) varies faster than MN (mode 0).
+    a_is_k_major = mA.stride(1) <= mA.stride(0)
+    b_is_k_major = mB.stride(1) <= mB.stride(0)
+    if not b_is_k_major:
+        raise NotImplementedError(
+            "SM120 block-scaled GEMM requires K-major B (the m16n8k32 warp MMA "
+            "N-fragment is 8-wide, below the 16 needed for ldmatrix.trans.b8)."
+        )
+    if not a_is_k_major and a_dtype.width != 8:
+        raise NotImplementedError(
+            "SM120 block-scaled GEMM supports M-major A only for FP8 "
+            "(no 4-bit ldmatrix transpose primitive); FP4 A must be K-major."
+        )
+
+    from quack.gemm_sm120_blockscaled import Sm120BlockScaledGemmKernel
+
+    # SM120 cooperative kernel: CTA tile (128, 128, 128) with epi (128, 128) is
+    # the validated path. tile_K=128 satisfies sf_vec=32 (K multiple of 128).
+    tile_shape_mnk = (128, 128, 128)
+    epi_tile = (128, 128)
+
+    a_cute = _make_compile_tensor_like(mA, a_dtype, dynamic_layout=True)
+    b_cute = _make_compile_tensor_like(mB, b_dtype, dynamic_layout=True)
+    d_cute = _make_compile_tensor_like(mD, d_dtype, dynamic_layout=True)
+    sfa_cute = _make_compile_tensor_like(mSFA, sf_dtype)
+    sfb_cute = _make_compile_tensor_like(mSFB, sf_dtype)
+
+    gemm = Sm120BlockScaledGemmKernel(cutlass.Float32, sf_vec_size, tile_shape_mnk, epi_tile)
+    max_active_clusters = get_max_active_clusters(1)
+    import cutlass.torch as cutlass_torch
+
+    stream = cutlass_torch.default_stream()
+    compiled = cute.compile(
+        gemm, a_cute, b_cute, sfa_cute, sfb_cute, d_cute, max_active_clusters, stream
+    )
+
+    def run(a, b, d, sfa, sfb):
+        # The SM120 cooperative kernel rebuilds the SF layout from A/B shape and
+        # reads SF through the raw iterator, so it assumes the packed
+        # (l, rm, rk, 512) BlockScaledBasicChunk layout is contiguous. If a
+        # caller passes a strided slice of a larger SF buffer, repack to
+        # contiguous first (correctness over zero-copy).
+        if not sfa.is_contiguous():
+            sfa = sfa.contiguous()
+        if not sfb.is_contiguous():
+            sfb = sfb.contiguous()
+        a_t = _make_compile_tensor_like(a, a_dtype, dynamic_layout=True)
+        b_t = _make_compile_tensor_like(b, b_dtype, dynamic_layout=True)
+        d_t = _make_compile_tensor_like(d, d_dtype, dynamic_layout=True)
+        sfa_t = _make_compile_tensor_like(sfa, sf_dtype)
+        sfb_t = _make_compile_tensor_like(sfb, sf_dtype)
+        compiled(a_t, b_t, sfa_t, sfb_t, d_t, cutlass_torch.default_stream())
+
+    return run
+
+
 def compile_blockscaled_gemm_tvm_ffi(
     ab_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
@@ -605,6 +879,7 @@ def compile_blockscaled_gemm_tvm_ffi(
     mSFA: torch.Tensor,
     mSFB: torch.Tensor,
     *,
+    b_dtype: Optional[Type[cutlass.Numeric]] = None,
     use_clc_persistence: bool = True,
     varlen_m: bool = False,
     varlen_k: bool = False,
@@ -615,10 +890,37 @@ def compile_blockscaled_gemm_tvm_ffi(
     mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
     When varlen_k: mA is (m, total_k), mB is (n, total_k), mD is (m, n, l);
     run(...) takes an extra cu_seqlens_k tensor.
+
+    ``b_dtype`` defaults to ``ab_dtype`` (same-dtype A/B). Pass a different
+    ``b_dtype`` for mixed-precision (SM120 mixed FP4xFP8 only): one operand is
+    Float4E2M1FN and the other Float8E4M3FN/E5M2, with sf_dtype=Float8E8M0FNU
+    and sf_vec_size=32.
     """
+    a_dtype = ab_dtype
+    if b_dtype is None:
+        b_dtype = ab_dtype
     device_capacity = get_device_capacity(mA.device)
+    if device_capacity[0] == 12:
+        return _compile_blockscaled_gemm_sm120(
+            a_dtype,
+            sf_dtype,
+            sf_vec_size,
+            d_dtype,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            mA,
+            mB,
+            mD,
+            mSFA,
+            mSFB,
+            b_dtype=b_dtype,
+            varlen_m=varlen_m,
+            varlen_k=varlen_k,
+        )
+    if b_dtype != a_dtype:
+        raise NotImplementedError("Mixed-precision A/B block-scaled GEMM is currently SM120-only.")
     if device_capacity[0] not in (10, 11):
-        raise RuntimeError("Blockscaled SM100 GEMM requires SM100/SM110")
+        raise RuntimeError("Blockscaled GEMM requires SM100/SM110 (tcgen05) or SM120 (warp MMA)")
     assert not (varlen_m and varlen_k), "Only one of varlen_m / varlen_k"
 
     gemm = partial(
