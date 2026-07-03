@@ -24,6 +24,44 @@ def _skip_if_not_sm100():
         pytest.skip("SM100+ required")
 
 
+def _is_sm120():
+    return torch.cuda.get_device_properties(0).major == 12
+
+
+def _skip_if_sm120_unsupported(
+    ab_dtype=None,
+    sf_dtype=None,
+    sf_vec_size=None,
+    d_dtype=None,
+    a_major="k",
+    b_major="k",
+    varlen=False,
+):
+    """SM120 block-scaled GEMM capability boundary: dense, K-major, same-dtype
+    MXFP8/MXFP4/NVFP4 with f16/bf16/f32 output. Non-K-major operands, mixed
+    FP4xFP8, and varlen are SM100/SM110-only (tcgen05) for now."""
+    if not _is_sm120():
+        return
+    if varlen:
+        pytest.skip("SM120 block-scaled GEMM does not support varlen yet")
+    if ab_dtype is not None and ab_dtype not in (
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E5M2,
+        cutlass.Float4E2M1FN,
+    ):
+        pytest.skip("SM120 block-scaled GEMM supports same-dtype MXFP8/MXFP4/NVFP4 only")
+    # SM120 dispatch enforces the standard scale-factor pairing (the SM100 path
+    # is more permissive). FP4 + vec16 is NVFP4 (e4m3 scales); FP4 + vec32 is
+    # MXFP4 (e8m0 scales). Reject the mismatched combos.
+    if ab_dtype == cutlass.Float4E2M1FN and sf_dtype is not None and sf_vec_size is not None:
+        if sf_vec_size == 16 and sf_dtype != cutlass.Float8E4M3FN:
+            pytest.skip("SM120 NVFP4 (vec16) requires Float8E4M3FN scales")
+        if sf_vec_size == 32 and sf_dtype != cutlass.Float8E8M0FNU:
+            pytest.skip("SM120 MXFP4 (vec32) requires Float8E8M0FNU scales")
+    if a_major != "k" or b_major != "k":
+        pytest.skip("SM120 block-scaled GEMM requires K-major A and B")
+
+
 def _compile_blockscaled_gemm(
     ab_dtype,
     sf_dtype,
@@ -412,6 +450,9 @@ def test_blockscaled_correctness(
     ab_dtype, sf_dtype, sf_vec_size, d_dtype, mma_tiler_mn, cluster_shape_mn, m, n, k, l
 ):
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(
+        ab_dtype=ab_dtype, sf_dtype=sf_dtype, sf_vec_size=sf_vec_size, d_dtype=d_dtype
+    )
 
     (
         compiled,
@@ -436,6 +477,56 @@ def test_blockscaled_correctness(
     err = (d_torch.float() - ref).abs().max().item()
     tol = 5e-3 if d_dtype != cutlass.Float32 else 5e-4
     assert err < tol, f"max_err={err}"
+
+
+# ---------------------------------------------------------------------------
+# FP4 block-scaled (NVFP4 / MXFP4) with f16/bf16/f32 output.
+#
+# The shared test_blockscaled_correctness FP4 cases all use Float32 output and
+# non-128-aligned N; these exercise the FP4 input path with all supported
+# output dtypes on aligned shapes (SM120 and SM100/SM110).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("d_dtype", [cutlass.BFloat16, cutlass.Float16, cutlass.Float32])
+@pytest.mark.parametrize(
+    "sf_dtype,sf_vec_size",
+    [
+        (cutlass.Float8E8M0FNU, 32),  # MXFP4
+        (cutlass.Float8E4M3FN, 16),  # NVFP4
+    ],
+)
+@pytest.mark.parametrize("m,n,k,l", [(256, 256, 256, 1), (512, 512, 512, 1), (256, 384, 512, 1)])
+def test_blockscaled_fp4(m, n, k, l, sf_dtype, sf_vec_size, d_dtype):
+    # NOTE: l==1 only. QuACK's FP4 operand builder lays L innermost for l>1
+    # (packed float4_e2m1fn_x2 storage), which is not K-major; batched FP4 is a
+    # separate follow-up. l=1 is the common FP4 inference case.
+    _skip_if_not_sm100()
+    ab_dtype = cutlass.Float4E2M1FN
+    a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
+    b_ref, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype)
+    _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
+    sfa_ref, mSFA = create_blockscaled_scale_tensor(l, m, k, sf_vec_size, sf_dtype)
+    sfb_ref, mSFB = create_blockscaled_scale_tensor(l, n, k, sf_vec_size, sf_dtype)
+
+    runner = compile_blockscaled_gemm_tvm_ffi(
+        ab_dtype,
+        sf_dtype,
+        sf_vec_size,
+        d_dtype,
+        (128, 128),
+        (1, 1),
+        mA,
+        mB,
+        mD,
+        mSFA,
+        mSFB,
+    )
+    runner(mA, mB, mD, mSFA, mSFB)
+    torch.cuda.synchronize()
+
+    ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
+    err = (mD.float() - ref).abs().max().item()
+    rel = err / (ref.abs().max().item() + 1e-6)
+    assert rel < 5e-2, f"rel_err={rel} (max_abs={err})"
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +708,7 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     """MXFP8 with A in {k,m}-major × B in {k,n}-major. The SF tensor layout
     stays K-major (hardware convention); only A/B operand strides differ."""
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(a_major=a_major, b_major=b_major)
     from quack.mx_utils import to_mx
 
     m, n, k, l = 256, 256, 256, 1
@@ -705,6 +797,7 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
     SFA is stored in dQaccum-style padded format; kernel reads it via
     offset_batch_SFA."""
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(varlen=True)
     num_experts = len(seqlens_m)
     n, k = 256, 256
     sf_vec = 32
@@ -770,6 +863,7 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
     is NOT required). SFA/SFB use dQaccum-style K-padded storage and the kernel
     reads them via offset_batch_SFA/offset_batch_SFB padded-K formula."""
     _skip_if_not_sm100()
+    _skip_if_sm120_unsupported(varlen=True)
     num_experts = len(seqlens_k)
     m, n = 256, 256
     sf_vec = 32
