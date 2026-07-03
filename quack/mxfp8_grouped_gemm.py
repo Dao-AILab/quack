@@ -1,0 +1,503 @@
+# Copyright (c) 2026, Tri Dao.
+"""MXFP8 grouped GEMM dispatcher for quack.
+
+Routes a grouped (per-expert) MXFP8 GEMM over cumulative ``offs`` onto quack's
+two existing SM100 blockscaled engines, mirroring ``torch._scaled_grouped_mm``:
+
+  * uniform 128-aligned groups -> batched-L dense (:func:`mxfp8_gemm_out`)
+  * ragged 128-aligned groups  -> varlen-M (:func:`compile_blockscaled_gemm_tvm_ffi`)
+  * ragged non-128 groups      -> varlen-M, dQaccum-padded SFA
+
+Contract (2D-A / 3D-B + offs, like ``torch._scaled_grouped_mm``)::
+
+    a:    (total_m, K)     float8_e4m3fn, K-contiguous
+    b:    (E, K, N)        float8_e4m3fn, K-contiguous (b.transpose(-2,-1).is_contiguous())
+    offs: (E,)             int32, CUMULATIVE per-group end rows; offs[-1] == total_m
+    sfa:  (total_m, K//32) float8_e8m0fnu, K-contiguous (raw per-block scales)
+    sfb:  (E, N, K//32)    float8_e8m0fnu, K-contiguous (raw per-block scales)
+    out:  optional (total_m, N) bfloat16, contiguous
+
+Returns bf16 ``(total_m, N)``.
+"""
+
+from functools import lru_cache
+from typing import List, Optional, Tuple
+
+import cutlass
+import torch
+from torch import Tensor
+
+from quack.blockscaled_gemm_utils import (
+    compile_blockscaled_gemm_tvm_ffi,
+    pack_scale_2d_to_blocked_contig,
+    scale_view_for_kernel,
+)
+from quack.gemm_blockscaled_interface import (
+    _compile_cached,
+    _default_tiler_cluster,
+    mxfp8_gemm_out,
+)
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # triton ships with torch on CUDA; fall back to the torch builder if absent
+    _HAS_TRITON = False
+
+SF_VEC = 32
+
+
+def _uniform_group_size(offsets_host: Tuple[int, ...]) -> Optional[int]:
+    prev, g = 0, None
+    for cur in offsets_host:
+        sz = cur - prev
+        if g is None:
+            g = sz
+        elif sz != g:
+            return None
+        prev = cur
+    return g
+
+
+def _boundaries_128_aligned(offsets_host: Tuple[int, ...]) -> bool:
+    prev = 0
+    for cur in offsets_host:
+        if prev % 128 != 0 or cur % 128 != 0:
+            return False
+        prev = cur
+    return True
+
+
+def _choose_route(offsets_host: Tuple[int, ...]) -> Tuple[str, Optional[int]]:
+    """Pick the kernel route from cumulative host offsets. Returns (route, g) where g is
+    the uniform group size for the 'uniform' route, else None. Routes:
+      'uniform'        -> batched-L dense (equal, 128-aligned groups)
+      'varlen'         -> varlen-M, natural SFA (ragged, all boundaries 128-aligned)
+      'varlen_dqaccum' -> varlen-M, dQaccum-padded SFA (arbitrary / non-128 boundaries)
+    """
+    g = _uniform_group_size(offsets_host)
+    if g is not None and g % 128 == 0:
+        return "uniform", g
+    if _boundaries_128_aligned(offsets_host):
+        return "varlen", None
+    return "varlen_dqaccum", None
+
+
+def _dqaccum_padded_sfa(sfa: Tensor, group_sizes: List[int], sf_k: int, e: int) -> Tensor:
+    """Pack SFA for the varlen-M kernel in dQaccum-padded layout: expert i's
+    scale rows live at padded tile offset (cu_seqlens[i] // 128 + i) * 128,
+    matching VarlenManager.offset_batch_SFA. Returns packed (1, rm, rk, 512)."""
+    tile = 128
+    total_m = sum(group_sizes)
+    total_padded_m = ((total_m + tile - 1) // tile + (e - 1)) * tile
+    sa_padded = sfa.new_zeros(total_padded_m, sf_k)
+    off = 0
+    for i, m_i in enumerate(group_sizes):
+        off_padded = (off // tile + i) * tile
+        sa_padded[off_padded : off_padded + m_i] = sfa[off : off + m_i]
+        off += m_i
+    return pack_scale_2d_to_blocked_contig(sa_padded.view(1, total_padded_m, sf_k))
+
+
+def _dqaccum_padded_sfa_device(sfa: Tensor, offs: Tensor, sf_k: int, e: int) -> Tensor:
+    """Device-only equivalent of _dqaccum_padded_sfa: builds the byte-identical padded
+    blocked SFA from natural sfa + device offs, so the non-128 route stays CUDA-graph
+    capturable (no host group sizes). Expert i's rows land at padded tile (cu[i] // 128 + i),
+    the same floor-cumulative placement the kernel reads via offset_batch_SFA (cu // 128 + b).
+
+    All ops are shape-derived / fixed-shape (searchsorted + index_copy_, no data-dependent
+    output shapes), so the builder itself captures under a CUDA graph. ``searchsorted`` with
+    right=True naturally skips empty experts.
+    """
+    tile = 128
+    total_m = sfa.shape[0]
+    total_padded_m = ((total_m + tile - 1) // tile + (e - 1)) * tile
+    dev = sfa.device
+    cu = torch.zeros(e + 1, dtype=torch.int64, device=dev)
+    cu[1:].copy_(offs)
+    rows = torch.arange(total_m, dtype=torch.int64, device=dev)
+    row_expert = torch.searchsorted(cu[1:], rows, right=True)
+    starts = cu[:-1]  # per-expert un-padded cumulative start (cu[i])
+    off_padded = (starts // tile + torch.arange(e, dtype=torch.int64, device=dev)) * tile
+    dest = rows + (off_padded - starts)[row_expert]
+    sa_padded = sfa.new_zeros(total_padded_m, sf_k)
+    # index_copy_ isn't implemented for e8m0; write through a uint8 view (shared 1-byte storage).
+    sa_padded.view(torch.uint8).index_copy_(0, dest, sfa.view(torch.uint8))
+    return pack_scale_2d_to_blocked_contig(sa_padded.view(1, total_padded_m, sf_k))
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _dqaccum_sfa_swizzle_kernel(
+        in_ptr,  # (total_m, sf_k) uint8, row-major
+        offs_ptr,  # (e,) int32 cumulative end offsets
+        out_ptr,  # flat uint8, zero-initialized, length rm * rk * 512
+        in_stride_m,  # row stride of in_ptr (= sf_k for contiguous)
+        sf_k,  # number of real scale columns
+        e,  # number of experts (runtime)
+        rk: tl.constexpr,  # ceil(sf_k, 4)
+        TILE: tl.constexpr,  # 128
+        KB: tl.constexpr,  # 4 (K-blocks packed per 512-byte atom)
+    ):
+        # One program per (output tile p, k-block cb). The dQaccum placement puts expert g's
+        # tiles at [offs[g-1]//TILE + g, ...); each program scans the experts to find the one
+        # owning tile p (branch-free via tl.where; s_g is strictly increasing), loads that
+        # 128-row input tile, swizzles, and stores it to tile p. Slack tiles (no owner) keep
+        # the zero-init.
+        p = tl.program_id(0).to(tl.int64)  # output tile index (0 .. rm-1)
+        cb = tl.program_id(1)  # k-block
+        found_gid = -1
+        found_start = tl.cast(0, tl.int64)
+        found_end = tl.cast(0, tl.int64)
+        for g in tl.range(e):
+            g_start = tl.load(offs_ptr + g - 1, mask=g > 0, other=0).to(tl.int64)
+            g_end = tl.load(offs_ptr + g).to(tl.int64)
+            s_g = g_start // TILE + g  # first output tile of expert g
+            n_g = (g_end - g_start + TILE - 1) // TILE  # 128-row tiles in expert g
+            owns = (p >= s_g) & (p < s_g + n_g)
+            found_gid = tl.where(owns, g, found_gid)
+            found_start = tl.where(owns, g_start, found_start)
+            found_end = tl.where(owns, g_end, found_end)
+        valid = found_gid >= 0  # False on slack tiles -> fully masked, output stays zero
+        s_gid = found_start // TILE + found_gid
+        cur = found_start + (p - s_gid) * TILE  # input-row start of this tile (garbage if !valid)
+        r = tl.arange(0, TILE)
+        c = tl.arange(0, KB)
+        # 32x4x4 blocked swizzle within the 512-byte atom; matches pack_scale_2d_to_blocked_contig
+        # ((r%32)*16 + (r//32)*4 + col) == its (128,4)->(4,32,4)->transpose(3,4)->512 reshuffle.
+        dest = ((r % 32)[:, None] * 16 + (r // 32)[:, None] * 4 + c[None, :]).to(tl.int64)
+        col = cb * KB + c
+        col_mask = col < sf_k
+        in_rows = cur + r
+        # !valid masks the whole tile, so the garbage `cur` is never dereferenced (masked load).
+        mask = valid & (in_rows < found_end)[:, None] & col_mask[None, :]
+        in_off = in_rows[:, None].to(tl.int64) * in_stride_m + col[None, :].to(tl.int64)
+        vals = tl.load(in_ptr + in_off, mask=mask, other=0)
+        tl.store(out_ptr + p * (rk * 512) + cb * 512 + dest, vals, mask=mask)
+
+
+def _dqaccum_padded_sfa_triton(sfa: Tensor, offs: Tensor, sf_k: int, e: int) -> Tensor:
+    """Fused single-pass equivalent of _dqaccum_padded_sfa_device: one Triton kernel does the
+    per-expert scatter + 32x4x4 swizzle, replacing searchsorted + index_copy_ + pack (~4-6
+    kernels). Byte-identical output, same syncless / CUDA-graph-capturable property. Falls back
+    to the torch builder if Triton is unavailable."""
+    if not _HAS_TRITON:
+        return _dqaccum_padded_sfa_device(sfa, offs, sf_k, e)
+    tile = 128
+    total_m = sfa.shape[0]
+    total_padded_m = ((total_m + tile - 1) // tile + (e - 1)) * tile
+    rm = total_padded_m // tile
+    rk = (sf_k + 3) // 4
+    out = torch.zeros(rm * rk * 512, dtype=torch.uint8, device=sfa.device)
+    in_u8 = sfa.view(torch.uint8)
+    # Grid over output tiles (rm) x k-blocks; see the kernel docstring.
+    _dqaccum_sfa_swizzle_kernel[(rm, rk)](
+        in_u8, offs.to(torch.int32), out, in_u8.stride(0), sf_k, e, rk, tile, 4
+    )
+    return out.view(torch.float8_e8m0fnu).view(1, rm, rk, 512)
+
+
+@lru_cache(maxsize=32)
+def _varlen_runner(n: int, k: int, e: int, tiler, cluster, sfa_tile_aligned: bool = True):
+    # Compile once; the kernel uses cute.sym_int for total_m so one compile serves
+    # all group configurations with the same (n, k, e, tiler, cluster). With
+    # sfa_tile_aligned=True the kernel reads SFA in natural (unpadded) packed layout
+    # (cu // 128 offset); =False expects the dQaccum-padded layout (cu // 128 + b).
+    dev = torch.device("cuda")
+    sf_k = k // SF_VEC
+    fake_mA = torch.empty(128 * e, k, dtype=torch.float8_e4m3fn, device=dev)
+    fake_mB = torch.empty(e, n, k, dtype=torch.float8_e4m3fn, device=dev).permute(1, 2, 0)
+    fake_mD = torch.empty(128 * e, n, dtype=torch.bfloat16, device=dev)
+    z = torch.zeros(128 * e, sf_k, dtype=torch.float8_e8m0fnu, device=dev)
+    if sfa_tile_aligned:
+        fake_sfa = pack_scale_2d_to_blocked_contig(z.view(1, 128 * e, sf_k))
+    else:
+        fake_sfa = _dqaccum_padded_sfa(z, [128] * e, sf_k, e)
+    fake_sfb = pack_scale_2d_to_blocked_contig(
+        torch.zeros(e, n, sf_k, dtype=torch.float8_e8m0fnu, device=dev)
+    )
+    return compile_blockscaled_gemm_tvm_ffi(
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        SF_VEC,
+        cutlass.BFloat16,
+        tiler,
+        cluster,
+        fake_mA,
+        fake_mB,
+        fake_mD,
+        fake_sfa,
+        fake_sfb,
+        varlen_m=True,
+        sfa_tile_aligned=sfa_tile_aligned,
+    )
+
+
+def _run_varlen_natural(a, offs, sfa, mB, mSFB, out, e, k, n, sf_k, tiler, cluster):
+    """Run the varlen-M kernel with NATURAL (unpadded) SFA -- packs SFA like torch's
+    to_blocked (no dQaccum scatter) and uses the sfa_tile_aligned kernel path. Requires
+    128-aligned per-expert boundaries (caller-checked). ``mB`` / ``mSFB`` are the (fixed)
+    B operand + packed B-scale; ``cu_seqlens`` is built on-device from ``offs``."""
+    total_m = a.shape[0]
+    mSFA = pack_scale_2d_to_blocked_contig(sfa.view(1, total_m, sf_k))
+    # torch.zeros (not empty + ``cu[0] = 0``) so building cu_seqlens is a pure device op:
+    # a host-scalar ``cu[0] = 0`` write is a CPU->CUDA copy that breaks CUDA-graph capture.
+    cu = torch.zeros(e + 1, dtype=torch.int32, device=offs.device)
+    cu[1:].copy_(offs.to(torch.int32))
+    runner = _varlen_runner(n, k, e, tiler, cluster, sfa_tile_aligned=True)
+    runner(a, mB, out, mSFA, mSFB, cu)
+    return out
+
+
+def _default_tiler_cluster_for(total_m: int, e: int, n: int):
+    """Single sync-free tiler choice for the whole grouped problem, keyed on the MEAN
+    tokens-per-expert (total_m // e). Using the mean (not max(group_sizes)) keeps the
+    choice sync-free -- derived from tensor shapes, no device->host copy."""
+    return _default_tiler_cluster(max(1, total_m // e), n)
+
+
+def _run_varlen_dqaccum(a, offs, sfa, mB, mSFB, out, e, k, n, sf_k, tiler, cluster):
+    """Run the varlen-M kernel for ARBITRARY (incl. non-128) ragged boundaries: build the
+    dQaccum-padded SFA on device and use the sfa_tile_aligned=False kernel path. A and the
+    output are passed NATURALLY (no full-A pad/copy, no gather-back -- only the small SFA is
+    padded). Everything is derived from shapes + device offs, so this path is sync-free."""
+    mSFA = _dqaccum_padded_sfa_triton(sfa, offs, sf_k, e)
+    cu = torch.zeros(e + 1, dtype=torch.int32, device=offs.device)
+    cu[1:].copy_(offs.to(torch.int32))
+    runner = _varlen_runner(n, k, e, tiler, cluster, sfa_tile_aligned=False)
+    runner(a, mB, out, mSFA, mSFB, cu)
+    return out
+
+
+def mxfp8_grouped_gemm(
+    a: Tensor,
+    b: Tensor,
+    offs: Tensor,
+    sfa: Tensor,
+    sfb: Tensor,
+    out: Optional[Tensor] = None,
+    uniform: bool = False,
+    varlen: bool = False,
+    varlen_nonaligned: bool = False,
+) -> Tensor:
+    """Grouped MXFP8 GEMM. See module docstring for shape/layout contract.
+
+    If ``uniform=True`` the caller asserts every group has the same size
+    ``total_m // E`` (e.g. fixed-capacity MoE). The route is then determined from
+    shapes alone, so ``offs`` is never read on the host and the call runs the dense
+    batched-L path directly.
+
+    If ``varlen=True`` the caller instead asserts ragged groups with 128-aligned
+    boundaries (e.g. capacity-padded MoE). ``offs`` is consumed only on device
+    (cu_seqlens) and the varlen-M kernel uses its natural (sfa_tile_aligned) SFA path.
+
+    If ``varlen_nonaligned=True`` the caller asserts ragged groups with ARBITRARY (incl.
+    non-128) boundaries. ``offs`` is consumed only on device and the dQaccum-padded SFA is
+    built on device, so this path is also CUDA-graph capturable.
+
+    All three flag paths read ``offs`` only on device, so they are CUDA-graph capturable;
+    they are mutually exclusive.
+    """
+    assert a.dim() == 2 and b.dim() == 3 and sfa.dim() == 2 and sfb.dim() == 3
+    assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
+    assert sfa.dtype == torch.float8_e8m0fnu and sfb.dtype == torch.float8_e8m0fnu
+    assert sum([uniform, varlen, varlen_nonaligned]) <= 1, (
+        "uniform/varlen/varlen_nonaligned are mutually exclusive"
+    )
+    total_m, k = a.shape
+    e, kb, n = b.shape
+    assert kb == k and k % SF_VEC == 0, f"K mismatch a={k} b={kb} (or not %{SF_VEC})"
+    sf_k = k // SF_VEC
+    assert tuple(sfa.shape) == (total_m, sf_k), f"sfa {tuple(sfa.shape)} != {(total_m, sf_k)}"
+    assert tuple(sfb.shape) == (e, n, sf_k), f"sfb {tuple(sfb.shape)} != {(e, n, sf_k)}"
+    if out is None:
+        out = torch.empty((total_m, n), dtype=torch.bfloat16, device=a.device)
+    if total_m == 0:
+        return out
+
+    # Shape-determined route (g = total_m // E); offs is never read on the host.
+    # The caller asserts groups are equal & 128-aligned (e.g. fixed-capacity MoE).
+    if uniform:
+        assert total_m % e == 0, f"uniform=True needs total_m {total_m} % E {e} == 0"
+        g = total_m // e
+        assert g % 128 == 0, f"uniform=True needs (total_m // E) = {g} to be % 128 == 0"
+        mxfp8_gemm_out(
+            a.view(e, g, k), b, sfa.view(e, g, sf_k), sfb.transpose(1, 2), out.view(e, g, n)
+        )
+        return out
+
+    # Ragged groups with 128-aligned boundaries (caller-asserted). offs is consumed
+    # only on device; natural SFA via the sfa_tile_aligned kernel path (no dQaccum scatter).
+    if varlen:
+        assert total_m % 128 == 0, f"varlen=True needs total_m {total_m} % 128 == 0"
+        tiler, cluster = _default_tiler_cluster(total_m // e, n)
+        return _run_varlen_natural(
+            a,
+            offs,
+            sfa,
+            b.permute(2, 1, 0),
+            pack_scale_2d_to_blocked_contig(sfb),
+            out,
+            e,
+            k,
+            n,
+            sf_k,
+            tiler,
+            cluster,
+        )
+
+    # Ragged groups with ARBITRARY (incl. non-128) boundaries (caller-asserted). offs is
+    # consumed only on device; dQaccum-padded SFA built on device via the sync-free builder.
+    if varlen_nonaligned:
+        tiler, cluster = _default_tiler_cluster_for(total_m, e, n)
+        return _run_varlen_dqaccum(
+            a,
+            offs,
+            sfa,
+            b.permute(2, 1, 0),
+            pack_scale_2d_to_blocked_contig(sfb),
+            out,
+            e,
+            k,
+            n,
+            sf_k,
+            tiler,
+            cluster,
+        )
+
+    offsets_host = tuple(int(v) for v in offs.detach().cpu().tolist())
+    assert len(offsets_host) == e, f"offs len {len(offsets_host)} != E {e}"
+    assert offsets_host[-1] == total_m, f"offs[-1] {offsets_host[-1]} != total_m {total_m}"
+    route, g = _choose_route(offsets_host)
+
+    if route == "uniform":
+        mxfp8_gemm_out(
+            a.view(e, g, k), b, sfa.view(e, g, sf_k), sfb.transpose(1, 2), out.view(e, g, n)
+        )
+        return out
+
+    tiler, cluster = _default_tiler_cluster_for(total_m, e, n)  # mean (total_m // e), sync-free
+    mB = b.permute(2, 1, 0)
+    mSFB = pack_scale_2d_to_blocked_contig(sfb)
+    if route == "varlen":
+        return _run_varlen_natural(a, offs, sfa, mB, mSFB, out, e, k, n, sf_k, tiler, cluster)
+    return _run_varlen_dqaccum(a, offs, sfa, mB, mSFB, out, e, k, n, sf_k, tiler, cluster)
+
+
+class MXFP8GroupedGemm:
+    """Prepared grouped MXFP8 GEMM with the fixed B operand baked in.
+
+    Pre-packs the B-scale and reuses the cached compiled kernel, so each call does
+    only per-step work (A-scale pack + the kernel). Call it like
+    ``torch._scaled_grouped_mm``::
+
+        gemm = MXFP8GroupedGemm(b, sfb)        # b/sfb are the fixed expert weights
+        out = gemm(a, offs, sfa)               # per step (offs may change per call)
+        out = gemm(a, offs, sfa, out=buf)      # reuse an output buffer
+
+    With ``uniform=True`` (at construction or per call) the route is derived from
+    shapes (g = total_m // E), so ``offs`` is never read on the host.
+
+    Per-call work is on fresh tensors; for CUDA-graph replay, call once on the
+    capture tensors then update ``a`` / ``sfa`` / ``out`` in place between replays.
+    """
+
+    def __init__(
+        self, b: Tensor, sfb: Tensor, uniform: bool = False, varlen_nonaligned: bool = False
+    ):
+        assert b.dim() == 3 and sfb.dim() == 3
+        assert b.dtype == torch.float8_e4m3fn and sfb.dtype == torch.float8_e8m0fnu
+        e, k, n = b.shape
+        assert k % SF_VEC == 0, f"K={k} not a multiple of {SF_VEC}"
+        sf_k = k // SF_VEC
+        assert tuple(sfb.shape) == (e, n, sf_k), f"sfb {tuple(sfb.shape)} != {(e, n, sf_k)}"
+        self.e, self.k, self.n, self.sf_k = e, k, n, sf_k
+        self.uniform = uniform
+        self.varlen_nonaligned = varlen_nonaligned
+        # Pre-pack the fixed B-scale once; shared across calls and routes.
+        self._sfb_packed = pack_scale_2d_to_blocked_contig(sfb)  # varlen passes this directly
+        self._sfb_view_dense = scale_view_for_kernel(self._sfb_packed, n, sf_k, e)  # dense view
+        self._mB_dense = b.mT.permute(1, 2, 0)  # (n,k,e) K-major view (dense/uniform)
+        self._mB_varlen = b.permute(2, 1, 0)  # (n,k,e) K-major view (varlen)
+
+    def _dense(self, a: Tensor, g: int, sfa: Tensor, out: Tensor) -> Tensor:
+        e, k, n, sf_k = self.e, self.k, self.n, self.sf_k
+        mA = a.view(e, g, k).permute(1, 2, 0)
+        mD = out.view(e, g, n).permute(1, 2, 0)
+        tiler, cluster = _default_tiler_cluster(g, n)
+        runner = _compile_cached(
+            g, n, k, e, tiler, cluster, torch.bfloat16, cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+        )
+        sfa_view = scale_view_for_kernel(
+            pack_scale_2d_to_blocked_contig(sfa.view(e, g, sf_k)), g, sf_k, e
+        )
+        runner(mA, self._mB_dense, mD, sfa_view, self._sfb_view_dense)
+        return out
+
+    def __call__(
+        self,
+        a: Tensor,
+        offs: Tensor,
+        sfa: Tensor,
+        out: Optional[Tensor] = None,
+        uniform: Optional[bool] = None,
+        varlen: bool = False,
+        varlen_nonaligned: Optional[bool] = None,
+    ) -> Tensor:
+        uniform = self.uniform if uniform is None else uniform
+        varlen_nonaligned = (
+            self.varlen_nonaligned if varlen_nonaligned is None else varlen_nonaligned
+        )
+        assert sum([uniform, varlen, varlen_nonaligned]) <= 1, (
+            "uniform/varlen/varlen_nonaligned are mutually exclusive"
+        )
+        e, k, n, sf_k = self.e, self.k, self.n, self.sf_k
+        total_m, ka = a.shape
+        assert ka == k, f"K mismatch a={ka} vs b={k}"
+        assert a.dtype == torch.float8_e4m3fn and sfa.dtype == torch.float8_e8m0fnu
+        assert tuple(sfa.shape) == (total_m, sf_k), f"sfa {tuple(sfa.shape)} != {(total_m, sf_k)}"
+        if out is None:
+            out = torch.empty((total_m, n), dtype=torch.bfloat16, device=a.device)
+        if total_m == 0:
+            return out
+
+        # Sync-free uniform path: shape-derived route + pre-packed B-scale.
+        if uniform:
+            assert total_m % e == 0, f"uniform=True needs total_m {total_m} % E {e} == 0"
+            g = total_m // e
+            assert g % 128 == 0, f"uniform=True needs (total_m // E) = {g} % 128 == 0"
+            return self._dense(a, g, sfa, out)
+
+        # Sync-free varlen path: ragged 128-aligned groups; natural SFA, cached B-scale.
+        if varlen:
+            assert total_m % 128 == 0, f"varlen=True needs total_m {total_m} % 128 == 0"
+            tiler, cluster = _default_tiler_cluster(total_m // e, n)
+            return _run_varlen_natural(
+                a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
+            )
+
+        # Sync-free non-128 path: arbitrary ragged groups; device-built dQaccum SFA.
+        if varlen_nonaligned:
+            tiler, cluster = _default_tiler_cluster_for(total_m, e, n)
+            return _run_varlen_dqaccum(
+                a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
+            )
+
+        # General route via offs (one host sync; B-scale already packed).
+        offsets_host = tuple(int(v) for v in offs.detach().cpu().tolist())
+        assert len(offsets_host) == e, f"offs len {len(offsets_host)} != E {e}"
+        assert offsets_host[-1] == total_m, f"offs[-1] {offsets_host[-1]} != total_m {total_m}"
+        route, g = _choose_route(offsets_host)
+        if route == "uniform":
+            return self._dense(a, g, sfa, out)
+        tiler, cluster = _default_tiler_cluster_for(total_m, e, n)
+        if route == "varlen":
+            return _run_varlen_natural(
+                a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
+            )
+        return _run_varlen_dqaccum(
+            a, offs, sfa, self._mB_varlen, self._sfb_packed, out, e, k, n, sf_k, tiler, cluster
+        )
