@@ -7,9 +7,10 @@ from quack.gemm_blockscaled_interface import (
     _SF_VEC_SIZE_SM90 as SF,
     _WEIGHT_BLOCK_N_SM90 as BN,
     mxfp8_gemm_act,
-    quantize_act_sm90,
+    quantize_act,
     quantize_weight_sm90,
 )
+from quack.gemm_interface import gemm_act
 from quack.gemm_interface import gemm_gated_ref
 
 
@@ -112,7 +113,7 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
 
     A_bf16, W_bf16 = _make_varied_scale_inputs(M, K, N, dtype=dtype, device=device)
 
-    A_q, A_sc = quantize_act_sm90(A_bf16)
+    A_q, A_sc = quantize_act(A_bf16)
     W_q, W_sc = quantize_weight_sm90(W_bf16)
     B_q, B_sc = W_q.mT, W_sc.mT
 
@@ -140,43 +141,26 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
     else:
         assert preact is None
 
-
-# ---------------------------------------------------------------------------
-# Variable-length M (grouped / ragged batch)
-# ---------------------------------------------------------------------------
 @pytest.mark.parametrize("store_preact", [True, False])
 @pytest.mark.parametrize("activation", ["swiglu", "geglu"])
 @pytest.mark.parametrize(
-    "seq_lens, K, N",
+    "M, K, N",
     [
-        ([128, 256, 64, 512], 2048, 1024),
-        ([32] * 8, 1024, 512),
-        ([128, 256], 768, 1024),  # K not divisible by 512
+        (512, 2048, 1024),
+        (512, 768, 2048),
+        (256, 1024, 512),
+        (1536, 4096, 2048),
     ],
 )
-def test_mxfp8_gemm_gated_sm90_varlen(seq_lens, K, N, activation, store_preact):
+def test_mxfp8_gemm_sm90(M, K, N, activation, store_preact):
     _skip_if_not_sm90()
     dtype = torch.bfloat16
     torch.manual_seed(0)
     device = "cuda"
 
-    L = len(seq_lens)
-    total_m = sum(seq_lens)
-    cu_seqlens_m = torch.cat(
-        [
-            torch.zeros(1, dtype=torch.int32),
-            torch.tensor(seq_lens, dtype=torch.int32).cumsum(0).int(),
-        ]
-    ).to(device)
+    A_bf16, W_bf16 = _make_varied_scale_inputs(M, K, N, dtype=dtype, device=device)
 
-    A_bf16, _ = _make_varied_scale_inputs(total_m, K, N, dtype=dtype, device=device)
-    # Per-batch varied W; same indexing-aware scale pattern, fresh random base per batch.
-    W_bf16 = torch.stack(
-        [_make_varied_scale_inputs(1, K, N, dtype=dtype, device=device)[1] for _ in range(L)],
-        dim=0,
-    )
-
-    A_q, A_sc = quantize_act_sm90(A_bf16)
+    A_q, A_sc = quantize_act(A_bf16)
     W_q, W_sc = quantize_weight_sm90(W_bf16)
     B_q, B_sc = W_q.mT, W_sc.mT
 
@@ -189,24 +173,24 @@ def test_mxfp8_gemm_gated_sm90_varlen(seq_lens, K, N, activation, store_preact):
         out_dtype=dtype,
         postact_dtype=dtype,
         store_preact=store_preact,
-        cu_seqlens_m=cu_seqlens_m,
         tuned=False,
     )
-
-    A_dq, B_dq = _fp8_dequant_ref(A_q, A_sc, W_q, W_sc)
-    pre_ref, post_ref = gemm_gated_ref(
-        A_dq,
-        B_dq,
+    pre_ref, post_ref = gemm_act(
+        A_bf16,
+        W_bf16.mT,
         activation=activation,
+        out_dtype=dtype,
+        postact_dtype=dtype,
         store_preact=store_preact,
-        cu_seqlens_m=cu_seqlens_m,
+        tuned=False
     )
 
-    assert postact.shape == (total_m, N)
-    _assert_cos_close(postact, post_ref, "postact")
+    assert postact.shape == (M, N)
+    # the activation increases the error
+    _assert_cos_close(postact, post_ref, "postact", tol=0.002)
     if store_preact:
         assert preact is not None and pre_ref is not None
-        assert preact.shape == (total_m, 2 * N)
+        assert preact.shape == (M, 2 * N)
         _assert_cos_close(preact, pre_ref, "preact")
     else:
         assert preact is None

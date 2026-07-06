@@ -30,7 +30,7 @@ from deep_gemm.utils.math import per_token_cast_to_fp8, per_block_cast_to_fp8
 
 from quack.gemm_blockscaled_interface import (
     mxfp8_gemm_act,
-    quantize_act_sm90,
+    quantize_act,
     quantize_weight_sm90,
 )
 
@@ -87,7 +87,7 @@ def _pb_cast_3d(x_3d: torch.Tensor):
 def bench_dense_quack(M: int, K: int, N: int, repeats: int) -> Tuple[float, float]:
     A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) / math.sqrt(K)
-    A_q, A_sc = quantize_act_sm90(A)
+    A_q, A_sc = quantize_act(A)
     W_q, W_sc = quantize_weight_sm90(W)
     B_q, B_sc = W_q.mT, W_sc.mT
     out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -131,7 +131,7 @@ def bench_batched_quack(G: int, M_per_expert: int, K: int, N: int, repeats: int)
     # 3D (L=G, M, K) and (L=G, N, K).
     A = torch.randn(G, M_per_expert, K, device="cuda", dtype=torch.bfloat16)
     W = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16) / math.sqrt(K)
-    A_q, A_sc = quantize_act_sm90(A)
+    A_q, A_sc = quantize_act(A)
     W_q, W_sc = quantize_weight_sm90(W)
     del A, W  # free bf16 — quantization is done
     B_q, B_sc = W_q.mT, W_sc.mT
@@ -201,7 +201,7 @@ def bench_varlen_quack(seqlens: List[int], K: int, N: int, repeats: int) -> Tupl
     W = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16) / math.sqrt(K)
     cu = torch.tensor([0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
                       dtype=torch.int32, device="cuda")
-    A_q, A_sc = quantize_act_sm90(A)
+    A_q, A_sc = quantize_act(A)
     W_q, W_sc = quantize_weight_sm90(W)
     del A, W
     B_q, B_sc = W_q.mT, W_sc.mT

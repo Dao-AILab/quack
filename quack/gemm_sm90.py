@@ -353,9 +353,7 @@ class GemmSm90(GemmTmaBase):
 
         # Compute stage before compute smem layout. SFA staging (mxfp8) needs
         # BLOCK_M * 4 extra bytes per stage so reduce ab_stage accordingly.
-        sfa_bytes_per_stage = (
-            self.cta_tile_shape_mnk[0] * 4 if (self.blockscaled and not self.gather_A) else 0
-        )
+        sfa_bytes_per_stage = self.cta_tile_shape_mnk[0] * 4 if self.blockscaled else 0
         # Fixed (once-per-CTA) SFB buffer; not staged, so reserve it up front.
         sfb_fixed_bytes = self.SFB_SMEM_MAX * 4 if (self.blockscaled and not self.pingpong) else 0
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
@@ -394,7 +392,7 @@ class GemmSm90(GemmTmaBase):
             self.c_dtype,
             self.c_layout,
             self.epi_c_stage,
-            sfa_staged=self.blockscaled and not self.gather_A,
+            sfa_staged=self.blockscaled,
         )
 
     @cute.jit
@@ -478,7 +476,7 @@ class GemmSm90(GemmTmaBase):
         # of sf_k per K-stage. mcast=1 since per-CTA SFA is small.
         tma_atom_sfa, tma_tensor_sfa = None, None
         sfa_smem_layout = None
-        if const_expr(self.blockscaled and not self.gather_A):
+        if const_expr(self.blockscaled):
             sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, 0))
             tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
                 mSFA,
@@ -517,9 +515,7 @@ class GemmSm90(GemmTmaBase):
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
         sfa_smem_size = (
-            cute.cosize(self.sfa_smem_layout_staged)
-            if (self.blockscaled and not self.gather_A)
-            else 0
+            cute.cosize(self.sfa_smem_layout_staged) if self.blockscaled else 0
         )
         # Fixed buffer staged once per output block (DeepGEMM-style), eliminating
         # the per-k_tile gmem dependency on the wgmma issue path. Size reserved in
@@ -848,14 +844,21 @@ class GemmSm90(GemmTmaBase):
                         mcast_mask=b_mcast_mask,
                     )
                     # SFA: TMA-load activation scales staged alongside A/B per K-block.
-                    # mSFA is (M, SF_K, L) for non-varlen (permuted in dispatch) or
-                    # (total_M, SF_K) for varlen. After offset_batch_SFA we have (M, SF_K).
+                    # mSFA is (M, SF_K, L) for non-varlen, or (total_padded_M, SF_K) for
+                    # varlen. For varlen, SFA is dQaccum-padded (flat, unswizzled): each
+                    # expert's scale rows start on a 128-row boundary, so expert b's rows
+                    # begin at the padded offset (cu_seqlens_m[b] // 128 + b) * 128. A itself
+                    # stays unpadded (gathered/offset by the plain cu_seqlens), but its scales
+                    # are pre-padded so each M tile reads a 128-aligned scale burst. This
+                    # mirrors the SM100 varlen scheme minus the 512B swizzle (SM90 applies
+                    # scales in software, so a flat per-row buffer suffices).
                     copy_SFA = None
                     if const_expr(sSFA is not None):
                         if const_expr(varlen_m):
-                            mSFA_mk = cute.domain_offset(
-                                (varlen_params.cu_seqlens_m[batch_idx], 0), mSFA
-                            )
+                            offset_row = (
+                                varlen_params.cu_seqlens_m[batch_idx] // 128 + batch_idx
+                            ) * 128
+                            mSFA_mk = cute.domain_offset((offset_row, 0), mSFA)
                         else:
                             mSFA_mk = mSFA[None, None, batch_idx]
                         gSFA_mk = cute.local_tile(
@@ -891,6 +894,7 @@ class GemmSm90(GemmTmaBase):
                             copy_B,
                             k_tile_cnt,
                             varlen_m=varlen_m,
+                            copy_SFA=copy_SFA,
                         )
                     tctx.e("tma_load")
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
@@ -1157,6 +1161,7 @@ class GemmSm90(GemmTmaBase):
         copy_B: Callable,
         k_tile_cnt: Int32,
         varlen_m: bool = True,
+        copy_SFA: Optional[Callable] = None,
     ) -> cutlass.pipeline.PipelineState:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
@@ -1177,6 +1182,8 @@ class GemmSm90(GemmTmaBase):
             # A bit faster to load B first while we calculate the indices for A
             if is_tma_warp:
                 tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                if const_expr(copy_SFA is not None):  # SFA before B: avoids losing the 2nd TMA tx in the cp.async-gather barrier
+                    copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out)
             # This tells mbarrier to track the completion of cp.async
@@ -1196,6 +1203,8 @@ class GemmSm90(GemmTmaBase):
             smem_idx = ab_producer_state.index
             if is_tma_warp:
                 tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                if const_expr(copy_SFA is not None):  # SFA before B: avoids losing the 2nd TMA tx in the cp.async-gather barrier
+                    copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out, pred=True)
             ab_pipeline.producer_cpasync_commit(ab_producer_state)

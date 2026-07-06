@@ -33,6 +33,8 @@ from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
+import triton
+import triton.language as tl
 
 import cutlass
 import cutlass.cute as cute
@@ -71,6 +73,7 @@ from quack.gemm_tvm_ffi_utils import (
     perm3d_single,
 )
 from quack.mx_utils import to_mx, to_mx_2d
+from quack.quant import blockwise_quant
 
 _SF_VEC_SIZE_SM100 = 32  # SM100 K-block size
 _SF_VEC_SIZE_SM90 = 128  # SM90 K-block size (activations and weights)
@@ -82,7 +85,7 @@ def default_config(device):
     if cap == 9:
         return GemmConfig(
             tile_m=128,
-            tile_n=256,
+            tile_n=128,
             cluster_m=1,
             cluster_n=2,
             pingpong=False,
@@ -113,12 +116,6 @@ def _f32_to_e8m0(scale_f32: torch.Tensor) -> torch.Tensor:
     return e8m0_byte.view(torch.float8_e8m0fnu)
 
 
-def _e8m0_to_f32(scale_e8m0: torch.Tensor) -> torch.Tensor:
-    """E8M0 (float8_e8m0fnu viewed as uint8) → float32 power-of-2 scale."""
-    bits = scale_e8m0.contiguous().view(torch.uint8).to(torch.int32) << 23
-    return (bits & 0x7F000000).view(torch.float32)
-
-
 def quantize_act_sm100(x: Tensor) -> Tuple[Tensor, Tensor]:
     """SM100 activation quantization: 32-element K-blocks, per-row.
     Returns (qdata: float8_e4m3fn, scale: float8_e8m0fnu) in torchao layout."""
@@ -128,44 +125,16 @@ def quantize_act_sm100(x: Tensor) -> Tuple[Tensor, Tensor]:
     return to_mx(x.contiguous(), _SF_VEC_SIZE_SM100)
 
 
-def quantize_act_sm90(x: Tensor) -> Tuple[Tensor, Tensor]:
-    """SM90 activation quantization: 128-element K-blocks, per-row. Scales as float32."""
-    assert x.shape[-1] % _SF_VEC_SIZE_SM90 == 0, (
-        f"last dim ({x.shape[-1]}) must be divisible by {_SF_VEC_SIZE_SM90}"
-    )
-    qdata, scale_e8m0 = to_mx(x.contiguous(), _SF_VEC_SIZE_SM90)
-    return qdata, _e8m0_to_f32(scale_e8m0).mT.contiguous().mT
-
-
-def quantize_weight_sm90(w: Tensor) -> Tuple[Tensor, Tensor]:
-    """SM90 weight quantization: 128×128 block size (per-block, not per-row).
-
-    Args:
-        w: (..., N, K) bf16/fp32, N % 128 == 0, K % 128 == 0.
-    Returns:
-        qdata: float8_e4m3fn, same shape as w.
-        scale: float32, shape (..., N // 128, K // 128). One scale per 128×128 tile.
-    """
-    assert w.shape[-1] % _SF_VEC_SIZE_SM90 == 0, (
-        f"last dim K ({w.shape[-1]}) must be divisible by {_SF_VEC_SIZE_SM90}"
-    )
-    assert w.shape[-2] % _WEIGHT_BLOCK_N_SM90 == 0, (
-        f"second-to-last dim N ({w.shape[-2]}) must be divisible by {_WEIGHT_BLOCK_N_SM90}"
-    )
-    *batch_shape, N, K = w.shape
-    qdata_2d, scale_2d = to_mx_2d(
-        w.reshape(-1, K).contiguous(), _WEIGHT_BLOCK_N_SM90, _SF_VEC_SIZE_SM90
-    )
-    qdata = qdata_2d.reshape(*batch_shape, N, K)
-    scale = scale_2d.reshape(*batch_shape, N // _WEIGHT_BLOCK_N_SM90, K // _SF_VEC_SIZE_SM90)
-    return qdata, scale
-
-
 def quantize_act(x: Tensor) -> Tuple[Tensor, Tensor]:
-    """Auto-dispatch activation quantization based on device capability."""
+    """Auto-dispatch activation quantization based on device capability.
+
+    SM90 uses `blockwise_quant` (128-element K-blocks, M-innermost f32 scales) — the same
+    fast CuTe quantizer the GEMM's SFA expects. For varlen/grouped-M, quantize here (unpadded)
+    then dQaccum-pad the scales with `grouped_scale_to_dqaccum` / `permute_scale_to_dqaccum`.
+    """
     cap = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
     if cap == 9:
-        return quantize_act_sm90(x)
+        return blockwise_quant(x, block_size=_SF_VEC_SIZE_SM90, scale_transpose=True)
     elif cap == 10:
         return quantize_act_sm100(x)
     else:
@@ -485,7 +454,13 @@ def _compile_mxfp8_gemm_act_sm90(
         sf_k_sym = cute.sym_int()
         n_blocks_sym = cute.sym_int()
         if varlen_m:
-            fake_sfa = fake_tensor(cutlass.Float32, (m, sf_k_sym), leading_dim=0, divisibility=1)
+            # SFA's M extent is dQaccum-padded (total_padded_m), independent of A's
+            # total_m — give it its own symbol so the kernel does NOT bake in
+            # mSFA.shape[0] == mA.shape[0] (which no longer holds after padding).
+            padded_m_sym = cute.sym_int()
+            fake_sfa = fake_tensor(
+                cutlass.Float32, (padded_m_sym, sf_k_sym), leading_dim=0, divisibility=1
+            )
         else:
             fake_sfa = fake_tensor(cutlass.Float32, (m, sf_k_sym, l), leading_dim=0, divisibility=1)
         fake_sfb = fake_tensor(
@@ -1195,3 +1170,50 @@ def mxfp8_gemm_ref_sm100(
     b_dq = B3 * bs3.repeat_interleave(_SF_VEC_SIZE_SM100, dim=-1)
     out3 = torch.einsum("lmk,lnk->lmn", a_dq, b_dq).to(out_dtype)
     return out3.squeeze(0) if was_2d else out3
+
+@triton.jit
+def _quantize_weight_sm90_kernel(
+    w_ptr,  # (M, K) bf16/f32, row-major
+    q_ptr,  # (M, K) float8_e4m3fn
+    sc_ptr,  # (M // 128, K // 128) f32
+    K,
+    nbk,  # K // 128 (scale row stride)
+    BLOCK: tl.constexpr,  # 128 (block_rows == block_cols == sf_vec == weight_n_block)
+):
+    # One 128x128 MXFP8 block per program. Bit-exact with quack.mx_utils.to_mx_2d
+    # (FLOOR-mode e8m0 scale): amax over the tile -> power-of-2 dequant scale -> quantize.
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK + tl.arange(0, BLOCK)
+    offs_k = pid_k * BLOCK + tl.arange(0, BLOCK)
+    w_off = offs_m[:, None] * K + offs_k[None, :]
+    tile = tl.load(w_ptr + w_off).to(tl.float32)
+    amax = tl.max(tl.abs(tile))
+    # Per-block power-of-2 quant scale: FP8_MAX/amax truncated to a power of two by zeroing
+    # the mantissa (& 0xFF800000). Quantize with that same pow2 scale and store its reciprocal
+    # as the dequant scale, so q * stored_scale == tile up to fp8 rounding (the SM90 GEMM applies
+    # the scale as a plain f32 multiply). amax==0 -> scale 1 (all-zero tile stays zero).
+    scale = tl.where(amax == 0, 1.0, 448.0 / amax)
+    scale = (scale.to(tl.uint32, bitcast=True) & 0xFF800000).to(tl.float32, bitcast=True)
+    q = tile * scale
+    tl.store(q_ptr + w_off, q.to(q_ptr.dtype.element_ty))
+    tl.store(sc_ptr + pid_m * nbk + pid_k, 1.0 / scale)
+
+
+def quantize_weight_sm90(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """128x128 blockwise FP8 weight quantization in a single Triton kernel.
+
+    Each 128x128 block gets one power-of-2 scale (FP8_MAX/amax, mantissa-truncated). Returns
+    (qdata (..., N, K) float8_e4m3fn, scale (..., N//128, K//128) f32), where `scale` is the
+    *dequant* scale (reciprocal) the SM90 GEMM multiplies by: `w ≈ qdata * scale`. N and K
+    must be divisible by 128.
+    """
+    *batch, N, K = w.shape
+    assert N % 128 == 0 and K % 128 == 0, f"N ({N}) and K ({K}) must be divisible by 128"
+    w2d = w.reshape(-1, K).contiguous()
+    M = w2d.shape[0]
+    nbm, nbk = M // 128, K // 128
+    q = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=w.device)
+    sc = torch.empty(nbm, nbk, dtype=torch.float32, device=w.device)
+    _quantize_weight_sm90_kernel[(nbm, nbk)](w2d, q, sc, K, nbk, BLOCK=128)
+    return q.reshape(*batch, N, K), sc.reshape(*batch, N // 128, K // 128)
