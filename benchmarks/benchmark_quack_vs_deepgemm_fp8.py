@@ -28,7 +28,7 @@ import deep_gemm
 from deep_gemm.utils import get_m_alignment_for_contiguous_layout
 from deep_gemm.utils.math import per_token_cast_to_fp8, per_block_cast_to_fp8
 
-from quack.gemm_blockscaled_interface import (
+from quack.gemm_blockscaled_sm90 import (
     mxfp8_gemm_act,
     quantize_act,
     quantize_weight_sm90,

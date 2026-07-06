@@ -262,6 +262,7 @@ def _blockwise_quant(
     # scale stays 2D (dst_rows, N // block_size); its strides carry the layout (row/col-major).
     _blockwise_quant_launch(x_flat, out_flat, scale, scale_row_idx, block_size)
 
+
 def blockwise_quant(
     src: Tensor,
     block_size: int = 128,

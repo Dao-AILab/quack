@@ -34,7 +34,7 @@ from triton.testing import do_bench
 
 from quack.autotuner import default_cache_dir
 from quack.cache import get_cache_path
-from quack.gemm_blockscaled_interface import (
+from quack.gemm_blockscaled_sm90 import (
     mxfp8_gemm_act,
     quantize_act,
     quantize_weight_sm90,

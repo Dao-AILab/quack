@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from quack.gemm_blockscaled_interface import (
+from quack.gemm_blockscaled_sm90 import (
     _SF_VEC_SIZE_SM90 as SF,
     _WEIGHT_BLOCK_N_SM90 as BN,
     mxfp8_gemm_act,
