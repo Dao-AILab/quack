@@ -514,9 +514,7 @@ class GemmSm90(GemmTmaBase):
 
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
-        sfa_smem_size = (
-            cute.cosize(self.sfa_smem_layout_staged) if self.blockscaled else 0
-        )
+        sfa_smem_size = cute.cosize(self.sfa_smem_layout_staged) if self.blockscaled else 0
         # Fixed buffer staged once per output block (DeepGEMM-style), eliminating
         # the per-k_tile gmem dependency on the wgmma issue path. Size reserved in
         # _compute_stages via sfb_fixed_bytes so ab_stage leaves room for it.
@@ -853,15 +851,11 @@ class GemmSm90(GemmTmaBase):
                             (self.cta_tile_shape_mnk[0], 1),
                             (tile_coord_mnkl[0], None),
                         )
-                        copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
+                        copy_SFA = copy_utils.tma_get_block_copy_fn(
                             tma_atom_sfa,
-                            cta_coord=block_in_cluster_coord_mnk[1],
-                            cta_layout=cute.make_layout(
-                                cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
-                            ),
                             src_tensor=gSFA_mk,
                             dst_tensor=sSFA,
-                            mcast_mask=a_mcast_mask,
+                            tma_multicast=a_tma_multicast,
                         )
                     len_k = varlen_manager.len_k(batch_idx)
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
@@ -1167,7 +1161,9 @@ class GemmSm90(GemmTmaBase):
             # A bit faster to load B first while we calculate the indices for A
             if is_tma_warp:
                 tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
-                if const_expr(copy_SFA is not None):  # SFA before B: avoids losing the 2nd TMA tx in the cp.async-gather barrier
+                if const_expr(
+                    copy_SFA is not None
+                ):  # SFA before B: avoids losing the 2nd TMA tx in the cp.async-gather barrier
                     copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out)
@@ -1188,7 +1184,9 @@ class GemmSm90(GemmTmaBase):
             smem_idx = ab_producer_state.index
             if is_tma_warp:
                 tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
-                if const_expr(copy_SFA is not None):  # SFA before B: avoids losing the 2nd TMA tx in the cp.async-gather barrier
+                if const_expr(
+                    copy_SFA is not None
+                ):  # SFA before B: avoids losing the 2nd TMA tx in the cp.async-gather barrier
                     copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out, pred=True)

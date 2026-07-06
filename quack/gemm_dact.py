@@ -477,8 +477,7 @@ def gemm_dact(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
-    compiled_fn(
-        A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args, None, None, None
-    )
+    compiled_fn(A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args, None, None, None)
+
 
 gemm_dgated = gemm_dact

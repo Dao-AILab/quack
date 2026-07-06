@@ -32,7 +32,7 @@ from quack.reduction_base import ReductionBase
 from quack.fast_math import FastDivmod
 from quack.autotuner import autotune, AutotuneConfig
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.cache_utils import jit_cache, COMPILE_ONLY
+from quack.cache import jit_cache
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
@@ -192,9 +192,7 @@ def _compile_quant_fwd(
     # Scale is (dst_rows, num_blocks_N). leading_dim picks the contiguous axis:
     # last dim (row-major) by default, first dim (col-major / transposed) otherwise.
     m_sym, bn_sym = cute.sym_int(), cute.sym_int()
-    scale_cute = fake_tensor(
-        Float32, (m_sym, bn_sym), leading_dim=0 if scale_transpose else 1
-    )
+    scale_cute = fake_tensor(Float32, (m_sym, bn_sym), leading_dim=0 if scale_transpose else 1)
     # scale_row_idx: (M,) int32 per-input-row destination row into the scale tensor, so the
     # kernel scatters each block's scale straight to its dQaccum-padded position.
     scale_row_idx_cute = fake_tensor(cutlass.Int32, (cute.sym_int(),)) if has_scatter else None
@@ -239,8 +237,6 @@ def _blockwise_quant_launch(x, out, scale, scale_row_idx, block_size, config):
     compiled = _compile_quant_fwd(
         dtype, out_dtype, block_size, scale_transpose, has_scatter, threads_per_row, num_threads
     )
-    # Always pass 4 tensor args: the kernel compiled with has_scatter=False still has the
-    # mScaleRowIdx param slot (as None), so a 3-arg call would fail "Expects 4 parameters".
     compiled(x, out, scale, scale_row_idx)
 
 
@@ -265,25 +261,6 @@ def _blockwise_quant(
     out_flat = out.reshape(-1, block_size)
     # scale stays 2D (dst_rows, N // block_size); its strides carry the layout (row/col-major).
     _blockwise_quant_launch(x_flat, out_flat, scale, scale_row_idx, block_size)
-
-
-@_blockwise_quant.register_fake
-def _blockwise_quant_fake(
-    x: Tensor,
-    out: Tensor,
-    scale: Tensor,
-    scale_row_idx: Tensor | None,
-    block_size: int,
-) -> None:
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        assert N % block_size == 0
-        dtype = torch2cute_dtype_map[x.dtype]
-        out_dtype = torch2cute_dtype_map[out.dtype]
-        _compile_quant_fwd(
-            dtype, out_dtype, block_size, scale.stride(-1) != 1, scale_row_idx is not None
-        )
-
 
 def blockwise_quant(
     src: Tensor,
@@ -404,7 +381,12 @@ def permute_scale_to_dqaccum(
     total_padded_M = dqaccum_total_padded_m(TK, num_experts)
     token_of_entry = torch.arange(TK, device=token_scale.device) // topk
     return _scatter_scale_to_dqaccum(
-        token_scale, s_reverse_scatter_idx, token_of_entry, cu_seqlens_m, total_padded_M, m_contiguous
+        token_scale,
+        s_reverse_scatter_idx,
+        token_of_entry,
+        cu_seqlens_m,
+        total_padded_M,
+        m_contiguous,
     )
 
 
@@ -451,6 +433,7 @@ def quant_ref(
 # ---------------------------------------------------------------------------
 # Blockwise Dequantization
 # ---------------------------------------------------------------------------
+
 
 @torch.compile
 def blockwise_dequant(
