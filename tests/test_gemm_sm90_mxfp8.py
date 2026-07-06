@@ -141,6 +141,7 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
     else:
         assert preact is None
 
+
 @pytest.mark.parametrize("store_preact", [True, False])
 @pytest.mark.parametrize("activation", ["swiglu", "geglu"])
 @pytest.mark.parametrize(
@@ -182,7 +183,7 @@ def test_mxfp8_gemm_sm90(M, K, N, activation, store_preact):
         out_dtype=dtype,
         postact_dtype=dtype,
         store_preact=store_preact,
-        tuned=False
+        tuned=False,
     )
 
     assert postact.shape == (M, N)
