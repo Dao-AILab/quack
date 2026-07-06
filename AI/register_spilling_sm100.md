@@ -24,7 +24,7 @@ Budget check: `256 + 120 + 120 = 496 ≤ 504`. Values must be divisible by 8.
 Get SASS from the compiled kernel and count local memory instructions:
 
 ```python
-from quack.cache_utils import get_cache_path, _compute_source_fingerprint
+from quack.cache import get_cache_path, _compute_source_fingerprint
 cache_dir = get_cache_path() / _compute_source_fingerprint()
 ```
 

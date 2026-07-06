@@ -14,9 +14,10 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 from quack import copy_utils
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.dsl import cute_op
 
 
 def _ensure_last_dim_contiguous(t: Tensor) -> Tensor:
@@ -265,8 +266,7 @@ class RotaryKernel:
             cute.arch.sync_threads()
         else:
             for h in cutlass.range_constexpr(self.tile_h):
-                tCrX_f32 = cute.make_rmem_tensor(tXrX_g2r[None, None, None, 0].shape, Float32)
-                tCrX_f32.store(tXrX_g2r[None, None, None, h].load().to(Float32))
+                tCrX_f32 = tXrX_g2r[None, None, None, h].to(Float32)
                 assert cute.size(tCrX_f32.shape) == cute.size(rCos) * 2
                 for i in cutlass.range(cute.size(tCrX_f32.shape) // 2, unroll_full=True):
                     x0, x1 = tCrX_f32[2 * i], tCrX_f32[2 * i + 1]
@@ -284,57 +284,57 @@ class RotaryKernel:
                     if tXcX[0, m, 0][0] < seq_len:
                         copy(tXrX[None, m, None], tXgO[None, m, None, h])
 
-
-@jit_cache
-def _compile_rotary(
-    dtype,
-    cossin_dtype,
-    seqlen_offsets_dtype,
-    cu_seqlens_dtype,
-    dim,
-    interleaved,
-    conjugate,
-):
-    is_varlen = cu_seqlens_dtype is not None
-    has_seqlen_offsets = seqlen_offsets_dtype is not None
-    batch_sym = cute.sym_int()
-    batch_p1_sym = cute.sym_int()
-    seqlen_sym = cute.sym_int()
-    total_seqlen_sym = cute.sym_int()
-    nheads_sym = cute.sym_int()
-    x_dim_sym = cute.sym_int()
-    seqlen_ro_sym = cute.sym_int()
-    x_shape = (
-        (total_seqlen_sym, nheads_sym, x_dim_sym)
-        if is_varlen
-        else (batch_sym, seqlen_sym, nheads_sym, x_dim_sym)
-    )
-    x_divby = math.gcd(128 // dtype.width, dim)
-    cossin_divby = math.gcd(128 // cossin_dtype.width, dim // 2)
-    x_cute = fake_tensor(dtype, x_shape, x_divby)
-    out_cute = fake_tensor(dtype, x_shape, x_divby)
-    cos_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
-    sin_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
-    seqlen_offsets_cute = (
-        cute.runtime.make_fake_tensor(
-            seqlen_offsets_dtype, (batch_sym,), stride=(cute.sym_int64(divisibility=1),)
+    @staticmethod
+    @jit_cache
+    def compile(
+        dtype,
+        cossin_dtype,
+        seqlen_offsets_dtype,
+        cu_seqlens_dtype,
+        dim,
+        interleaved,
+        conjugate,
+    ):
+        is_varlen = cu_seqlens_dtype is not None
+        has_seqlen_offsets = seqlen_offsets_dtype is not None
+        batch_sym = cute.sym_int()
+        batch_p1_sym = cute.sym_int()
+        seqlen_sym = cute.sym_int()
+        total_seqlen_sym = cute.sym_int()
+        nheads_sym = cute.sym_int()
+        x_dim_sym = cute.sym_int()
+        seqlen_ro_sym = cute.sym_int()
+        x_shape = (
+            (total_seqlen_sym, nheads_sym, x_dim_sym)
+            if is_varlen
+            else (batch_sym, seqlen_sym, nheads_sym, x_dim_sym)
         )
-        if has_seqlen_offsets
-        else None
-    )
-    cu_seqlens_cute = fake_tensor(cu_seqlens_dtype, (batch_p1_sym,)) if is_varlen else None
-    return cute.compile(
-        RotaryKernel(dtype, dim, interleaved=interleaved, conjugate=conjugate),
-        x_cute,
-        cos_cute,
-        sin_cute,
-        seqlen_offsets_cute,
-        cu_seqlens_cute,
-        out_cute,
-        Int32(0),  # max_seqlen, just for compilation
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+        x_divby = math.gcd(128 // dtype.width, dim)
+        cossin_divby = math.gcd(128 // cossin_dtype.width, dim // 2)
+        x_cute = fake_tensor(dtype, x_shape, x_divby)
+        out_cute = fake_tensor(dtype, x_shape, x_divby)
+        cos_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
+        sin_cute = fake_tensor(cossin_dtype, (seqlen_ro_sym, dim // 2), cossin_divby)
+        seqlen_offsets_cute = (
+            cute.runtime.make_fake_tensor(
+                seqlen_offsets_dtype, (batch_sym,), stride=(cute.sym_int64(divisibility=1),)
+            )
+            if has_seqlen_offsets
+            else None
+        )
+        cu_seqlens_cute = fake_tensor(cu_seqlens_dtype, (batch_p1_sym,)) if is_varlen else None
+        return cute.compile(
+            RotaryKernel(dtype, dim, interleaved=interleaved, conjugate=conjugate),
+            x_cute,
+            cos_cute,
+            sin_cute,
+            seqlen_offsets_cute,
+            cu_seqlens_cute,
+            out_cute,
+            Int32(0),  # max_seqlen, just for compilation
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
 def _launch_rotary(
@@ -362,7 +362,7 @@ def _launch_rotary(
         torch2cute_dtype_map[seqlen_offsets.dtype] if seqlen_offsets is not None else None
     )
     cu_seqlens_dtype = Int32 if cu_seqlens is not None else None
-    _compile_rotary(
+    RotaryKernel.compile(
         dtype,
         cossin_dtype,
         seqlen_offsets_dtype,
@@ -373,7 +373,7 @@ def _launch_rotary(
     )(x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen)
 
 
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_fwd_out",
     mutates_args=("out",),
     device_types="cuda",
@@ -393,27 +393,7 @@ def _rotary_fwd_out(
     _launch_rotary(x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen, interleaved, conjugate)
 
 
-@_rotary_fwd_out.register_fake
-def _rotary_fwd_out_fake(
-    x: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    cu_seqlens: Optional[Tensor],
-    out: Tensor,
-    max_seqlen: int,
-    interleaved: bool,
-    conjugate: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(cos.size(1), torch.SymInt):
-        _launch_rotary(
-            x, cos, sin, seqlen_offsets, cu_seqlens, out, max_seqlen, interleaved, conjugate
-        )
-
-
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_fwd_inplace",
     mutates_args=("x",),
     device_types="cuda",
@@ -432,25 +412,6 @@ def _rotary_fwd_inplace(
     _launch_rotary(x, cos, sin, seqlen_offsets, cu_seqlens, x, max_seqlen, interleaved, conjugate)
 
 
-@_rotary_fwd_inplace.register_fake
-def _rotary_fwd_inplace_fake(
-    x: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    cu_seqlens: Optional[Tensor],
-    max_seqlen: int,
-    interleaved: bool,
-    conjugate: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(cos.size(1), torch.SymInt):
-        _launch_rotary(
-            x, cos, sin, seqlen_offsets, cu_seqlens, x, max_seqlen, interleaved, conjugate
-        )
-
-
 # CustomOpDef.register_effect() is only public in PyTorch 2.10+ (pytorch#163284).
 # On 2.8 / 2.9 fall back to the private torch._higher_order_ops.effects API,
 # which takes the underlying OpOverload. Collapse this once 2.10 is the floor.
@@ -465,7 +426,7 @@ def _register_ordered_effect(op) -> None:
         _register_effectful_op(op._opoverload, _EffectType.ORDERED)
 
 
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_inplace_bwd",
     mutates_args=(),
     device_types="cuda",
@@ -499,34 +460,6 @@ def _rotary_inplace_bwd(
 
 
 _register_ordered_effect(_rotary_inplace_bwd)
-
-
-@_rotary_inplace_bwd.register_fake
-def _rotary_inplace_bwd_fake(
-    dout: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    cu_seqlens: Optional[Tensor],
-    max_seqlen: Optional[int],
-    interleaved: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(cos.size(1), torch.SymInt):
-        max_seqlen = dout.shape[1] if cu_seqlens is None else max_seqlen
-        assert max_seqlen is not None
-        _launch_rotary(
-            dout,
-            cos,
-            sin,
-            seqlen_offsets,
-            cu_seqlens,
-            dout,
-            max_seqlen,
-            interleaved,
-            conjugate=True,
-        )
 
 
 def apply_rotary(
@@ -742,7 +675,7 @@ def _apply_rotary_qkv_inplace(
 
 # Keep the QKV view/reshape work behind this mutating custom op. Dynamo's
 # custom-autograd tracing still fails when the packed-QK GQA path is inlined.
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_qkv_inplace",
     mutates_args=("qkv",),
     device_types="cuda",
@@ -760,26 +693,7 @@ def _rotary_qkv_inplace(
     _apply_rotary_qkv_inplace(qkv, cos, sin, seqlen_offsets, num_heads_q, interleaved, conjugate)
 
 
-@_rotary_qkv_inplace.register_fake
-def _rotary_qkv_inplace_fake(
-    qkv: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    num_heads_q: int,
-    interleaved: bool,
-    conjugate: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    has_symint = isinstance(cos.size(1), torch.SymInt) or isinstance(qkv.size(0), torch.SymInt)
-    if COMPILE_ONLY and not has_symint:
-        _apply_rotary_qkv_inplace(
-            qkv, cos, sin, seqlen_offsets, num_heads_q, interleaved, conjugate
-        )
-
-
-@torch.library.custom_op(
+@cute_op(
     "quack::_rotary_qkv_inplace_bwd",
     mutates_args=(),
     device_types="cuda",
@@ -809,30 +723,6 @@ def _rotary_qkv_inplace_bwd(
 # first. Mark it as an ordered effect instead so Dynamo keeps the call without
 # inserting that clone; the returned grad input is the same mutated dqkv tensor.
 _register_ordered_effect(_rotary_qkv_inplace_bwd)
-
-
-@_rotary_qkv_inplace_bwd.register_fake
-def _rotary_qkv_inplace_bwd_fake(
-    dqkv: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    seqlen_offsets: Optional[Tensor],
-    num_heads_q: int,
-    interleaved: bool,
-) -> None:
-    from quack.cache_utils import COMPILE_ONLY
-
-    has_symint = isinstance(cos.size(1), torch.SymInt) or isinstance(dqkv.size(0), torch.SymInt)
-    if COMPILE_ONLY and not has_symint:
-        _apply_rotary_qkv_inplace(
-            dqkv,
-            cos,
-            sin,
-            seqlen_offsets,
-            num_heads_q,
-            interleaved,
-            conjugate=True,
-        )
 
 
 class ApplyRotaryEmbQKV_(torch.autograd.Function):

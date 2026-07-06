@@ -4,8 +4,8 @@ from typing import Type, Union
 
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils_og
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
+from cutlass.cute.nvgpu import OperandMajorMode
 
 
 @dsl_user_op

@@ -27,6 +27,11 @@ sm100_tma_gather_only = pytest.mark.skipif(
 )
 
 
+def assert_aliased(a, b) -> None:
+    """Assert two tensors share storage."""
+    assert a.data_ptr() == b.data_ptr()
+
+
 def generate_A_with_gather(total_m, k, device, dtype, gather_A=False):
     """Generate A matrix and optionally A_idx for gather_A case.
 
@@ -214,7 +219,7 @@ def test_gemm_varlen_m(
         tuned=False,
     )
     if pre_allocate_out:
-        assert out.data_ptr() == out_buf.data_ptr()
+        assert_aliased(out, out_buf)
     A_f, B_f = A.float(), B.float()
     out_ref = gemm_ref(A_f, B_f, bias=bias, alpha=alpha, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
     del A_f, B_f
@@ -577,8 +582,8 @@ def test_gemm_gated_varlen_m(
         tuned=False,
     )
     if pre_allocate_out:
-        assert preact.data_ptr() == preact_buf.data_ptr()
-        assert postact.data_ptr() == postact_buf.data_ptr()
+        assert_aliased(preact, preact_buf)
+        assert_aliased(postact, postact_buf)
     assert preact.shape == (total_m, n)
     assert postact.shape == (total_m, n // 2)
     # Compare with reference
@@ -667,8 +672,8 @@ def test_gemm_dgated_varlen_m(
         tuned=False,
     )
     if pre_allocate_out:
-        assert dx.data_ptr() == dx_buf.data_ptr()
-        assert postact.data_ptr() == postact_buf.data_ptr()
+        assert_aliased(dx, dx_buf)
+        assert_aliased(postact, postact_buf)
     if colvec_reduce:
         colvec_reduce_out = rest[0]
     assert dx.shape == (total_m, 2 * n)
@@ -746,7 +751,7 @@ def test_gemm_varlen_m_concat(
         concat_layout=concat,
     )
     if pre_allocate_out:
-        assert out.data_ptr() == out_buf.data_ptr()
+        assert_aliased(out, out_buf)
     out_ref = gemm_ref(
         A.float(),
         B.float(),
@@ -810,8 +815,8 @@ def test_gemm_gated_varlen_m_concat(
         concat_layout=concat,
     )
     if pre_allocate_out:
-        assert preact.data_ptr() == preact_buf.data_ptr()
-        assert postact.data_ptr() == postact_buf.data_ptr()
+        assert_aliased(preact, preact_buf)
+        assert_aliased(postact, postact_buf)
     preact_ref, postact_ref = gemm_gated_ref(
         A.float(),
         B.float(),

@@ -7,7 +7,7 @@ name = "quack-kernels"
 dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
-    "nvidia-cutlass-dsl>=4.4.2",
+    "nvidia-cutlass-dsl==4.6.0",
     "torch",
     "apache-tvm-ffi>=0.1.6,<0.2",
     "torch-c-dlpack-ext",
@@ -15,8 +15,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.2"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.0"]
 heuristics = ["nvidia-matmul-heuristics"]
+jax = ["jax", "jax-tvm-ffi"]
+bench = ["pandas"]
 dev = [
     "pre-commit",
     "pytest",
@@ -41,11 +43,43 @@ torch = [
     { index = "pytorch-cu130", marker = "extra == 'cu13'" },
 ]
 
+[tool.pytest.ini_options]
+# Disable pytest plugins we don't need. These add per-test hook dispatch and
+# session-end work that costs ~1-2s on a 2k-test file with no functional
+# benefit for quack's CI workflow:
+#   - cacheprovider:        .pytest_cache/ lastfailed bookkeeping (writes to disk per session)
+#   - unraisableexception:  3x gc.collect() at session end to flush sys.unraisablehook (0.6s)
+#   - threadexception:      same idea for threading.excepthook (~tens of ms)
+# Disabling these is safe: pytest reports test failures the same way; we just
+# lose the rarely-useful "there was an unraisable exception during test X"
+# secondary report. Tests still fail normally on real errors.
+addopts = "-p no:cacheprovider -p no:unraisableexception -p no:threadexception"
+
+# Filters set via warnings.filterwarnings() in conftest.py don't survive pytest's
+# per-test catch_warnings context — pytest prepends its own ('always', Warning)
+# filter, which then matches before any conftest 'ignore'. Filters declared here
+# are installed by pytest *after* its 'always', so they actually win.
+#
+# torch.compile / Inductor scripts dynamically-created methods via the
+# deprecated torch.jit.script_method during tracing, firing 300+ deprecation
+# warnings per --compile-only run. Suppress at the source module.
+filterwarnings = [
+    "ignore:`torch\\.jit\\.script_method`.*Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
+    # torch.profiler.profile() unconditionally warns when acc_events=False (the
+    # default) about events being cleared at each cycle. Our tests profile a
+    # single kernel launch in one cycle, so the warning is irrelevant. Silence
+    # at source rather than threading acc_events=True through every call site.
+    # NOTE: filterwarnings uses ':' as field separator, so the message regex
+    # cannot contain literal colons — match a colon-free substring instead.
+    "ignore:.*Profiler clears events at the end of each cycle.*:UserWarning:torch\\.profiler\\.profiler",
+]
+
 [tool.ruff]
 line-length = 100
 exclude = [".#*"]
 
 [tool.ruff.lint]
+extend-select = ["B904"]
 ignore = [
     "E731",  # do not assign a lambda expression, use a def
     "E741",  # Do not use variables named 'I', 'O', or 'l'

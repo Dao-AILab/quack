@@ -19,6 +19,11 @@ sm100_tma_gather_only = pytest.mark.skipif(
 )
 
 
+def assert_aliased(a, b) -> None:
+    """Assert two tensors share storage."""
+    assert a.data_ptr() == b.data_ptr()
+
+
 def generate_A_with_gather(m, total_k, device, dtype, gather_A=False):
     """Generate A matrix and optionally A_idx for gather_A case with varlen_k.
 
@@ -464,7 +469,7 @@ def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre
     )
     out_pt = gemm_ref(A, B, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx, concat_layout=concat_layout)
     if pre_allocate_out:
-        assert out.data_ptr() == out_buf.data_ptr()
+        assert_aliased(out, out_buf)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 

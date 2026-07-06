@@ -7,8 +7,12 @@ from triton.testing import do_bench
 from quack.gemm import gemm as quack_gemm
 
 """
-GEMM benchmark using quack.gemm.gemm() (dense path) or the SM100 blockscaled
-path (MXFP8 / MXFP4 / NVFP4) via --blockscaled.
+GEMM benchmark using quack.gemm.gemm() for both the dense path and the SM100
+blockscaled path (MXFP8 / MXFP4 / NVFP4), including blockscaled varlen_m.
+Blockscaled is selected by passing --sf_dtype and/or --sf_vec_size; everything
+runs through the same unified quack.gemm.gemm() dispatch (with SFA/SFB), so
+the tile/cluster flags apply identically and the timings include the real
+dispatch overhead users pay.
 
 Usage (dense):
     python benchmarks/benchmark_gemm.py --mnkl 512,7168,2048,256 \
@@ -17,18 +21,15 @@ Usage (dense):
 
 Usage (blockscaled MXFP8, with cuBLAS comparison):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
-        --blockscaled --ab_dtype Float8E4M3FN --sf_dtype Float8E8M0FNU \
-        --sf_vec_size 32 --init quant --compare_cublas
+        --tile_shape_mnk 256,256 --cluster_shape_mnk 2,1 --sf_vec_size 32
 
 Usage (blockscaled MXFP4):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
-        --blockscaled --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU \
-        --sf_vec_size 32 --d_dtype Float32
+        --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 32
 
 Usage (blockscaled NVFP4):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
-        --blockscaled --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN \
-        --sf_vec_size 16 --d_dtype Float32
+        --ab_dtype Float4E2M1FN --sf_dtype Float8E4M3FN --sf_vec_size 16
 """
 
 
@@ -74,8 +75,10 @@ def _torch_dtype(name: str) -> torch.dtype:
 def parse_comma_separated_ints(s: str):
     try:
         return tuple([int(x.strip()) for x in s.split(",")])
-    except ValueError:
-        raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            "Invalid format. Expected comma-separated integers."
+        ) from e
 
 
 def parse_cluster_shape_mnk(s: str):
@@ -187,13 +190,15 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def _run_blockscaled(args):
-    """Blockscaled (MXFP8 / MXFP4 / NVFP4) path using compile_blockscaled_gemm_tvm_ffi."""
+    """Blockscaled (MXFP8 / MXFP4 / NVFP4) path.
+
+    Both dense and varlen_m run through the unified quack.gemm.gemm() dispatch
+    (SFA/SFB tensors, dynamic-shape compile cache).
+    """
     import cutlass
-    from quack.blockscaled_gemm_utils import (
+    from quack.blockscaled.utils import (
         blockscaled_gemm_reference,
-        compile_blockscaled_gemm_tvm_ffi,
         create_blockscaled_operand_quantized,
-        create_blockscaled_operand_tensor,
         create_blockscaled_varlen_m_operands,
         scale_blocked_for_cublas,
         torch_dtype_for_cutlass,
@@ -219,6 +224,10 @@ def _run_blockscaled(args):
     cluster_shape_mn = cluster_shape_mnk[:2]
     if cluster_shape_mnk[2] != 1:
         raise NotImplementedError("blockscaled benchmark path only supports cluster_shape_mnk K=1")
+    if len(mma_tiler_mnk) == 3:
+        raise NotImplementedError(
+            "blockscaled derives tile K from the MMA instruction; pass --tile_shape_mnk M,N"
+        )
     # Default sf_vec_size: 32 (MX). Auto-pick sf_dtype / ab_dtype from (sf_vec_size, ab_dtype).
     sf_vec_size = args.sf_vec_size if args.sf_vec_size is not None else 32
     if args.sf_dtype is None:
@@ -279,12 +288,7 @@ def _run_blockscaled(args):
     assert k % sf_vec_size == 0, f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size})"
     if args.varlen_m:
         # varlen_m: l is num_experts, m is per-expert m, total_m = m * l.
-        # Requires MXFP8 currently.
-        assert (
-            ab_dtype == cutlass.Float8E4M3FN
-            and sf_dtype == cutlass.Float8E8M0FNU
-            and sf_vec_size == 32
-        ), "blockscaled varlen_m currently only supports MXFP8"
+        # Supports MXFP8 / MXFP4 / NVFP4 (fp4 operands must be K-major).
         # A must stay k-major in varlen_m (the per-expert padded SF offset
         # targets the M axis); B can be k- or n-major (MXFP8 only).
         assert a_major == "k", f"varlen_m currently requires a_major=k; got a={a_major}"
@@ -296,29 +300,35 @@ def _run_blockscaled(args):
                 n,
                 k,
                 sf_vec_size,
+                ab_dtype,
+                sf_dtype,
                 b_major=b_major,
             )
         )
-        # (l, rm, rk, 512) contig scale — consumed directly by the kernel.
-        mSFA, mSFB = a_sc_contig, b_sc_contig
+        mSFA, mSFB = a_sc_contig, b_sc_contig  # (1, padded_rm, rk, 32, 4, 4), (l, rn, rk, 32, 4, 4)
         mD = torch.empty(total_m, n, dtype=torch_dtype_for_cutlass(d_dtype), device="cuda")
-        runner = compile_blockscaled_gemm_tvm_ffi(
-            ab_dtype,
-            sf_dtype,
-            sf_vec_size,
-            d_dtype,
-            mma_tiler_mnk,
-            cluster_shape_mn,
-            mA,
-            mB,
-            mD,
-            mSFA,
-            mSFB,
-            varlen_m=True,
-        )
+        # Unified dispatch takes a (l, n, k) B view (zero-copy permute of the
+        # (n, k, l) kernel-layout tensor); A/D stay 2D (total_m, k[/2]) / (total_m, n).
+        B = mB.permute(2, 0, 1)
 
         def fn():
-            runner(mA, mB, mD, mSFA, mSFB, cu_seqlens_m)
+            quack_gemm(
+                mA,
+                B,
+                mD,
+                None,
+                tile_count_semaphore=None,
+                tile_M=mma_tiler_mnk[0],
+                tile_N=mma_tiler_mnk[1],
+                cluster_M=cluster_shape_mn[0],
+                cluster_N=cluster_shape_mn[1],
+                persistent=True,
+                is_dynamic_persistent=args.dynamic_persistent,
+                max_swizzle_size=args.max_swizzle_size,
+                cu_seqlens_m=cu_seqlens_m,
+                SFA=mSFA,
+                SFB=mSFB,
+            )
     else:
         a_ref, mA, a_sc_contig = create_blockscaled_operand_quantized(
             l,
@@ -338,27 +348,36 @@ def _run_blockscaled(args):
             ab_dtype,
             sf_dtype,
         )
-        # (l, rm, rk, 512) contig scale — consumed directly by the kernel.
-        mSFA, mSFB = a_sc_contig, b_sc_contig
+        # (l, rm, rk, 32, 4, 4) blocked scales, consumed by the unified dispatch as-is.
+        mSFA = a_sc_contig
+        mSFB = b_sc_contig
         sfa_ref = torch.ones_like(a_ref)
         sfb_ref = torch.ones_like(b_ref)
-        _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
-        runner = compile_blockscaled_gemm_tvm_ffi(
-            ab_dtype,
-            sf_dtype,
-            sf_vec_size,
-            d_dtype,
-            mma_tiler_mnk,
-            cluster_shape_mn,
-            mA,
-            mB,
-            mD,
-            mSFA,
-            mSFB,
+        # Unified dispatch takes (l, m, k) / (l, n, k) views (zero-copy permutes
+        # of the (m, k, l) / (n, k, l) kernel-layout tensors) and (l, m, n) D.
+        A = mA.permute(2, 0, 1)
+        B = mB.permute(2, 0, 1)
+        mD = torch.empty(l, m, n, dtype=torch_dtype_for_cutlass(d_dtype), device="cuda").permute(
+            1, 2, 0
         )
 
         def fn():
-            runner(mA, mB, mD, mSFA, mSFB)
+            quack_gemm(
+                A,
+                B,
+                mD.permute(2, 0, 1),
+                None,
+                tile_count_semaphore=None,
+                tile_M=mma_tiler_mnk[0],
+                tile_N=mma_tiler_mnk[1],
+                cluster_M=cluster_shape_mn[0],
+                cluster_N=cluster_shape_mn[1],
+                persistent=True,
+                is_dynamic_persistent=args.dynamic_persistent,
+                max_swizzle_size=args.max_swizzle_size,
+                SFA=mSFA,
+                SFB=mSFB,
+            )
 
     if not args.skip_ref_check:
         fn()

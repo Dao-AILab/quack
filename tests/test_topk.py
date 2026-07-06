@@ -43,6 +43,9 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
     if softmax:
         out_val_ref = torch.softmax(out_val_ref.float(), dim=-1).to(input_dtype)
 
+    dvalues = torch.randn_like(out_val)
+    out_val.backward(dvalues)
+
     # Check output shape and dtype
     assert out_val.shape == (M, k)
     assert out_val.dtype == input_dtype
@@ -57,8 +60,6 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
         torch.testing.assert_close(indexed_vals, out_val, atol=atol, rtol=rtol)
 
         # Backward check
-        dvalues = torch.randn_like(out_val)
-        out_val.backward(dvalues)
         dx_ref = torch.zeros_like(x)
         dx_ref.scatter_(1, out_idx.long(), dvalues)
         torch.testing.assert_close(x.grad, dx_ref, atol=1e-3, rtol=1e-3)
@@ -71,8 +72,6 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
             rtol=1e-2,
             msg="Softmax probabilities don't sum to 1",
         )
-        dvalues = torch.randn_like(out_val)
-        out_val.backward(dvalues)
         dot = (dvalues.float() * out_val.float()).sum(dim=1, keepdim=True)
         grad_topk = out_val.float() * (dvalues.float() - dot)
         grad_topk = grad_topk.to(input_dtype)

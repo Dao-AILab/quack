@@ -1,0 +1,411 @@
+# Copyright (c) 2026, Tri Dao.
+"""Async kernel compilation: defer-and-retry via a pool of CPU subprocesses.
+
+When a pool is active, ``jit_cache`` handles a ``.o``-cache miss by
+submitting the pickled ``(module, qualname, args, kwargs)`` of the
+``_compile_*`` function to the pool and raising :class:`CompilePending`
+instead of compiling in-process. The caller defers the work item, runs
+something else, and retries once the ``.o`` lands (a ~1 ms load). Two
+callers implement this loop:
+
+* the pytest plugin's ``--async-compile`` defer loop (tests are the work
+  items; see :mod:`quack.testing.pytest_plugin`);
+* the autotuner's bench loop under :func:`pool_scope` (candidate configs
+  are the work items; see :class:`quack.autotuner.Autotuner`).
+
+Design notes:
+
+* **The ``.o`` file is the only rendezvous** between workers and consumers —
+  compiled kernels aren't picklable, so the persistent cache doubles as the
+  IPC channel, and the per-key ``flock`` in ``jit_cache`` doubles as
+  cross-process dedupe (multiple pools / xdist workers coexist safely;
+  :func:`_flock_held_exclusively` lets a consumer defer on a key some other
+  process is already compiling).
+* **Workers never launch kernels by construction**: they call the
+  tensor-free ``_compile_*`` functions directly, GPU-blind (arch pinned via
+  ``QUACK_ARCH``/``CUTE_DSL_ARCH``, ``CUDA_VISIBLE_DEVICES=""``).
+* **Worker startup is an Inductor-style sidecar**: a ``forkserver`` preloads
+  torch/cutlass once (:mod:`quack.cache._pool_preload`, ~13 s) and workers
+  fork from it copy-on-write (~0.1 s each). :func:`_neutral_main` keeps
+  multiprocessing child prep from re-executing the user's script.
+* **Failure semantics**: a failed pool compile is never trusted — the
+  consumer falls through to an in-process compile so the real exception
+  surfaces with a local traceback.
+
+Env knobs: ``QUACK_ASYNC_COMPILE_START=spawn`` (disable the fork sidecar),
+``QUACK_COMPILE_WORKERS`` (shared-executor size, default 8).
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import fcntl
+import importlib
+import os
+import pickle
+from concurrent.futures import Future, ProcessPoolExecutor
+from multiprocessing import get_context
+from typing import Optional
+
+
+def _flock_held_exclusively(lock_path: str) -> bool:
+    """True if some process currently holds the flock exclusively.
+
+    Used to detect "another process is compiling this key right now" so the
+    consumer defers instead of submitting a duplicate compile to its own
+    pool (a duplicate would occupy a pool slot blocked on the same flock).
+    """
+    try:
+        fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except OSError:
+            return True
+    finally:
+        os.close(fd)
+
+
+class CompilePending(BaseException):
+    """A jit_cache miss was submitted to the async compile pool.
+
+    The caller (test) cannot proceed until the ``.o`` exists; the test runner
+    should defer the test and retry it later. Carries the cache ``sha`` so
+    the runner can poll for completion without re-running the test.
+
+    Derives from :class:`BaseException` (like ``KeyboardInterrupt``) so that
+    test-body ``except Exception`` / ``pytest.raises(Exception)`` blocks
+    cannot swallow it and turn a not-yet-run test into a false pass. Only
+    the plugin's phase hooks are supposed to catch it.
+    """
+
+    def __init__(self, sha: str, qualname: str):
+        super().__init__(f"kernel compile pending in pool: {qualname} [{sha[:12]}]")
+        self.sha = sha
+        self.qualname = qualname
+
+
+def _detect_arch_env() -> tuple[Optional[str], Optional[str]]:
+    """Return (QUACK_ARCH, CUTE_DSL_ARCH) for GPU-blind pool workers.
+
+    An explicit ``QUACK_ARCH`` env override wins — CI cross-compiles for a
+    different arch than the runner's GPU (e.g. ``QUACK_ARCH=120`` on an
+    H100), and workers must compile for the *target* arch, not the physical
+    one. Otherwise detect from the parent's GPU. Either way the workers
+    themselves never touch the CUDA driver (no context per worker,
+    fork-safe).
+    """
+    quack_arch = os.environ.get("QUACK_ARCH")
+    if quack_arch is not None:
+        cute_arch = os.environ.get("CUTE_DSL_ARCH")
+        if cute_arch is None:
+            from quack.cute_dsl_utils import _parse_arch_str
+
+            major, minor = _parse_arch_str(quack_arch)
+            cc = f"{major}{minor}"
+            cute_arch = f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
+        return quack_arch, cute_arch
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            cc = f"{major}{minor}"
+            return cc, f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
+    except Exception:
+        pass
+    return None, os.environ.get("CUTE_DSL_ARCH")
+
+
+def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
+    # GPU-blind compilation: hide devices and pin the target arch via the
+    # same overrides the CPU-only compile workflow uses. Forked workers must
+    # never initialize CUDA (fork-safety), and spawned workers save the
+    # ~1-2 s + ~300 MB of a per-worker CUDA context.
+    if quack_arch is not None:
+        os.environ["QUACK_ARCH"] = quack_arch
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if cute_dsl_arch is not None:
+        os.environ["CUTE_DSL_ARCH"] = cute_dsl_arch
+    # Pay the heavy torch/cutlass import at worker start (no-op under
+    # forkserver: the preload already imported it before the fork).
+    import quack.cache  # noqa: F401
+
+
+def _pool_worker(mod_name: str, qualname: str, key_b64: str, o_path: str) -> Optional[str]:
+    """Compile one key. Returns None on success, error string on failure."""
+    try:
+        obj = importlib.import_module(mod_name)
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+        args, kwargs = pickle.loads(base64.b64decode(key_b64))
+        obj(*args, **kwargs)  # jit_cache wrapper: compiles + exports .o
+        if not os.path.exists(o_path):
+            return "compile succeeded but .o was not exported"
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def _make_executor(jobs: int) -> ProcessPoolExecutor:
+    """Build a compile-worker executor (Inductor-style forkserver sidecar).
+
+    Forkserver + preload: one sidecar process pays the ~13 s torch/cutlass
+    import once, workers fork from it in ~0.1 s each (copy-on-write). The
+    forkserver singleton is shared per-process, so multiple executors (the
+    test pool, the autotuner's) fork from the same warm sidecar. Opt out
+    with QUACK_ASYNC_COMPILE_START=spawn.
+    """
+    start_method = os.environ.get("QUACK_ASYNC_COMPILE_START", "forkserver")
+    ctx = get_context(start_method)
+    if start_method == "forkserver":
+        ctx.set_forkserver_preload(["quack.cache._pool_preload"])
+    return ProcessPoolExecutor(
+        max_workers=jobs,
+        mp_context=ctx,
+        initializer=_pool_initializer,
+        initargs=_detect_arch_env(),
+    )
+
+
+_shared_executor: Optional[ProcessPoolExecutor] = None
+
+
+def get_shared_executor() -> ProcessPoolExecutor:
+    """Executor for ad-hoc compile tasks (e.g. autotuner precompile sweeps).
+
+    Reuses the active :class:`CompilePool`'s executor when one exists (the
+    pytest ``--async-compile`` session pool); otherwise lazily creates a
+    process-wide executor sized by ``QUACK_COMPILE_WORKERS`` (default 8).
+    Deliberately ignores :class:`suppress_pool` — suppression turns off the
+    *defer-on-miss* behavior of jit_cache, not access to compile workers.
+    """
+    global _shared_executor
+    if _active_pool is not None:
+        return _active_pool._executor
+    if _shared_executor is None:
+        import atexit
+
+        _shared_executor = _make_executor(int(os.environ.get("QUACK_COMPILE_WORKERS", "8")))
+        # Explicit teardown: without this, the executor is GC'd during
+        # interpreter shutdown after its weakref machinery is already gone,
+        # printing a spurious "Exception ignored in weakref_cb".
+        atexit.register(_shared_executor.shutdown, wait=False, cancel_futures=True)
+    return _shared_executor
+
+
+@contextlib.contextmanager
+def _neutral_main():
+    """Stop multiprocessing child prep from re-executing the user's script.
+
+    ``Process.start()`` captures preparation data from ``sys.modules['__main__']``:
+    for a path-based script the *child* re-runs the whole file via
+    ``runpy.run_path`` (so pickles referencing ``__main__`` resolve). Our
+    tasks never reference ``__main__`` — they resolve everything by module
+    name — and a user script that, say, builds CUDA tensors at import time
+    would kill every worker at spawn with "Cannot re-initialize CUDA in
+    forked subprocess". Executor workers are spawned synchronously inside
+    ``executor.submit`` (``_adjust_process_count``), so masking ``__main__``
+    with an empty stub for the duration of the submit is sufficient and
+    scoped. Single-threaded callers only (pytest defer loop, autotune bench
+    loop).
+    """
+    import sys
+    import types
+
+    real_main = sys.modules.get("__main__")
+    sys.modules["__main__"] = types.ModuleType("__main__")  # no __file__/__spec__
+    try:
+        yield
+    finally:
+        if real_main is not None:
+            sys.modules["__main__"] = real_main
+
+
+class CompilePool:
+    """Process pool + in-flight bookkeeping, keyed by jit_cache sha.
+
+    Owns its executor by default; pass ``executor=`` to share one (e.g.
+    :func:`pool_scope` wraps the session-long shared executor so scoped
+    pools don't respawn workers per autotune sweep). A shared executor is
+    not shut down by :meth:`shutdown` — only this pool's futures are
+    cancelled.
+    """
+
+    def __init__(self, jobs: Optional[int] = None, executor: Optional[ProcessPoolExecutor] = None):
+        self._own_executor = executor is None
+        self._executor = executor if executor is not None else _make_executor(jobs)
+        self._futures: dict[str, Future] = {}
+        # Keys being compiled by *another process* (e.g. a different xdist
+        # worker's pool), detected via the per-key flock. We defer on them
+        # without spending one of our own pool slots on a duplicate compile.
+        # sha -> (o_path, lock_path)
+        self._external: dict[str, tuple[str, str]] = {}
+        self.n_submitted = 0
+
+    def mark_external(self, sha: str, o_path: str, lock_path: str) -> None:
+        """Record that some other process is compiling ``sha`` right now."""
+        if sha not in self._futures:
+            self._external[sha] = (str(o_path), str(lock_path))
+
+    def prewarm(self) -> None:
+        """Start the sidecar + first worker now, off the critical path.
+
+        Same idea as Inductor's ``warm_pool()``: the forkserver's ~13 s
+        torch/cutlass preload import starts at the first ``Process`` spawn,
+        which is lazy (first submit). Submitting a no-op at session setup
+        overlaps that import with pytest collection and the leading warm
+        tests instead of the first cold compile.
+        """
+        with _neutral_main():
+            self._executor.submit(os.getpid)
+
+    def submit_raw(self, sha: str, mod: str, qualname: str, key_b64: str, o_path: str) -> None:
+        if sha in self._futures:
+            return
+        with _neutral_main():
+            self._futures[sha] = self._executor.submit(_pool_worker, mod, qualname, key_b64, o_path)
+        self.n_submitted += 1
+
+    def submit(self, sha: str, fn, args: tuple, kwargs: dict, o_path) -> bool:
+        """Submit a live jit_cache miss. Returns False if the key can't be
+        shipped to a subprocess (unpicklable args, ``<locals>`` qualname,
+        fn defined in ``__main__``) — the caller should compile in-process
+        instead."""
+        if sha in self._futures:
+            return True
+        if "<locals>" in fn.__qualname__ or fn.__module__ == "__main__":
+            # Not resolvable by module+qualname in a worker; compile in-process.
+            return False
+        try:
+            key_b64 = base64.b64encode(pickle.dumps((args, kwargs))).decode("ascii")
+        except Exception:
+            return False
+        self.submit_raw(sha, fn.__module__, fn.__qualname__, key_b64, str(o_path))
+        return True
+
+    def poll(self, sha: str) -> tuple[str, Optional[str]]:
+        """Return (state, error): state in {"new", "pending", "done", "failed"}."""
+        fut = self._futures.get(sha)
+        if fut is None:
+            ext = self._external.get(sha)
+            if ext is not None:
+                o_path, lock_path = ext
+                if os.path.exists(o_path):
+                    del self._external[sha]
+                    return "done", None
+                if _flock_held_exclusively(lock_path):
+                    return "pending", None
+                # External compiler released the lock without producing a .o
+                # (crashed / failed): forget it so the next attempt submits
+                # to our own pool.
+                del self._external[sha]
+            return "new", None
+        if not fut.done():
+            return "pending", None
+        try:
+            err = fut.result()
+        except Exception as e:  # BrokenProcessPool etc.
+            err = f"pool worker died: {type(e).__name__}: {e}"
+        return ("done", None) if err is None else ("failed", err)
+
+    def stats(self) -> dict:
+        done = sum(1 for f in self._futures.values() if f.done())
+        errors = []
+        for sha, f in self._futures.items():
+            if not f.done() or f.cancelled():
+                continue
+            exc = f.exception()
+            err = f"{type(exc).__name__}: {exc}" if exc is not None else f.result()
+            if err:
+                errors.append((sha, err))
+        return {
+            "submitted": self.n_submitted,
+            "done": done,
+            "failed": len(errors),
+            "errors": errors,
+        }
+
+    def shutdown(self) -> None:
+        if self._own_executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            for fut in self._futures.values():
+                fut.cancel()
+
+
+# --- module-level active pool -----------------------------------------------
+
+_active_pool: Optional[CompilePool] = None
+_suppress_depth = 0
+
+
+class suppress_pool:
+    """Context manager: make :func:`get_active_pool` return None inside.
+
+    Used by the test runner for a deferred test's final attempt: compile
+    in-process (blocking) so a key that never completes in the pool still
+    produces a real result or a real traceback instead of deferring forever.
+    """
+
+    def __enter__(self):
+        global _suppress_depth
+        _suppress_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _suppress_depth
+        _suppress_depth -= 1
+
+
+def activate(jobs: int) -> CompilePool:
+    """Activate the session-wide pool (idempotent). Used by the pytest plugin;
+    scoped callers should prefer :func:`pool_scope`."""
+    global _active_pool
+    if _active_pool is None:
+        _active_pool = CompilePool(jobs)
+    return _active_pool
+
+
+def deactivate() -> None:
+    global _active_pool
+    if _active_pool is not None:
+        _active_pool.shutdown()
+        _active_pool = None
+
+
+def get_active_pool() -> Optional[CompilePool]:
+    return None if _suppress_depth > 0 else _active_pool
+
+
+@contextlib.contextmanager
+def pool_scope():
+    """Activate a compile pool for the duration of the block.
+
+    Reuses the globally active pool when one exists (e.g. the pytest
+    ``--async-compile`` session pool); otherwise activates a temporary pool
+    backed by the shared executor and deactivates it on exit — so
+    ``CompilePending`` can only escape into code inside the block, never
+    into unrelated user code paths.
+
+    This is how the autotuner overlaps candidate-config compilation with
+    benchmarking: the bench loop runs inside ``pool_scope()``, catches
+    ``CompilePending`` per config, and retries a config once its ``.o``
+    lands (see ``Autotuner.__call__``).
+    """
+    global _active_pool
+    if _active_pool is not None:
+        yield _active_pool
+        return
+    pool = CompilePool(executor=get_shared_executor())
+    _active_pool = pool
+    try:
+        yield pool
+    finally:
+        _active_pool = None
+        pool.shutdown()

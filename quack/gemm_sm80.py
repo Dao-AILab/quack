@@ -145,6 +145,5 @@ class GemmSm80(GemmBase):
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
-        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         raise NotImplementedError("Gemm Sm80 is not implemented yet")

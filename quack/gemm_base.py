@@ -15,7 +15,7 @@ from cutlass.utils import LayoutEnum
 import quack.copy_utils as copy_utils
 from quack.cute_dsl_utils import ParamsBase
 from quack.epi_ops import EpiSmemBytes
-from quack.pipeline import PipelineTmaCpAsync
+from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
 from quack.tile_scheduler import (
     PersistenceMode,
@@ -37,6 +37,9 @@ class NamedBarrierGemm(enum.IntEnum):
     EpiWG0 = enum.auto()
     EpiWG1 = enum.auto()
     TmemPtr = enum.auto()
+    # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
+    # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
+    ClcThrottle = enum.auto()
 
 
 class GemmBase:
@@ -93,8 +96,12 @@ class GemmBase:
             and self.d_dtype == cutlass.BFloat16
         )
 
-        # Setup aux output (returns None for default epilogue, context tuple for Act)
-        aux_out_ctx = self.epi_setup_aux_out(
+        # Setup aux outputs. Returns a tuple of ``(tiled_copy_r2s,
+        # tRS_sAuxOut, copy_aux_out)`` triples — empty for the default
+        # epilogue, one entry for the standard ``GemmAct``/``GemmGated``
+        # single-output mixins, multiple entries for multi-output mixins
+        # (e.g. ``T*tanh`` + ``1-tanh^2`` from one GEMM).
+        aux_out_ctxs = self.epi_setup_aux_out(
             params,
             epi_smem_tensors,
             tiled_copy_r2s,
@@ -154,9 +161,7 @@ class GemmBase:
                         )
                     self.epi_tile_load_s2r(params, epi_tensors, epi_read_state.index)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        epi_pipeline.consumer_release(epi_read_state)
+                    epi_pipeline.consumer_release(epi_read_state)
                     epi_read_state.advance()
                 else:
                     c_buffer = epi_idx % self.epi_c_stage
@@ -178,7 +183,10 @@ class GemmBase:
                         src_idx=epi_coord_C,
                         dst_idx=(epi_idx + self.epi_c_stage) % self.epi_c_stage,
                     )
-            tRS_rAuxOut = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            # Returns a tuple of register tensors — one per aux output.
+            # Length matches ``aux_out_ctxs``. ``()`` for the default
+            # epilogue (no aux output).
+            tRS_rAuxOuts = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
             self.epi_end_loop(
                 params,
                 epi_tensors,
@@ -190,15 +198,19 @@ class GemmBase:
                 varlen_manager,
                 tidx,
             )
-            if const_expr(aux_out_ctx is not None):
-                tRS_rAuxOut_out = self.epi_convert_aux_out(
-                    tRS_rAuxOut,
-                    epi_loop_tensors["sr_seed"],
+            # Convert each output to its storage dtype.
+            tRS_rAuxOuts_out = tuple(
+                self.epi_convert_aux_out(
+                    i,
+                    tRS_rAuxOuts[i],
+                    epi_loop_tensors.get("sr_seed"),
                     tidx,
                     tile_coord_mnkl,
                     num_prev_subtiles,
                     epi_idx,
                 )
+                for i in range(len(aux_out_ctxs))
+            )
             if const_expr(use_tma_epi):
                 if is_tma_warp:
                     epi_store_pipeline.producer_acquire()
@@ -211,17 +223,22 @@ class GemmBase:
                 tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
                 if const_expr(use_stochastic_rounding):
                     seed = epilogue_sr_seed(
-                        epi_loop_tensors["sr_seed"], tile_coord_mnkl, num_prev_subtiles + epi_idx
+                        epi_loop_tensors.get("sr_seed"),
+                        tile_coord_mnkl,
+                        num_prev_subtiles + epi_idx,
                     )
                     copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
                 else:
                     copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
-            if const_expr(aux_out_ctx is not None):
-                tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out = aux_out_ctx
+            # Copy each aux output from registers to shared memory. All share
+            # the same ``epi_buffer`` index so the s2g TMA stores below happen
+            # in lockstep after the fence.
+            for i in cutlass.range_constexpr(len(aux_out_ctxs)):
+                tiled_copy_aux_out_r2s, tRS_sAuxOut, _ = aux_out_ctxs[i]
                 cute.copy(
                     tiled_copy_aux_out_r2s,
                     # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-                    copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOut_out)),
+                    tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
                     tRS_sAuxOut[None, None, None, epi_buffer],
                 )
             if const_expr(use_tma_epi):
@@ -230,14 +247,16 @@ class GemmBase:
                 if is_tma_warp:
                     if const_expr(has_D):
                         copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                    if const_expr(aux_out_ctx is not None):
+                    for i in cutlass.range_constexpr(len(aux_out_ctxs)):
+                        _, _, copy_aux_out = aux_out_ctxs[i]
                         copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
             else:
                 epilogue_barrier.arrive_and_wait()
                 if const_expr(has_D):
                     copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                if const_expr(aux_out_ctx is not None):
+                for i in cutlass.range_constexpr(len(aux_out_ctxs)):
+                    _, _, copy_aux_out = aux_out_ctxs[i]
                     copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
 
@@ -323,6 +342,7 @@ class GemmBase:
                     )
                 ),
                 cu_seqlens_m=varlen_args.mCuSeqlensM,
+                max_active_clusters=scheduler_args.max_active_clusters,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mn=self.cta_tile_shape_mnk[:2],
@@ -368,8 +388,8 @@ class GemmBase:
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        return None
+    ) -> Tuple[cute.Tensor, ...]:
+        return ()
 
     def epi_visit_acc(
         self,
@@ -460,14 +480,27 @@ class GemmBase:
         varlen_manager,
         tidx,
     ):
-        """Default epilogue has no aux output."""
-        return None
+        """Return a tuple of ``(tiled_copy_r2s, tRS_sAuxOut, copy_aux_out)``
+        triples — one per aux output. The default epilogue has no aux output,
+        so the tuple is empty.
+        """
+        return ()
 
     @cute.jit
     def epi_convert_aux_out(
-        self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        self,
+        output_idx: cutlass.Constexpr[int],
+        tRS_rAuxOut,
+        sr_seed,
+        tidx,
+        tile_coord_mnkl,
+        num_prev_subtiles,
+        epi_idx,
     ):
-        """Convert aux output from acc_dtype to output dtype. Override for custom postprocessing."""
+        """Convert one aux output register tensor from acc_dtype to its storage
+        dtype. ``output_idx`` selects which aux output this call is for
+        (single-output mixins can ignore it).
+        """
         return tRS_rAuxOut
 
 
@@ -615,7 +648,6 @@ class GemmTmaBase(GemmBase):
         self,
         tiled_mma: cute.TiledMma,
         cluster_layout_vmnk: cute.Layout,
-        ab_pipeline_mbar_ptr: cute.Pointer,
     ):
         # Threads/warps participating in this pipeline
         producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
@@ -628,7 +660,6 @@ class GemmTmaBase(GemmBase):
         )
         pipeline_cls = pipeline.PipelineTmaAsync if not self.gather_A else PipelineTmaCpAsync
         return pipeline_cls.create(
-            barrier_storage=ab_pipeline_mbar_ptr,
             num_stages=self.ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
@@ -639,7 +670,6 @@ class GemmTmaBase(GemmBase):
 
     def make_epi_pipeline(
         self,
-        epi_pipeline_mbar_ptr: cute.Pointer,
         tx_count: int,
     ):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -648,13 +678,14 @@ class GemmTmaBase(GemmBase):
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        return pipeline.PipelineTmaAsync.create(
-            barrier_storage=epi_pipeline_mbar_ptr,
+        return PipelineTmaAsync.create(
             num_stages=self.epi_c_stage,
             producer_group=epi_pipeline_producer_group,
             consumer_group=epi_pipeline_consumer_group,
             tx_count=tx_count,
             defer_sync=True,
+            elect_one_release=True,
+            syncwarp_before_release=True,
         )
 
     def make_epi_store_pipeline(self):
@@ -678,7 +709,7 @@ class GemmTmaBase(GemmBase):
         op = {
             "load": cpasync.CopyBulkTensorTileG2SOp(),
             "store": cpasync.CopyBulkTensorTileS2GOp(),
-            "add": cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionOp.ADD),
+            "add": cpasync.CopyReduceBulkTensorTileS2GOp(cpasync.ReductionOp.ADD),
         }[op_type]
         tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
             op, tensor_d, epi_smem_layout, d_cta_v_layout
@@ -693,16 +724,8 @@ class GemmTmaBase(GemmBase):
         mcast_dim: int,
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for input tensors."""
-        op = (
-            cpasync.CopyBulkTensorTileG2SOp()
-            if mcast_dim == 1
-            else cpasync.CopyBulkTensorTileG2SMulticastOp()
-        )
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
-            tensor,
-            smem_layout,
-            smem_tile,
-            num_multicast=mcast_dim,
-        )
+        # block_copy takes compiler-driven multicast metadata at the copy site,
+        # so the TMA atom itself must stay the non-multicast variant here.
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(op, tensor, smem_layout, smem_tile)
         return tma_atom, tma_tensor

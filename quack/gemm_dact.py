@@ -33,10 +33,10 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_gemm_tensors,
     compile_gemm_kernel,
 )
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.rounding import RoundingMode
-import quack.layout_utils as layout_utils
 from quack.activation import dact_fn_map, dgate_fn_map
+from quack import layout_utils
 
 
 class GemmDActMixin(GemmActMixin):
@@ -51,30 +51,20 @@ class GemmDActMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    ) -> Tuple[cute.Tensor, ...]:
         assert tRS_rC is not None
         # We don't add C to the accumulator
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None)
-        tRS_rC_acc = cute.make_rmem_tensor_like(tRS_rC, self.acc_dtype)
-        tRS_rC_acc.store(tRS_rC.load().to(self.acc_dtype))
+        tRS_rC_acc = tRS_rC.to(self.acc_dtype)
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
             tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            if const_expr(self.arch != 100):
-                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
-                    tRS_rD[i], tRS_rAuxOut[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
-            else:
-                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
-                    (
-                        (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
-                        (tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1]),
-                    ) = params.act_fn(
-                        (tRS_rC_acc[2 * i], tRS_rC_acc[2 * i + 1]),
-                        (tRS_rD[2 * i], tRS_rD[2 * i + 1]),
-                    )
+            vectorize = const_expr(self.arch == 100)
+            for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True, vectorize=vectorize):
+                tRS_rD[i], tRS_rAuxOut[i] = params.act_fn(tRS_rC_acc[i], tRS_rD[i])
         else:
             tRS_rAuxOut = tRS_rC_acc
-        return tRS_rAuxOut
+        return (tRS_rAuxOut,)
 
 
 class GemmDActSm90(GemmDActMixin, GemmSm90):
@@ -138,9 +128,9 @@ class GemmDGatedMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
-        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
+    ) -> Tuple[cute.Tensor, ...]:
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
+        tDrColVecReduce = epi_loop_tensors.get("mColVecReduce")
         assert tRS_rC is not None
         implicit_dtype = self.implicit_dtype
         assert implicit_dtype.width == 16, "GemmDGatedMixin only supports 16bit for now"
@@ -160,38 +150,24 @@ class GemmDGatedMixin(GemmActMixin):
                     tRS_rD_scaled, tDrColVec.layout
                 )
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    scale = tDrColVec_mn[m, 0]
                     for n in cutlass.range(
-                        cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
+                        cute.size(tDrColVec_mn, mode=[1]), unroll_full=True, vectorize=True
                     ):
-                        (
-                            tRS_rD_scaled_mn[m, 2 * n],
-                            tRS_rD_scaled_mn[m, 2 * n + 1],
-                        ) = cute.arch.mul_packed_f32x2(
-                            (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
-                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
-                        )
+                        tRS_rD_scaled_mn[m, n] = tRS_rD_mn[m, n] * scale
         else:
             tRS_rD_scaled.store(tRS_rD.load())
-        if const_expr(self.arch != 100):
-            for i in cutlass.range(cute.size(tRS_rD)):
-                (
-                    tRS_rdXY_f32x2[2 * i],
-                    tRS_rdXY_f32x2[2 * i + 1],
-                    tRS_rOut[i],
-                ) = params.act_bwd_fn(
-                    tRS_rXY_f32x2[2 * i], tRS_rXY_f32x2[2 * i + 1], tRS_rD_scaled[i]
-                )
-        else:
-            for i in cutlass.range(cute.size(tRS_rD) // 2):
-                (
-                    (tRS_rdXY_f32x2[4 * i], tRS_rdXY_f32x2[4 * i + 2]),
-                    (tRS_rdXY_f32x2[4 * i + 1], tRS_rdXY_f32x2[4 * i + 3]),
-                    (tRS_rOut[2 * i], tRS_rOut[2 * i + 1]),
-                ) = params.act_bwd_fn(
-                    (tRS_rXY_f32x2[4 * i], tRS_rXY_f32x2[4 * i + 2]),
-                    (tRS_rXY_f32x2[4 * i + 1], tRS_rXY_f32x2[4 * i + 3]),
-                    (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1]),
-                )
+        tRS_rXY_pair = cute.flat_divide(tRS_rXY_f32x2, cute.make_layout(2))
+        tRS_rX = tRS_rXY_pair[0, ...]
+        tRS_rY = tRS_rXY_pair[1, ...]
+        tRS_rdXY_pair = cute.flat_divide(tRS_rdXY_f32x2, cute.make_layout(2))
+        tRS_rdX = tRS_rdXY_pair[0, ...]
+        tRS_rdY = tRS_rdXY_pair[1, ...]
+        vectorize = const_expr(self.arch == 100)
+        for i in cutlass.range(cute.size(tRS_rD), vectorize=vectorize):
+            tRS_rdX[i], tRS_rdY[i], tRS_rOut[i] = params.act_bwd_fn(
+                tRS_rX[i], tRS_rY[i], tRS_rD_scaled[i]
+            )
         if const_expr(tDrColVecReduce is not None):
             # Accumulate postact * dout before D is scaled by colvec_scale
             colvec_reduce_accumulate(self, tDrColVecReduce, tRS_rOut, rScale=tRS_rD)
@@ -203,20 +179,16 @@ class GemmDGatedMixin(GemmActMixin):
                 tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
                 tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    scale = tDrColVec_mn[m, 0]
                     for n in cutlass.range(
-                        cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
+                        cute.size(tDrColVec_mn, mode=[1]), unroll_full=True, vectorize=True
                     ):
-                        tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1] = (
-                            cute.arch.mul_packed_f32x2(
-                                (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
-                                (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
-                            )
-                        )
+                        tRS_rOut_mn[m, n] = tRS_rOut_mn[m, n] * scale
         # Type conversion
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
-        return tRS_rOut
+        return (tRS_rOut,)
 
     # epi_end is inherited from ComposableEpiMixin → delegates to ColVecReduce.end()
 
@@ -481,11 +453,6 @@ def gemm_dact(
         use_tma_gather=use_tma_gather,
     )
 
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY:
-        return
-
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     if is_dgated:
         epi_args = GemmDGatedMixin.EpilogueArguments(
@@ -513,6 +480,5 @@ def gemm_dact(
     compiled_fn(
         A_p, B_p, Out_p, PreAct_p, epi_args, scheduler_args, varlen_args, None, None, None
     )
-
 
 gemm_dgated = gemm_dact

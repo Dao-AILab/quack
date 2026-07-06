@@ -1,13 +1,14 @@
 import argparse
-import time
-from typing import Type
+import os
+
+os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
 
 import torch
-from triton.testing import do_bench
+from triton.testing import Benchmark, do_bench, perf_report
 
 import cutlass
-import cutlass.torch as cutlass_torch
 
+from quack.bench.bench_utils import run_and_print
 from quack.topk import topk, topk_bwd
 
 try:
@@ -16,160 +17,138 @@ except ImportError:
     rtopk = None
 
 
-def run_topk(
-    M,
-    N,
-    k,
-    dtype: Type[cutlass.Numeric],
-    softmax: bool = False,
-    backward: bool = False,
-    warmup_iterations=10,
-    iterations=1000,
-):
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required to run this example!")
+# (N, k) sweep — M is held fixed as a Benchmark.args entry. Skip pairs with k > N//2.
+NK_PAIRS = [(n, k) for n in (64, 128, 256, 512, 1024) for k in (8, 16, 32) if k <= n // 2]
 
-    print(f"Tensor dimensions: [{M}, {N}], k={k}")
-    print(f"Input and Output Data type: {dtype}")
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
 
-    torch_dtype = cutlass_torch.dtype(dtype)
 
-    device = "cuda"
-    x = torch.randn(M, N, device=device, dtype=torch_dtype, requires_grad=True)
+def _result(num_bytes: int, ms: float) -> dict:
+    gbps = num_bytes / (ms / 1000) / 1e9
+    return {"ms": round(ms, 4), "GB/s": round(gbps)}
 
-    print("Input tensor shapes:")
-    print(f"x: {x.shape}, dtype: {x.dtype}")
-    out, idx = topk(x, k, softmax=softmax)
-    print(f"Output shape: {out.shape}")
 
-    if backward:
+def _fwd_providers():
+    providers = [("quack", "quack"), ("torch", "torch.topk")]
+    if rtopk is not None:
+        providers.append(("rtopk", "rtopk"))
+    return providers
+
+
+def _bwd_providers():
+    return [("quack", "quack"), ("torch", "torch")]
+
+
+def make_fwd_benchmark(M: int, dtype_name: str, softmax: bool, x_vals=None) -> Benchmark:
+    line_vals, line_names = zip(*_fwd_providers())
+    suffix = dtype_name + (f"-M{M}" if x_vals is None else "") + ("-softmax" if softmax else "")
+    return Benchmark(
+        x_names=["N", "k"],
+        x_vals=x_vals if x_vals is not None else NK_PAIRS,
+        line_arg="provider",
+        line_vals=list(line_vals),
+        line_names=list(line_names),
+        plot_name=f"topk-fwd-{suffix}",
+        args={"M": M, "dtype_name": dtype_name, "softmax": softmax},
+        xlabel="(N, k)",
+        ylabel="GB/s",
+    )
+
+
+def make_bwd_benchmark(M: int, dtype_name: str, softmax: bool, x_vals=None) -> Benchmark:
+    line_vals, line_names = zip(*_bwd_providers())
+    suffix = dtype_name + (f"-M{M}" if x_vals is None else "") + ("-softmax" if softmax else "")
+    return Benchmark(
+        x_names=["N", "k"],
+        x_vals=x_vals if x_vals is not None else NK_PAIRS,
+        line_arg="provider",
+        line_vals=list(line_vals),
+        line_names=list(line_names),
+        plot_name=f"topk-bwd-{suffix}",
+        args={"M": M, "dtype_name": dtype_name, "softmax": softmax},
+        xlabel="(N, k)",
+        ylabel="GB/s",
+    )
+
+
+def topk_fwd_runner(N, k, provider, M, dtype_name, softmax):
+    dtype = DTYPE_MAP[dtype_name]
+    elem_bytes = dtype.itemsize
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+
+    if provider == "quack":
+        fn = lambda: topk(x, k, softmax=softmax)
+    elif provider == "torch":
+        fn = lambda: torch.topk(x, k, dim=-1, largest=True, sorted=True)[0]
+    elif provider == "rtopk":
+        fn = lambda: rtopk.ops.rtopk(x, k, max_iter=512)
+    else:
+        raise ValueError(provider)
+
+    ms = do_bench(fn, warmup=10, rep=100)
+    # I/O: read x (M*N) + write values (M*k); ignore index output (small)
+    nbytes = (M * N + M * k) * elem_bytes
+    return _result(nbytes, ms)
+
+
+def topk_bwd_runner(N, k, provider, M, dtype_name, softmax):
+    dtype = DTYPE_MAP[dtype_name]
+    elem_bytes = dtype.itemsize
+    x = torch.randn(M, N, device="cuda", dtype=dtype, requires_grad=True)
+
+    if provider == "quack":
+        out, idx = topk(x, k, softmax=softmax)
         dvalues = torch.randn_like(out)
         fn = lambda: topk_bwd(dvalues, out, idx, N, softmax=softmax)
+        ms = do_bench(fn, warmup=10, rep=100, grad_to_none=(x,))
+    elif provider == "torch":
+        values = torch.topk(x, k, dim=-1, largest=True, sorted=True)[0]
+        if softmax:
+            values = torch.softmax(values, dim=-1)
+        dvalues = torch.randn_like(values)
+        fn = lambda: torch.autograd.grad(values, x, grad_outputs=dvalues, retain_graph=True)
+        ms = do_bench(fn, warmup=10, rep=100, grad_to_none=(x,))
     else:
-        # Benchmark our implementation
-        fn = lambda: topk(x, k, softmax=softmax)
-    fn()  # warm up
-    time.sleep(0.5)
-    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    # Memory: read input (M*N elements), write output (M*k elements)
-    if backward:
-        mem_accessed = (M * N + 2 * M * k) * dtype.width // 8
-    else:
-        mem_accessed = (M * N + M * k) * dtype.width // 8
-    mem_bw = round(mem_accessed / (avg_time / 1000) / 1e9, 2)
-    print(f"Kernel execution time: {avg_time:.4f} ms")
-    print(f"Mem throughput: {mem_bw:.2f} GB/s")
+        raise ValueError(provider)
 
-    # Benchmark PyTorch reference
-    if backward:
-        fn_ref = lambda: torch.autograd.grad(
-            torch.softmax(torch.topk(x, k, dim=-1, largest=True, sorted=True)[0], dim=-1)
-            if softmax
-            else torch.topk(x, k, dim=-1, largest=True, sorted=True)[0],
-            x,
-            grad_outputs=dvalues,
-            retain_graph=True,
+    # I/O: read x + read dvalues + write dx
+    nbytes = (M * N + 2 * M * k) * elem_bytes
+    return _result(nbytes, ms)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark top-k fwd / bwd")
+    parser.add_argument("--dtype", default="bfloat16", choices=list(DTYPE_MAP))
+    parser.add_argument("--M", default=65536, type=int, help="Held fixed during the (N, k) sweep")
+    parser.add_argument("--N", default=None, type=int, help="Bench a single N (requires --k)")
+    parser.add_argument("--k", default=None, type=int, help="Bench a single k (requires --N)")
+    parser.add_argument("--softmax", action="store_true")
+    parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--save_path", default=None)
+    args = parser.parse_args()
+
+    if (args.N is None) != (args.k is None):
+        parser.error("--N and --k must be given together")
+    x_vals = [(args.N, args.k)] if args.N is not None else None
+
+    torch.manual_seed(0)
+    cutlass.cuda.initialize_cuda_context()
+
+    if args.backward:
+        bench = perf_report(make_bwd_benchmark(args.M, args.dtype, args.softmax, x_vals))(
+            topk_bwd_runner
         )
-        for _ in range(5):
-            fn_ref()
-        time.sleep(0.5)
-        avg_time_ref = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = round(mem_accessed / (avg_time_ref / 1000) / 1e9, 2)
-        print(f"Ref backward execution time: {avg_time_ref:.4f} ms")
-        print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
-        speedup = avg_time_ref / avg_time
-        print(f"Speedup: {speedup:.2f}x")
     else:
-        fn_ref = lambda: torch.topk(x, k, dim=-1, largest=True, sorted=True)[0]
-        for _ in range(5):
-            fn_ref()  # warm up
-        time.sleep(0.5)
-        avg_time_ref = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = round(mem_accessed / (avg_time_ref / 1000) / 1e9, 2)
-        print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
-        print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
+        bench = perf_report(make_fwd_benchmark(args.M, args.dtype, args.softmax, x_vals))(
+            topk_fwd_runner
+        )
 
-        speedup = avg_time_ref / avg_time
-        print(f"Speedup: {speedup:.2f}x")
-
-    if rtopk is not None:
-        fn_rtopk = lambda: rtopk.ops.rtopk(x, k, max_iter=512)
-        for _ in range(5):
-            fn_rtopk()  # warm up
-        time.sleep(0.5)
-        avg_time_ref = do_bench(fn_rtopk, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = round(mem_accessed / (avg_time_ref / 1000) / 1e9, 2)
-        print(f"RTopK kernel execution time: {avg_time_ref:.4f} ms")
-        print(f"RTopK mem throughput: {mem_bw_ref:.2f} GB/s")
-
-    # do_bench doesn't seem very accurate for very fast kernels, so we use pytorch_profiler
-    from flash_attn.utils.benchmark import pytorch_profiler
-    pytorch_profiler(fn)
-    if rtopk is not None:
-        pytorch_profiler(fn_rtopk)
-
-    return mem_bw, mem_bw_ref, speedup
+    run_and_print(bench, save_path=args.save_path)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Benchmark top-k operation"
-    )
-    parser.add_argument("--M", default=8192, type=int)
-    parser.add_argument("--N", default=1024, type=int)
-    parser.add_argument("--k", default=32, type=int)
-    parser.add_argument("--dtype", type=cutlass.dtype, choices=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32], default=cutlass.BFloat16)
-    parser.add_argument("--softmax", action="store_true", help="Apply softmax to top-k values")
-    parser.add_argument("--warmup_iterations", default=10, type=int)
-    parser.add_argument("--iterations", default=100, type=int)
-    parser.add_argument("--sweep", action="store_true", help="Run sweep across different N and k values")
-    parser.add_argument("--backward", action="store_true", help="Benchmark backward pass instead of forward pass")
-
-    args = parser.parse_args()
-    torch.manual_seed(0)
-
-    cutlass.cuda.initialize_cuda_context()
-
-    if args.sweep:
-        print("=== Top-K Sweep Benchmark ===")
-        # Test different combinations of N and k
-        N_values = [64, 128, 256, 512, 1024]
-        k_values = [8, 16, 32]
-
-        results = []
-        for N in N_values:
-            for k in k_values:
-                if k > N // 2:  # Skip if k is too large relative to N
-                    continue
-                print(f"\n--- N={N}, k={k} ---")
-                try:
-                    mem_bw, mem_bw_ref, speedup = run_topk(
-                        args.M,
-                        N,
-                        k,
-                        dtype=args.dtype,
-                        softmax=args.softmax,
-                        backward=args.backward,
-                        warmup_iterations=args.warmup_iterations,
-                        iterations=args.iterations,
-                    )
-                    results.append((N, k, mem_bw, mem_bw_ref, speedup))
-                except Exception as e:
-                    print(f"Error with N={N}, k={k}: {e}")
-
-        print("\n=== Summary ===")
-        print("N\tk\tOurs (GB/s)\tRef (GB/s)\tSpeedup")
-        for N, k, mem_bw, mem_bw_ref, speedup in results:
-            print(f"{N}\t{k}\t{mem_bw}\t\t{mem_bw_ref}\t\t{speedup:.2f}x")
-    else:
-        print("=== Top-K Benchmark ===")
-        run_topk(
-            args.M,
-            args.N,
-            args.k,
-            dtype=args.dtype,
-            softmax=args.softmax,
-            backward=args.backward,
-            warmup_iterations=args.warmup_iterations,
-            iterations=args.iterations,
-        )
+    main()

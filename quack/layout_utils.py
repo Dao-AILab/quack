@@ -313,69 +313,41 @@ def convert_layout_zero_stride(
 
 
 def mma_partition_C_vec(
-    sVec: cute.Tensor, thr_mma: cute.core.ThrMma, expand_shape: int, is_colvec: bool
+    sVec: cute.Tensor, thr_mma: cute.ThrMma, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
-    stage = sVec.shape[1]
-    shape = (
-        (sVec.shape[0], expand_shape, stage)
-        if const_expr(is_colvec)
-        else (expand_shape, sVec.shape[0], stage)
-    )
-    stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
-    sVec_mma = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
-    tC_sVec = make_acc_tensor_mn_view(thr_mma.partition_C(sVec_mma))
+    sVec_mma = expand(sVec, 1 if const_expr(is_colvec) else 0, expand_shape)
+    tC_sVec = reshape_acc_to_mn(thr_mma.partition_C(sVec_mma))
     return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
 
 
 def mma_partition_A_vec(
-    sVec: cute.Tensor, thr_mma: cute.core.ThrMma, expand_shape: int, is_colvec: bool
+    sVec: cute.Tensor, thr_mma: cute.ThrMma, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
-    stage = sVec.shape[1]
-    shape = (
-        (sVec.shape[0], expand_shape, stage)
-        if const_expr(is_colvec)
-        else (expand_shape, sVec.shape[0], stage)
-    )
-    stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
-    sVec_mma = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
-    tC_sVec = make_acc_tensor_mn_view(thr_mma.partition_A(sVec_mma))
+    sVec_mma = expand(sVec, 1 if const_expr(is_colvec) else 0, expand_shape)
+    tC_sVec = reshape_acc_to_mn(thr_mma.partition_A(sVec_mma))
     return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
 
 
 def copy_partition_S_vec(
-    sVec: cute.Tensor, thr_copy: cute.core.ThrCopy, expand_shape: int, is_colvec: bool
+    sVec: cute.Tensor, thr_copy: cute.ThrCopy, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
-    stage = sVec.shape[1]
-    shape = (
-        (sVec.shape[0], expand_shape, stage)
-        if const_expr(is_colvec)
-        else (expand_shape, sVec.shape[0], stage)
-    )
-    stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
-    sVec_thr = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
+    sVec_thr = expand(sVec, 1 if const_expr(is_colvec) else 0, expand_shape)
     tC_sVec = reshape_acc_to_mn(thr_copy.partition_S(sVec_thr))
     return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
 
 
 def copy_partition_D_vec(
-    sVec: cute.Tensor, thr_copy: cute.core.ThrCopy, expand_shape: int, is_colvec: bool
+    sVec: cute.Tensor, thr_copy: cute.ThrCopy, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
-    stage = sVec.shape[1]
-    shape = (
-        (sVec.shape[0], expand_shape, stage)
-        if const_expr(is_colvec)
-        else (expand_shape, sVec.shape[0], stage)
-    )
-    stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
-    sVec_thr = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
+    sVec_thr = expand(sVec, 1 if const_expr(is_colvec) else 0, expand_shape)
     tC_sVec = reshape_acc_to_mn(thr_copy.partition_D(sVec_thr))
     return tC_sVec[None, 0, None] if const_expr(is_colvec) else tC_sVec[0, None, None]
 
@@ -402,11 +374,11 @@ def tile_atom_to_shape_SF_strided(
         shape: A/B operand shape. Rank-3 `(m/n, k, l)` or rank-2
             `(total_mn, k)` (varlen_m).
         sf_vec_size: Scale factor vector size (16 or 32).
-        sf_strides: Strides of the scale tensor, which has logical shape
-            `(L, rmn, rk, 512)` (rank 4). Only `sf_strides[0..2]` are used:
-            `sf_strides[1]` as the rmn stride, `sf_strides[2]` as the rk
-            stride, and `sf_strides[0]` as the L stride (only for rank-3
-            `shape`).
+        sf_strides: Strides of the `(L, rmn, rk, 32, 4, 4)` scale tensor.
+            Only `sf_strides[0..2]` are used: `sf_strides[1]` as the rmn
+            stride, `sf_strides[2]` as the rk stride, and `sf_strides[0]` as
+            the L stride (only for rank-3 `shape`); the inner atom layout is
+            hardware-fixed.
     """
     from cutlass.utils.blockscaled_layout import BlockScaledBasicChunk
 

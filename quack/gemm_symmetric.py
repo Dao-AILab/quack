@@ -24,7 +24,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     compile_gemm_kernel,
 )
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.tile_scheduler import TriangularTileScheduler
 from quack.varlen_utils import VarlenManager
 import quack.copy_utils as copy_utils
@@ -75,8 +75,10 @@ class GemmSymmetricMixin(GemmActMixin):
             and self.d_dtype == cutlass.BFloat16
         )
 
-        # Setup aux output (returns None for default epilogue, context tuple for Act)
-        aux_out_ctx = self.epi_setup_aux_out(
+        # Setup aux outputs. Returns a tuple of ``(tiled_copy_r2s,
+        # tRS_sAuxOut, copy_aux_out)`` triples — empty when no aux output
+        # was requested, one entry per aux output otherwise.
+        aux_out_ctxs = self.epi_setup_aux_out(
             params,
             epi_smem_tensors,
             tiled_copy_r2s,
@@ -141,9 +143,7 @@ class GemmSymmetricMixin(GemmActMixin):
                         )
                     self.epi_tile_load_s2r(params, epi_tensors, epi_read_state.index)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        epi_pipeline.consumer_release(epi_read_state)
+                    epi_pipeline.consumer_release(epi_read_state)
                     epi_read_state.advance()
                 else:
                     c_buffer = epi_idx % self.epi_c_stage
@@ -165,7 +165,9 @@ class GemmSymmetricMixin(GemmActMixin):
                         src_idx=epi_coord_C,
                         dst_idx=(epi_idx + self.epi_c_stage) % self.epi_c_stage,
                     )
-            tRS_rAuxOut = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            # Returns a tuple of register tensors — one per aux output.
+            # Length matches ``aux_out_ctxs``.
+            tRS_rAuxOuts = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
             self.epi_end_loop(
                 params,
                 epi_tensors,
@@ -177,15 +179,19 @@ class GemmSymmetricMixin(GemmActMixin):
                 varlen_manager,
                 tidx,
             )
-            if const_expr(aux_out_ctx is not None):
-                tRS_rAuxOut_out = self.epi_convert_aux_out(
-                    tRS_rAuxOut,
-                    epi_loop_tensors["sr_seed"],
+            # Convert each output to its storage dtype.
+            tRS_rAuxOuts_out = tuple(
+                self.epi_convert_aux_out(
+                    i,
+                    tRS_rAuxOuts[i],
+                    epi_loop_tensors.get("sr_seed"),
                     tidx,
                     tile_coord_mnkl,
                     num_prev_subtiles,
                     epi_idx,
                 )
+                for i in range(len(aux_out_ctxs))
+            )
             if const_expr(use_tma_epi):
                 if is_tma_warp:
                     epi_store_pipeline.producer_acquire()
@@ -198,17 +204,19 @@ class GemmSymmetricMixin(GemmActMixin):
                 tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
                 if const_expr(use_stochastic_rounding):
                     seed = epilogue_sr_seed(
-                        epi_loop_tensors["sr_seed"], tile_coord_mnkl, num_prev_subtiles + epi_idx
+                        epi_loop_tensors.get("sr_seed"),
+                        tile_coord_mnkl,
+                        num_prev_subtiles + epi_idx,
                     )
                     copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
                 else:
                     copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
-            if const_expr(aux_out_ctx is not None):
-                tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out = aux_out_ctx
+            for i in cutlass.range_constexpr(len(aux_out_ctxs)):
+                tiled_copy_aux_out_r2s, tRS_sAuxOut, _ = aux_out_ctxs[i]
                 cute.copy(
                     tiled_copy_aux_out_r2s,
                     # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-                    copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOut_out)),
+                    tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
                     tRS_sAuxOut[None, None, None, epi_buffer],
                 )
             if const_expr(use_tma_epi):
@@ -217,7 +225,8 @@ class GemmSymmetricMixin(GemmActMixin):
                 if is_tma_warp:
                     if const_expr(has_D):
                         copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                    if const_expr(aux_out_ctx is not None):
+                    for i in cutlass.range_constexpr(len(aux_out_ctxs)):
+                        _, _, copy_aux_out = aux_out_ctxs[i]
                         if square_tile_m != square_tile_n:  # don't write twice on the diagonal
                             copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
@@ -225,7 +234,8 @@ class GemmSymmetricMixin(GemmActMixin):
                 epilogue_barrier.arrive_and_wait()
                 if const_expr(has_D):
                     copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
-                if const_expr(aux_out_ctx is not None):
+                for i in cutlass.range_constexpr(len(aux_out_ctxs)):
+                    _, _, copy_aux_out = aux_out_ctxs[i]
                     if square_tile_m != square_tile_n:  # don't write twice on the diagonal
                         copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
@@ -412,11 +422,6 @@ def gemm_symmetric(
         beta_mode,
         device_capacity,
     )
-
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY:
-        return
 
     cluster_size = cluster_M * cluster_N
     max_active_clusters = (

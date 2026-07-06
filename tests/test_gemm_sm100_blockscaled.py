@@ -3,7 +3,7 @@ import torch
 
 import cutlass
 
-from quack.blockscaled_gemm_utils import (
+from quack.blockscaled.utils import (
     blockscaled_gemm_reference,
     compile_blockscaled_gemm_tvm_ffi,
     create_blockscaled_operand_quantized,
@@ -15,7 +15,7 @@ from quack.blockscaled_gemm_utils import (
     scale_view_for_kernel,
 )
 from quack.gemm_default_epi import GemmDefaultSm100
-from quack.mx_utils import to_blocked
+from quack.blockscaled.quantize import to_blocked
 
 
 def _skip_if_not_sm100():
@@ -323,18 +323,6 @@ def test_blockscaled_validation():
             1,
         ),
         (
-            cutlass.Float8E4M3FN,
-            cutlass.Float8E8M0FNU,
-            32,
-            cutlass.Float32,
-            (256, 224),
-            (2, 1),
-            256,
-            224,
-            256,
-            1,
-        ),
-        (
             cutlass.Float4E2M1FN,
             cutlass.Float8E8M0FNU,
             32,
@@ -343,18 +331,6 @@ def test_blockscaled_validation():
             (1, 1),
             256,
             256,
-            256,
-            1,
-        ),
-        (
-            cutlass.Float4E2M1FN,
-            cutlass.Float8E8M0FNU,
-            32,
-            cutlass.Float32,
-            (256, 224),
-            (2, 1),
-            256,
-            224,
             256,
             1,
         ),
@@ -394,15 +370,49 @@ def test_blockscaled_validation():
             256,
             1,
         ),
+        # tile_n=192 with N=448: the last N-tile's SF window (atoms 3,4)
+        # straddles past the last allocated SF atom (ceil(448/128)=4).
+        # Regression: the old overlapped-window TMA remap presented atoms in
+        # groups of 4 and zero-filled past the presented extent, silently
+        # zeroing the last 64 output columns; the chunk-granular SFB load
+        # bounds-checks the atom-n dim and zero-fills only the truly
+        # out-of-range atom.
+        (
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E8M0FNU,
+            32,
+            cutlass.BFloat16,
+            (128, 192),
+            (1, 1),
+            256,
+            448,
+            256,
+            1,
+        ),
+        # tile_n=192 with multiple N-tiles: exercises mid-atom SF window starts
+        # for e4m3 scale factors (regression: the old remap was gated on e8m0
+        # only, loading wrong SFB atoms for N-tile index >= 1)
         (
             cutlass.Float4E2M1FN,
             cutlass.Float8E4M3FN,
             16,
             cutlass.Float32,
-            (256, 224),
+            (128, 192),
+            (1, 1),
+            256,
+            384,
+            256,
+            1,
+        ),
+        (
+            cutlass.Float4E2M1FN,
+            cutlass.Float8E4M3FN,
+            16,
+            cutlass.Float32,
+            (256, 192),
             (2, 1),
             256,
-            224,
+            576,
             256,
             1,
         ),
@@ -451,7 +461,7 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
     scale_2d = torch.randint(0, 255, (l, mn, sf_k), device="cuda", dtype=torch.uint8)
 
     # Build our contiguous scale storage via create_blockscaled_operand_quantized's
-    # rearrangement logic: pad + (l, rm, 128, rk, 4) -> (l, rm, rk, 512)
+    # rearrangement logic: pad + (l, rm, 128, rk, 4) -> (l, rm, rk, 32, 4, 4)
     rm = (mn + 127) // 128
     rk = (sf_k + 3) // 4
     mn_pad = rm * 128
@@ -460,11 +470,13 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
     padded[:, :mn, :sf_k] = scale_2d
     blocks = padded.view(l, rm, 128, rk, 4).permute(0, 1, 3, 2, 4)
     blocks = blocks.reshape(l, rm, rk, 4, 32, 4).transpose(3, 4).contiguous()
-    scale_contig = blocks.view(l, rm, rk, 512)  # (l, rm, rk, 512)
+    scale_contig = blocks  # (l, rm, rk, 32, 4, 4)
 
     # kernel view indexing: byte offset within tile = (m%32)*16 + ((m//32)%4)*4 + (k%4)
-    kv = scale_view_for_kernel(scale_contig.view(torch.float8_e8m0fnu), mn, sf_k, l).view(
-        torch.uint8
+    kv = (
+        scale_view_for_kernel(scale_contig.view(torch.float8_e8m0fnu), mn, sf_k, l)
+        .view(torch.uint8)
+        .flatten(-3)
     )
     m_positions = sorted({0, 1, 17, 31, 33, 127, min(128, mn - 1), mn - 1} & set(range(mn)))
     k_positions = sorted({0, 1, 3, 4, 7, sf_k - 1} & set(range(sf_k)))
@@ -491,7 +503,7 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
 @pytest.mark.parametrize(
     "mma_tiler_mn,cluster_shape_mn,m,n,k",
     [
-        # All 5 supported blockscaled tile_n values (64, 128, 192, 224, 256).
+        # All supported blockscaled tile_n values (64, 128, 192, 256).
         ((128, 64), (1, 1), 256, 64, 512),
         ((128, 128), (1, 1), 256, 256, 256),
         ((128, 128), (1, 1), 512, 512, 512),
@@ -501,8 +513,6 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
         ((256, 192), (2, 1), 256, 192, 256),
         ((256, 192), (2, 1), 256, 384, 256),
         ((256, 192), (2, 1), 512, 192, 512),
-        ((256, 224), (2, 1), 256, 224, 256),
-        ((256, 224), (2, 1), 512, 224, 512),
         ((256, 256), (2, 1), 512, 256, 512),
     ],
 )
@@ -562,62 +572,13 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
     )
 
 
-# ---------------------------------------------------------------------------
-# High-level PyTorch interface
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("shape_mnk", [(256, 256, 256), (512, 256, 256), (128, 128, 256)])
-@pytest.mark.parametrize("batched", [False, True])
-def test_mxfp8_interface(shape_mnk, batched):
-    _skip_if_not_sm100()
-    from quack.gemm_blockscaled_interface import (
-        mxfp8_gemm,
-        mxfp8_gemm_cublas_sm100,
-        mxfp8_gemm_ref_sm100,
-        mxfp8_gemm_quantize_sm100,
-        quantize_act_sm100,
-    )
-
-    M, N, K = shape_mnk
-    L = 2 if batched else 1
-    torch.manual_seed(0)
-    shape_A = (L, M, K) if batched else (M, K)
-    # Weight stored nn.Linear-style (N, K) row-major; pass .mT to get K-contig (K, N)
-    shape_W = (L, N, K) if batched else (N, K)
-    A_hp = torch.randn(*shape_A, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    W_hp = torch.randn(*shape_W, device="cuda", dtype=torch.bfloat16) * K**-0.5
-
-    A_q, A_sc = quantize_act_sm100(A_hp)
-    W_q, W_sc = quantize_act_sm100(W_hp)  # (..., N, K), (..., N, K/32)
-    assert A_q.dtype == torch.float8_e4m3fn and A_sc.dtype == torch.float8_e8m0fnu
-
-    B_q = W_q.mT  # (..., K, N) K-contig view
-    B_sc = W_sc.mT  # (..., K/32, N) K-contig view
-
-    out = mxfp8_gemm(A_q, B_q, A_sc, B_sc)
-    assert out.shape == ((L, M, N) if batched else (M, N))
-    assert out.dtype == torch.bfloat16
-
-    ref = mxfp8_gemm_ref_sm100(A_q, B_q, A_sc, B_sc)
-    err = (out.float() - ref.float()).abs().max().item()
-    assert err < 5e-3, f"quack vs ref max_err={err}"
-
-    # cuBLAS comparison only for 2D / L=1
-    if not batched:
-        out_cublas = mxfp8_gemm_cublas_sm100(A_q, B_q, A_sc, B_sc)
-        assert torch.equal(out, out_cublas), "quack interface != cuBLAS"
-
-    # High-level quantize+gemm convenience fn
-    out2 = mxfp8_gemm_quantize_sm100(A_hp, W_hp)
-    assert torch.equal(out, out2)
-
-
 @pytest.mark.parametrize("a_major", ["k", "m"])
 @pytest.mark.parametrize("b_major", ["k", "n"])
 def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     """MXFP8 with A in {k,m}-major × B in {k,n}-major. The SF tensor layout
     stays K-major (hardware convention); only A/B operand strides differ."""
     _skip_if_not_sm100()
-    from quack.mx_utils import to_mx
+    from quack.blockscaled.quantize import to_mx
 
     m, n, k, l = 256, 256, 256, 1
     sf_vec = 32
@@ -648,7 +609,7 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     # Sanity: stride(0) == 1 iff mn-major.
     assert (mA.stride(0) == 1) == (a_major == "m"), f"mA stride: {mA.stride()}"
     assert (mB.stride(0) == 1) == (b_major == "n"), f"mB stride: {mB.stride()}"
-    from quack.blockscaled_gemm_utils import pack_scale_2d_to_blocked_contig
+    from quack.blockscaled.utils import pack_scale_2d_to_blocked_contig
 
     a_sc = pack_scale_2d_to_blocked_contig(sa_2d)
     b_sc = pack_scale_2d_to_blocked_contig(sb_2d)
@@ -690,6 +651,15 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     assert err < 5e-3, f"A={a_major} B={b_major} max_err={err}"
 
 
+VARLEN_FMT = {
+    # format: (ab_dtype, sf_dtype, sf_vec_size)
+    "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
+    "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
+    "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
+}
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("b_major", ["k", "n"])
 @pytest.mark.parametrize(
     "seqlens_m",
@@ -700,14 +670,16 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
         [1, 128, 127, 129],  # boundary conditions
     ],
 )
-def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
+def test_blockscaled_varlen_m_nonaligned(seqlens_m, b_major, fmt):
     """varlen_m with per-expert seqlens not divisible by 128, plus k/n-major B.
-    SFA is stored in dQaccum-style padded format; kernel reads it via
+    SFA is stored with tile-aligned per-batch padding; kernel reads it via
     offset_batch_SFA."""
     _skip_if_not_sm100()
+    if fmt != "mxfp8" and b_major == "n":
+        pytest.skip("fp4 operands must be K-major")
+    ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
     num_experts = len(seqlens_m)
     n, k = 256, 256
-    sf_vec = 32
     mma_tiler_mn = (128, 128)
     cluster_shape_mn = (1, 1)
 
@@ -719,22 +691,24 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
             n,
             k,
             sf_vec,
+            ab_dtype,
+            sf_dtype,
             seqlens_m=seqlens_m,
             b_major=b_major,
         )
     )
-    expected_b_stride0 = 1 if b_major == "n" else k
+    expected_b_stride0 = 1 if b_major == "n" else mB.shape[1]  # k, or k/2 for packed fp4
     assert mB.stride(0) == expected_b_stride0, (
         f"b_major={b_major} → mB.stride(0) should be {expected_b_stride0}, got {mB.stride()}"
     )
     total_m = int(sum(seqlens_m))
-    mSFA = a_sc_contig  # (1, total_padded_rm, rk, 512)
-    mSFB = b_sc_contig  # (L, rn, rk, 512)
+    mSFA = a_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4)
+    mSFB = b_sc_contig  # (L, rn, rk, 32, 4, 4)
 
     mD = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
     runner = compile_blockscaled_gemm_tvm_ffi(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
+        ab_dtype,
+        sf_dtype,
         sf_vec,
         cutlass.BFloat16,
         mma_tiler_mn,
@@ -753,7 +727,7 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
     cu = cu_seqlens_m.tolist()
     ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
     err = (mD.float() - ref).abs().max().item()
-    assert err < 5e-3, f"varlen_m non-aligned seqlens_m={seqlens_m} max_err={err}"
+    assert err < 5e-3, f"varlen_m non-aligned {fmt} seqlens_m={seqlens_m} max_err={err}"
 
 
 @pytest.mark.parametrize(
@@ -763,12 +737,16 @@ def test_blockscaled_mxfp8_varlen_m_nonaligned(seqlens_m, b_major):
         [128, 256, 128],  # 128-aligned mixed sizes
         [96, 160, 128],  # not 128-aligned (but all sf_vec-aligned)
         [32, 256, 64, 128],  # small + varied
+        [100, 220, 65],  # not even sf_vec(32)-aligned: partial last scale block
+        [1, 33, 158, 192],  # boundary conditions, non-aligned
     ],
 )
 def test_blockscaled_mxfp8_varlen_k(seqlens_k):
-    """varlen_k blockscaled: per-expert k_i (must be sf_vec-aligned; 128-alignment
-    is NOT required). SFA/SFB use dQaccum-style K-padded storage and the kernel
-    reads them via offset_batch_SFA/offset_batch_SFB padded-K formula."""
+    """varlen_k blockscaled: per-expert k_i is arbitrary (neither 128- nor
+    sf_vec(32)-alignment required; a partial last scale block pairs with the
+    ragged TMA's zero-filled value tail). SFA/SFB use tile-aligned per-batch K
+    padding and the kernel reads them via offset_batch_SFA/offset_batch_SFB
+    padded-K formula."""
     _skip_if_not_sm100()
     num_experts = len(seqlens_k)
     m, n = 256, 256
@@ -808,6 +786,151 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
         assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
 
 
+@pytest.mark.parametrize(
+    "seqlens_k",
+    [
+        [128, 128, 128],  # baseline: all aligned
+        [96, 160, 128],  # not 128-aligned
+        [100, 220, 65],  # not even sf_vec(32)-aligned
+    ],
+)
+def test_blockscaled_varlen_k_public_api(seqlens_k):
+    """varlen_k through the public quack.gemm.gemm API (jit-cached compile path).
+    A is (m, total_k) m-major, B is (n, total_k) n-major, and BOTH SFA/SFB are
+    tile-aligned K-padded buffers passed as (1, rm/rn, total_padded_rk, 32, 4, 4)."""
+    _skip_if_not_sm100()
+    from quack.gemm import gemm as gemm_public
+
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
+        create_blockscaled_varlen_k_operands(num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k)
+    )
+    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,  # (m, total_k) m-major
+        mB,  # (n, total_k) n-major
+        mD,  # (L, m, n); gemm() permutes to (m, n, L) internally
+        None,
+        None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        cu_seqlens_k=cu_seqlens_k,
+        SFA=a_sc_contig,
+        SFB=b_sc_contig,
+    )
+    torch.cuda.synchronize()
+
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        err = (mD[i].float() - ref_i).abs().max().item()
+        assert err < 5e-3, f"public API varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
+
+
+@pytest.mark.parametrize(
+    "tile_cluster",
+    [((128, 128), (1, 1)), ((128, 256), (1, 2)), ((256, 128), (2, 1)), ((256, 256), (2, 2))],
+)
+@pytest.mark.parametrize("seqlens_k", [[96, 160, 128], [100, 220, 65]])
+def test_blockscaled_varlen_k_poisoned_sf_pad(seqlens_k, tile_cluster):
+    """For mxfp8 one MMA instruction consumes exactly one SF k-block, so the
+    kernel skips the instructions for pad blocks on the ragged last k-tile
+    (their A/B values are TMA-zero-filled, contributing nothing) — pad scales
+    are never consumed and the gmem SF pad may be arbitrary. Poison it with
+    0xFF (e8m0 NaN): any pad byte reaching an MMA would turn whole output rows
+    NaN via 0-value x NaN-scale products in the K tail. Instruction issue is a
+    leader-only decision, so 2-CTA MMA (tile_M 256) is covered too."""
+    _skip_if_not_sm100()
+    from quack.gemm import gemm as gemm_public
+
+    (tile_m, tile_n), (cluster_m, cluster_n) = tile_cluster
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, mA, mB, SFA, SFB, cu_seqlens_k = create_blockscaled_varlen_k_operands(
+        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k, sf_pad_byte=0xFF
+    )
+    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,
+        mB,
+        mD,
+        None,
+        None,
+        tile_M=tile_m,
+        tile_N=tile_n,
+        cluster_M=cluster_m,
+        cluster_N=cluster_n,
+        cu_seqlens_k=cu_seqlens_k,
+        SFA=SFA,
+        SFB=SFB,
+    )
+    torch.cuda.synchronize()
+    assert not mD.isnan().any(), "NaN leaked from poisoned SF pad into the output"
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        err = (mD[i].float() - ref_i).abs().max().item()
+        assert err < 5e-3, f"poisoned pad seqlens_k={seqlens_k} expert={i} max_err={err}"
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("b_major", ["k", "n"])
+@pytest.mark.parametrize(
+    "seqlens_m",
+    [
+        [128, 128, 128],  # baseline: all aligned
+        [100, 200, 150],  # none aligned to 128
+        [1, 128, 127, 129],  # boundary conditions
+    ],
+)
+def test_blockscaled_varlen_m_public_api(seqlens_m, b_major, fmt):
+    """varlen_m through the public quack.gemm.gemm API (jit-cached compile path).
+    SFA is the tile-aligned M-padded buffer passed as a
+    (1, total_padded_rm, rk, 32, 4, 4) view."""
+    _skip_if_not_sm100()
+    if fmt != "mxfp8" and b_major == "n":
+        pytest.skip("fp4 operands must be K-major")
+    from quack.gemm import gemm as gemm_public
+
+    ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+
+    torch.manual_seed(0)
+    a_ref_dq, b_ref_dq, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_m = (
+        create_blockscaled_varlen_m_operands(
+            num_experts, 0, n, k, sf_vec, ab_dtype, sf_dtype, seqlens_m=seqlens_m, b_major=b_major
+        )
+    )
+    total_m = int(sum(seqlens_m))
+    SFA, SFB = a_sc_contig, b_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4), (L, rn, rk, 32, 4, 4)
+    mD = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,
+        mB.permute(2, 0, 1),  # (n, k, l) -> (l, n, k); gemm() permutes back internally
+        mD,
+        None,
+        None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=SFA,
+        SFB=SFB,
+    )
+    torch.cuda.synchronize()
+
+    cu = cu_seqlens_m.tolist()
+    ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
+    err = (mD.float() - ref).abs().max().item()
+    assert err < 5e-3, f"public API varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
+
+
 @pytest.mark.parametrize("rk_pad", [1, 3, 5])
 def test_blockscaled_mxfp8_strided_sf(rk_pad):
     """Verify the kernel honors mSFA/mSFB's actual outer strides (doesn't
@@ -828,13 +951,13 @@ def test_blockscaled_mxfp8_strided_sf(rk_pad):
 
     # Allocate padded scale buffers (rk + rk_pad along K-blocks), copy valid
     # tiles into the prefix, slice back to rk.  The slice is non-contig:
-    # stride(1) = (rk + rk_pad) * 512 instead of rk * 512.
-    a_sc_big = torch.zeros(l, rm, rk + rk_pad, 512, dtype=torch.float8_e8m0fnu, device="cuda")
-    b_sc_big = torch.zeros(l, rn, rk + rk_pad, 512, dtype=torch.float8_e8m0fnu, device="cuda")
-    a_sc_big[:, :, :rk, :] = a_sc
-    b_sc_big[:, :, :rk, :] = b_sc
-    mSFA_strided = a_sc_big[:, :, :rk, :]
-    mSFB_strided = b_sc_big[:, :, :rk, :]
+    # stride(1) = (rk + rk_pad) * 512 elements instead of rk * 512.
+    a_sc_big = torch.zeros(l, rm, rk + rk_pad, 32, 4, 4, dtype=torch.float8_e8m0fnu, device="cuda")
+    b_sc_big = torch.zeros(l, rn, rk + rk_pad, 32, 4, 4, dtype=torch.float8_e8m0fnu, device="cuda")
+    a_sc_big[:, :, :rk] = a_sc
+    b_sc_big[:, :, :rk] = b_sc
+    mSFA_strided = a_sc_big[:, :, :rk]
+    mSFB_strided = b_sc_big[:, :, :rk]
     assert not mSFA_strided.is_contiguous()
     assert mSFA_strided.stride(-1) == 1
     assert mSFA_strided.stride(1) == (rk + rk_pad) * 512, (
@@ -885,21 +1008,3 @@ def test_blockscaled_mxfp8_strided_sf(rk_pad):
         f"strided-SF output differs from contig-SF: "
         f"max_abs_err={(mD_strided.float() - mD_contig.float()).abs().max().item()}"
     )
-
-
-def test_mxfp8_interface_preallocated_out():
-    _skip_if_not_sm100()
-    from quack.gemm_blockscaled_interface import mxfp8_gemm, quantize_act_sm100
-
-    M, N, K = 256, 256, 256
-    torch.manual_seed(0)
-    A_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    W_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    A_q, A_sc = quantize_act_sm100(A_hp)
-    W_q, W_sc = quantize_act_sm100(W_hp)
-    B_q, B_sc = W_q.mT, W_sc.mT
-
-    out_alloc = mxfp8_gemm(A_q, B_q, A_sc, B_sc)
-    out_pre = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    mxfp8_gemm(A_q, B_q, A_sc, B_sc, out=out_pre)
-    assert torch.equal(out_alloc, out_pre)

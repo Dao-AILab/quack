@@ -9,7 +9,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_default_epi import (
@@ -29,7 +29,9 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     make_fake_varlen_args,
     make_fake_gemm_tensors,
+    make_fake_sf_tensor,
     compile_gemm_kernel,
+    validate_blockscaled_sf,
 )
 
 
@@ -63,8 +65,9 @@ def _compile_gemm(
     device_capacity,
     rounding_mode,
     sr_seed_mode,
-    has_trace_ptr,
     num_warps,
+    sf_dtype=None,
+    sf_vec_size=None,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -118,6 +121,14 @@ def _compile_gemm(
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    if sf_dtype is not None:
+        # Padded SF buffers have a static batch dim of exactly 1 (not l): SFA for
+        # varlen_m (M-padded) and varlen_k (K-padded); SFB is K-padded too for
+        # varlen_k but stays per-batch (l, rn, rk, ...) for varlen_m.
+        mSFA = make_fake_sf_tensor(sf_dtype, 1 if (varlen_m or varlen_k) else l)
+        mSFB = make_fake_sf_tensor(sf_dtype, 1 if varlen_k else l)
+    else:
+        mSFA, mSFB = None, None
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -135,10 +146,12 @@ def _compile_gemm(
         epi_args,
         scheduler_args,
         varlen_args,
-        has_trace_ptr=has_trace_ptr,
+        mSFA=mSFA,
+        mSFB=mSFB,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
         num_warps=num_warps,
+        sf_vec_size=sf_vec_size,
     )
 
 
@@ -172,13 +185,20 @@ def gemm(
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
-    trace_ptr=None,  # Optional Int64 from TraceSession.ptr
     num_warps: Optional[int] = None,
+    # SFA/SFB: (l, rm/rn, rk, 32, 4, 4) blocked scale factors. For varlen_m, SFA is
+    # M-padded (1, total_padded_rm, rk, 32, 4, 4) while SFB stays per-batch. For
+    # varlen_k, BOTH are K-padded (1, rm/rn, total_padded_rk, 32, 4, 4); pad bytes
+    # may be arbitrary (the kernel skips the MMA instructions covering them).
+    # See AI/varlen_blockscaled_sf_layout.md.
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
+    blockscaled = SFA is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
     if gather_A:
         assert varlen, "gather_A requires varlen"
@@ -196,6 +216,20 @@ def gemm(
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
+    sf_dtype, sf_vec_size = None, None
+    if blockscaled:
+        assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
+        assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
+        assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
+        if varlen_m:
+            num_batches = cu_seqlens_m.shape[0] - 1
+        elif varlen_k:
+            num_batches = cu_seqlens_k.shape[0] - 1
+        else:
+            num_batches = None
+        sf_dtype, sf_vec_size = validate_blockscaled_sf(
+            A, B, SFA, SFB, device_capacity, num_batches=num_batches, varlen_k=varlen_k
+        )
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
     if rounding_mode == RoundingMode.RS:
@@ -251,14 +285,10 @@ def gemm(
         device_capacity,
         rounding_mode,
         sr_seed_mode,
-        trace_ptr is not None,
         num_warps,
+        sf_dtype,
+        sf_vec_size,
     )
-
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY:
-        return
 
     def scalar_arg(scalar, mode, dtype=Float32):
         if mode == 0:
@@ -285,7 +315,10 @@ def gemm(
     scheduler_args = make_scheduler_args(
         max_active_clusters,
         max_swizzle_size,
-        tile_count_semaphore,
+        # Must mirror make_fake_scheduler_args in _compile_gemm: only the SM8x/SM90
+        # dynamic scheduler consumes the semaphore; SM100 uses CLC instead, and the
+        # compiled signature has None there.
+        tile_count_semaphore if (is_dynamic_persistent and device_capacity[0] <= 9) else None,
         batch_idx_permute,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)

@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from triton.testing import do_bench
 
 from quack.autotuner import default_cache_dir
-from quack.cache_utils import get_cache_path
+from quack.cache import get_cache_path
 from quack.gemm_blockscaled_interface import (
     mxfp8_gemm_act,
     quantize_act,
@@ -54,7 +54,7 @@ from quack.gemm_interface import (
 
 def clear_caches():
     """Clear both the .so kernel cache and the autotuning result cache."""
-    # .so kernel cache (from cache_utils.get_cache_path)
+    # .so kernel cache (from quack.cache.get_cache_path)
     so_cache = str(get_cache_path())
     if os.path.isdir(so_cache):
         shutil.rmtree(so_cache)

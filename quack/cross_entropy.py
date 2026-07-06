@@ -17,9 +17,10 @@ import quack.utils as utils
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.dsl import cute_op
 from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
-from quack.cache_utils import jit_cache
+from quack.cache import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from cutlass.base_dsl.arch import Arch
 
@@ -249,7 +250,6 @@ class CrossEntropy(ReductionBase):
             probs = exp_x * denom_inv
             gdX = cute.local_tile(mdX, tiler_mn, (bidx, cluster_y))
             tXgdX = thr_copy.partition_D(gdX)
-            tXrdX = cute.make_rmem_tensor_like(tXgdX)
             tXcFull = thr_copy.partition_S(cX)
             # Compute gradient: probs for all classes, (probs - 1) for target class
             # If ignored, gradient is already zero
@@ -260,55 +260,56 @@ class CrossEntropy(ReductionBase):
                     tXrdX_f32[i] = tXrdX_f32[i] if tXcFull[i][1] != target else tXrdX_f32[i] - 1.0
             if const_expr(mWeight is not None):
                 tXrdX_f32.store(tXrdX_f32.load() * target_weight)
-            tXrdX.store(tXrdX_f32.load().to(tXrdX.element_type))
+            tXrdX = tXrdX_f32.to(tXgdX.element_type)
             if row < shape[0]:
                 copy(tXrdX, tXgdX)
 
-
-@jit_cache
-def _compile_cross_entropy_fwd(
-    dtype,
-    target_dtype,
-    target_logit_dtype,
-    N,
-    has_lse,
-    has_dx,
-    weight_dtype,
-    target_logit_ndim,
-):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    x_cute = fake_tensor(dtype, (batch_sym, N), div)
-    dx_cute = fake_tensor(dtype, (batch_sym, N), div) if has_dx else None
-    target_cute = fake_tensor(target_dtype, (batch_sym,))
-    if target_logit_dtype is not None:
-        if target_logit_ndim == 2:
-            target_logit_cute = fake_tensor(target_logit_dtype, (batch_sym, cute.sym_int()), div)
+    @staticmethod
+    @jit_cache
+    def compile(
+        dtype,
+        target_dtype,
+        target_logit_dtype,
+        N,
+        has_lse,
+        has_dx,
+        weight_dtype,
+        target_logit_ndim,
+    ):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        x_cute = fake_tensor(dtype, (batch_sym, N), div)
+        dx_cute = fake_tensor(dtype, (batch_sym, N), div) if has_dx else None
+        target_cute = fake_tensor(target_dtype, (batch_sym,))
+        if target_logit_dtype is not None:
+            if target_logit_ndim == 2:
+                target_logit_cute = fake_tensor(
+                    target_logit_dtype, (batch_sym, cute.sym_int()), div
+                )
+            else:
+                target_logit_cute = fake_tensor(target_logit_dtype, (batch_sym,))
         else:
-            target_logit_cute = fake_tensor(target_logit_dtype, (batch_sym,))
-    else:
-        target_logit_cute = None
-    loss_cute = fake_tensor(Float32, (batch_sym,))
-    lse_cute = fake_tensor(Float32, (batch_sym,)) if has_lse else None
-    weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
-    # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
-    cross_entropy_op = CrossEntropy(dtype, N, online_softmax=not has_dx)
-    return cute.compile(
-        cross_entropy_op,
-        x_cute,
-        target_cute,
-        target_logit_cute,
-        loss_cute,
-        lse_cute,
-        dx_cute,
-        weight_cute,
-        Int32(0),  # ignore_index, just for compilation
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+            target_logit_cute = None
+        loss_cute = fake_tensor(Float32, (batch_sym,))
+        lse_cute = fake_tensor(Float32, (batch_sym,)) if has_lse else None
+        weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
+        # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
+        return cute.compile(
+            CrossEntropy(dtype, N, online_softmax=not has_dx),
+            x_cute,
+            target_cute,
+            target_logit_cute,
+            loss_cute,
+            lse_cute,
+            dx_cute,
+            weight_cute,
+            Int32(0),  # ignore_index, just for compilation
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
-@torch.library.custom_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
+@cute_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
 def cross_entropy_fwd_out(
     x: Tensor,
     target: Tensor,
@@ -351,7 +352,7 @@ def cross_entropy_fwd_out(
     )
     target_logit_ndim = target_logit.ndim if target_logit is not None else None
     weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
-    _compile_cross_entropy_fwd(
+    CrossEntropy.compile(
         dtype,
         target_dtype,
         target_logit_dtype,
@@ -361,42 +362,6 @@ def cross_entropy_fwd_out(
         weight_dtype,
         target_logit_ndim,
     )(x, target, target_logit, loss, lse, dx, weight, Int32(ignore_index))
-
-
-@cross_entropy_fwd_out.register_fake
-def _cross_entropy_fwd_out_fake(
-    x: Tensor,
-    target: Tensor,
-    target_logit: Optional[Tensor],
-    loss: Tensor,
-    lse: Optional[Tensor],
-    dx: Optional[Tensor],
-    weight: Optional[Tensor],
-    ignore_index: int = -100,
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        target_dtype = torch2cute_dtype_map[target.dtype]
-        target_logit_dtype = (
-            torch2cute_dtype_map[target_logit.dtype] if target_logit is not None else None
-        )
-        target_logit_ndim = target_logit.ndim if target_logit is not None else None
-        weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
-        _compile_cross_entropy_fwd(
-            dtype,
-            target_dtype,
-            target_logit_dtype,
-            N,
-            lse is not None,
-            dx is not None,
-            weight_dtype,
-            target_logit_ndim,
-        )
-        _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)
 
 
 def cross_entropy_fwd(
@@ -580,29 +545,30 @@ class CrossEntropyBackward:
         if row < shape[0]:
             copy(tXrdX, tXgdX)
 
-
-@jit_cache
-def _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
-    target_cute = fake_tensor(target_dtype, (batch_sym,))
-    dloss_cute = cute.runtime.make_fake_tensor(Float32, (batch_sym,), stride=(cute.sym_int64(),))
-    lse_cute = fake_tensor(Float32, (batch_sym,))
-    weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
-    cross_entropy_backward_op = CrossEntropyBackward(dtype, N)
-    return cute.compile(
-        cross_entropy_backward_op,
-        x_cute,
-        target_cute,
-        dloss_cute,
-        dx_cute,
-        lse_cute,
-        weight_cute,
-        Int32(0),  # ignore_index, just for compilation
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+    @staticmethod
+    @jit_cache
+    def compile(dtype, target_dtype, N, weight_dtype):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
+        target_cute = fake_tensor(target_dtype, (batch_sym,))
+        dloss_cute = cute.runtime.make_fake_tensor(
+            Float32, (batch_sym,), stride=(cute.sym_int64(),)
+        )
+        lse_cute = fake_tensor(Float32, (batch_sym,))
+        weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
+        return cute.compile(
+            CrossEntropyBackward(dtype, N),
+            x_cute,
+            target_cute,
+            dloss_cute,
+            dx_cute,
+            lse_cute,
+            weight_cute,
+            Int32(0),  # ignore_index, just for compilation
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
 def _cross_entropy_backward(
@@ -644,12 +610,12 @@ def _cross_entropy_backward(
     dtype = torch2cute_dtype_map[x.dtype]
     target_dtype = torch2cute_dtype_map[target.dtype]
     weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
-    _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)(
+    CrossEntropyBackward.compile(dtype, target_dtype, N, weight_dtype)(
         x, target, dloss, dx, lse, weight, Int32(ignore_index)
     )
 
 
-@torch.library.custom_op("quack::cross_entropy_bwd_out", mutates_args={"dx"})
+@cute_op("quack::cross_entropy_bwd_out", mutates_args={"dx"})
 def cross_entropy_bwd_out(
     x: torch.Tensor,
     target: torch.Tensor,
@@ -660,27 +626,6 @@ def cross_entropy_bwd_out(
     ignore_index: int = -100,
 ) -> None:
     _cross_entropy_backward(x, target, dloss, lse, dx, weight, ignore_index)
-
-
-@cross_entropy_bwd_out.register_fake
-def _cross_entropy_bwd_out_fake(
-    x: torch.Tensor,
-    target: torch.Tensor,
-    dloss: torch.Tensor,
-    lse: torch.Tensor,
-    dx: torch.Tensor,
-    weight: Optional[torch.Tensor] = None,
-    ignore_index: int = -100,
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from quack.cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        target_dtype = torch2cute_dtype_map[target.dtype]
-        weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
-        _compile_cross_entropy_backward(dtype, target_dtype, N, weight_dtype)
 
 
 def cross_entropy_bwd(

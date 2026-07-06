@@ -6,13 +6,14 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate, and_, dsl_user_op
-from cutlass.pipeline import MbarrierArray, CooperativeGroup, PipelineOp
+from cutlass._mlir.dialects import nvvm as _nvvm, llvm
+from cutlass.cute.typing import AddressSpace, Int, Pointer
 from cutlass.pipeline import PipelineState, PipelineUserType
-from cutlass.pipeline import Agent, agent_sync
 from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
 from cutlass.pipeline import PipelineCpAsync as PipelineCpAsyncOg
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
+from cutlass.pipeline import PipelineTmaStore as PipelineTmaStoreOg
 from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 from cutlass.pipeline import PipelineUmmaAsync as PipelineUmmaAsyncOg
 from cutlass.pipeline import PipelineAsyncUmma as PipelineAsyncUmmaOg
@@ -32,6 +33,72 @@ def _override_create(parent_cls, child_cls):
         return obj
 
     return create
+
+
+@dsl_user_op
+def mbarrier_arrive_release_cluster(
+    mbar_ptr: Pointer, peer_cta_rank_in_cluster: Int, *, loc=None, ip=None
+) -> None:
+    """Arrive on a peer CTA's mbarrier with cluster-scope release semantics.
+
+    cute.arch.mbarrier_arrive with a peer rank emits mbarrier.arrive with the default
+    .release.cta semantics, which does not order this CTA's smem writes with the peer
+    CTA's reads of them (e.g. a 2-CTA tcgen05.mma reading our smem over DSMEM). Emit
+    fence.release.sync_restrict::shared::cta.cluster followed by
+    mbarrier.arrive.relaxed.cluster.shared::cluster instead: the fence releases all smem
+    writes this thread has observed at cluster scope, and a cluster-scope acquire of the
+    barrier phase on the consumer side (mbarrier_test_wait_acquire_cluster) completes the
+    release-acquire relation. This is the cheaper form of mbarrier.arrive.release.cluster,
+    which lowers to MEMBAR.GPU.
+    """
+    _nvvm.fence_sync_restrict(_nvvm.MemOrderKind.RELEASE, loc=loc, ip=ip)
+    remote_ptr = _nvvm.mapa(
+        llvm.PointerType.get(AddressSpace.dsmem),
+        mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+        Int32(peer_cta_rank_in_cluster).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    _nvvm.mbarrier_arrive(
+        None,
+        remote_ptr,
+        count=Int32(1).ir_value(loc=loc, ip=ip),
+        scope=_nvvm.MemScopeKind.CLUSTER,
+        relaxed=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbarrier_acquire_cluster(mbar_ptr: Pointer, phase: Int, *, loc=None, ip=None) -> None:
+    """Cluster-scope acquire observation of an already-completed mbarrier phase.
+
+    Emits mbarrier.test_wait.parity.acquire.cluster. The regular waits
+    (mbarrier.try_wait.parity) only acquire at cta scope, which cannot pair with a
+    cluster-scope release from another CTA (mbarrier_arrive_release_cluster). Call this
+    after a regular wait on the same (barrier, phase) has already succeeded: the test_wait
+    then observes the completed phase and upgrades the observation to cluster scope.
+    The result must feed control flow, otherwise the test_wait is dead-code-eliminated;
+    branch to a (never-taken) blocking wait so the observation cannot be dropped.
+    """
+    status = Boolean(
+        _nvvm.mbarrier_wait_parity(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            _nvvm.MBarrierWaitKind.TEST,
+            scope=_nvvm.MBarrierScopeKind.CLUSTER,
+            order=_nvvm.MemOrderKind.ACQUIRE,
+            loc=loc,
+            ip=ip,
+        )
+    )
+    if_generate(
+        status == 0,
+        lambda: cute.arch.mbarrier_wait(mbar_ptr, phase, loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
 
 
 def _make_state(index: Int32, phase: Int32) -> PipelineState:
@@ -238,11 +305,12 @@ class PipelineCpAsync(_PipelineIndexPhaseMixin, PipelineCpAsyncOg):
     @staticmethod
     def create(
         *args,
+        barrier_storage: Optional[cute.Pointer] = None,
         elect_one_release: bool = False,
         syncwarp_before_release: bool = True,
         **kwargs,
     ):
-        obj = PipelineCpAsyncOg.create(*args, **kwargs)
+        obj = PipelineCpAsyncOg.create(*args, barrier_storage=barrier_storage, **kwargs)
         object.__setattr__(obj, "__class__", PipelineCpAsync)
         object.__setattr__(obj, "_elect_one_release", elect_one_release)
         object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
@@ -268,7 +336,23 @@ class PipelineCpAsync(_PipelineIndexPhaseMixin, PipelineCpAsyncOg):
 
 @dataclass(frozen=True)
 class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
-    """Override producer_acquire to take in extra_tx_count parameter."""
+    """PipelineTmaAsync with extra_tx_count plus optional elected consumer release."""
+
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
+
+    @staticmethod
+    def create(
+        *args,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineTmaAsyncOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineTmaAsync)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
 
     @dsl_user_op
     def producer_acquire(
@@ -289,14 +373,48 @@ class PipelineTmaAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
             loc=loc,
             ip=ip,
         )
-        if const_expr(extra_tx_count == 0):
+        if const_expr(isinstance(extra_tx_count, int) and extra_tx_count == 0):
             self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
 
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineTmaAsyncOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
 
-PipelineTmaAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaAsync)
+
+# ── PipelineTmaStore ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PipelineTmaStore(PipelineTmaStoreOg):
+    """PipelineTmaStore with configurable cp.async.bulk wait read flag."""
+
+    _read: bool = True
+
+    @staticmethod
+    def create(*args, read: bool = True, **kwargs):
+        obj = PipelineTmaStoreOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineTmaStore)
+        object.__setattr__(obj, "_read", read)
+        return obj
+
+    @dsl_user_op
+    def producer_acquire(self, *, loc=None, ip=None) -> None:
+        cute.arch.cp_async_bulk_wait_group(self.num_stages - 1, read=self._read, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def producer_tail(self, *, loc=None, ip=None) -> None:
+        cute.arch.cp_async_bulk_wait_group(0, read=self._read, loc=loc, ip=ip)
 
 
 # ── PipelineTmaUmma ─────────────────────────────────────────────────────────
@@ -357,10 +475,56 @@ PipelineTmaUmma.create = _override_create(PipelineTmaUmmaOg, PipelineTmaUmma)
 
 @dataclass(frozen=True)
 class PipelineUmmaAsync(_PipelineIndexPhaseMixin, PipelineUmmaAsyncOg):
-    pass
+    """
+    PipelineUmmaAsync with optional elect_one for producer_commit and
+    consumer_release, mirroring PipelineAsync.
+    """
 
+    _elect_one_commit: bool = False
+    _syncwarp_before_commit: bool = True
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
 
-PipelineUmmaAsync.create = _override_create(PipelineUmmaAsyncOg, PipelineUmmaAsync)
+    @staticmethod
+    def create(
+        *args,
+        elect_one_commit: bool = False,
+        syncwarp_before_commit: bool = True,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineUmmaAsyncOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineUmmaAsync)
+        object.__setattr__(obj, "_elect_one_commit", elect_one_commit)
+        object.__setattr__(obj, "_syncwarp_before_commit", syncwarp_before_commit)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
+
+    @dsl_user_op
+    def producer_commit(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineUmmaAsyncOg.producer_commit,
+            self,
+            state,
+            self._elect_one_commit,
+            self._syncwarp_before_commit,
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineUmmaAsyncOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
 
 
 # ── PipelineAsyncUmma ───────────────────────────────────────────────────────
@@ -368,10 +532,56 @@ PipelineUmmaAsync.create = _override_create(PipelineUmmaAsyncOg, PipelineUmmaAsy
 
 @dataclass(frozen=True)
 class PipelineAsyncUmma(_PipelineIndexPhaseMixin, PipelineAsyncUmmaOg):
-    pass
+    """
+    PipelineAsyncUmma with optional elect_one for producer_commit and
+    consumer_release, mirroring PipelineAsync.
+    """
 
+    _elect_one_commit: bool = False
+    _syncwarp_before_commit: bool = True
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
 
-PipelineAsyncUmma.create = _override_create(PipelineAsyncUmmaOg, PipelineAsyncUmma)
+    @staticmethod
+    def create(
+        *args,
+        elect_one_commit: bool = False,
+        syncwarp_before_commit: bool = True,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineAsyncUmmaOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineAsyncUmma)
+        object.__setattr__(obj, "_elect_one_commit", elect_one_commit)
+        object.__setattr__(obj, "_syncwarp_before_commit", syncwarp_before_commit)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
+
+    @dsl_user_op
+    def producer_commit(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineAsyncUmmaOg.producer_commit,
+            self,
+            state,
+            self._elect_one_commit,
+            self._syncwarp_before_commit,
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineAsyncUmmaOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
 
 
 # ── PipelineTmaCpAsync ──────────────────────────────────────────────────────
@@ -420,54 +630,6 @@ class PipelineTmaCpAsync(_PipelineIndexPhaseMixin, PipelineTmaAsyncOg):
 PipelineTmaCpAsync.create = _override_create(PipelineTmaAsyncOg, PipelineTmaCpAsync)
 
 
-# ── MbarrierArrayWDropCount ─────────────────────────────────────────────────
-
-
-class MbarrierArrayWDropCount(MbarrierArray):
-    @dsl_user_op
-    def __init__(
-        self,
-        barrier_storage: cute.Pointer,
-        num_stages: int,
-        agent: tuple[PipelineOp, CooperativeGroup],
-        tx_count: int = 0,
-        drop_count: Optional[Int32] = None,
-        *,
-        loc=None,
-        ip=None,
-    ) -> None:
-        self.barrier_storage = barrier_storage
-        self.tx_count = tx_count
-        self.num_stages = num_stages
-        self.op_type, self.cg = agent
-        self.arrive_count = self.cg.size
-        self.drop_count = drop_count
-
-        if self.num_stages <= 0:
-            raise ValueError("Error: Mbarrier stage count must be greater than 0.")
-        if self.arrive_count <= 0:
-            raise ValueError("Error: Mbarrier arrive count must be greater than 0.")
-        if self.op_type is PipelineOp.TmaLoad and self.tx_count < 0:
-            raise ValueError("Error: Mbarrier tx count must not be less than 0 for TMA ops.")
-
-        if const_expr(drop_count is not None):
-            self.arrive_count = self.arrive_count - drop_count
-
-        # Store mbarrier base pointer
-        self.mbarrier_base = self.barrier_storage
-
-        # Mbarrier initialization in constructor
-        self.mbarrier_init(loc=loc, ip=ip)
-
-    def __extract_mlir_values__(self):
-        return [self.barrier_storage, self.drop_count]
-
-    def __new_from_mlir_values__(self, values):
-        return MbarrierArrayWDropCount(
-            values[0], self.num_stages, (self.op_type, self.cg), self.tx_count, values[1]
-        )
-
-
 # ── PipelineTmaCpAsyncUmma ──────────────────────────────────────────────────
 
 
@@ -477,108 +639,6 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmmaOg):
     PipelineTmaCpAsync is used for CpAsync + TMA producers and UMMA consumers
     (e.g. Blackwell mainloops)
     """
-
-    @dsl_user_op
-    @staticmethod
-    def create(
-        *,
-        num_stages: int,
-        producer_group: CooperativeGroup,
-        consumer_group: CooperativeGroup,
-        tx_count: int,
-        barrier_storage: cute.Pointer = None,
-        cta_layout_vmnk: Optional[cute.Layout] = None,
-        mcast_mode_mn: tuple[int, int] = (1, 1),
-        defer_sync: bool = False,
-        producer_drop_count: Optional[Int32] = None,
-        loc=None,
-        ip=None,
-    ):
-        """Creates and initializes a new PipelineTmaUmma instance.
-
-        :param num_stages: Number of buffer stages for this pipeline
-        :type num_stages: int
-        :param producer_group: CooperativeGroup for the producer agent
-        :type producer_group: CooperativeGroup
-        :param consumer_group: CooperativeGroup for the consumer agent
-        :type consumer_group: CooperativeGroup
-        :param tx_count: Number of bytes expected to be written to the transaction barrier for one stage
-        :type tx_count: int
-        :param barrier_storage: Pointer to the shared memory address for this pipeline's mbarriers
-        :type barrier_storage: cute.Pointer, optional
-        :param cta_layout_vmnk: Layout of the cluster shape
-        :type cta_layout_vmnk: cute.Layout, optional
-        :param mcast_mode_mn: Tuple specifying multicast modes for m and n dimensions (each 0 or 1)
-        :type mcast_mode_mn: tuple[int, int], optional
-        :raises ValueError: If barrier_storage is not a cute.Pointer instance
-        :return: A new PipelineTmaUmma instance configured with the provided parameters
-        :rtype: PipelineTmaUmma
-        """
-        if not isinstance(barrier_storage, cute.Pointer):
-            raise TypeError(
-                f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
-            )
-
-        producer_type = PipelineOp.TmaLoad
-        consumer_type = PipelineOp.TCGen05Mma
-
-        producer = (producer_type, producer_group)
-        consumer = (consumer_type, consumer_group)
-
-        sync_object_full = MbarrierArrayWDropCount(
-            barrier_storage.align(min_align=8),
-            num_stages,
-            producer,
-            tx_count,
-            drop_count=producer_drop_count,
-            loc=loc,
-            ip=ip,
-        )
-        sync_object_empty = PipelineTmaUmmaOg._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages,
-            num_stages,
-            consumer,
-            loc=loc,
-            ip=ip,
-        )
-
-        if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, loc=loc, ip=ip) == 1:
-            # No mcast mask if not using clusters
-            producer_mask = None
-            # All threadblocks are leaders if not using clusters
-            is_leader_cta = True
-        else:
-            producer_mask = PipelineTmaUmmaOg._compute_mcast_arrival_mask(
-                cta_layout_vmnk, mcast_mode_mn, loc=loc, ip=ip
-            )
-            is_leader_cta = PipelineTmaUmmaOg._compute_is_leader_cta(
-                cta_layout_vmnk, loc=loc, ip=ip
-            )
-
-        cta_group = (
-            cute.nvgpu.tcgen05.CtaGroup.ONE
-            if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, mode=[0], loc=loc, ip=ip) == 1
-            else cute.nvgpu.tcgen05.CtaGroup.TWO
-        )
-
-        consumer_mask = producer_mask
-
-        if not defer_sync:
-            cute.arch.mbarrier_init_fence()
-            if cta_layout_vmnk is None or cute.size(cta_layout_vmnk, loc=loc, ip=ip) == 1:
-                agent_sync(Agent.ThreadBlock)
-            else:
-                agent_sync(Agent.ThreadBlockCluster, is_relaxed=True)
-
-        return PipelineTmaCpAsyncUmma(
-            sync_object_full,
-            sync_object_empty,
-            num_stages,
-            producer_mask,
-            consumer_mask,
-            is_leader_cta,
-            cta_group,
-        )
 
     @dsl_user_op
     def producer_acquire(
@@ -617,3 +677,6 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmmaOg):
         cute.arch.cp_async_mbarrier_arrive_noinc(
             self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip
         )
+
+
+PipelineTmaCpAsyncUmma.create = _override_create(PipelineTmaUmmaOg, PipelineTmaCpAsyncUmma)

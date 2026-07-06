@@ -192,7 +192,7 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
         assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
 
 
-@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
+@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx", "tanh"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("n", [1504, 2048])
@@ -622,12 +622,14 @@ def test_linear_act_partial_grad(input_dtype, freeze, activation):
         assert w.grad is None
 
 
+@pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize(
     "fn_name", ["linear_func", "linear_act_func", "linear_gated_func", "mlp_func"]
 )
-def test_autocast(fn_name):
+def test_autocast(fn_name, use_compile):
     """Autocast: float32 inputs are cast to bfloat16 for the kernel.
 
+    Covers both eager and torch.compile(fullgraph=True) paths.
     Regression test for https://github.com/Dao-AILab/quack/issues/54.
     """
     device = "cuda"
@@ -638,92 +640,51 @@ def test_autocast(fn_name):
     w = torch.randn(out_features, in_features, device=device, dtype=torch.float32)
     w /= math.sqrt(in_features)
     w.requires_grad_(True)
-
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        if fn_name == "linear_func":
-            out = linear_func(x, w, tuned=False)
-        elif fn_name == "linear_act_func":
-            out, _postact = linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
-        elif fn_name == "linear_gated_func":
-            w_gated = (
-                torch.randn(2 * out_features, in_features, device=device, dtype=torch.float32)
-                / math.sqrt(in_features)
-            ).requires_grad_(True)
-            out, _postact = linear_gated_func(x, w_gated, activation="swiglu", tuned=False)
-            w = w_gated  # for grad check below
-        elif fn_name == "mlp_func":
-            w2 = torch.randn(
-                in_features,
-                out_features,
-                device=device,
-                dtype=torch.float32,
-                requires_grad=True,
-            ) / math.sqrt(out_features)
-            out = mlp_func(x, w, w2, activation="gelu_tanh_approx", tuned=False)
-
-    assert out.dtype == torch.bfloat16, f"expected bfloat16 output, got {out.dtype}"
-    out.sum().backward()
-    assert x.grad is not None
-    assert w.grad is not None
-
-
-@pytest.mark.parametrize(
-    "fn_name", ["linear_func", "linear_act_func", "linear_gated_func", "mlp_func"]
-)
-def test_autocast_compile(fn_name):
-    """Autocast under torch.compile(fullgraph=True).
-
-    Regression test for https://github.com/Dao-AILab/quack/issues/54.
-    """
-    device = "cuda"
-    torch.random.manual_seed(0)
-    m, in_features, out_features = 256, 512, 512
-
-    x = torch.randn(m, in_features, device=device, dtype=torch.float32, requires_grad=True)
-    w = torch.randn(out_features, in_features, device=device, dtype=torch.float32)
-    w /= math.sqrt(in_features)
-    w.requires_grad_(True)
-
-    if fn_name == "linear_func":
-
-        @torch.compile(fullgraph=True)
-        def fn(x, w):
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_func(x, w, tuned=False)
-
-        out = fn(x, w)
-    elif fn_name == "linear_act_func":
-
-        @torch.compile(fullgraph=True)
-        def fn(x, w):
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
-
-        out, _postact = fn(x, w)
-    elif fn_name == "linear_gated_func":
+    w_gated = None
+    w2 = None
+    if fn_name == "linear_gated_func":
         w_gated = (
             torch.randn(2 * out_features, in_features, device=device, dtype=torch.float32)
             / math.sqrt(in_features)
         ).requires_grad_(True)
-
-        @torch.compile(fullgraph=True)
-        def fn(x, w):
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_gated_func(x, w, activation="swiglu", tuned=False)
-
-        out, _postact = fn(x, w_gated)
-        w = w_gated
     elif fn_name == "mlp_func":
         w2 = (
             torch.randn(in_features, out_features, device=device, dtype=torch.float32)
             / math.sqrt(out_features)
         ).requires_grad_(True)
 
-        @torch.compile(fullgraph=True)
-        def fn(x, w, w2):
+    if fn_name == "linear_func":
+
+        def body(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_func(x, w, tuned=False)
+
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
+        out = fn(x, w)
+    elif fn_name == "linear_act_func":
+
+        def body(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
+
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
+        out, _postact = fn(x, w)
+    elif fn_name == "linear_gated_func":
+
+        def body(x, w):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                return linear_gated_func(x, w, activation="swiglu", tuned=False)
+
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
+        out, _postact = fn(x, w_gated)
+        w = w_gated  # for grad check below
+    elif fn_name == "mlp_func":
+
+        def body(x, w, w2):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 return mlp_func(x, w, w2, activation="gelu_tanh_approx", tuned=False)
 
+        fn = torch.compile(body, fullgraph=True) if use_compile else body
         out = fn(x, w, w2)
 
     assert out.dtype == torch.bfloat16, f"expected bfloat16 output, got {out.dtype}"
@@ -924,6 +885,59 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
     )
     assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("tile_M,tile_N", [(128, 128), (128, 256), (64, 256)])
+@pytest.mark.parametrize("M,N,K", [(4096, 4096, 4096)])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
+    """Regression test for https://github.com/Dao-AILab/quack/issues/135:
+
+    Passing both colvec (rstd) and rowvec (norm_weight) to gemm_norm_act_fn
+    produced corrupted output for tile shapes where the vec smem region was
+    smaller than the tiled cp_async partition tile. cp_async with pred=False
+    zero-fills the destination instead of skipping the write, which corrupted
+    the adjacent vec smem field.
+    """
+    device = "cuda"
+    if get_device_capacity(torch.device(device))[0] != 9:
+        pytest.skip("This regression test targets SM90.")
+    from quack.gemm_norm_act import gemm_norm_act_fn
+
+    torch.manual_seed(0)
+    A = torch.randn(1, M, K, device=device, dtype=input_dtype)
+    B = torch.randn(1, N, K, device=device, dtype=input_dtype)
+    colvec = torch.randn(1, M, device=device, dtype=input_dtype)
+    rowvec = torch.randn(1, N, device=device, dtype=input_dtype)
+    ref = ((A.float() @ B.float().mT) * colvec.float()[:, :, None] * rowvec.float()[:, None, :]).to(
+        input_dtype
+    )
+    out = torch.empty(1, M, N, dtype=input_dtype, device=device)
+    gemm_norm_act_fn(
+        A,
+        B,
+        D=None,
+        C=None,
+        PostAct=out,
+        tile_count_semaphore=None,
+        activation=None,
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+        colvec=colvec,
+        rowvec=rowvec,
+    )
+    # Bf16 dot-product noise tolerance: pre-fix this same test saw absolute
+    # errors of >1e3 because some output tiles were entirely zeroed out.
+    diff = (out.float() - ref.float()).abs()
+    # < 0.5% of elements should exceed an absolute tolerance of 0.5 (bf16 ulp
+    # at the magnitudes involved is roughly that scale).
+    frac_bad = (diff > 0.5).float().mean().item()
+    assert frac_bad < 5e-3, (
+        f"tile=({tile_M},{tile_N}): {frac_bad * 100:.2f}% of elements have |err|>0.5 "
+        f"(max|err|={diff.max().item():.2e}); see issue #135"
+    )
 
 
 @pytest.mark.parametrize("use_compile", [False, True])

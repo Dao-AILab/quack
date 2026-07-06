@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import sys
 import time
 import inspect
 import base64
@@ -12,6 +13,11 @@ import json
 from pathlib import Path
 from functools import cached_property, partial
 from typing import Dict, Tuple, List, Optional, Any
+from quack.bench.bench_utils import (
+    _bench_cuda_graph_l2_rotate,
+    _clone_l2_rotate_inputs,
+    _pick_l2_rotate_count,
+)
 
 import torch
 from torch import Tensor
@@ -23,29 +29,6 @@ from . import __version__
 
 PACKAGE_NAME = "quack"
 VERSION = __version__
-
-
-def _get_current_cuda_device() -> str | None:
-    """Return the physical CUDA device identifier for the current process.
-
-    Maps the logical ``torch.cuda.current_device()`` index through
-    ``CUDA_VISIBLE_DEVICES`` (if set) so the result is valid as a
-    standalone ``CUDA_VISIBLE_DEVICES`` value (handles integer IDs,
-    GPU UUIDs, and MIG IDs).
-
-    Returns ``None`` if CUDA is not initialized or the device cannot
-    be determined.
-    """
-    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
-        return None
-    logical_device = torch.cuda.current_device()
-    parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if parent_visible is not None:
-        visible_devices = [d.strip() for d in parent_visible.split(",")]
-        if logical_device < len(visible_devices):
-            return visible_devices[logical_device]
-        return None
-    return str(logical_device)
 
 
 def get_home_dir():
@@ -75,6 +58,14 @@ def _base32(key):
     return base64.b32encode(bytes.fromhex(key)).decode("utf-8").rstrip("=")
 
 
+#: How long a deferred config may wait on its pool compile before the bench
+#: loop stops trusting the pool and benches it with the pool suppressed
+#: (in-process compile). Guards against a wedged worker / a foreign flock
+#: holder that never produces the .o; without it a permanently-"pending"
+#: sha would rotate forever. Tests override this.
+_POOL_WEDGE_TIMEOUT_S = 300.0
+
+
 def _gpu_warmup(duration_ms=200):
     """Saturate the GPU to reach thermal steady-state before benchmarking.
 
@@ -89,6 +80,21 @@ def _gpu_warmup(duration_ms=200):
         for _ in range(100):
             a = a @ a
         torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Candidate-config compilation
+#
+# There is no separate precompile phase: the bench loop in ``benchmark()``
+# (inside ``Autotuner.__call__``) runs under ``pool_scope()`` from
+# quack.cache.async_compile. A config whose kernel misses the .o cache
+# raises ``CompilePending`` from jit_cache after shipping the pickled
+# ``_compile_*`` key to a CPU worker; the loop rotates that config to the
+# back and benches whichever config is ready. Total wall stays
+# max(parallel_compile, serial_bench), key discovery uses the real tensors
+# in-process, and workers never launch kernels (they call the tensor-free
+# ``_compile_*`` functions directly).
+# ---------------------------------------------------------------------------
 
 
 class Autotuner:
@@ -163,132 +169,6 @@ class Autotuner:
             return partial(triton.testing.do_bench, warmup=5, rep=25)
         return self._do_bench
 
-    def _precompile(self, *args, configs, **kwargs):
-        """Pre-compile all configs in parallel subprocesses to populate .o cache.
-
-        cute.compile() is not thread-safe (MLIR thread-local state) and fork after
-        CUDA init causes segfaults. So we spawn persistent subprocess workers: each
-        has its own CUDA context, creates FakeTensors matching the parent's tensor
-        metadata, and compiles with COMPILE_ONLY=True. Workers stay alive to amortize
-        import overhead across multiple configs. The parent then loads instantly from
-        the .o cache during benchmarking.
-        """
-        from quack.cache_utils import CACHE_ENABLED
-
-        if not CACHE_ENABLED:
-            return
-
-        max_workers = min(len(configs), int(os.getenv("QUACK_COMPILE_WORKERS", "8")))
-        if max_workers <= 1:
-            return
-
-        # Quick check: compile first config in-process. If it loads from .o cache
-        # (<0.5s), the rest are likely cached too — skip spawning workers.
-        t_check = time.time()
-        try:
-            current = dict(kwargs, **configs[0].all_kwargs())
-            self.fn(*args, **current)
-        except Exception:
-            pass
-        if time.time() - t_check < 0.5:
-            return
-
-        verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
-        if verbose:
-            print(f"Pre-compiling {len(configs)} configs with {max_workers} workers")
-        t0 = time.time()
-
-        import pickle
-        import struct
-        import subprocess
-        import sys
-
-        def _send(stream, msg):
-            data = pickle.dumps(msg)
-            stream.write(struct.pack("<I", len(data)))
-            stream.write(data)
-            stream.flush()
-
-        def _recv(stream):
-            header = stream.read(4)
-            if len(header) < 4:
-                return None
-            length = struct.unpack("<I", header)[0]
-            return pickle.loads(stream.read(length)) if length else None
-
-        # Serialize tensor metadata
-        tensor_meta = []
-        for arg in args:
-            if isinstance(arg, Tensor):
-                tensor_meta.append(
-                    {
-                        "shape": list(arg.shape),
-                        "stride": list(arg.stride()),
-                        "dtype": str(arg.dtype),
-                    }
-                )
-            else:
-                tensor_meta.append(arg)
-
-        fn_module = self.fn.__module__
-        fn_qualname = self.fn.__qualname__
-
-        # Restrict worker subprocesses to the parent's current CUDA device.
-        # Without this, all workers default to cuda:0 and their CUDA context
-        # initialization can OOM when many ranks share a node.
-        worker_env = os.environ.copy()
-        current_device = _get_current_cuda_device()
-        if current_device is not None:
-            worker_env["CUDA_VISIBLE_DEVICES"] = current_device
-
-        # Launch persistent worker pool
-        workers = []
-        for _ in range(max_workers):
-            p = subprocess.Popen(
-                [sys.executable, "-m", "quack._compile_worker"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL if not verbose else None,
-                env=worker_env,
-            )
-            ready = _recv(p.stdout)
-            if ready != "READY":
-                p.kill()
-                continue
-            workers.append(p)
-
-        if not workers:
-            return
-
-        # Round-robin dispatch configs to workers
-        pending = [0] * len(workers)
-        for i, config in enumerate(configs):
-            w = workers[i % len(workers)]
-            _send(
-                w.stdin,
-                {
-                    "fn_module": fn_module,
-                    "fn_qualname": fn_qualname,
-                    "tensor_meta": tensor_meta,
-                    "kwargs": kwargs,
-                    "config_kwargs": config.all_kwargs(),
-                },
-            )
-            pending[i % len(workers)] += 1
-
-        # Collect all results
-        for wi, w in enumerate(workers):
-            for _ in range(pending[wi]):
-                _recv(w.stdout)
-
-        # Shutdown workers (close stdin → worker exits)
-        for w in workers:
-            w.stdin.close()
-            w.wait()
-
-        if verbose:
-            print(f"Pre-compilation done in {time.time() - t0:.1f}s")
-
     def _bench(self, *args, config, **meta):
         verbose = os.environ.get(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
         if verbose:
@@ -306,6 +186,45 @@ class Autotuner:
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
+        # Default path: L2-cold CUDA-graph round-robin bench. ``__call__``
+        # sets ``self._l2_cold_arg_sets`` / ``self._l2_cold_kwarg_sets`` to
+        # pre-cloned (args, kwargs) sets once per shape (reused across all
+        # configs). Round-robin over fresh sets keeps the kernel measured
+        # under the cache-cold conditions that match production access
+        # patterns, so the autotuner picks configs that win at the same
+        # workload the user actually runs.
+        l2_cold_arg_sets = getattr(self, "_l2_cold_arg_sets", None)
+        l2_cold_kwarg_sets = getattr(self, "_l2_cold_kwarg_sets", None)
+        has_hooks = self.pre_hook is not None or self.post_hook is not None
+        use_l2_cold = (
+            self._do_bench is None
+            and l2_cold_arg_sets is not None
+            and l2_cold_kwarg_sets is not None
+            and not has_hooks
+        )
+
+        if use_l2_cold:
+            try:
+                return _bench_cuda_graph_l2_rotate(
+                    self.fn,
+                    l2_cold_arg_sets,
+                    l2_cold_kwarg_sets,
+                    extra_kwargs=config.all_kwargs(),
+                    quantiles=(0.5, 0.2, 0.8),
+                )
+            except (RuntimeError, MemoryError) as e:
+                # Narrow catch: only swallow GPU-side failures (smem
+                # overflow, kernel launch errors, OOM). Programming errors
+                # (TypeError, AssertionError, ValueError from conflict check
+                # above) propagate so the user sees them.
+                if verbose:
+                    print(f"Autotuning failed with {type(e).__name__}: {e}")
+                return [float("inf"), float("inf"), float("inf")]
+
+        # Legacy path: triton.testing.do_bench or user-supplied do_bench.
+        # Used when (a) a custom do_bench was passed via the decorator's
+        # ``do_bench=`` arg, or (b) pre/post hooks are configured (the
+        # clone/restore inside hooks doesn't work under CUDA graph capture).
         def kernel_call():
             if self.pre_hook is not None:
                 self.pre_hook(full_nargs)
@@ -392,17 +311,118 @@ class Autotuner:
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
-                    self._precompile(*args, configs=pruned_configs, **kwargs)
-                    _gpu_warmup()
+                    # Compile/bench overlap via the async compile pool
+                    # (quack.cache.async_compile): the bench loop runs inside
+                    # pool_scope(). A config whose kernel isn't compiled yet
+                    # raises CompilePending from jit_cache (after shipping the
+                    # key to a CPU worker); the loop rotates it to the back
+                    # and benches whichever config is ready, retrying once its
+                    # .o lands. Discovery happens in-process with the real
+                    # tensors (no fake-tensor reconstruction), and the pool
+                    # workers replay the pickled _compile_* key directly --
+                    # which never launches, by construction.
+                    #
+                    # CompilePending can only fire OUTSIDE CUDA graph capture:
+                    # the L2-cold bench does priming launches before capture,
+                    # and the legacy do_bench path warms up first, so a cold
+                    # key raises at the first plain launch.
+                    from collections import deque
+
+                    from quack.cache.async_compile import (
+                        CompilePending,
+                        pool_scope,
+                        suppress_pool,
+                    )
+
                     bench_start = time.time()
-                    timings = {
-                        config: self._bench(*args, config=config, **kwargs)
-                        for config in pruned_configs
-                    }
+                    verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+                    has_hooks = self.pre_hook is not None or self.post_hook is not None
+                    timings = {}
+                    _MAX_ATTEMPTS = 20
+                    try:
+                        _gpu_warmup()
+                        # Pre-allocate cloned (args, kwargs) sets once per
+                        # shape; the same sets are reused across all configs
+                        # to avoid ~400x re-cloning. Skipped when hooks are
+                        # present or a custom do_bench was supplied (legacy
+                        # fallback in _bench).
+                        if self._do_bench is None and not has_hooks:
+                            try:
+                                n_buffers = _pick_l2_rotate_count(args, kwargs)
+                                arg_sets, kwarg_sets = _clone_l2_rotate_inputs(
+                                    args, kwargs, n_buffers
+                                )
+                                self._l2_cold_arg_sets = arg_sets
+                                self._l2_cold_kwarg_sets = kwarg_sets
+                            except (RuntimeError, MemoryError):
+                                # Cloning failed (likely OOM at extreme N);
+                                # legacy do_bench path will be used by _bench.
+                                self._l2_cold_arg_sets = None
+                                self._l2_cold_kwarg_sets = None
+                        else:
+                            self._l2_cold_arg_sets = None
+                            self._l2_cold_kwarg_sets = None
+
+                        with pool_scope() as pool:
+                            queue = deque(pruned_configs)
+                            awaiting = {}  # id(config) -> sha
+                            attempts = {}  # id(config) -> int
+                            deadline = {}  # id(config) -> wedge deadline
+                            spins = 0
+                            while queue:
+                                config = queue.popleft()
+                                sha = awaiting.get(id(config))
+                                wedged = sha is not None and time.monotonic() > deadline[id(config)]
+                                if sha is not None and not wedged:
+                                    state, _ = pool.poll(sha)
+                                    if state == "pending":
+                                        queue.append(config)
+                                        spins += 1
+                                        if spins >= len(queue):
+                                            time.sleep(0.05)
+                                            spins = 0
+                                        continue
+                                spins = 0
+                                n = attempts.get(id(config), 0) + 1
+                                attempts[id(config)] = n
+                                try:
+                                    if wedged or n > _MAX_ATTEMPTS:
+                                        # Wedged pool: compile in-process so
+                                        # the sweep always terminates.
+                                        with suppress_pool():
+                                            timings[config] = self._bench(
+                                                *args, config=config, **kwargs
+                                            )
+                                    else:
+                                        timings[config] = self._bench(
+                                            *args, config=config, **kwargs
+                                        )
+                                except CompilePending as e:
+                                    awaiting[id(config)] = e.sha
+                                    deadline.setdefault(
+                                        id(config),
+                                        time.monotonic() + _POOL_WEDGE_TIMEOUT_S,
+                                    )
+                                    queue.append(config)
+                    finally:
+                        # Free L2-cold sets before persisting the cache so the
+                        # user's subsequent .fn(...) call has full HBM.
+                        self._l2_cold_arg_sets = None
+                        self._l2_cold_kwarg_sets = None
                     bench_end = time.time()
-                    if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
+                    if verbose:
                         for config, time_ in timings.items():
                             print(f"[{config}] -> {time_[0]:.3f}ms")
+                    # Surface bench failures (configs returning inf timings)
+                    # so smem-overflow / launch errors aren't silently masked.
+                    n_failed = sum(1 for t in timings.values() if t[0] == float("inf"))
+                    if n_failed:
+                        print(
+                            f"quack autotune: {n_failed}/{len(timings)} configs "
+                            f"failed for {self.fn.__name__}{key}; "
+                            f"set {PACKAGE_NAME.upper()}_PRINT_AUTOTUNING=1 for details",
+                            file=sys.stderr,
+                        )
                     self.bench_time = bench_end - bench_start
                     self.cache[key] = builtins.min(timings, key=timings.get)
                     self.configs_timings = timings

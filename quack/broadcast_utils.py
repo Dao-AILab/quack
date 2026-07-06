@@ -5,18 +5,17 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
-from quack.layout_utils import make_acc_tensor_mn_view
+from quack import layout_utils
 
 
 @cute.jit
 def vec_op(tCrC: cute.Tensor, tCrVec: cute.Tensor, op: Callable, is_colvec: bool) -> None:
     if const_expr(tCrC.element_type != Float32):  # Convert to f32
-        tCrC_f32 = cute.make_rmem_tensor(tCrC.shape, Float32)
-        tCrC_f32.store(tCrC.load().to(Float32))
+        tCrC_f32 = tCrC.to(Float32)
     else:
         tCrC_f32 = tCrC
     # this happens to work for frgA layout too, not just acc layout
-    tCrC_f32_mn = make_acc_tensor_mn_view(tCrC_f32)
+    tCrC_f32_mn = layout_utils.reshape_acc_to_mn(tCrC_f32)
     if const_expr(is_colvec):
         assert cute.size(tCrC_f32_mn, mode=[0]) == cute.size(tCrVec)
         for r in cutlass.range(cute.size(tCrC_f32_mn, mode=[0]), unroll_full=True):

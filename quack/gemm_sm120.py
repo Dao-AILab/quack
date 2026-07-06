@@ -17,6 +17,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Int32, Boolean, const_expr
+from cutlass.utils import SmemPartition
 
 from quack.varlen_utils import VarlenManager
 from quack.pipeline import make_pipeline_state
@@ -176,11 +177,8 @@ class GemmSm120(GemmSm90):
         epi_c_smem_layout: cute.ComposedLayout,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
-        trace_ptr: Optional[cutlass.Int64] = None,
     ):
-        from quack.trace import TraceContext
-
-        tctx = TraceContext.create(trace_ptr)
+        from cutlass.cute.experimental import iket
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -204,24 +202,24 @@ class GemmSm120(GemmSm90):
         ab_pipeline = self.make_ab_pipeline(
             tiled_mma=tiled_mma,
             cluster_layout_vmnk=cute.make_layout((1, *cluster_layout_mnk.shape)),
-            ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
         )
         epi_pipeline = None
         has_epi_load = const_expr(self.epi_c_stage > 0)
         if const_expr(has_epi_load):
-            epi_pipeline = self.make_epi_pipeline(
-                epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
-                tx_count=self.epi_load_bytes_per_stage,
-            )
+            epi_pipeline = self.make_epi_pipeline(tx_count=self.epi_load_bytes_per_stage)
         sched_pipeline = None
         sched_data = None
         if const_expr(self.is_persistent):
-            sched_pipeline = self.make_sched_pipeline(
-                cluster_layout_mnk,
-                sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
-                varlen_k=varlen_k,
+            sched_pipeline = self.make_sched_pipeline(cluster_layout_mnk, varlen_k=varlen_k)
+            # Keep scheduler scratch out of SharedStorage. A small buffer before
+            # the 1024-byte aligned epilogue tensors can add a 1 KiB pad; CLC
+            # responses also use i128 copies, so this stays 16-byte aligned.
+            sched_data = smem.allocate_tensor(
+                Int32,
+                cute.make_layout((4, self.sched_stage)),
+                byte_alignment=16,
+                partition=SmemPartition.RESERVED,
             )
-            sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
 
         # Cluster sync
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
@@ -260,17 +258,18 @@ class GemmSm120(GemmSm90):
                 warp_idx >= self.ab_load_warp_id
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
             ):
-                # Get mcast mask
-                cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                block_in_cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
-                a_mcast_mask = cute.make_layout_image_mask(
-                    cluster_layout_mnk, block_in_cluster_coord_mnk, mode=1
-                )
-                b_mcast_mask = cute.make_layout_image_mask(
-                    cluster_layout_mnk, block_in_cluster_coord_mnk, mode=0
-                )
-                a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
-                b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
+                # block_copy's lowering wants the coordinate held fixed by the
+                # multicast mask: A is same-M across N peers, while B is
+                # same-N across M peers. Degenerate cluster dimensions are
+                # left for the compiler lowering to simplify.
+                a_tma_multicast = {
+                    "cluster_shape": self.cluster_shape_mnk[:2],
+                    "multicast_dim": "M",
+                }
+                b_tma_multicast = {
+                    "cluster_shape": self.cluster_shape_mnk[:2],
+                    "multicast_dim": "N",
+                }
 
                 # Persistent tile scheduling loop
                 is_scheduler_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
@@ -282,7 +281,7 @@ class GemmSm120(GemmSm90):
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
                 while work_tile.is_valid_tile:
-                    tctx.b("tma_load")
+                    iket.range_push("tma_load")
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
                     # Local_tile partition global tensors
@@ -296,15 +295,11 @@ class GemmSm120(GemmSm90):
                             (tile_coord_mnkl[0], None),
                         )
                         #  TMA load A partition_S/D
-                        copy_A, _, _ = copy_utils.tma_get_copy_fn(
+                        copy_A = copy_utils.tma_get_block_copy_fn(
                             tma_atom_a,
-                            cta_coord=block_in_cluster_coord_mnk[1],
-                            cta_layout=cute.make_layout(
-                                cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
-                            ),
                             src_tensor=gA_mk,
                             dst_tensor=sA,
-                            mcast_mask=a_mcast_mask,
+                            tma_multicast=a_tma_multicast,
                         )
                     else:
                         copy_A, prefetch_A = self._make_gather_A_copy(
@@ -317,15 +312,11 @@ class GemmSm120(GemmSm90):
                         (tile_coord_mnkl[1], None),
                     )
                     # TMA load B partition_S/D
-                    copy_B, _, _ = copy_utils.tma_get_copy_fn(
+                    copy_B = copy_utils.tma_get_block_copy_fn(
                         tma_atom_b,
-                        cta_coord=block_in_cluster_coord_mnk[0],
-                        cta_layout=cute.make_layout(
-                            cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
-                        ),
                         src_tensor=gB_nk,
                         dst_tensor=sB,
-                        mcast_mask=b_mcast_mask,
+                        tma_multicast=b_tma_multicast,
                     )
                     len_k = varlen_manager.len_k(batch_idx)
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
@@ -343,7 +334,7 @@ class GemmSm120(GemmSm90):
                             k_tile_cnt,
                             varlen_m=varlen_m,
                         )
-                    tctx.e("tma_load")
+                    iket.range_pop()
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
@@ -436,7 +427,7 @@ class GemmSm120(GemmSm90):
                 acc.fill(0.0)
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
-                tctx.b("mma")
+                iket.range_push("mma")
                 ab_read_state = self.mma(
                     ab_pipeline,
                     ab_read_state,
@@ -453,14 +444,14 @@ class GemmSm120(GemmSm90):
                 if const_expr(self.pingpong):
                     # Cue for next WG's MMA to start
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
-                tctx.e("mma")
+                iket.range_pop()
 
                 # ============================================================
                 # EPILOGUE — reuse SM90's epilogue flow
                 # ============================================================
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
-                tctx.b("epilogue")
+                iket.range_push("epilogue")
 
                 copy_D = None
                 if const_expr(has_D):
@@ -543,7 +534,7 @@ class GemmSm120(GemmSm90):
                     if is_tma_warp:
                         epi_store_pipeline.producer_tail()
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
-                tctx.e("epilogue")
+                iket.range_pop()
 
                 if const_expr(not self.pingpong):
                     tile_scheduler.advance_to_next_work()
@@ -571,8 +562,6 @@ class GemmSm120(GemmSm90):
             if const_expr(not self.pingpong):
                 if is_tma_warp:
                     epi_store_pipeline.producer_tail()
-
-        tctx.flush()
 
     @cute.jit
     def mma(
