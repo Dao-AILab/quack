@@ -232,11 +232,49 @@ def to_nvfp4(x: torch.Tensor, block_size: int = 16, per_tensor_scale=None):
     return data_lp, block_scale_fp8, returned_pts
 
 
+def to_mx_2d(data_hp: torch.Tensor, block_rows: int = 128, block_cols: int = 128):
+    """MXFP8-e4m3 quantization with 2D (block_rows × block_cols) FLOOR scaling.
+
+    Each (block_rows, block_cols) tile shares one E8M0 scale.
+
+    Args:
+        data_hp: (N, K) bf16 or fp32, contiguous. N % block_rows == 0, K % block_cols == 0.
+    Returns:
+        qdata: (N, K) float8_e4m3fn
+        scale: (N // block_rows, K // block_cols) float32
+    """
+    assert data_hp.dtype in (torch.bfloat16, torch.float32)
+    assert data_hp.ndim == 2, "to_mx_2d requires a 2D (N, K) input"
+    N, K = data_hp.shape
+    assert N % block_rows == 0 and K % block_cols == 0
+    assert data_hp.is_contiguous()
+
+    # Reshape to (N//block_rows, block_rows, K//block_cols, block_cols) and
+    # reduce max over the two inner (tile) dims.
+    blocked = data_hp.float().reshape(N // block_rows, block_rows, K // block_cols, block_cols)
+    max_abs = torch.amax(torch.abs(blocked), dim=(1, 3), keepdim=True)  # (nr, 1, nk, 1)
+
+    scale_e8m0_biased = _compute_e8m0_scale_floor(max_abs, F8E4M3_MAX_POW2)  # (nr, 1, nk, 1)
+    scale_fp32 = (torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)).view(
+        torch.float32
+    )
+    scale_fp32 = torch.clamp(scale_fp32, min=F32_MIN_NORMAL)
+
+    data_lp = blocked / scale_fp32
+    if not torch.compiler.is_compiling():
+        data_lp = torch.clamp(data_lp, min=-F8E4M3_MAX, max=F8E4M3_MAX)
+
+    qdata = data_lp.to(torch.float8_e4m3fn).reshape(N, K)
+    scale = scale_fp32.squeeze(1).squeeze(-1)  # (nr, nk)
+    return qdata, scale
+
+
 # ---------------------------------------------------------------------------
 # torch.compile-wrapped fast paths. Generates fused Triton quant kernels via
 # Inductor. dynamic=True avoids recompilation on shape changes.
 # ---------------------------------------------------------------------------
 to_mx_compiled = torch.compile(to_mx, dynamic=True)
+to_mx_2d_compiled = torch.compile(to_mx_2d, dynamic=True)
 to_mxfp4_compiled = torch.compile(to_mxfp4, dynamic=True)
 to_nvfp4_compiled = torch.compile(to_nvfp4, dynamic=True)
 

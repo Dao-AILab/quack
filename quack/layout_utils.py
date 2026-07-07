@@ -31,6 +31,41 @@ def concat_to_interleave(a: cute.Tensor, dim: int) -> cute.Tensor:
     return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
 
 
+def permute_gated_sm90_postact_n(a: cute.Tensor, dim: int) -> cute.Tensor:
+    """Undo the SM90 N-split gated postact 4-column chunk permutation."""
+    mode_shape = a.shape[dim]
+    mode_stride = a.stride[dim]
+    if isinstance(mode_shape, tuple):
+        base_shape = mode_shape[0]
+        base_stride = mode_stride[0]
+        tail_shape = mode_shape[1:]
+        tail_stride = mode_stride[1:]
+        new_mode_shape = ((4, 2, 2, base_shape // 16), *tail_shape)
+        new_mode_stride = (
+            (base_stride, 8 * base_stride, 4 * base_stride, 16 * base_stride),
+            *tail_stride,
+        )
+    else:
+        new_mode_shape = (4, 2, 2, cute.size(a, mode=[dim]) // 16)
+        new_mode_stride = (
+            a.stride[dim],
+            8 * a.stride[dim],
+            4 * a.stride[dim],
+            16 * a.stride[dim],
+        )
+    shape = (
+        *a.shape[:dim],
+        new_mode_shape,
+        *a.shape[dim + 1 :],
+    )
+    stride = (
+        *a.stride[:dim],
+        new_mode_stride,
+        *a.stride[dim + 1 :],
+    )
+    return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
+
+
 def expand(a: cute.Tensor, dim: int, size: Int32 | int) -> cute.Tensor:
     shape = (*a.shape[:dim], size, *a.shape[dim:])
     stride = (*a.layout.stride[:dim], 0, *a.layout.stride[dim:])
