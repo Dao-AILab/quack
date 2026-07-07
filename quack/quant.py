@@ -156,22 +156,17 @@ class BlockwiseQuant(ReductionBase):
         scale_bits = scale_bits & 0xFF800000
         quant_scale = arith.bitcast(T.f32(), scale_bits)
         dequant_scale = 1.0 / quant_scale
+        y = x * quant_scale
+        tXrO.store(y.to(tXrO.element_type))
+        # Quantize and store FP8 output
+        if row < shape[0]:
+            copy(tXrO, tXgO)
 
-        # Store dequant scale (one per block, column-0 thread only). Map the flat
-        # block row `row` to (m, bj) and write mScale[dst, bj]. The scale tensor's own
-        # strides select row-major vs col-major (transposed). When mScaleRowIdx is given,
-        # dst = mScaleRowIdx[m] scatters this row to its (e.g. dQaccum-padded) destination.
         if tXcX[0][1] == 0 and row < shape[0]:
             m, bj = divmod(row, bn_divmod)
             if const_expr(mScaleRowIdx is not None):
                 m = mScaleRowIdx[m]
             mScale[m, bj] = dequant_scale
-
-        # Quantize and store FP8 output
-        y = x * quant_scale
-        tXrO.store(y.to(tXrO.element_type))
-        if row < shape[0]:
-            copy(tXrO, tXgO)
 
 
 @jit_cache

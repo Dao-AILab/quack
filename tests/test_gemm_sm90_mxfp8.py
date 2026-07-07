@@ -11,7 +11,6 @@ from quack.gemm_blockscaled_sm90 import (
     quantize_weight_sm90,
 )
 from quack.gemm_interface import gemm_act
-from quack.gemm_interface import gemm_gated_ref
 
 
 def _skip_if_not_sm90():
@@ -42,7 +41,7 @@ def _assert_cos_close(kernel_out, ref, tag, tol=0.001):
     assert cos < tol, f"{tag}: cosine_diff={cos:.6f} >= {tol}"
 
 
-def _make_varied_scale_inputs(M, K, N, *, dtype=torch.bfloat16, device="cuda"):
+def _make_varied_scale_inputs(M, K, N, *, num_experts=1, dtype=torch.bfloat16, device="cuda"):
     """Build (A, W) bf16 tensors whose MXFP8 scales differ across every relevant
     indexing axis. Plain randn quantizes to nearly-uniform power-of-2 scales, masking
     indexing bugs (wrong-row / wrong-K-block / wrong-m_block reads still produce
@@ -62,7 +61,7 @@ def _make_varied_scale_inputs(M, K, N, *, dtype=torch.bfloat16, device="cuda"):
     """
     sf_k = K // SF
     base_a = torch.randn(M, K, device=device, dtype=dtype) / math.sqrt(K)
-    base_w = torch.randn(2 * N, K, device=device, dtype=dtype) / math.sqrt(K)
+    base_w = torch.randn(2 * N * num_experts, K, device=device, dtype=dtype) / math.sqrt(K)
 
     rows = torch.arange(M, device=device)
     # Combined exponent = (row % 4) + (row // 64) % 4: 4*4 = 16 combinations,
@@ -83,65 +82,13 @@ def _make_varied_scale_inputs(M, K, N, *, dtype=torch.bfloat16, device="cuda"):
 
     w = base_w.view(n_blk, BN, sf_k, SF) * w_kb.view(1, 1, sf_k, 1)
     w = w * w_nb.view(n_blk, 1, 1, 1)
-    w = w.reshape(2 * N, K)
+    if num_experts > 1:
+        w = w.reshape(num_experts, 2 * N, K)
+    else:
+        w = w.reshape(2 * N, K)
     return a, w
 
 
-# ---------------------------------------------------------------------------
-# Batched (no varlen)
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("store_preact", [True, False])
-@pytest.mark.parametrize("activation", ["swiglu", "geglu"])
-@pytest.mark.parametrize(
-    "M, K, N",
-    [
-        (512, 2048, 1024),
-        # TODO: M=1 fails with varied scales (cosine_diff ~0.87). Real kernel bug
-        # at M<BLOCK_M=64 that uniform-scale randn was diluting. Suspect: TMA SFA
-        # descriptor / row-scale load when M<BLOCK_M. Re-enable once fixed.
-        # (1,    2048, 1024),   # M=1 edge
-        (512, 768, 2048),
-        (256, 1024, 512),
-        (1536, 4096, 2048),
-    ],
-)
-def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
-    _skip_if_not_sm90()
-    dtype = torch.bfloat16
-    torch.manual_seed(0)
-    device = "cuda"
-
-    A_bf16, W_bf16 = _make_varied_scale_inputs(M, K, N, dtype=dtype, device=device)
-
-    A_q, A_sc = quantize_act(A_bf16)
-    W_q, W_sc = quantize_weight_sm90(W_bf16)
-    B_q, B_sc = W_q.mT, W_sc.mT
-
-    preact, postact = mxfp8_gemm_act(
-        A_q,
-        B_q,
-        A_sc,
-        B_sc,
-        activation=activation,
-        out_dtype=dtype,
-        postact_dtype=dtype,
-        store_preact=store_preact,
-        tuned=False,
-    )
-
-    A_dq, B_dq = _fp8_dequant_ref(A_q, A_sc, W_q, W_sc)
-    pre_ref, post_ref = gemm_gated_ref(A_dq, B_dq, activation=activation, store_preact=store_preact)
-
-    assert postact.shape == (M, N)
-    _assert_cos_close(postact, post_ref, "postact")
-    if store_preact:
-        assert preact is not None and pre_ref is not None
-        assert preact.shape == (M, 2 * N)
-        _assert_cos_close(preact, pre_ref, "preact")
-    else:
-        assert preact is None
-
-
 @pytest.mark.parametrize("store_preact", [True, False])
 @pytest.mark.parametrize("activation", ["swiglu", "geglu"])
 @pytest.mark.parametrize(
@@ -153,7 +100,7 @@ def test_mxfp8_gemm_gated_sm90(M, K, N, activation, store_preact):
         (1536, 4096, 2048),
     ],
 )
-def test_mxfp8_gemm_sm90(M, K, N, activation, store_preact):
+def test_mxfp8_gemm_sm90_batched(M, K, N, activation, store_preact):
     _skip_if_not_sm90()
     dtype = torch.bfloat16
     torch.manual_seed(0)
