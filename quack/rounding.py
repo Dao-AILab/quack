@@ -11,7 +11,7 @@ from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Uint32
+from cutlass import Float32, Uint32, Uint64
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cutlass_dsl import dsl_user_op, Int32, T
@@ -123,8 +123,8 @@ def cvt_f32x2_bf16x2_rs(
 
 @dsl_user_op
 def philox(
-    counter: Uint32,
-    key: Uint32,
+    counter,
+    key,
     n_rounds: int = PHILOX_N_ROUNDS_DEFAULT,
     *,
     loc=None,
@@ -132,16 +132,31 @@ def philox(
 ) -> tuple:
     """Philox 4x32b counter-based random number generator.
 
-    Given a 32b counter and a 32b key, returns four pseudo-random uint32 words
-    produced by running n_rounds of the Philox 4x32 bijection. Each round
-    performs two wide 32x32->64 multiplies with the Philox constants.
+    ``counter`` and ``key`` each accept a 32b or 64b unsigned value: a 64b
+    counter fills both counter words (c0, c1) and a 64b key fills both key
+    words (k0, k1), widening the usable counter/key space to 2^64. A 32b
+    input zeroes the corresponding high word, which reproduces the original
+    32b-only behavior bit-exactly. The parameters are intentionally
+    unannotated so no width coercion happens ahead of the dispatch below.
+
+    Returns four pseudo-random uint32 words produced by running n_rounds of
+    the Philox 4x32 bijection. Each round performs two wide 32x32->64
+    multiplies with the Philox constants.
     """
-    c0 = Uint32(counter)
-    c1 = Uint32(0)
+    if cutlass.const_expr(isinstance(counter, Uint64)):
+        c0 = (counter & Uint64(0xFFFFFFFF)).to(Uint32)
+        c1 = (counter >> Uint64(32)).to(Uint32)
+    else:
+        c0 = Uint32(counter)
+        c1 = Uint32(0)
     c2 = Uint32(0)
     c3 = Uint32(0)
-    k0 = Uint32(key)
-    k1 = Uint32(0)
+    if cutlass.const_expr(isinstance(key, Uint64)):
+        k0 = (key & Uint64(0xFFFFFFFF)).to(Uint32)
+        k1 = (key >> Uint64(32)).to(Uint32)
+    else:
+        k0 = Uint32(key)
+        k1 = Uint32(0)
 
     round_a = Uint32(PHILOX_ROUND_A)
     round_b = Uint32(PHILOX_ROUND_B)
