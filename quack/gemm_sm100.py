@@ -360,7 +360,9 @@ class GemmSm100(GemmTmaBase):
                 f"(storage {self.a_dtype}), B={self.b_mma_dtype} (storage {self.b_dtype}), "
                 f"SF={self.sf_dtype}, sf_vec_size={self.sf_vec_size}, D={self.d_dtype}"
             )
-            self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            # quack's wrapper, not the DSL helper: both-fp4 pairs always run
+            # the single kind::mxf4nvf4 atom with the format's scale config.
+            self.tiled_mma = quack_sm100_utils.make_blockscaled_trivial_tiled_mma(
                 self.a_mma_dtype,
                 self.b_mma_dtype,
                 self.a_major_mode,

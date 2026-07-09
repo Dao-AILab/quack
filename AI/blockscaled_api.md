@@ -229,7 +229,12 @@ SM100 under tcgen05 `kind::mxf8f6f4` - including fp6 x fp4, where both operands
 unpack. Both-fp4 runs the single denser `kind::mxf4nvf4` atom, parameterized by the
 format's scale config (vec 32 e8m0 = mxfp4 - PTX spells that instantiation
 `kind::mxf4` - vec 16 = nvfp4, mirroring CUTLASS C++'s `SM100_MMA_MXF4_SS<..., VS>`);
-nvfp4 pairs only with itself (the scale config is instruction-wide).
+nvfp4 pairs only with itself (the scale config is instruction-wide). Concretely,
+quack subclasses the DSL's `MmaMXF4NVF4Op` to un-pin its hardcoded vec 16 and
+always constructs it for both-fp4 (`quack/sm100_utils.py:
+make_blockscaled_trivial_tiled_mma`) - safe because both DSL fp4 op classes build
+the identical MLIR atom type (no kind attribute; the backend derives the PTX
+spelling from the vec size).
 
 **The TMA-unpack recipe (mirrors CUTLASS C++ `SmemAllocType=uint8_t`):** per unpack
 operand - a packed sub-byte gmem operand in any pair other than both-packed-fp4:
