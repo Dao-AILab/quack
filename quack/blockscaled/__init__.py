@@ -14,7 +14,6 @@ rejected with a TypeError). Design doc: ``AI/blockscaled_api.md``.
 from quack.blockscaled.operand import (  # noqa: F401
     BLOCKSCALED_FORMAT_REGISTRY,
     MXFP4,
-    MXFP4_BYTE,
     MXFP6_E2M3,
     MXFP6_E3M2,
     MXFP8_E4M3,

@@ -191,6 +191,42 @@ def _pack_uint4(uint8_data: torch.Tensor) -> torch.Tensor:
     return (uint8_data[::2] | uint8_data[1::2] << 4).view(*shape[:-1], shape[-1] // 2)
 
 
+def pack_uint6(codes: torch.Tensor) -> torch.Tensor:
+    """Pack 6-bit codes (one per uint8, low 6 bits) into a little-endian bit
+    stream along the last dim: element i occupies bits [6*i, 6*i + 6) of its
+    row, so 4 codes pack into 3 bytes as
+
+        b0 = c0 | (c1 << 6);  b1 = (c1 >> 2) | (c2 << 4);  b2 = (c2 >> 4) | (c3 << 2)
+
+    (..., K) uint8 -> (..., 3*K//4) uint8. This is the CUTLASS SubbyteReference
+    bit order - the gmem layout the CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B unpack
+    tensormap consumes (verified bit-exact against the DSL's fp6 fill kernel).
+    """
+    assert codes.dtype == torch.uint8
+    k = codes.shape[-1]
+    assert k % 4 == 0, f"K ({k}) must be divisible by 4 to pack 6-bit codes"
+    c = codes.reshape(*codes.shape[:-1], k // 4, 4)
+    c0, c1, c2, c3 = c[..., 0], c[..., 1], c[..., 2], c[..., 3]
+    # uint8 shifts truncate mod 256, keeping exactly the in-byte bits.
+    packed = torch.stack([c0 | (c1 << 6), (c1 >> 2) | (c2 << 4), (c2 >> 4) | (c3 << 2)], dim=-1)
+    return packed.reshape(*codes.shape[:-1], 3 * (k // 4))
+
+
+def unpack_uint6(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`pack_uint6`: (..., 3*K//4) uint8 bit stream ->
+    (..., K) uint8 codes in the low 6 bits."""
+    assert packed.dtype == torch.uint8
+    kb = packed.shape[-1]
+    assert kb % 3 == 0, f"packed extent ({kb}) must be whole 3-byte groups"
+    b = packed.reshape(*packed.shape[:-1], kb // 3, 3)
+    b0, b1, b2 = b[..., 0], b[..., 1], b[..., 2]
+    codes = torch.stack(
+        [b0 & 0x3F, (b0 >> 6) | ((b1 & 0x0F) << 2), (b1 >> 4) | ((b2 & 0x03) << 4), b2 >> 2],
+        dim=-1,
+    )
+    return codes.reshape(*packed.shape[:-1], kb // 3 * 4)
+
+
 def _compute_e8m0_scale_floor(max_abs: torch.Tensor, target_max_pow2: int) -> torch.Tensor:
     """Return biased E8M0 scale (uint8) for FLOOR-mode MX quantization."""
     max_abs_int32 = max_abs.view(torch.int32)
@@ -263,8 +299,9 @@ F6_E3M2_MAX_POW2 = 4
 
 
 def _to_mx_floatx_unpacked(x: torch.Tensor, block_size: int, ebits: int, mbits: int, max_pow2: int):
-    """E8M0-scaled quantization to UNPACKED floatx codes (one code per uint8 -
-    the byte-container storage kind::mxf8f6f4 consumes), FLOOR scaling.
+    """E8M0-scaled quantization to UNPACKED floatx codes (one code per uint8,
+    in the low bits), FLOOR scaling. The code<->value logic is shared; storage
+    packing (e.g. :func:`pack_uint6` for fp6) is a separate step on top.
 
     Returns (codes uint8 (..., K), scale float8_e8m0fnu (..., K // block_size)).
     """
@@ -290,20 +327,22 @@ def _to_mx_floatx_unpacked(x: torch.Tensor, block_size: int, ebits: int, mbits: 
     return codes, scale
 
 
-def to_mxfp4_byte(x: torch.Tensor, block_size: int = 32):
-    """MXFP4 with byte-container storage (one E2M1 code per uint8): the form
-    kind::mxf8f6f4 consumes, enabling mixed fp4 x fp8/fp6 pairs."""
-    return _to_mx_floatx_unpacked(x, block_size, EBITS_F4_E2M1, MBITS_F4_E2M1, F4_E2M1_MAX_POW2)
-
-
 def to_mxfp6_e2m3(x: torch.Tensor, block_size: int = 32):
-    """MXFP6-E2M3 quantization (byte-container uint8 codes + E8M0 scales)."""
-    return _to_mx_floatx_unpacked(x, block_size, 2, 3, F6_E2M3_MAX_POW2)
+    """MXFP6-E2M3 quantization: packed 6-bit codes + E8M0 scales.
+
+    Returns (qdata_packed uint8 (..., 3*K//4) - see :func:`pack_uint6` for the
+    bit stream layout - and scale float8_e8m0fnu (..., K // block_size)).
+    Requires K % 4 == 0 (subsumed by K % block_size == 0 for block_size 32).
+    """
+    codes, scale = _to_mx_floatx_unpacked(x, block_size, 2, 3, F6_E2M3_MAX_POW2)
+    return pack_uint6(codes), scale
 
 
 def to_mxfp6_e3m2(x: torch.Tensor, block_size: int = 32):
-    """MXFP6-E3M2 quantization (byte-container uint8 codes + E8M0 scales)."""
-    return _to_mx_floatx_unpacked(x, block_size, 3, 2, F6_E3M2_MAX_POW2)
+    """MXFP6-E3M2 quantization: packed 6-bit codes + E8M0 scales (see
+    :func:`to_mxfp6_e2m3` for the layout)."""
+    codes, scale = _to_mx_floatx_unpacked(x, block_size, 3, 2, F6_E3M2_MAX_POW2)
+    return pack_uint6(codes), scale
 
 
 def nvfp4_per_tensor_scale(amax: torch.Tensor) -> torch.Tensor:
@@ -375,16 +414,14 @@ to_nvfp4_compiled = torch.compile(to_nvfp4, **_COMPILE_KW)
 
 # In-repo quantizers by canonical format name: (eager fn, torch.compile'd fn).
 # Membership is the single source of "which formats can be quantized in-repo";
-# formats without an entry (mxfp8_e5m2, fp6) are from_parts-only until an
-# encoder lands.
-to_mxfp4_byte_compiled = torch.compile(to_mxfp4_byte, dynamic=True)
+# formats without an entry (mxfp8_e5m2) are from_parts-only until an encoder
+# lands.
 to_mxfp6_e2m3_compiled = torch.compile(to_mxfp6_e2m3, dynamic=True)
 to_mxfp6_e3m2_compiled = torch.compile(to_mxfp6_e3m2, dynamic=True)
 
 QUANTIZERS = {
     "mxfp8_e4m3": (to_mx, to_mx_compiled),
     "mxfp4": (to_mxfp4, to_mxfp4_compiled),
-    "mxfp4_byte": (to_mxfp4_byte, to_mxfp4_byte_compiled),
     "mxfp6_e2m3": (to_mxfp6_e2m3, to_mxfp6_e2m3_compiled),
     "mxfp6_e3m2": (to_mxfp6_e3m2, to_mxfp6_e3m2_compiled),
     "nvfp4": (to_nvfp4, to_nvfp4_compiled),
@@ -467,8 +504,8 @@ def floatx_unpacked_to_value(codes: torch.Tensor, ebits: int, mbits: int) -> tor
     return sign * torch.where(exp > 0, normal, subnormal)
 
 
-# unpacked-code (ebits, mbits) per byte-container format name
-_FLOATX_CODE_BITS = {"mxfp4_byte": (2, 1), "mxfp6_e2m3": (2, 3), "mxfp6_e3m2": (3, 2)}
+# unpacked-code (ebits, mbits) per packed-fp6 format name
+_FP6_CODE_BITS = {"mxfp6_e2m3": (2, 3), "mxfp6_e3m2": (3, 2)}
 
 
 def dequant_operand(x: torch.Tensor, fmt=None) -> torch.Tensor:
@@ -476,8 +513,8 @@ def dequant_operand(x: torch.Tensor, fmt=None) -> torch.Tensor:
 
     fp8 tensors convert directly; ``float4_e2m1fn_x2`` tensors unpack two codes
     per byte (low nibble = even K, high nibble = odd K), doubling the last dim.
-    uint8 byte-container codes (fp6, byte-fp4) are ambiguous from the dtype
-    alone - pass the BlockScaledFormat.
+    uint8 packed-fp6 bit streams (3 bytes per 4 codes along the last dim) are
+    ambiguous from the dtype alone - pass the BlockScaledFormat.
     """
     if x.dtype == torch.float4_e2m1fn_x2:
         u8 = x.view(torch.uint8)
@@ -485,12 +522,12 @@ def dequant_operand(x: torch.Tensor, fmt=None) -> torch.Tensor:
         hi = _fp4_unpacked_to_value((u8 >> 4) & 0x0F)
         return torch.stack([lo, hi], dim=-1).reshape(*x.shape[:-1], x.shape[-1] * 2)
     if x.dtype == torch.uint8:
-        if fmt is None or fmt.name not in _FLOATX_CODE_BITS:
+        if fmt is None or fmt.name not in _FP6_CODE_BITS:
             raise ValueError(
-                "uint8 operand codes are ambiguous; pass the byte-container "
-                "BlockScaledFormat (mxfp4_byte / mxfp6_*)"
+                "uint8 operand bytes are ambiguous; pass the packed-fp6 "
+                "BlockScaledFormat (mxfp6_e2m3 / mxfp6_e3m2)"
             )
-        return floatx_unpacked_to_value(x, *_FLOATX_CODE_BITS[fmt.name])
+        return floatx_unpacked_to_value(unpack_uint6(x), *_FP6_CODE_BITS[fmt.name])
     return x.float()
 
 

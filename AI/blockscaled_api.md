@@ -30,18 +30,22 @@ constraints anchor the rationale where noted.
 | D1 | **The container is a non-differentiable plain object** - a frozen dataclass, not a `torch.Tensor` subclass, so it structurally cannot enter autograd. Training on quantized operands is out of scope by design: a forward-quantized operand is scaled along the wrong axis for both backward GEMMs (dgrad contracts N, wgrad contracts M; scales block along K), and the square-weight case (K==N) fails *silently*. Any training story is hp master weights + per-GEMM requantization, layered above this container. |
 | D2 | **`shape`/`dtype` report the logical hp view** (unpacked shape, `orig_dtype`, default bf16) as honest computed properties. Storage truth lives in `qdata`/`scale`. The container is unpacked at the top of each public entry point (where `_unpack_operand` sits); **nothing below that line ever sees it** - custom ops, autotuner, `jit_cache`, TVM-FFI all see flat plain tensors. |
 | D3 | **Transpose = qdata stride-swap view; scale untouched.** The blocked `(rm, rk, 32, 4, 4)` scale atom is not view-transposable; scale is defined as "always blocked along K in either orientation". Preserves the load-bearing `weight.T` / `qw.mT` idiom. qdata<->scale shape coupling is validated at gemm dispatch time (`validate_blockscaled_sf`), NOT at construction - varlen padded scale buffers must stay constructible. |
-| D4 | **Format = frozen dataclass descriptor** (`BlockScaledFormat`), not an enum: storage dtype, elem bits, elems-per-container, scale dtype, sf_vec_size, k-alignment are *data per format*. New formats are data, not code. Registry + singletons; legacy string names (`"mxfp8"`) coerce. |
+| D4 | **Format = frozen dataclass descriptor** (`BlockScaledFormat`), not an enum: storage dtype, elem bits, packing, scale dtype, sf_vec_size, k-alignment are *data per format*. New formats are data, not code. Registry + singletons; legacy string names (`"mxfp8"`) coerce. |
 | D5 | **Format crosses the custom-op boundary explicitly** as a scalar `bs_format: str` op-schema arg. Formats are never derived from tensor dtypes (no `SF_DTYPE_TO_VEC_SIZE` table, no fp4 `A.dtype` logical-K special case, no `gemm_blockscaled_ref` sf-vec ternary); `_sf_decode` is format-driven - this kills the "uint8 scale view decoded as e8m0 => NVFP4 silently runs as vec-32 MXFP8" trap. There is NO dtype->format inference site anywhere (the tuple path's `_legacy_format_from_dtypes`, the last one, was deleted with tuple support - D10). |
-| D6 | **MXFP6 qdata = byte-per-element `uint8`** (identity K shape map): matches the PTX `kind::mxf8f6f4` 8-bit SMEM container, CUDA `__nv_fp6_storage_t`, cuBLASLt `CUDA_R_6F_*`; torchao does the same. Documented consequence: byte-per-element MXFP6 has fp8's bandwidth - its value is accuracy headroom over MXFP4, not speed. A packed-6-bit gmem format (CUTLASS 16U6 TMA) would change only descriptor data. |
+| D6 | **MXFP6 qdata = packed 6-bit storage carried in `uint8` bytes**: a little-endian 6-bit stream, element i at bits [6i, 6i+6) - the CUTLASS SubbyteReference layout (`pack_uint6`/`unpack_uint6` in quantize.py). Packed gmem is what the TMA-unpack path consumes (section 6) and keeps fp6's bandwidth advantage over fp8. torch has no fp6 dtype, so the packed stream crosses the FFI boundary as raw `torch.uint8` of shape `(..., 3K/4)` - see section 5 and the boundary notes in section 6. |
 | D7 | **Loud failure, explicit surface.** No aten interception: torch ops reject the non-tensor container with a plain `TypeError`; the supported surface is the explicit methods (`mT`/`T`/`transpose` restricted to last-two-dims, `to(device)` - dtype conversion raises pointing at `dequantize()`, `clone`, `dequantize`). **No dequantize fallback** in a kernels library. Targeted `TypeError` guards at non-blockscaled entry points (`gemm_dact`, `gemm_symmetric`, `gemm_rms`, `gemm_norm_act`) for message quality. |
 | D8 | **`per_tensor_scale` is a field** (NVFP4 only). `gemm` folds `pts_A * pts_B` into alpha at the unwrap site via the existing *tensor-alpha* path (no `.item()` sync; nvfp4-with-pts compiles the tensor-alpha kernel variant). |
 | D9 | **torch.compile support via pytree registration** plus a normal inlineable construction helper for in-graph quantize. It must not use `allow_in_graph`: that makes Dynamo treat the helper as an opaque op, whose non-Tensor `BlockScaledOperand` return is illegal under `fullgraph=True`. `_sf_encode` (e8m0->uint8 view across the op boundary, an Inductor `decompose_auto_functionalized` workaround) sits at the unwrap site. |
 | D10 | **Containers are the only blockscaled operand form**: `(data, scale_factor)` tuples/lists are rejected at the unwrap site with a `TypeError` pointing at `BlockScaledOperand.from_parts`. Every blockscaled operand is therefore construction-validated before it reaches a GEMM. `blockscaled_quantize` / `blockscaled_quantize_dim0` keep their raw `(q, sf)` returns - they are quantizers, not operand constructors (changing the return silently corrupts `qa, sfa = ...` call sites); wrap via `from_parts`, or use `BlockScaledOperand.quantize` directly. The TVM-FFI direct path (`compile_blockscaled_gemm_tvm_ffi`) is plain-tensors-only forever. |
-| D11 | **A and B carry independent formats end-to-end** (`bs_format_a` / `bs_format_b` through every layer, including the op schemas). Pair *legality* is hardware fact, owned by `mma_kind_for_pair` in `operand.py` (PTX: `mxf4nvf4` and `mxf4` need matching element types; `mxf8f6f4` mixes fp8/fp6/fp4 freely but stores every element as an **8-bit container** - so packed-fp4x2 operands cannot join mixed pairs; the byte-container `mxfp4_byte` registry entry is what a mixed pair consumes). Pair *implementation* is enforced **per-architecture**: each `gemm_smXXX` kernel class owns the asserts for the (A, B, SF, D) dtype combinations it supports (`GemmSm100.is_valid_dtypes_and_scale_factor_vec_size`, asserted in its blockscaled setup path; different SM versions support different mx dtypes). SM100's matrix admits **mixed fp8 pairs (e4m3 x e5m2, both orders)**: the DSL's `MmaMXF8F6F4Op` takes independent a/b dtypes, and instruction-K is kind-derived (mxf4/mxf4nvf4 => 64 elements, mxf8f6f4 => 32), not element-width-derived. Pairs involving fp4/fp6 sit outside SM100's matrix; section 6 describes the registry and plumbing groundwork for them and the intended smem-expansion mechanism. `validate_blockscaled_sf` checks per-operand dtypes and cross-checks logical K (`A.shape[-1]*epc_a == B.shape[-1]*epc_b` - packings may differ). |
+| D11 | **A and B carry independent formats end-to-end** (`bs_format_a` / `bs_format_b` through every layer, including the op schemas). Pair *legality* is hardware fact, owned by `mma_kind_for_pair` in `operand.py`, which returns `"mxf8f6f4"` for every non-nvfp4, non-both-mxfp4 pair (PTX: `mxf4nvf4` and `mxf4` need matching element types; `mxf8f6f4` mixes fp8/fp6/fp4 freely, with sub-byte operands TMA-unpacked from packed gmem into 8-bit SMEM containers). Pair *implementation* is enforced **per-architecture**: each `gemm_smXXX` kernel class owns the asserts for the (A, B, SF, D) dtype combinations it supports (`GemmSm100.is_valid_dtypes_and_scale_factor_vec_size`, asserted in its blockscaled setup path; different SM versions support different mx dtypes). SM100's matrix admits **mixed fp8 pairs (e4m3 x e5m2, both orders)**: the DSL's `MmaMXF8F6F4Op` takes independent a/b dtypes, and instruction-K is kind-derived (mxf4/mxf4nvf4 => 64 elements, mxf8f6f4 => 32), not element-width-derived. **Mixed pairs involving fp4/fp6 run via the TMA-unpack path** (section 6): packed gmem + `internal_type=Uint8` + byte-domain SMEM; the `a/b_mma_dtype` split through both compile paths carries the packed-fp6 boundary dtype. `validate_blockscaled_sf` checks per-operand dtypes and cross-checks logical K via the formats' `logical_k` mapping - packings may differ. |
 | D12 | **Blockscaled output D is a first-class API**: `out_dtype: torch.dtype \| BlockScaledFormat \| str` on `gemm`/`gemm_add`/`gemm_act(+postact_dtype)`; the op-schema plumbing is `SFD` (mutated) + `bs_format_d`, completing the (a, b, d) format triple. See section 7. |
 
 ### Rejected alternatives
 
+- **Raw `(data, scale_factor)` tuple operands**: the original convention; kept
+  briefly behind a `DeprecationWarning`, then removed (D10). Ambiguous detection,
+  no fp6, silently dropped NVFP4 per-tensor scales, and required a dtype->format
+  inference site (section 1).
 - **torchao `MXTensor` dependency**: its 2-D lazily swizzled scales do not fit quack's
   permanently-blocked scale atom or varlen padded buffers.
 - **Enum-based format**: recreates the switch-on-format duplication one level up; the
@@ -53,6 +57,11 @@ constraints anchor the rationale where noted.
   frozen dataclass. The container's field set and constructors are exactly what a
   tensor-subclass wrapper would hold, so module citizenship can layer on top later
   without breaking this API.
+- **Byte-container gmem formats for sub-byte elements** (one uint8 byte per fp4/fp6
+  element): rejected because TMA unpack consumes packed gmem directly (section 6), so
+  byte containers would only double (fp4) or inflate by 4/3 (fp6) the gmem traffic
+  and duplicate registry entries; the packed formats serve homogeneous and mixed
+  pairs alike.
 
 ### Out of scope
 
@@ -75,11 +84,10 @@ constraints anchor the rationale where noted.
 ```python
 @dataclass(frozen=True)
 class BlockScaledFormat:
-    name: str                    # "mxfp8_e4m3" | "mxfp8_e5m2" | "mxfp4" | "mxfp4_byte" | "nvfp4" | "mxfp6_e2m3" | "mxfp6_e3m2"
-    qdata_dtype: torch.dtype     # e4m3 | e5m2 | float4_e2m1fn_x2 | uint8 (byte-container fp4/fp6)
-    elem_bits: int               # 8 | 4 | 6
-    elems_per_container: int     # 1 | 2 (fp4x2)
+    name: str                    # "mxfp8_e4m3" | "mxfp8_e5m2" | "mxfp4" | "nvfp4" | "mxfp6_e2m3" | "mxfp6_e3m2"
+    qdata_dtype: torch.dtype     # e4m3 | e5m2 | float4_e2m1fn_x2 | uint8 (packed fp6)
     cutlass_dtype_name: str      # CuTe-DSL MMA element type (may differ from storage: fp6)
+    elem_bits: int               # 8 | 4 | 6
     scale_dtype: torch.dtype     # float8_e8m0fnu | float8_e4m3fn
     sf_vec_size: int             # 32 | 16 (also the min logical-K divisibility)
     has_per_tensor_scale: bool   # nvfp4 only
@@ -87,14 +95,17 @@ class BlockScaledFormat:
 
 - Hashable/picklable -> usable as dynamo guard ctx and kernel-cache key material; only
   `name` crosses the op schema.
-- `logical_k(packed_k)` / `packed_k(logical_k)`; `to_cutlass_dtype()` (lazy cutlass
-  import: `Float8E4M3FN`, `Float8E5M2`, `Float4E2M1FN`, `Float6E2M3FN`, `Float6E3M2FN`);
-  `from_name`, `from_cutlass_dtypes`.
-- Kernel support is NOT a registry property: fp6 descriptors are registered and
-  constructible (checkpoints, round-trips), and whether a GEMM can execute a given
-  (A, B, D) dtype combination is asserted per-architecture inside the `gemm_smXXX`
-  classes (SM100's matrix admits fp8 pairs, including mixed e4m3 x e5m2, and
-  homogeneous fp4; fp6 and mixed sub-byte pairs sit outside it - see section 6).
+- `logical_k(storage_k)` / `storage_k(logical_k)` map between the logical element
+  extent and the storage extent, derived from `elem_bits` (fp4: 2 elements per byte,
+  fp6: 4 elements per 3 bytes - an integer elems-per-container field cannot express
+  that ratio); `is_packed` marks sub-byte packed storage. `to_cutlass_dtype()` (lazy
+  cutlass import: `Float8E4M3FN`, `Float8E5M2`, `Float4E2M1FN`, `Float6E2M3FN`,
+  `Float6E3M2FN`); `from_name`, `from_cutlass_dtypes`.
+- Kernel support is NOT a registry property: descriptors are registered and
+  constructible (checkpoints, round-trips) independently of any kernel, and whether a
+  GEMM can execute a given (A, B, D) dtype combination is asserted per-architecture
+  inside the `gemm_smXXX` classes (SM100 accepts any fp8/fp6/fp4 mix under
+  kind::mxf8f6f4 - see section 6).
 - E5M2: descriptor + `from_parts` work (the kernel admits e5m2); `quantize` raises
   because `to_mx` has no e5m2 encoder - `from_parts` is the e5m2 construction path.
 
@@ -110,14 +121,14 @@ class BlockScaledOperand:
 ```
 
 - **Logical metadata as computed properties**: `shape` (unpacked; packed dim = the
-  unit-stride dim of qdata - fp4 formats are K-major by kernel requirement, so
-  unit-stride == packed == K), `dtype = orig_dtype` (hp provenance; storage truth is
-  `qdata.dtype`), `device`, `ndim`.
+  unit-stride dim of qdata - packed sub-byte formats are K-major by kernel
+  requirement, so unit-stride == packed == K), `dtype = orig_dtype` (hp provenance;
+  storage truth is `qdata.dtype`), `device`, `ndim`.
 - **Quantized axis** `quant_dim in {-1, -2}`: which logical dim the scale vector runs
   along - the direct analogue of CUTLASS's `UMMA::Major` SF-atom parameter. Storage
   alone cannot express it - a square fp8 canonical operand and its `.mT` view are
-  byte-identical. fp4 packing pins it to the packed dim (conflicting requests raise);
-  byte formats default to -1 (quantize's convention); transpose views flip it;
+  byte-identical. Sub-byte packing pins it to the packed dim (conflicting requests
+  raise); byte formats default to -1 (quantize's convention); transpose views flip it;
   `quantize(dim=-2)` and `from_parts(quant_dim=-2)` build the other direction
   directly. Carried through pytree/pickle; used by `dequantize()`. **The interface
   enforces per operand slot that the quantized axis is the contraction axis** (A: -1,
@@ -139,8 +150,9 @@ class BlockScaledOperand:
   view (re-viewed to the format dtype - canonicalization); pts only when
   `fmt.has_per_tensor_scale`. **No qdata<->scale shape coupling** (varlen buffers).
 - Constructors: `from_parts(qdata, scale, format, *, per_tensor_scale=None,
-  orig_dtype=bf16)` and `quantize(x_hp, format, *, per_tensor_scale=None)`, both via an
-  ordinary helper that Dynamo inlines through under `torch.compile`.
+  orig_dtype=bf16, quant_dim=-1)` and `quantize(x_hp, format, *, dim=-1,
+  per_tensor_scale=None)`, both via an ordinary helper that Dynamo inlines through
+  under `torch.compile`.
   Explicit `dequantize()`; never implicit. It requires the canonical dense scale
   shape: padded varlen buffers need `cu_seqlens` offsets the container does not carry,
   so dequantization rejects them rather than silently applying padding as real scales.
@@ -186,81 +198,91 @@ element-class + recipe gates in `mma_kind_for_pair`) are already in place.
 - Rejection guards (`TypeError`) at `gemm_dact`, `gemm_symmetric`, `gemm_rms`,
   `gemm_norm_act`.
 
-## 5. Kernel-path plumbing (`gemm.py`, `gemm_act.py`, `gemm_tvm_ffi_utils.py`)
+## 5. Kernel-path plumbing (`gemm.py`, `gemm_epilogue.py`, `gemm_tvm_ffi_utils.py`)
 
 - `quack.gemm.gemm` and `quack.gemm_act.gemm_act` take `bs_format_a`/`bs_format_b`,
   **both required** when SFA is passed - the kernel-level API carries formats
   explicitly, same as the custom ops.
 - `validate_blockscaled_sf(A, B, SFA, SFB, ..., fmt_a=, fmt_b=)`: per-operand vec
-  size / scale dtype / qdata dtype from the descriptors; logical K =
-  `shape[-1] * elems_per_container` per operand with an A<->B cross-check (no fp4
-  dtype special case; fp6-correct by construction); validates layout and
-  consistency ONLY - dtype-combination support is enforced per-architecture by the
-  kernel classes. **`gemm_act.py` is a full second blockscaled dispatch path** (its
-  own `validate_blockscaled_sf` call and `_compile_gemm_act` cache keys) and gets
-  identical treatment.
-- `_compile_gemm` / `_compile_gemm_act` cache keys: `(sf_dtype, sf_vec_size,
+  size / scale dtype / qdata dtype from the descriptors; logical K via each format's
+  `logical_k(storage_k)` mapping with an A<->B cross-check (no fp4 dtype special
+  case; fp6-correct by construction); validates layout and consistency ONLY -
+  dtype-combination support is enforced per-architecture by the kernel classes.
+  Activation and gated GEMMs use the shared `EpiMod` path in `gemm_epilogue.py`,
+  which performs the same validation before building a plan through `gemm_host.py`.
+- `_compile_gemm` / `_compile_gemm_epi` cache keys: `(sf_dtype, sf_vec_size,
   a_mma_dtype, b_mma_dtype)`, all derived from `fmt` at the caller. Both compile
   paths are `@jit_cache`-keyed on their full argument tuples INCLUDING the MMA
-  dtypes, so same-storage formats that differ only in element type (fp6
-  e2m3/e3m2, byte-fp4 vs fp8) key distinctly - no collision when the per-arch
-  gate admits them. The AB cute dtype comes from `torch2cute_dtype_map[A.dtype]`
-  (correct for all admitted formats). For byte-container sub-byte operands,
-  `GemmSm100` separates the MMA dtype from the copy dtype: `a/b_mma_dtype`
-  (threaded through both compile paths) drives the MMA builder and dtype-validity
-  checks, while SMEM layouts/TMA/sizes run on the storage (container) types. Note
-  that `div_for_dtype` with width 6 is non-integral, so a width-6 storage format
-  needs byte-extent handling at the `_compile_gemm`/fake-tensor level.
+  dtypes, so the two packed-fp6 encodings key distinctly despite sharing uint8
+  storage. The AB cute boundary dtype comes from
+  `torch2cute_dtype_map[A.dtype]`; for packed fp6 that is `Uint8`, while
+  `a/b_mma_dtype` drives the MMA builder and dtype-validity checks. The fake-tensor
+  spec uses a byte-extent K symbol for fp6 because `div_for_dtype` with width 6 is
+  non-integral (96 bytes = 128 logical elements).
 - `_blockscaled_format_of` is a shim over `BlockScaledFormat.from_cutlass_dtypes`.
 - `compile_blockscaled_gemm_tvm_ffi`: asserts plain tensors; docstring states the policy.
 
 ## 6. Sub-byte operands: mixed fp4/fp6/fp8
 
-SM100's tcgen05 `kind::mxf8f6f4` stores every operand element in an 8-bit SMEM
-container regardless of gmem width, and its instruction-K is kind-derived
-(mxf4/mxf4nvf4 => 64 elements, mxf8f6f4 => 32). Two design pieces support sub-byte
-elements under this kind:
+Any A/B pair of {mxfp8_e4m3, mxfp8_e5m2, mxfp4, mxfp6_e2m3, mxfp6_e3m2} runs on
+SM100 under tcgen05 `kind::mxf8f6f4` - including fp6 x fp4, where both operands
+unpack. Both-fp4 runs the single denser `kind::mxf4nvf4` atom, parameterized by the
+format's scale config (vec 32 e8m0 = mxfp4 - PTX spells that instantiation
+`kind::mxf4` - vec 16 = nvfp4, mirroring CUTLASS C++'s `SM100_MMA_MXF4_SS<..., VS>`);
+nvfp4 pairs only with itself (the scale config is instruction-wide).
 
-- **Registry**: byte-container formats `mxfp4_byte` / `mxfp6_e2m3` / `mxfp6_e3m2`
-  (uint8 storage per D6) with quantizers (the `_to_mx_floatx_unpacked` family) and
-  format-keyed dequantization.
-- **Kernel plumbing**: the mma-dtype/copy-dtype split - `a/b_mma_dtype` threaded
-  through `_compile_gemm`/`_compile_gemm_act` into `GemmSm100` (MMA builder +
-  validity on MMA types; SMEM layouts/TMA/sizes on storage types).
+**The TMA-unpack recipe (mirrors CUTLASS C++ `SmemAllocType=uint8_t`):** per unpack
+operand - a packed sub-byte gmem operand in any pair other than both-packed-fp4:
 
-Which pairs execute is each architecture's dtype matrix (D11); fp6 and fp4/fp6-mixed
-pairs sit outside SM100's matrix.
+- **gmem keeps the true sub-byte element type** (`Float4E2M1FN` / `Float6E*FN`,
+  packed). Passing `internal_type=cutlass.Uint8` to `make_tiled_tma_atom_A/B`
+  sets `use_unpack` (`cute/nvgpu/helpers.py:153-175`) and selects the
+  `TmaDataFormat.U4_UNPACK_U8` / `U6_UNPACK_U8` tensormap
+  (= `CU_TENSOR_MAP_DATA_TYPE_16U4/16U6_ALIGN16B`). Recasting gmem to Uint8
+  kills `use_unpack` (that is the sm103 example's *packed*-smem mxf4 path, a
+  different convention).
+- **Everything SMEM-side is byte-domain (Uint8)**: `make_smem_layout_a/b`
+  dtype, `MemRange` storage, stage budgeting. TMA expands each 16 packed
+  elements into a 16-byte smem footprint (8B fp4 / 12B fp6 packed chunk + gap),
+  i.e. one byte of footprint per element; no software indexes below 16B.
+- **The Uint8-typed smem tensor feeds `make_fragment_A/B` directly.** The DSL
+  never checks the fragment dtype against the MMA dtype and builds the smem
+  descriptor from width x stride products, so the byte layout yields the correct
+  LBO/SBO (16-byte units). An f4-typed `make_smem_layout_a(..., Float4E2M1FN)`
+  layout is WRONG here - that is the SW64 packed-mxf4 convention with a halved K
+  stride. The sub-byte identity reaches the instruction only via the tiled_mma's
+  `a/b_mma_dtype` (instruction-descriptor format bits).
+- **mbarrier tx counts packed bytes** (elements x 4 or 6 bits - the gaps are
+  not written), matching CUTLASS `sizeof_bits<ElementA> x cosize(SmemLayoutA)`.
+  quack's existing `size_in_bytes(a_dtype, a_smem_layout)` line does this
+  automatically once the layout is byte-domain and `a_dtype` stays sub-byte.
+- **Constraints** (CUDA driver, cuTensorMapEncodeTiled): unpack operands are
+  K-major with logical K % 128 (globalDim[0] rule; also = the 96B fp6 / 64B fp4
+  inner-extent rules), base address 32B-aligned, byte strides % 32, boxDim[0]
+  exactly 128 elements (satisfied by the SW128 byte-domain atom). Enforced:
+  arg-spec k divisibility 128 (fp4-mixed), fp6 K%128 assert in
+  `validate_blockscaled_sf`, `GemmSm100.can_implement` K%128 + per-operand
+  K-major.
 
-**TMA unpack is the intended mechanism for sub-byte SMEM expansion**, so gmem can
-stay packed:
+**Kernel structure (`gemm_sm100.py`):** per-operand `a/b_unpack` flags +
+`a/b_smem_dtype` (Uint8 when unpack) derived next to the dtype resolution;
+byte-domain smem layouts/storage/stage-budget; `internal_type=Uint8` on the A/B
+TMA atoms; the dtype gate accepts fp8/fp4/fp6 MMA dtypes in any mix (fp6 copy dtype
+may be Uint8 - see the FFI boundary below); the 16B-alignment helper uses a
+128-element granule for width 6 (16*8//6 is fractional).
 
-- `TmaDataFormat` IntEnum in the `cute_nvgpu` dialect has `U4_UNPACK_U8 = 12` and
-  `U6_UNPACK_U8 = 13`; the TMA atom op (`cute_nvgpu.atom.make_non_exec_tiled_tma_load`)
-  takes an optional `tma_format` attribute.
-- The sanctioned Python hook is `internal_type=cutlass.Uint8` on
-  `make_tiled_tma_atom_A/B` (`cute/nvgpu/helpers.py:153-175`): with a gmem tensor
-  typed sub-byte (packed fp4/fp6) and an 8-bit internal type, `use_unpack=True`
-  selects the expanding tensormap - packed gmem, byte containers in SMEM.
-- Precedent: `examples/python/CuTeDSL/blackwell/mixed_input_gemm/*` feeds packed
-  narrow operands exactly this way (then upconverts via `nvgpu.cvt_fpext`, whose
-  docstring confirms the DSL's f6 register convention is i8 with 2-bit MSB padding);
-  `sm103_dense_blockscaled_gemm_persistent.py` shows the byte-domain SMEM layout
-  pattern (`make_smem_layout_atom(K_SW128, Uint8)`, `MemRange[Uint8]`,
-  `adapt_layout_for_tma_*`).
-
-Sketch, per unpack operand (a sub-byte MMA dtype under kind mxf8f6f4): (1) packed
-gmem (the existing `mxfp4` storage; packed-6-bit gmem for fp6, 16 codes / 12 B,
-16 B-aligned rows); (2) a TMA atom with `internal_type=Uint8`; (3) SMEM
-layout/storage/load-byte counts in the byte domain (Uint8); (4) an MMA fragment over
-a hand-built layout in the MMA element's addressing domain - for fp4: outer strides
-x2 with the swizzle base shifted one bit (`cute.recast_layout` at
-`cute/core.py:4229` is the related helper; the shape must stay at logical element
-count, so hand-scale rather than recast); for fp6 (6-bit units cannot express byte
-spacing) the byte-domain layout with an f6-typed pointer - the i8-padding register
-convention suggests the MLIR addresses f6 SMEM by bytes. Plain byte storage without
-the hand-built layout leaves the fragment/descriptor width math inconsistent, and a
-naive recast keeps unscaled layouts. With TMA unpack carrying the GEMM path, the
-byte-container gmem formats serve checkpoints/interop only (quantizers stay).
+**fp6 FFI boundary:** torch has no fp6 dtype (and no `float6_x4`-style packed
+dtype to ride the way fp4 rides `float4_e2m1fn_x2`), so packed-fp6 qdata crosses
+tvm-ffi as raw `torch.uint8` of shape `(..., 3K/4)` - a little-endian 6-bit
+stream, element i at bits [6i, 6i+6), the CUTLASS SubbyteReference layout
+(bit-identical to the DSL's own fp6 fill kernel). The arg spec gives the byte
+extent an independent sym (divisibility 96 = 128 elements; the 4/3 relation
+between shared syms is not expressible - logical-K consistency is checked
+host-side), and `GemmSm100.__call__` reinterprets it via `_reinterpret_packed_fp6`
+(recast_ptr to `Float6E*FN` + logical layout: K extent x4/3, K stride stays 1,
+outer byte strides x4/3 - exact since rows are whole 96-byte groups).
+`a/b_mma_dtype` (threaded through both compile paths) is what marks the operand as
+packed fp6 at the boundary.
 
 ## 7. Blockscaled outputs: SF-generation epilogue
 
@@ -315,6 +337,10 @@ shape or smoke checks alone.
 - Compile: container as fullgraph input (attribute reads + the e8m0/Inductor
   regression); in-graph `quantize` + gemm fullgraph; an in-graph `from_parts`
   compile test with raw (q, sf) graph inputs.
+- Mixed pairs: representative fp8/fp6/fp4 A/B combinations are validated against
+  the dequantized-operand reference at the same tolerance as the fp8-pair baseline,
+  including fp6 x fp4 where both operands unpack; the packed 6-bit stream is checked
+  bit-exact against the DSL's fp6 fill kernel.
 - Numerics references: `gemm_blockscaled_ref` dequant-matmul, plus bit-exact
   `torch._scaled_mm` comparison via `scale_blocked_for_cublas`.
 

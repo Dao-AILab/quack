@@ -20,10 +20,10 @@ Design doc: AI/blockscaled_api.md. In short:
 - ``quant_dim`` records which logical dim the scale vector runs along (-1 or
   -2) - the analogue of CUTLASS's ``UMMA::Major`` on its SF atoms. Storage alone
   cannot express it: a square fp8 canonical operand and its ``.mT`` view are
-  byte-identical. fp4 packing pins it to the packed (unit-stride) dim; byte
-  formats default to the last dim (quantize's convention); transpose flips it.
-  Consumed as a GEMM operand, the quantized axis must be the contraction axis
-  (the interface enforces this per operand slot).
+  byte-identical. Packed formats (fp4, fp6) pin it to the packed (unit-stride)
+  dim; 8-bit formats default to the last dim (quantize's convention); transpose
+  flips it. Consumed as a GEMM operand, the quantized axis must be the
+  contraction axis (the interface enforces this per operand slot).
 
 This module must stay import-light (torch only at module level): it is imported
 by ``quack.gemm_interface`` at module level and by the kernel-layer modules
@@ -51,7 +51,6 @@ __all__ = [
     "MXFP8_E4M3",
     "MXFP8_E5M2",
     "MXFP4",
-    "MXFP4_BYTE",
     "NVFP4",
     "MXFP6_E2M3",
     "MXFP6_E3M2",
@@ -74,19 +73,58 @@ class BlockScaledFormat:
     # (copy dtype, MMA dtype, convert) triple. See AI/blockscaled_api.md section 9.
     cutlass_dtype_name: Optional[str]
     elem_bits: int
-    elems_per_container: int  # logical elements per qdata element (2 for fp4x2)
     scale_dtype: torch.dtype
     sf_vec_size: int  # logical K elements per scale factor (== min logical-K divisibility)
     has_per_tensor_scale: bool = False
 
     def to_cutlass_dtype(self):
         """The CuTe-DSL element type for the MMA instruction (not the storage/copy
-        dtype: MXFP6 stores uint8 byte containers but computes as Float6*)."""
+        dtype: packed MXFP6 stores raw uint8 bytes but computes as Float6*)."""
         if self.cutlass_dtype_name is None:
             raise ValueError(f"{self.name} has no CuTe-DSL element type")
         import cutlass  # lazy: keep this module importable without the DSL
 
         return getattr(cutlass, self.cutlass_dtype_name)
+
+    # -- logical <-> storage K mapping ----------------------------------------
+    # qdata shapes carry the STORAGE K extent; these derive it from elem_bits
+    # and the torch storage element width instead of an elements-per-container
+    # int (which cannot express fp6's 4-elements-per-3-bytes packing).
+
+    @property
+    def storage_elem_bits(self) -> int:
+        """Bits per qdata storage element (the torch dtype's width)."""
+        return self.qdata_dtype.itemsize * 8
+
+    @property
+    def is_packed(self) -> bool:
+        """True when logical elements share storage elements (fp4x2, packed
+        fp6): the storage K extent then differs from logical K, and the packing
+        pins the quantized axis to the unit-stride dim."""
+        return self.elem_bits < self.storage_elem_bits
+
+    def storage_k(self, logical_k: int) -> int:
+        """Storage K extent of a qdata row holding ``logical_k`` elements
+        (fp8: identity; fp4x2: K/2; packed fp6 in uint8: 3*K/4)."""
+        bits = logical_k * self.elem_bits
+        if bits % self.storage_elem_bits:
+            raise ValueError(
+                f"{self.name}: logical K={logical_k} does not fill whole storage "
+                f"elements ({self.elem_bits}-bit codes in {self.storage_elem_bits}-bit units)"
+            )
+        return bits // self.storage_elem_bits
+
+    def logical_k(self, storage_k: int) -> int:
+        """Logical K extent of a qdata row of ``storage_k`` storage elements.
+        Exact inverse of :meth:`storage_k`: rows hold whole packed groups
+        (fp6: whole 3-byte groups of 4 codes)."""
+        bits = storage_k * self.storage_elem_bits
+        if bits % self.elem_bits:
+            raise ValueError(
+                f"{self.name}: storage K={storage_k} is not whole packed groups "
+                f"({self.storage_elem_bits}-bit units of {self.elem_bits}-bit codes)"
+            )
+        return bits // self.elem_bits
 
     @classmethod
     def from_name(cls, name: str) -> "BlockScaledFormat":
@@ -119,46 +157,39 @@ class BlockScaledFormat:
 
 
 MXFP8_E4M3 = BlockScaledFormat(
-    "mxfp8_e4m3", torch.float8_e4m3fn, "Float8E4M3FN", 8, 1, torch.float8_e8m0fnu, 32
+    "mxfp8_e4m3", torch.float8_e4m3fn, "Float8E4M3FN", 8, torch.float8_e8m0fnu, 32
 )
 MXFP8_E5M2 = BlockScaledFormat(
-    "mxfp8_e5m2", torch.float8_e5m2, "Float8E5M2", 8, 1, torch.float8_e8m0fnu, 32
+    "mxfp8_e5m2", torch.float8_e5m2, "Float8E5M2", 8, torch.float8_e8m0fnu, 32
 )
 MXFP4 = BlockScaledFormat(
-    "mxfp4", torch.float4_e2m1fn_x2, "Float4E2M1FN", 4, 2, torch.float8_e8m0fnu, 32
+    "mxfp4", torch.float4_e2m1fn_x2, "Float4E2M1FN", 4, torch.float8_e8m0fnu, 32
 )
 NVFP4 = BlockScaledFormat(
     "nvfp4",
     torch.float4_e2m1fn_x2,
     "Float4E2M1FN",
     4,
-    2,
     torch.float8_e4m3fn,
     16,
     has_per_tensor_scale=True,
 )
-# MXFP6 qdata is byte-per-element uint8 (one fp6 code in bits [5:0], bits [7:6] zero):
-# PTX kind::mxf8f6f4 addresses every element as an 8-bit container in SMEM, matching
-# CUDA __nv_fp6_storage_t and cuBLASLt CUDA_R_6F_*. Byte-per-element MXFP6 therefore
-# has fp8's bandwidth; its value is accuracy headroom over MXFP4, not speed. Packed
-# 6-bit gmem (CUTLASS 16U6 TMA) is a backlog item that only changes descriptor data.
-# Byte-container fp4: one E2M1 code per uint8. This is fp4 in the form the
-# mixed-capable kind::mxf8f6f4 consumes (the DSL has no TMA sub-byte->container
-# expansion, so byte containers live in gmem too). Use packed `mxfp4` for pure
-# fp4 x fp4 GEMMs (kind::mxf4, half the bandwidth).
-MXFP4_BYTE = BlockScaledFormat(
-    "mxfp4_byte", torch.uint8, "Float4E2M1FN", 4, 1, torch.float8_e8m0fnu, 32
-)
+# MXFP6 qdata is PACKED 6-bit storage in uint8 bytes: each row is the K 6-bit
+# codes as a little-endian bit stream (element i occupies bits [6i, 6i+6)), so
+# 4 codes pack into 3 bytes and the storage K extent is 3*K/4 (torch has no fp6
+# dtype, so the bytes are raw uint8). This is the CUTLASS SubbyteReference
+# layout the CU_TENSOR_MAP_DATA_TYPE_16U6 unpack tensormap consumes: TMA
+# expands packed gmem into 8-bit SMEM containers for tcgen05 kind::mxf8f6f4
+# (fp8's SMEM footprint, but 3/4 of its gmem/L2 bandwidth).
 MXFP6_E2M3 = BlockScaledFormat(
-    "mxfp6_e2m3", torch.uint8, "Float6E2M3FN", 6, 1, torch.float8_e8m0fnu, 32
+    "mxfp6_e2m3", torch.uint8, "Float6E2M3FN", 6, torch.float8_e8m0fnu, 32
 )
 MXFP6_E3M2 = BlockScaledFormat(
-    "mxfp6_e3m2", torch.uint8, "Float6E3M2FN", 6, 1, torch.float8_e8m0fnu, 32
+    "mxfp6_e3m2", torch.uint8, "Float6E3M2FN", 6, torch.float8_e8m0fnu, 32
 )
 
 BLOCKSCALED_FORMAT_REGISTRY = {
-    fmt.name: fmt
-    for fmt in (MXFP8_E4M3, MXFP8_E5M2, MXFP4, MXFP4_BYTE, NVFP4, MXFP6_E2M3, MXFP6_E3M2)
+    fmt.name: fmt for fmt in (MXFP8_E4M3, MXFP8_E5M2, MXFP4, NVFP4, MXFP6_E2M3, MXFP6_E3M2)
 }
 
 # Worked examples of formats the descriptor already expresses but that are NOT
@@ -170,19 +201,19 @@ BLOCKSCALED_FORMAT_REGISTRY = {
 #
 #   # DeepSeek-style 1x128 fp32-scale fp8 (SM90/SM100 blockwise promotion):
 #   BlockScaledFormat("fp8_e4m3_1x128", torch.float8_e4m3fn, "Float8E4M3FN",
-#                     8, 1, torch.float32, 128)
+#                     8, torch.float32, 128)
 #   # kscale: bf16 elements, per-row fp32 scale every 128 of K (one-sided;
 #   # quantize() would raise - scales are upstream-structural, from_parts only):
 #   BlockScaledFormat("bf16_1x128", torch.bfloat16, "BFloat16",
-#                     16, 1, torch.float32, 128)
+#                     16, torch.float32, 128)
 #   # W4A16 int4-g128 (AWQ/GPTQ-style; uint4b8's fixed offset is element
 #   # decode, not a descriptor field; bf16 scales are just data):
 #   BlockScaledFormat("int4_1x128", torch.uint8, "Int4",
-#                     4, 2, torch.bfloat16, 128)
+#                     4, torch.bfloat16, 128)
 #   # A hypothetical e3m4: no CuTe-DSL element type -> host-side only until a
 #   # kernel declares its own (copy dtype, MMA dtype, convert) triple:
 #   BlockScaledFormat("mxfp8_e3m4", torch.uint8, None,
-#                     8, 1, torch.float8_e8m0fnu, 32)
+#                     8, torch.float8_e8m0fnu, 32)
 #
 # NVFP4 weight-only (W4A16) needs NO new row: the same NVFP4 format pairs with
 # a plain bf16 activation tensor and dispatches to an upconvert kernel per
@@ -209,9 +240,13 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
     combinations; see GemmSm100.is_valid_dtypes_and_scale_factor_vec_size,
     asserted in its blockscaled setup path).
 
-    PTX rules: ``kind::mxf4nvf4`` (e4m3 scales, vec 16) requires fp4 on both
-    operands; ``kind::mxf4`` covers both-fp4 with e8m0 scales; ``kind::mxf8f6f4``
-    admits any mix of fp8/fp6/fp4 element types (e8m0 scales, vec 32).
+    PTX rules: ``kind::mxf4nvf4`` requires fp4 on both operands and covers both
+    scale configs - scale_vec::2X (vec 32, e8m0 = mxfp4; PTX also spells this
+    instantiation ``kind::mxf4``) and scale_vec::4X (vec 16 = nvfp4). It is ONE
+    MMA atom parameterized by (sf_dtype, sf_vec_size), mirroring CUTLASS C++'s
+    ``SM100_MMA_MXF4_SS<..., VS>``; the scale config is instruction-wide, so
+    the two operands' formats must match. ``kind::mxf8f6f4`` admits any mix of
+    fp8/fp6/fp4 element types (e8m0 scales, vec 32).
 
     The kind rules are encoded in three places that must stay in sync (this
     function cannot be shared: the kernel layer keys on cutlass dtypes and must
@@ -226,16 +261,11 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
         raise ValueError(
             f"nvfp4 (e4m3 scales, vec 16) cannot pair with "
             f"{fmt_b.name if fmt_a.name == 'nvfp4' else fmt_a.name}: "
-            f"the mxf4nvf4 MMA kind requires nvfp4 on both operands"
+            f"the mxf4nvf4 MMA kind's scale config is instruction-wide, so it "
+            f"requires nvfp4 on both operands"
         )
     if fmt_a.name == "mxfp4" and fmt_b.name == "mxfp4":
-        return "mxf4"
-    if fmt_a.name == "mxfp4_byte" and fmt_b.name == "mxfp4_byte":
-        raise ValueError(
-            "mxfp4_byte x mxfp4_byte has no MMA kind: use mxfp4 (packed, kind::mxf4) "
-            "for pure fp4 pairs; byte-container fp4 exists for mixed mxf8f6f4 pairs"
-        )
-    # fp8/fp6 byte-width element types mix freely under mxf8f6f4 (all e8m0 / vec 32).
+        return "mxf4nvf4"
     # Gate BOTH axes explicitly rather than falling through: a format whose
     # elements no tcgen05 kind can consume (no DSL type, or a non-fp8/6/4 one),
     # or whose scale RECIPE the SF hardware cannot represent (kind::mxf8f6f4 is
@@ -257,16 +287,10 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
                 f"32; software-scaled recipes are a follow-up (AI/blockscaled_api.md "
                 f"section 9)"
             )
-    if fmt_a.elems_per_container > 1 or fmt_b.elems_per_container > 1:
-        packed = fmt_a.name if fmt_a.elems_per_container > 1 else fmt_b.name
-        other = fmt_b.name if fmt_a.elems_per_container > 1 else fmt_a.name
-        raise ValueError(
-            f"{packed} (packed fp4x2 storage) cannot join a mixed pair with {other}: "
-            f"the mixed-capable mxf8f6f4 MMA kind reads sub-byte elements from 8-bit "
-            f"SMEM containers, which packed gmem storage cannot feed; requantize as "
-            f"mxfp4_byte (byte-container fp4) for mixed pairs "
-            f"(AI/blockscaled_api.md section 6)"
-        )
+    # Everything else - fp8 x fp8 and any mix involving a packed sub-byte
+    # operand - runs kind::mxf8f6f4 (all e8m0 scales / vec 32): sub-byte
+    # operands are loaded from packed gmem via TMA unpack into 8-bit smem
+    # containers (the CUTLASS *_unpacksmem_t convention).
     return "mxf8f6f4"
 
 
@@ -302,7 +326,7 @@ def _packed_dim(qdata: torch.Tensor, fmt: BlockScaledFormat) -> int:
     """The qdata dim holding multiple logical elements per storage element.
 
     Convention: the unit-stride dim. Packing is always along the quantization
-    (K) axis, and packed (fp4) formats are required K-major by the kernel, so
+    (K) axis, and packed (fp4/fp6) formats are required K-major by the kernel, so
     unit-stride == packed == K. Scanned from the last dim so fully-contiguous
     qdata resolves to the innermost dim. Size-1 dims report arbitrary strides
     (a (Kp, 1) K-major operand can present stride 1 on BOTH dims), so dims with
@@ -385,12 +409,12 @@ class BlockScaledOperand:
         requested = (
             None if self.quant_dim is None else _normalize_quant_dim(self.quant_dim, self.ndim)
         )
-        if fmt.elems_per_container > 1:
-            # fp4 packing pins the quantized axis to the packed (unit-stride) dim.
+        if fmt.is_packed:
+            # fp4/fp6 packing pins the quantized axis to the packed (unit-stride) dim.
             derived = -1 if _packed_dim(self.qdata, fmt) == self.qdata.ndim - 1 else -2
             if requested is not None and requested != derived:
                 raise ValueError(
-                    f"quant_dim={self.quant_dim} conflicts with the fp4 packed dim "
+                    f"quant_dim={self.quant_dim} conflicts with the {fmt.name} packed dim "
                     f"(packing runs along the quantized axis, here dim {derived})"
                 )
             object.__setattr__(self, "quant_dim", derived)
@@ -401,13 +425,14 @@ class BlockScaledOperand:
 
     @property
     def shape(self) -> Tuple[int, ...]:
-        """Logical (unpacked) shape; fp4x2 doubles the packed dim, which
-        ``quant_dim`` already tracks."""
-        epc = self.format.elems_per_container
-        if epc == 1:
+        """Logical (unpacked) shape; the packed dim (fp4x2: K/2, packed fp6:
+        3*K/4 bytes) maps back to logical K, which ``quant_dim`` already
+        tracks."""
+        fmt = self.format
+        if not fmt.is_packed:
             return tuple(self.qdata.shape)
         k_dim = self._mn_k_dims()[1]
-        return tuple(s * epc if d == k_dim else s for d, s in enumerate(self.qdata.shape))
+        return tuple(fmt.logical_k(s) if d == k_dim else s for d, s in enumerate(self.qdata.shape))
 
     @property
     def ndim(self) -> int:
@@ -538,8 +563,11 @@ class BlockScaledOperand:
             pts = pts_out.to(torch.float32) if per_tensor_scale is not None else None
         else:
             q, sc = fn(x_flat, fmt.sf_vec_size)
-        if fmt.elems_per_container > 1:  # quantizers emit packed uint8 codes for fp4
-            q = q.view(torch.uint8).view(fmt.qdata_dtype)
+        # Quantizers emit packed storage: fp4 as uint8 nibble pairs (re-viewed
+        # to the fp4x2 storage dtype), fp6 as the packed uint8 bit stream
+        # (already the storage dtype), fp8 as the storage dtype directly.
+        if q.dtype != fmt.qdata_dtype:
+            q = q.view(fmt.qdata_dtype)
         q = q.reshape(*x.shape[:-1], -1)
         sf = pack_scale_2d_to_blocked_contig(sc.view(l, mn, k // fmt.sf_vec_size))
         if not batched:

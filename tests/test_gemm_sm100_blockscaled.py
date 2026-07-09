@@ -14,6 +14,7 @@ from quack.blockscaled.utils import (
     scale_blocked_for_cublas,
     scale_view_for_kernel,
 )
+from quack.blockscaled.operand import MXFP4, MXFP8_E4M3, NVFP4
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.blockscaled.quantize import to_blocked
 
@@ -68,11 +69,10 @@ def _run_blockscaled_gemm(compiled, args):
 
 
 def test_blockscaled_validation():
-    assert GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.BFloat16,
         (128, 64),
         (1, 1),
@@ -84,11 +84,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.BFloat16,
         (128, 192),
         (1, 1),
@@ -100,11 +99,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.BFloat16,
         (128, 128),
         (1, 1),
@@ -116,11 +114,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float4E2M1FN,
-        cutlass.Float4E2M1FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert GemmDefaultSm100.can_implement(
+        MXFP4,
+        MXFP4,
+        cutlass.Float32,
         cutlass.Float32,
         (128, 128),
         (1, 1),
@@ -132,11 +129,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float4E2M1FN,
-        cutlass.Float4E2M1FN,
-        cutlass.Float8E4M3FN,
-        16,
+    assert GemmDefaultSm100.can_implement(
+        NVFP4,
+        NVFP4,
+        cutlass.Float32,
         cutlass.Float32,
         (128, 192),
         (1, 1),
@@ -148,11 +144,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert not GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert not GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.BFloat16,
         (256, 384),
         (2, 1),
@@ -164,11 +159,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert not GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert not GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.Float32,
         (256, 224),
         (2, 1),
@@ -180,11 +174,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert not GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float4E2M1FN,
-        cutlass.Float4E2M1FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert not GemmDefaultSm100.can_implement(
+        MXFP4,
+        MXFP4,
+        cutlass.Float32,
         cutlass.Float32,
         (256, 384),
         (2, 1),
@@ -196,11 +189,10 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert not GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert not GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.BFloat16,
         (64, 128),
         (1, 1),
@@ -212,27 +204,19 @@ def test_blockscaled_validation():
         "k",
         "n",
     )
-    assert not GemmDefaultSm100.can_implement_blockscaled(
+    # fp4 with e4m3 scales at vec 32 is an illegal scale config that no
+    # registry format descriptor can express; check the dtype gate directly.
+    assert not GemmDefaultSm100.is_valid_dtypes_and_scale_factor_vec_size(
         cutlass.Float4E2M1FN,
         cutlass.Float4E2M1FN,
         cutlass.Float8E4M3FN,
         32,
         cutlass.Float32,
-        (128, 128),
-        (1, 1),
-        256,
-        256,
-        256,
-        1,
-        "k",
-        "k",
-        "n",
     )
-    assert not GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        32,
+    assert not GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.BFloat16,
         (256, 128),
         (1, 1),
@@ -243,6 +227,22 @@ def test_blockscaled_validation():
         "k",
         "k",
         "n",
+    )
+
+
+def test_can_implement_operand_kind_polymorphism():
+    """One preflight entry point for both kernels: plain cutlass dtypes select
+    the dense checks, BlockScaledFormat descriptors the blockscaled checks, and
+    one operand of each kind is rejected."""
+    common = ((128, 128), (1, 1), 256, 256, 256, 1, "k", "k", "n")
+    assert GemmDefaultSm100.can_implement(
+        cutlass.BFloat16, cutlass.BFloat16, cutlass.Float32, cutlass.BFloat16, *common
+    )
+    assert not GemmDefaultSm100.can_implement(
+        MXFP8_E4M3, cutlass.Float8E4M3FN, cutlass.Float32, cutlass.BFloat16, *common
+    )
+    assert not GemmDefaultSm100.can_implement(
+        cutlass.Float8E4M3FN, MXFP8_E4M3, cutlass.Float32, cutlass.BFloat16, *common
     )
 
 
@@ -626,11 +626,10 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     b_sc = pack_scale_2d_to_blocked_contig(sb_2d)
     _, mD = create_blockscaled_operand_tensor(l, m, n, False, cutlass.BFloat16, init="empty")
 
-    assert GemmDefaultSm100.can_implement_blockscaled(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        sf_vec,
+    assert GemmDefaultSm100.can_implement(
+        MXFP8_E4M3,
+        MXFP8_E4M3,
+        cutlass.Float32,
         cutlass.BFloat16,
         (128, 128),
         (1, 1),

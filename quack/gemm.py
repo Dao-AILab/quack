@@ -83,7 +83,7 @@ def _compile_gemm(
     b_kn=False,
     sf_batched=True,
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
-    b_mma_dtype=None,  # storage dtypes (byte-container sub-byte formats)
+    b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -107,6 +107,8 @@ def _compile_gemm(
         gather_A=gather_A,
         batched=batched,
         b_kn=b_kn,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
     )
     if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
         # D is the f32 partials workspace; its batch extent is l * split_k, not l,
@@ -672,7 +674,8 @@ def _build_gemm_plan(
     if blockscaled:
         fmt_a, fmt_b = resolve_blockscaled_formats(bs_format_a, bs_format_b)
         # MMA element types come from the descriptors; identical to the storage
-        # dtypes except for byte-container sub-byte formats (fp6, byte-fp4).
+        # dtypes except packed fp6, which crosses the FFI boundary as raw bytes
+        # (torch has no fp6 dtype) and is reinterpreted in-kernel.
         a_mma_dtype = fmt_a.to_cutlass_dtype()
         b_mma_dtype = fmt_b.to_cutlass_dtype()
         assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
