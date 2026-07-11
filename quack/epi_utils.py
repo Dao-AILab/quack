@@ -38,14 +38,16 @@ def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
     Args:
         gemm: The GEMM object (provides arch, epi_stage, and epilogue layout helpers).
         tensor: The global memory tensor to set up for the epilogue.
-        epi_tile: Epilogue tile shape. Defaults to gemm.epi_tile.
+        epi_tile: Epilogue tile shape. Defaults to gemm.epi_tile. If use_epi_reduce,
+            set to gemm.epi_reduce_tile (the epi_reduce warps consume EpiOp tensors).
         op_type: "store" or "load".
 
     Returns:
         (copy_atom, tensor, smem_layout_staged, epi_tile). copy_atom is None for pre-TMA archs.
     """
     if epi_tile is None:
-        epi_tile = gemm.epi_tile
+        use_epi_reduce = getattr(gemm, "use_epi_reduce", None)
+        epi_tile = gemm.epi_reduce_tile if use_epi_reduce is not None else gemm.epi_tile
     if stage is None:
         stage = gemm.epi_stage
     dtype = tensor.element_type

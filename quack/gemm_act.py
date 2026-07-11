@@ -100,6 +100,10 @@ class GemmActMixin(ComposableEpiMixin):
 
     def epi_make_aux_out_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
         """Build the register-to-shared tiled copy used by aux outputs."""
+        if const_expr(getattr(self, "use_epi_reduce", None) is not None):
+            # epi_reduce warps: fragments are partitioned by tiled_copy_r2s directly
+            # (no MMA t2r arrangement to match), so use it as-is.
+            return tiled_copy_r2s
         copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(params, tiled_copy_t2r)
         return cute.make_tiled_copy_S(copy_atom_aux_out_r2s, tiled_copy_r2s)
 
