@@ -7,6 +7,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from quack.blockscaled.operand import (
+    BlockScaledFormat,
+    BlockScaledOperand,
+    mma_kind_for_pair,
+)
+
 # SplitKMode is re-exported here as its canonical public import path; it is *defined*
 # in the gemm_config leaf because the kernel layer needs it at import time and this
 # module sits above quack.gemm in the import graph (importing it from here would cycle).
@@ -143,18 +149,21 @@ def _concat_interleave_bias(t):
     return t.unflatten(-1, (2, half)).transpose(-2, -1).flatten(-2, -1)
 
 
-# ── Blockscaled (MXFP8 / MXFP4 / NVFP4) helpers ─────────────────────────────
+# -- Blockscaled (MXFP8 / MXFP4 / NVFP4) operand handling --------------------
 #
-# A and B may be passed as ``(data, scale_factor)`` tuples. Scale factors use
-# the canonical cuBLAS/CUTLASS 128x4 blocked layout: shape
-# ``(M // 128, K // VEC // 4, 32, 4, 4)`` (optionally with a leading batch L),
+# Blockscaled A / B operands are :class:`quack.blockscaled.operand.BlockScaledOperand`
+# instances carrying (qdata, scale, format, per_tensor_scale) - see
+# AI/blockscaled_api.md. The container is the ONLY blockscaled operand form;
+# (data, scale_factor) tuples are rejected with a TypeError at the unwrap site.
+# Scale factors use the canonical cuBLAS/CUTLASS 128x4
+# blocked layout: shape ``(rm, rk, 32, 4, 4)`` (optionally with a leading batch L),
 # where the ``(32, 4, 4)`` inner block is ``(m % 32, (m // 32) % 4, k_block % 4)``
 # with strides ``(16, 4, 1)`` — one contiguous 512-byte atom per 128 rows x 4
 # K-blocks, matching torchao's ``to_blocked`` and ``torch._scaled_mm``.
-# VEC (the quantization block along K) is implied by the SF dtype:
-# float8_e8m0fnu -> 32 (MX formats), float8_e4m3fn -> 16 (NVFP4).
-# fp4 operands use ``torch.float4_e2m1fn_x2`` storage: shapes carry packed K
-# (two elements per byte); K here always refers to logical K.
+# All format properties (scale vec size, element packing, scale dtype) come from
+# the BlockScaledFormat descriptor; nothing below this layer may re-derive them
+# from tensor dtypes. fp4 operands use ``torch.float4_e2m1fn_x2`` storage: shapes
+# carry packed K (two elements per byte); K here always refers to logical K.
 
 
 def _launch(op):
@@ -167,33 +176,100 @@ def _launch(op):
     return getattr(op, "_init_fn", op)
 
 
-def _unpack_operand(X) -> Tuple[Tensor, Optional[Tensor]]:
-    """Split an ``A`` / ``B`` argument into (data, scale_factor or None)."""
+class _Operand(NamedTuple):
+    data: Tensor
+    sf: Optional[Tensor] = None
+    fmt: Optional[BlockScaledFormat] = None
+    pts: Optional[Tensor] = None  # NVFP4 per-tensor scale
+    quant_dim: Optional[int] = None  # container operands: which dim the scales run along
+
+
+def _unpack_operand(X) -> _Operand:
+    """Split an ``A`` / ``B`` argument into (data, scale, format, per_tensor_scale)."""
+    if isinstance(X, BlockScaledOperand):
+        return _Operand(X.qdata, X.scale, X.format, X.per_tensor_scale, quant_dim=X.quant_dim)
     if isinstance(X, (tuple, list)):
-        data, sf = X
-        return data, sf
-    return X, None
+        raise TypeError(
+            "blockscaled operands must be BlockScaledOperand containers; "
+            "(data, scale_factor) tuples are no longer accepted - wrap the parts with "
+            "quack.BlockScaledOperand.from_parts(data, scale_factor, format)"
+        )
+    return _Operand(X)
 
 
-def _sf_validate(SF: Tensor, name: str) -> Tensor:
-    """Validate a user scale-factor tensor (rank-preserving).
+def _prep_blockscaled(
+    opA: _Operand, opB: _Operand
+) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[str], Optional[str]]:
+    """Validate an (A, B) operand pair; return encoded (SFA, SFB) and the format
+    NAMES (what the op schemas carry).
 
-    Requires ``(rm, rk, 32, 4, 4)`` or ``(L, rm, rk, 32, 4, 4)`` with the inner
-    ``(32, 4, 4)`` block contiguous (strides ``(16, 4, 1)`` — one 512 B atom);
-    outer strides are free, so slices of a larger scale buffer are accepted.
-    The kernel consumes either rank directly for dense calls (it prepends the
-    trivial batch mode to 5-D SFs at trace time); varlen calls require the 6-D
-    padded-buffer form and get the batch dim added by the caller.
-    """
-    assert SF.ndim in (5, 6) and tuple(SF.shape[-3:]) == (32, 4, 4), (
-        f"{name}: expected (rm, rk, 32, 4, 4) or (L, rm, rk, 32, 4, 4) blocked scale factors, "
-        f"got shape {tuple(SF.shape)}"
+    A and B carry independent formats. Pair legality (which combinations the
+    hardware can express at all) is decided here via mma_kind_for_pair; whether a
+    legal pair is IMPLEMENTED is enforced per-architecture by the gemm_smXXX
+    kernel classes (each SM version supports different mx dtype combinations)."""
+    assert (opA.sf is None) == (opB.sf is None), (
+        "A and B must both (or neither) carry scale factors"
     )
-    assert SF.stride()[-3:] == (16, 4, 1), (
-        f"{name}: inner (32, 4, 4) block must be contiguous with strides (16, 4, 1), "
-        f"got {SF.stride()[-3:]}"
-    )
-    return SF
+    if opA.sf is None:
+        return None, None, None, None
+    mma_kind_for_pair(opA.fmt, opB.fmt)  # ValueError on unrepresentable pairs
+    # The quantized axis must be each operand's contraction axis: A is (M, K) -
+    # last dim; B is (K, N) - dim -2. Containers carry quant_dim, so wrong-axis
+    # operands fail here even when the shapes happen to line up (square K == N),
+    # which storage checks alone cannot catch.
+    if opA.quant_dim != -1:
+        raise ValueError(
+            "A must be quantized along its last dim (the contraction dim K of (M, K)); "
+            "got scales along dim -2 - remove a stray transpose or quantize with dim=-1"
+        )
+    if opB.quant_dim != -2:
+        raise ValueError(
+            "B must be quantized along dim -2 (the contraction dim K of (K, N)); pass "
+            "W.mT of an (N, K) weight, or quantize the (K, N) data with dim=-2"
+        )
+    # Container scales were validated at construction. Rank is preserved
+    # (5-D unbatched or 6-D batched); callers batch-canonicalize as needed.
+    return _sf_encode(opA.sf), _sf_encode(opB.sf), opA.fmt.name, opB.fmt.name
+
+
+def _fold_pts(alpha, opA: _Operand, opB: _Operand):
+    """Fold NVFP4 per-tensor scales into alpha, out-of-place and without a host
+    sync: a present pts turns alpha into a device scalar (the tensor-alpha path)."""
+    pts = opA.pts
+    if opB.pts is not None:
+        pts = opB.pts if pts is None else pts * opB.pts
+    if pts is None:
+        return alpha
+    pts = pts.reshape(1)
+    return pts if (isinstance(alpha, float) and alpha == 1.0) else alpha * pts
+
+
+def _reject_blockscaled(op_name: str, **operands) -> None:
+    """Early, legible rejection at entry points without a blockscaled path."""
+    for name, X in operands.items():
+        if isinstance(X, (BlockScaledOperand, tuple, list)):
+            raise TypeError(
+                f"quack.{op_name} does not support blockscaled operands (got {name} as "
+                f"{type(X).__name__}); blockscaled entry points: gemm, gemm_add, "
+                f"gemm_add_inplace, gemm_act, gemm_gated"
+            )
+
+
+def _reserve_blockscaled_out(out_dtype) -> None:
+    """``out_dtype`` may name a BlockScaledFormat to request a blockscaled output
+    (the call then returns a BlockScaledOperand). API reserved here; the
+    SF-generation epilogue that implements it is milestone M5
+    (AI/blockscaled_api.md section 8)."""
+    if isinstance(out_dtype, (BlockScaledFormat, str)):
+        fmt_d = (
+            out_dtype
+            if isinstance(out_dtype, BlockScaledFormat)
+            else BlockScaledFormat.from_name(out_dtype)
+        )
+        raise NotImplementedError(
+            f"blockscaled output (out_dtype={fmt_d.name}) requires the SF-generation "
+            f"epilogue - milestone M5 in AI/blockscaled_api.md section 8"
+        )
 
 
 def _sf_batch_canonicalize(SFA: Tensor, SFB: Tensor, batched: bool) -> Tuple[Tensor, Tensor]:
@@ -204,11 +280,6 @@ def _sf_batch_canonicalize(SFA: Tensor, SFB: Tensor, batched: bool) -> Tuple[Ten
         SFA = SFA.unsqueeze(0) if SFA.ndim == 5 else SFA
         SFB = SFB.unsqueeze(0) if SFB.ndim == 5 else SFB
     return SFA, SFB
-
-
-def _logical_k(X: Tensor) -> int:
-    """Logical contraction extent of the last dim (fp4 packs two elements per byte)."""
-    return X.shape[-1] * (2 if X.dtype == torch.float4_e2m1fn_x2 else 1)
 
 
 def _sf_encode(SF: Tensor) -> Tensor:
@@ -228,10 +299,12 @@ def _sf_encode(SF: Tensor) -> Tensor:
     return SF
 
 
-def _sf_decode(SF: Optional[Tensor]) -> Optional[Tensor]:
-    """Inverse of :func:`_sf_encode` (uint8 -> e8m0), applied inside op bodies."""
+def _sf_decode(SF: Optional[Tensor], bs_format: Optional[str]) -> Optional[Tensor]:
+    """Inverse of :func:`_sf_encode`, applied inside op bodies. Format-driven:
+    the scale dtype comes from the descriptor, never sniffed from uint8 (an
+    NVFP4 e4m3 scale seen as uint8 must not silently decode as vec-32 e8m0)."""
     if SF is not None and SF.dtype == torch.uint8:
-        SF = SF.view(torch.float8_e8m0fnu)
+        SF = SF.view(BlockScaledFormat.from_name(bs_format).scale_dtype)
     return SF
 
 
@@ -325,7 +398,7 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["dynamic_scheduler", "split_k", "split_k_mode"],
+    key=["dynamic_scheduler", "split_k", "split_k_mode", "bs_format_a", "bs_format_b"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
 def gemm_tuned(
@@ -349,12 +422,15 @@ def gemm_tuned(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     SFA: Optional[Tensor] = None,  # (L, rm, rk, 32, 4, 4) blocked scale factors
     SFB: Optional[Tensor] = None,  # (L, rn, rk, 32, 4, 4)
+    # BlockScaledFormat names for A / B (independent; required when SFA/SFB are passed)
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,  # None: let the autotuner choose the factor (config.split_k)
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[GemmConfig, int, bool, object]:  # (config, split_k, dynamic_scheduler, dispatch plan)
     blockscaled = SFA is not None
     if blockscaled:
-        SFA, SFB = _sf_decode(SFA), _sf_decode(SFB)
+        SFA, SFB = _sf_decode(SFA, bs_format_a), _sf_decode(SFB, bs_format_b)
     if config is None:
         if blockscaled:
             m = A.shape[-2]
@@ -413,6 +489,8 @@ def gemm_tuned(
         SFB=SFB,
         split_k=split_k,
         split_k_mode=split_k_mode,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
     )
     # Resolved decisions, so the eager `gemm` wrapper can record an interface
     # plan (see _GemmIfacePlan). The custom-op route discards this.
@@ -442,6 +520,8 @@ def _gemm_execute(
     SFB: Optional[Tensor],
     split_k: int,
     split_k_mode: int,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     dispatch_plan=None,
 ):
     """Transform operands (batch dims, swap_ab, concat) and launch the GEMM.
@@ -589,6 +669,8 @@ def _gemm_execute(
         tile_K=config.tile_k,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         split_k=split_k,
         split_k_mode=split_k_mode,
         b_kn=b_kn,
@@ -616,6 +698,8 @@ def _gemm_act_call(
     A_idx: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,  # decoded (real-dtype) scale factors
     SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,  # BlockScaledFormat names (see quack.gemm.gemm)
+    bs_format_b: Optional[str] = None,
     concat_layout: tuple | None = None,
     dynamic_scheduler: bool,
     alpha: float | Tensor = 1.0,
@@ -662,6 +746,8 @@ def _gemm_act_call(
         A_idx=A_idx,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         concat_layout=concat_layout,
         **operands,
     )
@@ -764,14 +850,16 @@ _gemm_iface_plan_cache: dict[tuple, _GemmIfacePlan] = {}
 
 def gemm(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
-    # For blockscaled (MXFP8/MXFP4/NVFP4): a tuple (A, SFA) with A fp8/fp4 and SFA the
-    # blocked scale factors (rm, rk, 32, 4, 4) or (L, rm, rk, 32, 4, 4) — see helpers above.
-    A: Tensor | Tuple[Tensor, Tensor],
-    B: Tensor | Tuple[Tensor, Tensor],  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    # For blockscaled (MXFP8/MXFP4/NVFP4/MXFP6): a BlockScaledOperand container
+    # carrying the blocked (rm, rk, 32, 4, 4) / (L, rm, rk, 32, 4, 4) scale factors.
+    A: Tensor | BlockScaledOperand,
+    B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float | Tensor = 1.0,
-    out_dtype: Optional[torch.dtype] = None,
+    # a BlockScaledFormat (or its name) requests a blockscaled output -> returns a
+    # BlockScaledOperand (SF-generation epilogue, milestone M5; reserved for now)
+    out_dtype: Optional[torch.dtype | BlockScaledFormat | str] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
@@ -785,9 +873,11 @@ def gemm(
     split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
-    A, SFA = _unpack_operand(A)
-    B, SFB = _unpack_operand(B)
-    assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
+    _reserve_blockscaled_out(out_dtype)
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
+    alpha = _fold_pts(alpha, opA, opB)
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(
             SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
@@ -813,6 +903,10 @@ def gemm(
             tensor_key(bias),
             tensor_key(SFA),
             tensor_key(SFB),
+            bs_format_a,
+            bs_format_b,
+            opA.quant_dim,
+            opB.quant_dim,
             A.device,
             out_dtype,
             tuned,
@@ -850,14 +944,13 @@ def gemm(
                 concat_layout=None,
                 SFA=SFA,
                 SFB=SFB,
+                bs_format_a=bs_format_a,
+                bs_format_b=bs_format_b,
                 split_k=plan.split_k,
                 split_k_mode=split_k_mode,
                 dispatch_plan=plan.dispatch_plan,
             )
             return out
-    if SFA is not None:
-        SFA = _sf_encode(_sf_validate(SFA, "SFA"))
-        SFB = _sf_encode(_sf_validate(SFB, "SFB"))
     if out is None:
         if out_dtype is None:
             # Blockscaled inputs are fp8/fp4; default to bf16 output.
@@ -913,6 +1006,8 @@ def gemm(
             concat_layout=concat_str,
             SFA=SFA,
             SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
             split_k=split_k,
             split_k_mode=split_k_mode,
         )
@@ -937,6 +1032,8 @@ def gemm(
         concat_layout=concat_layout,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         split_k=split_k,
         split_k_mode=split_k_mode,
     )
@@ -978,11 +1075,15 @@ def gemm_out(
     sr_seed: int = 0,
     sr_seed_tensor: Optional[Tensor] = None,
     concat_layout: Optional[str] = None,
-    # Blockscaled scale factors, (L, rm/rn, rk, 32, 4, 4); tuples are unpacked
+    # Blockscaled scale factors, (L, rm/rn, rk, 32, 4, 4); operands are unpacked
     # to these flat args before the custom-op boundary since torch.library
-    # schemas have no (Tensor, Tensor) argument type.
+    # schemas have no (Tensor, Tensor) argument type. ``bs_format_a/_b`` are the
+    # (independent) BlockScaledFormat names - the descriptors are the single
+    # source of format properties below this boundary.
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
@@ -1009,6 +1110,8 @@ def gemm_out(
         concat_layout=_parse_concat_layout(concat_layout),
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         split_k=split_k,
         split_k_mode=split_k_mode,
     )
@@ -1084,22 +1187,25 @@ def gemm_ref(
 
 
 def gemm_blockscaled_ref(
-    A: Tuple[Tensor, Tensor],  # ((M, K) or (L, M, K) fp8/fp4x2, blocked SFA)
-    B: Tuple[Tensor, Tensor],  # ((K, N) or (L, K, N) fp8/fp4x2 K-contig, blocked SFB)
+    A: BlockScaledOperand,  # (M, K) or (L, M, K) logical view
+    B: BlockScaledOperand,  # (K, N) or (L, K, N) logical view, K-contig qdata
     alpha: float | Tensor = 1.0,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
     """Dequantize-and-matmul reference for blockscaled GEMM."""
     from quack.blockscaled.utils import dequant_operand, unpack_scale_blocked_to_2d
 
-    A, SFA = _unpack_operand(A)
-    B, SFB = _unpack_operand(B)
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    assert opA.fmt is not None and opB.fmt is not None, (
+        "gemm_blockscaled_ref requires blockscaled A and B"
+    )
+    mma_kind_for_pair(opA.fmt, opB.fmt)  # legality; mixed MX pairs are fine
+    assert opA.fmt.sf_vec_size == opB.fmt.sf_vec_size
     # unpack_scale_blocked_to_2d wants the batched 6-D form
-    SFA = _sf_validate(SFA, "SFA")
-    SFB = _sf_validate(SFB, "SFB")
-    SFA = SFA.unsqueeze(0) if SFA.ndim == 5 else SFA
-    SFB = SFB.unsqueeze(0) if SFB.ndim == 5 else SFB
-    sf_vec = 32 if SFA.dtype == torch.float8_e8m0fnu else 16
+    SFA = opA.sf.unsqueeze(0) if opA.sf.ndim == 5 else opA.sf
+    SFB = opB.sf.unsqueeze(0) if opB.sf.ndim == 5 else opB.sf
+    sf_vec = opA.fmt.sf_vec_size
     batched = A.ndim == 3
     a3 = A if batched else A.unsqueeze(0)  # (l, m, k_packed)
     b3 = (B if batched else B.unsqueeze(0)).mT  # (l, n, k_packed)
@@ -1112,6 +1218,9 @@ def gemm_blockscaled_ref(
     a_dq = a_val * sfa.repeat_interleave(sf_vec, dim=-1)
     b_dq = b_val * sfb.repeat_interleave(sf_vec, dim=-1)
     out = torch.einsum("lmk,lnk->lmn", a_dq, b_dq)
+    for pts in (opA.pts, opB.pts):  # NVFP4 per-tensor scales
+        if pts is not None:
+            out = out * pts
     if not (isinstance(alpha, float) and alpha == 1.0):
         out = out * alpha
     out = out.to(out_dtype)
@@ -1120,14 +1229,14 @@ def gemm_blockscaled_ref(
 
 def gemm_add(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
-    # For blockscaled: a tuple (A, SFA) — see gemm().
-    A: Tensor | Tuple[Tensor, Tensor],
-    B: Tensor | Tuple[Tensor, Tensor],  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    # For blockscaled: a BlockScaledOperand container - see gemm().
+    A: Tensor | BlockScaledOperand,
+    B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     C: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
-    out_dtype: Optional[torch.dtype] = None,
+    out_dtype: Optional[torch.dtype | BlockScaledFormat | str] = None,  # format: see gemm()
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
@@ -1139,15 +1248,15 @@ def gemm_add(
     split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
 ) -> Tensor:
     """GEMM with addition and optional output tensor."""
-    A, SFA = _unpack_operand(A)
-    B, SFB = _unpack_operand(B)
-    assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
+    _reserve_blockscaled_out(out_dtype)
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
+    alpha = _fold_pts(alpha, opA, opB)
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(
             SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
         )
-        SFA = _sf_encode(_sf_validate(SFA, "SFA"))
-        SFB = _sf_encode(_sf_validate(SFB, "SFB"))
     if out is None:
         if out_dtype is None:
             out_dtype = torch.bfloat16 if SFA is not None else A.dtype
@@ -1184,10 +1293,16 @@ def gemm_add(
     beta_arg = _merge_tensor(beta, beta_tensor)
     concat_str = ",".join(concat_layout) if concat_layout else None
     if add_to_output:
-        _launch(gemm_add_inplace)(
-            A if SFA is None else (A, SFA),
-            B if SFB is None else (B, SFB),
+        # Pass flat parts: the operands were already unpacked and validated, and
+        # pts was already folded into alpha above.
+        _launch(_gemm_add_inplace_parts)(
+            A,
+            B,
             out,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
             alpha=alpha_arg,
             beta=beta_arg,
             cu_seqlens_m=cu_seqlens_m,
@@ -1220,6 +1335,8 @@ def gemm_add(
             concat_layout=concat_str,
             SFA=SFA,
             SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
             split_k=split_k,
             split_k_mode=split_k_mode,
         )
@@ -1254,6 +1371,8 @@ def gemm_add_out(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
@@ -1270,6 +1389,8 @@ def gemm_add_out(
         beta=beta,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
@@ -1365,9 +1486,9 @@ def gemm_add_ref(
 
 def gemm_add_inplace(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
-    # For blockscaled: a tuple (A, SFA) — see gemm().
-    A: Tensor | Tuple[Tensor, Tensor],
-    B: Tensor | Tuple[Tensor, Tensor],  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    # For blockscaled: a BlockScaledOperand container - see gemm().
+    A: Tensor | BlockScaledOperand,
+    B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
     out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m or (L, M, N) if varlen_k
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
@@ -1393,15 +1514,62 @@ def gemm_add_inplace(
         dynamic_scheduler: Whether to use dynamic scheduler
         tuned: Whether to use autotuned configuration
     """
-    A, SFA = _unpack_operand(A)
-    B, SFB = _unpack_operand(B)
-    assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(
-            SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
+            SFA,
+            SFB,
+            opA.data.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None,
         )
-        SFA = _sf_encode(_sf_validate(SFA, "SFA"))
-        SFB = _sf_encode(_sf_validate(SFB, "SFB"))
+    _gemm_add_inplace_parts(
+        opA.data,
+        opB.data,
+        out,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
+        alpha=_fold_pts(alpha, opA, opB),
+        beta=beta,
+        cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
+        concat_layout=",".join(concat_layout)
+        if isinstance(concat_layout, tuple)
+        else concat_layout,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
+    )
+
+
+def _gemm_add_inplace_parts(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    *,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
+    cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+    batch_idx_permute: Optional[Tensor] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+    concat_layout: Optional[str] = None,
+    split_k: Optional[int] = 1,
+    split_k_mode: int = SplitKMode.SERIAL,
+) -> None:
+    """gemm_add_inplace on pre-unpacked operand parts. Also used internally by
+    gemm_add's add-to-output path, which passes flat parts instead of rebuilding
+    operand containers (the operands were already unpacked and validated)."""
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
     beta_tensor = beta if not isinstance(beta, float) else None
@@ -1428,11 +1596,11 @@ def gemm_add_inplace(
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
-        concat_layout=",".join(concat_layout)
-        if isinstance(concat_layout, tuple)
-        else concat_layout,
+        concat_layout=concat_layout,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         split_k=split_k,
         split_k_mode=split_k_mode,
     )
@@ -1464,6 +1632,8 @@ def gemm_add_inplace_op(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
@@ -1479,6 +1649,8 @@ def gemm_add_inplace_op(
         out if not add_to_output else None,
         alpha=alpha,
         beta=beta,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
@@ -1494,12 +1666,10 @@ def gemm_add_inplace_op(
 
 
 def gemm_act(
-    # For blockscaled: a tuple (A, SFA) — see gemm().
-    A: Tensor
-    | Tuple[
-        Tensor, Tensor
-    ],  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
-    B: Tensor | Tuple[Tensor, Tensor],  # (K, N) or (L, K, N)
+    # For blockscaled: a BlockScaledOperand container - see gemm().
+    # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
+    A: Tensor | BlockScaledOperand,
+    B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Activation = None,
@@ -1524,14 +1694,15 @@ def gemm_act(
     (``postact = act(alpha * A @ B + C + bias)``). It is applied in fp32 and
     may be a float or a 1-element CUDA tensor; 1.0 keeps the alpha-free epilogue.
     """
+    _reserve_blockscaled_out(out_dtype)
+    _reserve_blockscaled_out(postact_dtype)
     _check_split_k_unsupported("gemm_act", split_k)
-    A, SFA = _unpack_operand(A)
-    B, SFB = _unpack_operand(B)
-    assert (SFA is None) == (SFB is None), "A and B must both (or neither) carry scale factors"
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
+    alpha = _fold_pts(alpha, opA, opB)
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None)
-        SFA = _sf_validate(SFA, "SFA")
-        SFB = _sf_validate(SFB, "SFB")
     is_gated = activation in gated_to_pytorch_fn_map
     default_dtype = torch.bfloat16 if SFA is not None else A.dtype
     out_dtype = default_dtype if out_dtype is None else out_dtype
@@ -1580,6 +1751,8 @@ def gemm_act(
             tuned,
             SFA=SFA,
             SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
             alpha=alpha if isinstance(alpha, float) else 1.0,
             alpha_tensor=alpha if not isinstance(alpha, float) else None,
             **kwargs,
@@ -1595,8 +1768,10 @@ def gemm_act(
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        SFA=SFA,
-        SFB=SFB,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         concat_layout=concat_layout if is_gated else None,
         dynamic_scheduler=dynamic_scheduler,
         alpha=alpha,
@@ -1613,7 +1788,7 @@ gemm_gated = gemm_act
     "quack::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
 )
 def gemm_act_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1629,6 +1804,8 @@ def gemm_act_out(
     tuned: bool = True,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
 ) -> None:
@@ -1643,8 +1820,10 @@ def gemm_act_out(
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        SFA=_sf_decode(SFA),
-        SFB=_sf_decode(SFB),
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         dynamic_scheduler=dynamic_scheduler,
         alpha=_merge_tensor(alpha, alpha_tensor),
         tuned=tuned,
@@ -1725,6 +1904,7 @@ def gemm_dact(
     split_k_mode: int = SplitKMode.SERIAL,
 ):
     """GEMM with activation (or gated activation) gradient and optional output tensors."""
+    _reject_blockscaled("gemm_dact", A=A, B=B)
     _check_split_k_unsupported("gemm_dact", split_k)
     is_dgated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -2011,6 +2191,7 @@ def gemm_symmetric(
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with symmetric output."""
+    _reject_blockscaled("gemm_symmetric", A=A, B=B)
     _check_split_k_unsupported("gemm_symmetric", split_k)
     # Eager plan fast path; see gemm(). The key subsumes the dispatch key
     # (alpha/beta modes select compiled epilogues).
@@ -2085,7 +2266,7 @@ def gemm_symmetric(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2102,6 +2283,8 @@ def gemm_gated_out(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
 ) -> None:
@@ -2116,8 +2299,10 @@ def gemm_gated_out(
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
-        SFA=_sf_decode(SFA),
-        SFB=_sf_decode(SFB),
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         concat_layout=_parse_concat_layout(concat_layout),
         dynamic_scheduler=dynamic_scheduler,
         alpha=_merge_tensor(alpha, alpha_tensor),
@@ -2211,6 +2396,8 @@ def gemm_add_inplace_fake(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> None:
@@ -2441,6 +2628,7 @@ def gemm_rms(
     If premult_out is provided, D_raw (the pre-norm_weight value) is also written to it.
     Returns (D_out, rstd).
     """
+    _reject_blockscaled("gemm_rms", A=A, B=B)
     _check_split_k_unsupported("gemm_rms", split_k)
     out_dtype = A.dtype if out_dtype is None else out_dtype
     N = B.shape[-1]
@@ -2631,6 +2819,7 @@ def gemm_norm_act(
     rstd is a column vector (M,).
     Returns (preact, postact) where preact is the normalized value before activation.
     """
+    _reject_blockscaled("gemm_norm_act", A=A, B=B)
     _check_split_k_unsupported("gemm_norm_act", split_k)
     is_gated = activation in gated_to_pytorch_fn_map
     out_dtype = A.dtype if out_dtype is None else out_dtype

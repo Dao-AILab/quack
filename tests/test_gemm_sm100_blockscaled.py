@@ -70,6 +70,7 @@ def _run_blockscaled_gemm(compiled, args):
 def test_blockscaled_validation():
     assert GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float8E4M3FN,
+        cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         32,
         cutlass.BFloat16,
@@ -84,6 +85,7 @@ def test_blockscaled_validation():
         "n",
     )
     assert GemmDefaultSm100.can_implement_blockscaled(
+        cutlass.Float8E4M3FN,
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         32,
@@ -100,6 +102,7 @@ def test_blockscaled_validation():
     )
     assert GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float8E4M3FN,
+        cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         32,
         cutlass.BFloat16,
@@ -115,6 +118,7 @@ def test_blockscaled_validation():
     )
     assert GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float4E2M1FN,
+        cutlass.Float4E2M1FN,
         cutlass.Float8E8M0FNU,
         32,
         cutlass.Float32,
@@ -129,6 +133,7 @@ def test_blockscaled_validation():
         "n",
     )
     assert GemmDefaultSm100.can_implement_blockscaled(
+        cutlass.Float4E2M1FN,
         cutlass.Float4E2M1FN,
         cutlass.Float8E4M3FN,
         16,
@@ -145,6 +150,7 @@ def test_blockscaled_validation():
     )
     assert not GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float8E4M3FN,
+        cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         32,
         cutlass.BFloat16,
@@ -159,6 +165,7 @@ def test_blockscaled_validation():
         "n",
     )
     assert not GemmDefaultSm100.can_implement_blockscaled(
+        cutlass.Float8E4M3FN,
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         32,
@@ -175,6 +182,7 @@ def test_blockscaled_validation():
     )
     assert not GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float4E2M1FN,
+        cutlass.Float4E2M1FN,
         cutlass.Float8E8M0FNU,
         32,
         cutlass.Float32,
@@ -189,6 +197,7 @@ def test_blockscaled_validation():
         "n",
     )
     assert not GemmDefaultSm100.can_implement_blockscaled(
+        cutlass.Float8E4M3FN,
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         32,
@@ -205,6 +214,7 @@ def test_blockscaled_validation():
     )
     assert not GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float4E2M1FN,
+        cutlass.Float4E2M1FN,
         cutlass.Float8E4M3FN,
         32,
         cutlass.Float32,
@@ -219,6 +229,7 @@ def test_blockscaled_validation():
         "n",
     )
     assert not GemmDefaultSm100.can_implement_blockscaled(
+        cutlass.Float8E4M3FN,
         cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         32,
@@ -617,6 +628,7 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
 
     assert GemmDefaultSm100.can_implement_blockscaled(
         cutlass.Float8E4M3FN,
+        cutlass.Float8E4M3FN,
         cutlass.Float8E8M0FNU,
         sf_vec,
         cutlass.BFloat16,
@@ -822,6 +834,8 @@ def test_blockscaled_varlen_k_public_api(seqlens_k):
         cu_seqlens_k=cu_seqlens_k,
         SFA=a_sc_contig,
         SFB=b_sc_contig,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
     )
     torch.cuda.synchronize()
 
@@ -868,6 +882,8 @@ def test_blockscaled_varlen_k_poisoned_sf_pad(seqlens_k, tile_cluster):
         cu_seqlens_k=cu_seqlens_k,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
     )
     torch.cuda.synchronize()
     assert not mD.isnan().any(), "NaN leaked from poisoned SF pad into the output"
@@ -922,6 +938,8 @@ def test_blockscaled_varlen_m_public_api(seqlens_m, b_major, fmt):
         cu_seqlens_m=cu_seqlens_m,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=fmt,  # from_name resolves the legacy "mxfp8" alias
+        bs_format_b=fmt,
     )
     torch.cuda.synchronize()
 
@@ -1023,6 +1041,7 @@ def test_mxfp8_split_k(batched, split_k, split_k_mode):
     the plain (split_k=1) MXFP8 kernel to within ~1 bf16 ULP and stay deterministic for
     serial."""
     _skip_if_not_sm100()
+    from quack.blockscaled.operand import BlockScaledOperand
     from quack.blockscaled.utils import blockscaled_quantize
     from quack.gemm_config import SplitKMode
     from quack.gemm_interface import gemm, gemm_blockscaled_ref
@@ -1038,7 +1057,8 @@ def test_mxfp8_split_k(batched, split_k, split_k_mode):
     W_hp = torch.randn(*shape_W, device="cuda", dtype=torch.bfloat16) * K**-0.5
     A_q, A_sc = blockscaled_quantize(A_hp, "mxfp8")
     W_q, W_sc = blockscaled_quantize(W_hp, "mxfp8")
-    A_op, B_op = (A_q, A_sc), (W_q.mT, W_sc)  # B = (..., K, N) K-contig view
+    A_op = BlockScaledOperand.from_parts(A_q, A_sc, "mxfp8")
+    B_op = BlockScaledOperand.from_parts(W_q, W_sc, "mxfp8").mT  # B = (..., K, N) K-contig view
 
     ref = gemm_blockscaled_ref(A_op, B_op)
     base = gemm(A_op, B_op, tuned=False)  # plain (split_k=1) MXFP8 kernel
@@ -1062,6 +1082,7 @@ def test_mxfp8_split_k_staged_rejected():
     """SEPARATE needs a block-scaled-reachable reduction kernel (not yet wired); it must
     raise a clear error rather than silently misconfigure."""
     _skip_if_not_sm100()
+    from quack.blockscaled.operand import BlockScaledOperand
     from quack.blockscaled.utils import blockscaled_quantize
     from quack.gemm_config import SplitKMode
     from quack.gemm_interface import gemm
@@ -1076,8 +1097,8 @@ def test_mxfp8_split_k_staged_rejected():
     )
     with pytest.raises(NotImplementedError, match="SEPARATE"):
         gemm(
-            (A_q, A_sc),
-            (W_q.mT, W_sc),
+            BlockScaledOperand.from_parts(A_q, A_sc, "mxfp8"),
+            BlockScaledOperand.from_parts(W_q, W_sc, "mxfp8").mT,
             split_k=2,
             split_k_mode=SplitKMode.SEPARATE,
             tuned=False,

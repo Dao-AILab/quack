@@ -257,6 +257,55 @@ def to_mxfp4(x: torch.Tensor, block_size: int = 32):
     return data_lp, scale
 
 
+# fp6 max-normal exponents (E2M3: 1.875 * 2^2 = 7.5; E3M2: 1.75 * 2^4 = 28)
+F6_E2M3_MAX_POW2 = 2
+F6_E3M2_MAX_POW2 = 4
+
+
+def _to_mx_floatx_unpacked(x: torch.Tensor, block_size: int, ebits: int, mbits: int, max_pow2: int):
+    """E8M0-scaled quantization to UNPACKED floatx codes (one code per uint8 -
+    the byte-container storage kind::mxf8f6f4 consumes), FLOOR scaling.
+
+    Returns (codes uint8 (..., K), scale float8_e8m0fnu (..., K // block_size)).
+    """
+    assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    assert x.shape[-1] % block_size == 0
+    assert x.is_contiguous()
+
+    orig_shape = x.shape
+    data_hp = x.reshape(*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
+    max_abs = torch.amax(torch.abs(data_hp), -1).unsqueeze(-1)
+    data_hp = data_hp.to(torch.float32)
+    max_abs = max_abs.to(torch.float32)
+
+    scale_biased = _compute_e8m0_scale_floor(max_abs, max_pow2)
+    scale_fp32 = (torch.bitwise_left_shift(scale_biased.to(torch.int32), MBITS_F32)).view(
+        torch.float32
+    )
+    scale_fp32 = torch.clamp(scale_fp32, min=F32_MIN_NORMAL)
+
+    data_lp = (data_hp / scale_fp32).reshape(orig_shape)
+    codes = _f32_to_floatx_unpacked(data_lp.float(), ebits, mbits)
+    scale = scale_biased.view(torch.float8_e8m0fnu).squeeze(-1)
+    return codes, scale
+
+
+def to_mxfp4_byte(x: torch.Tensor, block_size: int = 32):
+    """MXFP4 with byte-container storage (one E2M1 code per uint8): the form
+    kind::mxf8f6f4 consumes, enabling mixed fp4 x fp8/fp6 pairs."""
+    return _to_mx_floatx_unpacked(x, block_size, EBITS_F4_E2M1, MBITS_F4_E2M1, F4_E2M1_MAX_POW2)
+
+
+def to_mxfp6_e2m3(x: torch.Tensor, block_size: int = 32):
+    """MXFP6-E2M3 quantization (byte-container uint8 codes + E8M0 scales)."""
+    return _to_mx_floatx_unpacked(x, block_size, 2, 3, F6_E2M3_MAX_POW2)
+
+
+def to_mxfp6_e3m2(x: torch.Tensor, block_size: int = 32):
+    """MXFP6-E3M2 quantization (byte-container uint8 codes + E8M0 scales)."""
+    return _to_mx_floatx_unpacked(x, block_size, 3, 2, F6_E3M2_MAX_POW2)
+
+
 def nvfp4_per_tensor_scale(amax: torch.Tensor) -> torch.Tensor:
     """NVFP4 per-tensor scale: amax / (F8E4M3_MAX * F4_E2M1_MAX) = amax / 2688."""
     return amax.to(torch.float32) / (F8E4M3_MAX * F4_E2M1_MAX)
@@ -324,6 +373,23 @@ to_mx_dim0_compiled = torch.compile(to_mx_dim0, **_COMPILE_KW)
 to_mxfp4_compiled = torch.compile(to_mxfp4, **_COMPILE_KW)
 to_nvfp4_compiled = torch.compile(to_nvfp4, **_COMPILE_KW)
 
+# In-repo quantizers by canonical format name: (eager fn, torch.compile'd fn).
+# Membership is the single source of "which formats can be quantized in-repo";
+# formats without an entry (mxfp8_e5m2, fp6) are from_parts-only until an
+# encoder lands.
+to_mxfp4_byte_compiled = torch.compile(to_mxfp4_byte, dynamic=True)
+to_mxfp6_e2m3_compiled = torch.compile(to_mxfp6_e2m3, dynamic=True)
+to_mxfp6_e3m2_compiled = torch.compile(to_mxfp6_e3m2, dynamic=True)
+
+QUANTIZERS = {
+    "mxfp8_e4m3": (to_mx, to_mx_compiled),
+    "mxfp4": (to_mxfp4, to_mxfp4_compiled),
+    "mxfp4_byte": (to_mxfp4_byte, to_mxfp4_byte_compiled),
+    "mxfp6_e2m3": (to_mxfp6_e2m3, to_mxfp6_e2m3_compiled),
+    "mxfp6_e3m2": (to_mxfp6_e3m2, to_mxfp6_e3m2_compiled),
+    "nvfp4": (to_nvfp4, to_nvfp4_compiled),
+}
+
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
@@ -351,3 +417,134 @@ def to_blocked(input_matrix: torch.Tensor) -> torch.Tensor:
     blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
     rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
     return rearranged.flatten()
+
+
+# -- Pure-torch operand/scale-layout helpers ---------------------------------
+#
+# These live here (not in blockscaled/utils.py) so that BlockScaledOperand
+# quantize/dequantize and the scale-layout math are usable without importing
+# the CuTe-DSL kernel stack. blockscaled/utils.py re-exports them.
+
+FP4_E2M1FN_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+_FP4_E2M1_CODE_TO_VALUE = torch.tensor(FP4_E2M1FN_VALUES, dtype=torch.float32)
+
+
+def _fp4_unpacked_to_value(codes_u8: torch.Tensor) -> torch.Tensor:
+    """Convert FP4 E2M1 codes in [0,16) to signed float values via table lookup.
+    Code layout: bit 3 = sign, bits 0-2 = magnitude index into {0,.5,1,1.5,2,3,4,6}."""
+    table = _FP4_E2M1_CODE_TO_VALUE.to(codes_u8.device)
+    return table[codes_u8.long()]
+
+
+def floatx_unpacked_to_value(codes: torch.Tensor, ebits: int, mbits: int) -> torch.Tensor:
+    """Decode unpacked floatx codes (sign | ebits | mbits in the low bits of a
+    uint8) to float32 values. Inverse of :func:`_f32_to_floatx_unpacked` on
+    representable values."""
+    sign = 1.0 - 2.0 * ((codes >> (ebits + mbits)) & 1).float()
+    exp = ((codes >> mbits) & ((1 << ebits) - 1)).float()
+    man = (codes & ((1 << mbits) - 1)).float()
+    bias = 2 ** (ebits - 1) - 1
+    normal = torch.exp2(exp - bias) * (1.0 + man / 2**mbits)
+    subnormal = torch.exp2(torch.tensor(1.0 - bias, device=codes.device)) * (man / 2**mbits)
+    return sign * torch.where(exp > 0, normal, subnormal)
+
+
+# unpacked-code (ebits, mbits) per byte-container format name
+_FLOATX_CODE_BITS = {"mxfp4_byte": (2, 1), "mxfp6_e2m3": (2, 3), "mxfp6_e3m2": (3, 2)}
+
+
+def dequant_operand(x: torch.Tensor, fmt=None) -> torch.Tensor:
+    """Dequantize an operand tensor to float32 values (without scale factors).
+
+    fp8 tensors convert directly; ``float4_e2m1fn_x2`` tensors unpack two codes
+    per byte (low nibble = even K, high nibble = odd K), doubling the last dim.
+    uint8 byte-container codes (fp6, byte-fp4) are ambiguous from the dtype
+    alone - pass the BlockScaledFormat.
+    """
+    if x.dtype == torch.float4_e2m1fn_x2:
+        u8 = x.view(torch.uint8)
+        lo = _fp4_unpacked_to_value(u8 & 0x0F)
+        hi = _fp4_unpacked_to_value((u8 >> 4) & 0x0F)
+        return torch.stack([lo, hi], dim=-1).reshape(*x.shape[:-1], x.shape[-1] * 2)
+    if x.dtype == torch.uint8:
+        if fmt is None or fmt.name not in _FLOATX_CODE_BITS:
+            raise ValueError(
+                "uint8 operand codes are ambiguous; pass the byte-container "
+                "BlockScaledFormat (mxfp4_byte / mxfp6_*)"
+            )
+        return floatx_unpacked_to_value(x, *_FLOATX_CODE_BITS[fmt.name])
+    return x.float()
+
+
+def check_blocked_scale_atom(SF: torch.Tensor, name: str = "scale") -> None:
+    """Validate the hardware-fixed 128x4 blocked scale layout: rank 5/6 with a
+    trailing (32, 4, 4) atom contiguous as one 512 B block (strides (16, 4, 1)).
+    Single source of this contract (operand container, GEMM interface, tests)."""
+    if SF.ndim not in (5, 6) or tuple(SF.shape[-3:]) != (32, 4, 4):
+        raise ValueError(
+            f"{name}: expected (rm, rk, 32, 4, 4) or (L, rm, rk, 32, 4, 4) blocked "
+            f"scale factors, got shape {tuple(SF.shape)}"
+        )
+    if tuple(SF.stride()[-3:]) != (16, 4, 1):
+        raise ValueError(
+            f"{name}: inner (32, 4, 4) atom must be contiguous with strides (16, 4, 1), "
+            f"got {SF.stride()[-3:]}"
+        )
+
+
+def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
+    """Rearrange a (l, mn, sf_k) or (mn, sf_k) e8m0 scale tensor into the
+    contiguous (l, rm, rk, 32, 4, 4) blocked layout shared by the quack kernel
+    and cuBLAS's block-scaling. Each inner (32, 4, 4) atom (512 B) holds one
+    128 MN x 4 K swizzled tile. Pads `mn` to a multiple of 128 and `sf_k` to a
+    multiple of 4 with zeros."""
+    if scale_2d.dim() == 2:
+        scale_2d = scale_2d.unsqueeze(0)
+    assert scale_2d.dim() == 3, f"expected (l, mn, sf_k), got shape {tuple(scale_2d.shape)}"
+    orig_dtype = scale_2d.dtype
+    l, mn, sf_k = scale_2d.shape
+    rm = _ceil_div(mn, 128)
+    rk = _ceil_div(sf_k, 4)
+    mn_pad = rm * 128
+    sf_k_pad = rk * 4
+    u8 = scale_2d.contiguous().view(torch.uint8)
+    if mn_pad != mn or sf_k_pad != sf_k:
+        padded = torch.zeros(l, mn_pad, sf_k_pad, device=scale_2d.device, dtype=torch.uint8)
+        padded[:, :mn, :sf_k] = u8
+    else:
+        padded = u8
+    # (l, mn_pad, sf_k_pad) -> (l, rm, 128, rk, 4) -> (l, rm, rk, 128, 4)
+    blocks = padded.view(l, rm, 128, rk, 4).permute(0, 1, 3, 2, 4)
+    # split 128 into (4 outer, 32 inner), then swap to (32, 4)
+    blocks = blocks.reshape(l, rm, rk, 4, 32, 4).transpose(3, 4).contiguous()
+    return blocks.view(orig_dtype)
+
+
+def unpack_scale_blocked_to_2d(blocked: torch.Tensor, mn: int, sf_k: int) -> torch.Tensor:
+    """Unswizzle (l, rm, rk, 32, 4, 4) blocked scale factors to (l, mn, sf_k)."""
+    l, rm, rk = blocked.shape[:3]
+    assert tuple(blocked.shape[3:]) == (32, 4, 4)
+    orig_dtype = blocked.dtype
+    u8 = blocked.view(torch.uint8)
+    # (32=m%32, 4=m//32, 4=k%4) -> (4, 32, 4) -> (l, rm, rk, 128, 4) -> (l, mn_pad, sf_k_pad)
+    u8 = u8.transpose(3, 4).reshape(l, rm, rk, 128, 4)
+    u8 = u8.permute(0, 1, 3, 2, 4).reshape(l, rm * 128, rk * 4)
+    return u8[:, :mn, :sf_k].contiguous().view(orig_dtype)

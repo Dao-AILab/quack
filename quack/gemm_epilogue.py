@@ -1221,6 +1221,10 @@ class EpiMod:
         concat_layout=None,
         SFA=None,  # blockscaled scale factors, see quack.gemm
         SFB=None,
+        # BlockScaledFormat names for A / B (independent; required when SFA/SFB
+        # are passed) — the descriptors drive validation and the MMA dtypes.
+        bs_format_a=None,
+        bs_format_b=None,
         swap_ab=False,  # swap-at-trace: requires b_kn (B given (k, n)); dense element mode
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
@@ -1268,6 +1272,8 @@ class EpiMod:
             concat_key,
             tensor_key(SFA),
             tensor_key(SFB),
+            bs_format_a,
+            bs_format_b,
             swap_ab,
         )
         plan = self._plan_cache.get(key)
@@ -1472,11 +1478,18 @@ class EpiMod:
         if paired_acc and self.outputs and device_capacity[0] == 9 and tile_N % 32:
             raise ValueError("SM90 acc_pair auxiliary output requires tile_N divisible by 32")
         sf_dtype = sf_vec_size = None
+        a_mma_dtype = b_mma_dtype = None
         if blockscaled:
-            from quack.gemm_tvm_ffi_utils import validate_blockscaled_sf
+            from quack.gemm_tvm_ffi_utils import (
+                resolve_blockscaled_formats,
+                validate_blockscaled_sf,
+            )
 
+            fmt_a, fmt_b = resolve_blockscaled_formats(bs_format_a, bs_format_b)
+            a_mma_dtype = fmt_a.to_cutlass_dtype()
+            b_mma_dtype = fmt_b.to_cutlass_dtype()
             sf_dtype, sf_vec_size = validate_blockscaled_sf(
-                A, B, SFA, SFB, device_capacity, b_kn=b_kn
+                A, B, SFA, SFB, device_capacity, b_kn=b_kn, fmt_a=fmt_a, fmt_b=fmt_b
             )
         # Re-map pinned ops' kind for the device loop: explicit pins still
         # need a fragment kind; VecLoads present as their dim.
@@ -1532,6 +1545,8 @@ class EpiMod:
             sf_dtype=sf_dtype,
             sf_vec_size=sf_vec_size,
             sf_batched=SFA.ndim == 6 if blockscaled else True,
+            a_mma_dtype=a_mma_dtype,
+            b_mma_dtype=b_mma_dtype,
             post_init_attrs=post_init_attrs,
             gemm_cls_ref=self._class_ref(mint_key),
             packed_cd=packed_form,
@@ -1638,6 +1653,8 @@ class EpiMod:
             A_idx=ctx.get("A_idx"),
             SFA=ctx.get("SFA"),
             SFB=ctx.get("SFB"),
+            bs_format_a=ctx.get("bs_format_a"),
+            bs_format_b=ctx.get("bs_format_b"),
             rounding_mode=ctx["rounding_mode"],
             epi_key_overrides=ctx["epi_key_overrides"],
             b_kn=ctx["b_kn"],
@@ -1664,6 +1681,8 @@ class EpiMod:
         A_idx=None,
         SFA=None,
         SFB=None,
+        bs_format_a=None,  # BlockScaledFormat names (see EpiMod.gemm)
+        bs_format_b=None,
         rounding_mode=RoundingMode.RN,
         epi_key_overrides=None,
         concat_layout=None,  # tensors whose non-contiguous dim is concat [gate; up]
@@ -1707,6 +1726,8 @@ class EpiMod:
                 A_idx=A_idx,
                 SFA=SFA,
                 SFB=SFB,
+                bs_format_a=bs_format_a,
+                bs_format_b=bs_format_b,
                 rounding_mode=rounding_mode,
                 operands=operands,
             )
@@ -1744,6 +1765,8 @@ class EpiMod:
                 tensor_key(A_idx),
                 tensor_key(SFA),
                 tensor_key(SFB),
+                bs_format_a,
+                bs_format_b,
                 rounding_mode,
                 None if epi_key_overrides is None else tuple(sorted(epi_key_overrides.items())),
             )
@@ -1835,6 +1858,8 @@ class EpiMod:
                 dynamic_scheduler=dynamic_scheduler,
                 SFA=SFA,
                 SFB=SFB,
+                bs_format_a=bs_format_a,
+                bs_format_b=bs_format_b,
                 concat_layout=concat_layout,
             )
             sink_bufs = {name: res.sinks[name] for name in owned_sinks}
@@ -1854,6 +1879,8 @@ class EpiMod:
                 A_idx=A_idx,
                 SFA=SFA,
                 SFB=SFB,
+                bs_format_a=bs_format_a,
+                bs_format_b=bs_format_b,
                 rounding_mode=rounding_mode,
                 epi_key_overrides=epi_key_overrides,
                 concat_layout=concat_layout,
@@ -1908,6 +1935,8 @@ class EpiMod:
         A_idx=None,
         SFA=None,
         SFB=None,
+        bs_format_a=None,  # BlockScaledFormat names (see EpiMod.gemm)
+        bs_format_b=None,
         rounding_mode=RoundingMode.RN,
         epi_key_overrides=None,
         **operands,
@@ -1940,6 +1969,8 @@ class EpiMod:
             A_idx=A_idx,
             SFA=SFA,
             SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
             rounding_mode=rounding_mode,
             epi_key_overrides=epi_key_overrides,
         )

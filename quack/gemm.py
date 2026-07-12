@@ -34,6 +34,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_gemm_tensors,
     make_fake_sf_tensor,
     compile_gemm_kernel,
+    resolve_blockscaled_formats,
     validate_blockscaled_sf,
     tensor_key,
     scalar_mode,
@@ -81,6 +82,8 @@ def _compile_gemm(
     batched=True,
     b_kn=False,
     sf_batched=True,
+    a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
+    b_mma_dtype=None,  # storage dtypes (byte-container sub-byte formats)
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -197,6 +200,8 @@ def _compile_gemm(
         split_k=split_k,
         split_k_mode=split_k_mode,
         b_transposed=b_kn,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
     )
 
 
@@ -374,6 +379,11 @@ def gemm(
     # See AI/varlen_blockscaled_sf_layout.md.
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
+    # BlockScaledFormat names for A and B (independent; e.g. "mxfp8_e4m3"); both
+    # required when SFA/SFB are passed. The descriptors are the single source of
+    # scale vec size / packing - formats are never re-derived from tensor dtypes.
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     split_k: int = 1,
     split_k_mode: int = SplitKMode.SERIAL,
     # B is passed (k, n) / (l, k, n) and relabeled to kernel order (n, k) at trace
@@ -426,6 +436,8 @@ def gemm(
         split_k,
         split_k_mode,
         b_kn,
+        bs_format_a,
+        bs_format_b,
     )
     plan = _gemm_plan_cache.get(key)
     if plan is None:
@@ -464,6 +476,8 @@ def gemm(
             split_k=split_k,
             split_k_mode=split_k_mode,
             b_kn=b_kn,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -612,6 +626,8 @@ def _build_gemm_plan(
     split_k,
     split_k_mode,
     b_kn=False,
+    bs_format_a=None,
+    bs_format_b=None,
 ) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -652,7 +668,13 @@ def _build_gemm_plan(
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
     sf_dtype, sf_vec_size = None, None
+    a_mma_dtype, b_mma_dtype = None, None
     if blockscaled:
+        fmt_a, fmt_b = resolve_blockscaled_formats(bs_format_a, bs_format_b)
+        # MMA element types come from the descriptors; identical to the storage
+        # dtypes except for byte-container sub-byte formats (fp6, byte-fp4).
+        a_mma_dtype = fmt_a.to_cutlass_dtype()
+        b_mma_dtype = fmt_b.to_cutlass_dtype()
         assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
@@ -663,7 +685,16 @@ def _build_gemm_plan(
         else:
             num_batches = None
         sf_dtype, sf_vec_size = validate_blockscaled_sf(
-            A, B, SFA, SFB, device_capacity, num_batches=num_batches, varlen_k=varlen_k, b_kn=b_kn
+            A,
+            B,
+            SFA,
+            SFB,
+            device_capacity,
+            num_batches=num_batches,
+            varlen_k=varlen_k,
+            b_kn=b_kn,
+            fmt_a=fmt_a,
+            fmt_b=fmt_b,
         )
     if split_k > 1 and device_capacity[0] not in [9, 10, 11, 12]:
         raise ValueError("split_k > 1 requires SM90, SM100, SM110, or SM120")
@@ -765,6 +796,8 @@ def _build_gemm_plan(
         batched,
         b_kn,
         SFA.ndim == 6 if blockscaled else True,
+        a_mma_dtype,
+        b_mma_dtype,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K

@@ -6,10 +6,24 @@
 - :mod:`quack.blockscaled.utils` — scale-factor packing/unpacking, operand
   builders for tests/benchmarks, and the kernel-level compile path.
 
-The GEMM entry points live in :mod:`quack.gemm_interface` (pass ``(A, SFA)`` /
-``(B, SFB)`` tuples).
+The GEMM entry points live in :mod:`quack.gemm_interface`; pass
+:class:`BlockScaledOperand` operands (``(data, scale_factor)`` tuples are
+rejected with a TypeError). Design doc: ``AI/blockscaled_api.md``.
 """
 
+from quack.blockscaled.operand import (  # noqa: F401
+    BLOCKSCALED_FORMAT_REGISTRY,
+    MXFP4,
+    MXFP4_BYTE,
+    MXFP6_E2M3,
+    MXFP6_E3M2,
+    MXFP8_E4M3,
+    MXFP8_E5M2,
+    NVFP4,
+    BlockScaledFormat,
+    BlockScaledOperand,
+    mma_kind_for_pair,
+)
 from quack.blockscaled.quantize import (  # noqa: F401
     nvfp4_per_tensor_scale,
     to_blocked,
