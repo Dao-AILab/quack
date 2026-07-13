@@ -17,7 +17,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Int32, Boolean, const_expr
-from cutlass.utils import SmemPartition
+from cutlass.memory import SmemPartition
 
 from quack.varlen_utils import VarlenManager
 from quack.pipeline import make_pipeline_state
@@ -101,7 +101,7 @@ class GemmSm120(GemmSm90):
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         self.occupancy = 1
-        self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(f"sm_{self.arch}")
 
         # In pingpong, only 1 warp group (4 warps) participates in epilogue at a time
         self.num_epi_warps = (self.mma_warp_groups if not self.pingpong else 1) * 4
@@ -200,7 +200,7 @@ class GemmSm120(GemmSm90):
                     cpasync.prefetch_descriptor(tma_atom)
 
         # Allocate shared memory
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         ab_pipeline = self.make_ab_pipeline(

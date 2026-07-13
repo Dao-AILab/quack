@@ -124,7 +124,7 @@ class _SmemRoundTrip:
         for i in cutlass.range_constexpr(_SMEM_ELEMS_PER_THREAD):
             rmem[i] = mX[bidx, tidx * const_expr(_SMEM_ELEMS_PER_THREAD) + const_expr(i)]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         exchange = allocate_smem_complex(smem, cute.make_layout(_SMEM_BLOCK_ELEMS))
 
         for i in cutlass.range_constexpr(_SMEM_ELEMS_PER_THREAD):

@@ -168,7 +168,7 @@ class RMSNorm(ReductionBase):
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
         tv_layout = tiled_copy.layout_tv_tiled
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sX = smem.allocate_tensor(
             mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
         )
@@ -767,7 +767,7 @@ class RMSNormBackward(ReductionBase):
 
         idX = cute.make_identity_tensor(shape)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         USE_TMA = const_expr(self.USE_TMA)
         n_smem_stages = const_expr(self.config.smem_stages)
         smem_layout = cute.make_ordered_layout(

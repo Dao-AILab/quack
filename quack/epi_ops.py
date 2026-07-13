@@ -598,7 +598,7 @@ class TileLoad(EpiOp):
 
     def to_params(self, gemm, args):
         tensor = getattr(args, self.name)
-        setattr(gemm, self._layout_gemm_attr(), cutlass.utils.LayoutEnum.from_tensor(tensor))
+        setattr(gemm, self._layout_gemm_attr(), cutlass.tensor_utils.LayoutEnum.from_tensor(tensor))
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(

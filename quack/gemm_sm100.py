@@ -22,7 +22,7 @@ from cutlass.cute.nvgpu.warp import (
     StMatrix16x8x8bOp,
 )
 from cutlass import Int32, Float32, Boolean, const_expr
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 from cutlass.cute.experimental import iket
 
 
@@ -443,7 +443,7 @@ class GemmSm100(GemmTmaBase):
             self.c_layout,
             epilogue_args,
             prefetch_A_idx,
-            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
+            cutlass.memory.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
         )
@@ -980,7 +980,7 @@ class GemmSm100(GemmTmaBase):
         tidx, _, _ = cute.arch.thread_idx()
 
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = self.shared_storage.allocate(smem)
 
         # Initialize pipelines and states
@@ -1007,7 +1007,7 @@ class GemmSm100(GemmTmaBase):
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
             is_two_cta=use_2cta_instrs,
@@ -2537,7 +2537,7 @@ class GemmSm100(GemmTmaBase):
         """
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
-        num_tmem_alloc_cols = cutlass.utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        num_tmem_alloc_cols = cutlass.memory.get_num_tmem_alloc_cols(tCtAcc_fake)
         return num_tmem_alloc_cols
 
     @staticmethod
