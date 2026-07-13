@@ -149,7 +149,9 @@ import enum
 import functools
 import hashlib
 import inspect
+import os
 import sys
+import sysconfig
 import types
 from typing import NamedTuple, Optional
 
@@ -280,6 +282,35 @@ def _semantic_value_key(value, seen):
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _stdlib_root() -> str:
+    return os.path.abspath(sysconfig.get_paths()["stdlib"]) + os.sep
+
+
+def _is_extern_function(fn) -> bool:
+    """True for functions defined in installed (stdlib / site-packages /
+    dist-packages) code outside the quack package. Like classes and modules,
+    they fingerprint by qualname only: their source is pinned by the installed
+    distribution (the disk cache additionally stamps the cutlass version and
+    hashes every quack source file), and recursing into them would pull
+    runtime-MUTABLE library globals into the digest — e.g. any fn touching
+    cutlass's dsl_user_op machinery reaches cutlass._mlir_helpers.op, which
+    lazily materializes _DSL_PACKAGE_ROOT(S) on the first traced op, so the
+    digest would depend on whether this process compiled anything yet (async
+    workers resolve module-global EpiMods by re-import and reject the ref as
+    "changed" on any mismatch)."""
+    module = getattr(fn, "__module__", None) or ""
+    if module == "quack" or module.startswith("quack."):
+        return False
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return False
+    filename = code.co_filename
+    if f"{os.sep}site-packages{os.sep}" in filename or f"{os.sep}dist-packages{os.sep}" in filename:
+        return True
+    return filename.startswith(_stdlib_root())
+
+
 def _function_semantic_key(fn, seen=None):
     """Fingerprint source plus the globals/closures that can change its math."""
     seen = set() if seen is None else seen
@@ -287,6 +318,8 @@ def _function_semantic_key(fn, seen=None):
     if ident in seen:
         return ("function_ref", *ident)
     seen.add(ident)
+    if _is_extern_function(fn):
+        return ("extern_function", *ident)
     try:
         source = inspect.getsource(fn).encode()
     except (OSError, TypeError):

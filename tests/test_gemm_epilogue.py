@@ -1467,6 +1467,42 @@ def test_semantic_key_fail_closed_and_protocol():
     assert op.__quack_semantic_key__() == op.cache_key()
 
 
+def test_semantic_digest_ignores_extern_library_state():
+    """The digest must not depend on runtime-mutable state inside installed
+    libraries. cutlass._mlir_helpers.op lazily materializes _DSL_PACKAGE_ROOT(S)
+    on the first traced op, so a digest that recursed into cutlass function
+    globals differed between "before any compile" and "after a compile" in the
+    same process: async-compile workers (which typically compile other keys
+    before their lazy first import of quack.epilogues) then rejected every
+    module-global epilogue ref as "changed while resolving" and every one of
+    those keys fell back to an in-process compile."""
+    import cutlass._mlir_helpers.op as _op
+
+    from quack.activation import gelu_tanh_approx
+
+    def mint():
+        @gemm_epilogue()
+        def epi(acc):
+            return {"D": gelu_tanh_approx(acc)}
+
+        return epi
+
+    saved = (_op._DSL_PACKAGE_ROOT, _op._DSL_PACKAGE_ROOTS)
+    try:
+        # State of a process that has never compiled anything.
+        _op._DSL_PACKAGE_ROOT, _op._DSL_PACKAGE_ROOTS = "", None
+        d_fresh = mint().semantic_digest
+        # First framework-frame check (any traced op) populates the roots.
+        _op._is_framework_frame.cache_clear()
+        _op._is_framework_frame(__file__)
+        assert _op._DSL_PACKAGE_ROOTS is not None
+        d_after_compile = mint().semantic_digest
+    finally:
+        _op._DSL_PACKAGE_ROOT, _op._DSL_PACKAGE_ROOTS = saved
+        _op._is_framework_frame.cache_clear()
+    assert d_fresh == d_after_compile
+
+
 def test_epi_mod_multi_output_mixed_dtype():
     """Tier-1 unlock: several TileStores from one epilogue, mixed dtypes —
     each op derives its own dtype/copy-atom (no singular aux_out_dtype)."""

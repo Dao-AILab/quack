@@ -277,45 +277,13 @@ def jit_cache(fn):
         #    while we were waiting; in that case we just load and return
         #    without duplicating the compile.
         try:
-            with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
-                if o_path.exists():
-                    try:
-                        loaded = _load_cached()
-                    except Exception as e:
-                        _quarantine_corrupt(e)  # holds the exclusive lock: safe
-                    else:
-                        cache[cache_key] = loaded
-                        hits += 1
-                        return loaded
-
-                misses += 1
-                compiled_fn = fn(*args, **kwargs)
-                # Export to a private temp file, then atomically rename into
-                # place: a process killed mid-export (xdist worker OOM-kill,
-                # timeout) must never leave a truncated .o at the final path —
-                # the advisory flock dies with the process, and a persistent
-                # cache (CI keeps one in $HOME) would then fail every future
-                # run on this key with "Symbols not found: __tvm_ffi_func".
-                tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")
-                try:
-                    compiled_fn.export_to_c(
-                        object_file_path=str(tmp_path),
-                        function_name=EXPORT_FUNC_NAME,
-                    )
-                    os.replace(tmp_path, o_path)
-                except Exception as e:
-                    warnings.warn(
-                        f"quack cache: export failed for key {sha}: {e} "
-                        f"(this key will recompile every run)",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    try:
-                        tmp_path.unlink()
-                    except OSError:
-                        pass
-                cache[cache_key] = compiled_fn
-                return compiled_fn
+            lock = FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT)
+            # Acquire outside the compile's try scope: only the acquisition
+            # raises the timeout RuntimeError. A blanket `try: with lock: fn()`
+            # also caught RuntimeErrors from the compile itself, mislabeling
+            # real compile failures as lock timeouts and re-running the failed
+            # compile a second time.
+            lock.__enter__()
         except RuntimeError as e:
             # Lock acquisition timed out (heavy contention or stuck holder).
             # Fall back to in-process compile, no disk write. Better to do
@@ -330,6 +298,47 @@ def jit_cache(fn):
             compiled_fn = fn(*args, **kwargs)
             cache[cache_key] = compiled_fn
             return compiled_fn
+        try:
+            if o_path.exists():
+                try:
+                    loaded = _load_cached()
+                except Exception as e:
+                    _quarantine_corrupt(e)  # holds the exclusive lock: safe
+                else:
+                    cache[cache_key] = loaded
+                    hits += 1
+                    return loaded
+
+            misses += 1
+            compiled_fn = fn(*args, **kwargs)
+            # Export to a private temp file, then atomically rename into
+            # place: a process killed mid-export (xdist worker OOM-kill,
+            # timeout) must never leave a truncated .o at the final path —
+            # the advisory flock dies with the process, and a persistent
+            # cache (CI keeps one in $HOME) would then fail every future
+            # run on this key with "Symbols not found: __tvm_ffi_func".
+            tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")
+            try:
+                compiled_fn.export_to_c(
+                    object_file_path=str(tmp_path),
+                    function_name=EXPORT_FUNC_NAME,
+                )
+                os.replace(tmp_path, o_path)
+            except Exception as e:
+                warnings.warn(
+                    f"quack cache: export failed for key {sha}: {e} "
+                    f"(this key will recompile every run)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            cache[cache_key] = compiled_fn
+            return compiled_fn
+        finally:
+            lock.__exit__(None, None, None)
 
     def cache_clear():
         nonlocal hits, misses
