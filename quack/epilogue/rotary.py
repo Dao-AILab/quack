@@ -8,7 +8,7 @@ import cutlass.cute as cute
 from cutlass import Boolean, const_expr
 
 import quack.copy_utils as copy_utils
-from quack.epi_ops import EpiOp, TileLoad
+from quack.epi_ops import ColVecLoad, EpiOp, RowVecLoad, TileLoad
 from quack.gemm_epilogue import gemm_epilogue, pack, unpack
 
 
@@ -337,6 +337,301 @@ def rope_table_ldg_epi(acc, cs, bias):
     x1, x2 = unpack(acc + bias)
     c, s = unpack(cs)
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+
+
+# vectorize=False (here and on every epilogue built on _angle_turns): the
+# SM100 loop vectorizer heap-corrupts on this body — the magic-bias round
+# reuses t across two arith consumers, minimal repro `pack(x1 + t, x2 + t)`
+# (segfault / double-free / compile hang, nondeterministic). The hatch is
+# free while the epilogue is mainloop-hidden (B300 K=4096: +1.9% vs
+# bias-only) and costs ~14pp of kernel time when epilogue-exposed (K=512:
+# +65% vs +51% for a vectorized roundeven variant) — when the upstream
+# vectorizer is fixed, remove it and re-bench magic-bias vs FRND under
+# vectorization.
+@gemm_epilogue(
+    ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")},
+    mode="acc_pair",
+    vectorize=False,
+)
+def rope_posfreq_epi(acc, pos, freq, bias):
+    """RoPE computing cos/sin in-kernel via ``sincos(pos * inv_freq)`` instead
+    of loading the precomputed (seqlen_ro, head_dim) table.
+
+    ``pos`` is the per-row position, (l, m) float32 (exact up to 2^24; may
+    differ per batch, unlike the shared table). ``freq`` is the per-output-
+    column inv-freq as a float-float table, (l, n) float32, hi at even
+    columns and lo at odd (same interleaving convention as the cos/sin
+    table) — build it with ``make_interleaved_inv_freq``. Both are plain
+    broadcast vector loads, so the per-tile gmem traffic is tile_M + tile_N
+    elements vs the table's tile_M * head_dim; the table's tile_N/head_dim
+    alignment constraint disappears (the head wrap is baked into the freq
+    table), and varlen_m works for free (rank-1 (total_m,) ``pos``).
+    Per-column behavior is data, not kernel structure: zero-frequency columns
+    rotate by angle 0, an exact identity, so packed QKV projections rotate
+    only the Q/K block via ``make_interleaved_inv_freq(inv_freq, qk_dim,
+    v_dim)`` — no branch, V passes through bitwise.
+
+    Angle math: the f32 product pos*freq loses absolute precision linearly in
+    the angle (a plain-f32 pipeline — including a table built from f32 host
+    angles — is off by 5e-3 of output scale at 128k positions, 0.67 at 16M),
+    so the angle is computed as a float-float, in TURNS: the table stores
+    inv_freq/2pi, the reduction is an exact mod-1 (H100's MUFU natively works
+    in turns — ptxas prepends an FMUL.RZ by 1/2pi to every ``sin.approx``, so
+    reducing mod 2pi in radians is the same work in the wrong unit; mod-1
+    needs no Cody-Waite constant split at all). Max error vs an f64 reference
+    is ~8e-7 of output scale at every position range through 2^24 — same as a
+    table built from f64 host angles (checked: in-kernel libdevice sincosf
+    gains nothing and costs +17-65% kernel time). Pipe budget per rotation
+    pair: 15 FMA-pipe ops + 2 MUFU — the quarter-rate XU pipe (MUFU) is the
+    epilogue's math wall, which is why the round uses the magic-bias adds
+    instead of FRND (FRND also issues on XU; evicting it cut the exposed
+    k=512 rope overhead by ~4-6pp, ncu-verified). H100 m=16384 k=4096 n=4096
+    head_dim=128, overhead vs a bias-only epilogue at the same config
+    (interleaved-median bench), against rope_table_epi's TMA table:
+
+    ==================  ========  =======
+    config              posfreq   table
+    ==================  ========  =======
+    192x128 c(1,2) pp     +0.8%    +2.0%
+    128x256 c(1,1)        +3.8%    +4.8%
+    256x128 c(1,2)        +4.2%   +10.8%
+    ==================  ========  =======
+    """
+    # Reference math, per rotation pair (x1, x2) at row position `pos`:
+    #     theta = pos * inv_freq
+    #     D = (x1*cos(theta) - x2*sin(theta), x1*sin(theta) + x2*cos(theta))
+    # The angle helpers below compute this with three transformations that
+    # lose no accuracy (turns units, float-float compensation, magic-bias
+    # rounding) — see _angle_turns / _sincos_turns for the derivations.
+    x1, x2 = unpack(acc + bias)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+
+
+def _angle_turns(pos, freq):
+    """theta = pos * inv_freq as an unevaluated float-float sum (t, lo), in
+    TURNS (the freq table stores inv_freq/2pi — see make_interleaved_inv_freq).
+
+    The plain product pos*fh rounds away low bits worth whole rotations once
+    pos*freq is large (~0.5 ulp = 1 rotation at pos ~ 2^24, freq ~ 1). The
+    exact FFMA residual of the product plus the below-f32 freq bits (fl)
+    carry them in the compensation term `lo`, re-added after range reduction
+    when the angle is small again (_sincos_turns)."""
+    fh, fl = unpack(freq)  # float-float inv_freq/2pi: fh + fl to ~2^-49 rel
+    t = pos * fh  # angle in turns, rounded to f32
+    terr = cute.math.fma(pos, fh, -t)  # bits the product rounded away (exact)
+    lo = cute.math.fma(pos, fl, terr)  # + the angle bits below fh's precision
+    return t, lo
+
+
+def _sincos_turns(t, lo):
+    """(sin, cos) of the float-float angle (t + lo) turns via MUFU.
+
+    Turns make range reduction exact: theta mod 1 is a round and a subtract,
+    no Cody-Waite constant splitting — and turns are the hardware's native
+    unit (MUFU.SIN takes turns; ptxas prepends x*(1/2pi) to every radians
+    sin.approx). The round uses the magic-bias adds because MUFU.SIN/COS and
+    FRND all issue on the quarter-rate XU pipe, the epilogue's math
+    bottleneck (the 2 MUFU are its floor) — two full-rate FADDs beat FRND."""
+    # Round-to-nearest-even via the magic bias: exact for |t| < 2^22 (here
+    # t < 2^24/2pi), because adding 1.5*2^23 shifts the integer part onto the
+    # mantissa boundary. t - q is then exact (both are multiples of ulp(t)).
+    q = (t + 12582912.0) - 12582912.0
+    r = (t - q) + lo  # theta mod 1, plus the compensation term
+    # sin.approx wants radians and ptxas rescales by 1/2pi for MUFU; the
+    # cancelling multiply pair is PTX's toll — there is no turns-domain PTX.
+    # Separate sin/cos calls, NOT cute.math.sincos: the SM100 loop vectorizer
+    # (the vectorize=True pair loop in gemm_epilogue) segfaults the MLIR
+    # compiler on the fused two-result op. Identical SASS either way — ptxas
+    # shares the FMUL.RZ between the MUFU.SIN/MUFU.COS pair of one argument.
+    r_rad = r * 6.283185307179586
+    s = cute.math.sin(r_rad, fastmath=True)
+    c = cute.math.cos(r_rad, fastmath=True)
+    return s, c
+
+
+@gemm_epilogue(
+    ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")},
+    mode="acc_pair",
+    vectorize=False,  # SM100 vectorizer bug — see note above rope_posfreq_epi
+)
+def rope_posfreq_scaled_epi(acc, pos, freq, bias, scale):
+    """rope_posfreq_epi with an attention-temperature factor on the rotated
+    output: D = scale * rope(acc + bias). This is YaRN's mscale (DeepSeek-V2/
+    V3, Qwen long-context) — the table-op form bakes it into the host cos/sin
+    values, but with in-kernel sincos it must be a multiply (an angle change
+    cannot express a magnitude change), so it costs one Scalar operand and
+    two FMULs per pair. The YaRN frequency transform itself is pure data:
+    feed the transformed inv_freq to make_interleaved_inv_freq."""
+    x1, x2 = unpack(acc + bias)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    x1, x2 = x1 * scale, x2 * scale
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+
+
+@gemm_epilogue(
+    ops={
+        "pos_t": ColVecLoad("pos_t"),
+        "pos_h": ColVecLoad("pos_h"),
+        "pos_w": ColVecLoad("pos_w"),
+        "freq_t": RowVecLoad("freq_t"),
+        "freq_h": RowVecLoad("freq_h"),
+        "freq_w": RowVecLoad("freq_w"),
+    },
+    mode="acc_pair",
+    vectorize=False,  # SM100 vectorizer bug — see note above rope_posfreq_epi
+)
+def mrope_posfreq_epi(acc, pos_t, pos_h, pos_w, freq_t, freq_h, freq_w, bias):
+    """Multimodal 3D RoPE (Qwen2-VL mRoPE): head-dim sections rotate by
+    different position axes — pair j uses pos_t, pos_h, or pos_w according to
+    which section j falls in. The section SELECT is data, not kernel
+    structure: each axis gets its own freq table, zeroed outside its section
+    (make_mrope_inv_freq), so the angle is the three-term dot product
+
+        theta = pos_t*f_t(j) + pos_h*f_h(j) + pos_w*f_w(j)
+
+    with exactly one nonzero term per column — the sums are exact (adding
+    zeros), so the float-float compensation of the live term survives intact.
+    Costs two extra vector-load pairs and ~6 FMA-pipe ops per pair over
+    rope_posfreq_epi; the XU (MUFU) cost is unchanged."""
+    x1, x2 = unpack(acc + bias)
+    t1, lo1 = _angle_turns(pos_t, freq_t)
+    t2, lo2 = _angle_turns(pos_h, freq_h)
+    t3, lo3 = _angle_turns(pos_w, freq_w)
+    s, c = _sincos_turns((t1 + t2) + t3, (lo1 + lo2) + lo3)
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+
+
+@gemm_epilogue(
+    ops={
+        "pos": ColVecLoad("pos"),
+        "dpos": ColVecLoad("dpos"),
+        "freq": RowVecLoad("freq"),
+        "logz": RowVecLoad("logz"),
+    },
+    mode="acc_pair",
+    vectorize=False,  # SM100 vectorizer bug — see note above rope_posfreq_epi
+)
+def xpos_posfreq_epi(acc, pos, dpos, freq, logz, bias):
+    """xPos (length-extrapolatable RoPE, Sun et al. 2022): the rope_posfreq
+    rotation times a per-pair magnitude decay zeta_j**dpos.
+
+    xPos REQUIRES OPPOSITE scales on Q and K — query zeta^(+m/s), key
+    zeta^(-m/s), so the attention score decays as zeta^((m-n)/s) — and that
+    sign lives in the DATA, not in two kernels: ``logz`` carries per-column
+    log2(zeta_j) (make_xpos_log_scale), positive over Q columns, negative
+    over K, zero over V (exp2(0) = 1, so the packed-QKV passthrough
+    survives). ``dpos`` is the decay exponent, typically
+    (pos - offset) / scale_base — a separate colvec from the rotation
+    position because implementations offset/rescale it to keep zeta**dpos in
+    f32 range. Costs one MUFU.EX2 per pair: the quarter-rate XU pipe goes
+    from 2 to 3 ops/pair, so expect ~1.5x plain rope's exposed-epilogue
+    overhead (hidden regimes unaffected)."""
+    x1, x2 = unpack(acc + bias)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    z, _ = unpack(logz)  # both lanes of a pair share the decay
+    zeta = cute.math.exp2(dpos * z, fastmath=True)
+    x1, x2 = x1 * zeta, x2 * zeta
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+
+
+def _ff_turns_head(inv_freq):
+    """(head,) float-float split of inv_freq/2pi, interleaved hi/lo per pair."""
+    import math
+
+    import torch
+
+    f64 = inv_freq.double() / (2 * math.pi)
+    hi = f64.float()
+    lo = (f64 - hi.double()).float()
+    return torch.stack([hi, lo], dim=-1).reshape(-1)
+
+
+def make_interleaved_inv_freq(inv_freq, rotary_n, nonrotary_n=0, head_dim=None):
+    """Pack HF-style inv_freq (rotary_dim/2,) into the (rotary_n + nonrotary_n,)
+    float-float table rope_posfreq_epi consumes: rotation pair j of each head
+    reads (hi, lo) at columns (2j, 2j+1), where hi + lo is the two-float32
+    split of inv_freq[j] / 2pi — the kernel's angle unit is TURNS (see
+    rope_posfreq_epi) — with heads repeating the pattern over the first
+    rotary_n columns. Zero frequency means angle 0, an exact identity (MUFU
+    sincos(0) is exactly (0, 1)), which encodes the popular non-rotated
+    layouts as data:
+
+    * packed QKV — RoPE on Q/K, V passed through bitwise: the last
+      nonrotary_n columns are zero-frequency;
+      ``make_interleaved_inv_freq(inv_freq, q_dim + k_dim, v_dim)``.
+    * partial rotary (GPT-J / Phi / GLM: rotary_dim < head_dim) — pass
+      ``head_dim``: each head's tail beyond 2*len(inv_freq) is zero-frequency.
+
+    NTK-aware scaling (fixed or dynamic) and YaRN's NTK-by-parts ramp are
+    pure inv_freq transforms — pass the transformed values here (YaRN's
+    mscale additionally needs rope_posfreq_scaled_epi).
+
+    The split preserves inv_freq/2pi to ~2^-49 relative precision — pass
+    inv_freq as float64 if available; float32 input still splits exactly (the
+    /2pi quotient is computed in f64), only the input's own quantization is
+    unrecoverable."""
+    import torch
+
+    head = _ff_turns_head(inv_freq)
+    rotary_dim = head.shape[0]
+    head_dim = rotary_dim if head_dim is None else head_dim
+    assert head_dim >= rotary_dim and head_dim % 2 == 0
+    head = torch.nn.functional.pad(head, (0, head_dim - rotary_dim))
+    assert rotary_n % head_dim == 0, "rotary_n must be a whole number of heads"
+    assert nonrotary_n % 2 == 0, "nonrotary_n must be even (columns are processed in pairs)"
+    return torch.nn.functional.pad(head.repeat(rotary_n // head_dim), (0, nonrotary_n))
+
+
+def make_mrope_inv_freq(inv_freq, sections, rotary_n, nonrotary_n=0):
+    """Per-axis freq tables for mrope_posfreq_epi (Qwen2-VL mRoPE).
+
+    ``sections`` is the pairs-per-axis split of the head (HF mrope_section,
+    e.g. (16, 24, 24) for head_dim 128); axis a's table carries inv_freq/2pi
+    over its own section's pairs and zero elsewhere, so the kernel's
+    three-term angle dot product selects the right position axis per column
+    purely through the data. Returns len(sections) tables shaped like
+    make_interleaved_inv_freq's output."""
+    import torch
+
+    assert sum(sections) == inv_freq.shape[0], "sections must cover all rotation pairs"
+    head = _ff_turns_head(inv_freq)
+    head_dim = head.shape[0]
+    assert rotary_n % head_dim == 0, "rotary_n must be a whole number of heads"
+    assert nonrotary_n % 2 == 0, "nonrotary_n must be even (columns are processed in pairs)"
+    outs = []
+    start = 0
+    for sec in sections:
+        masked = torch.zeros_like(head)
+        masked[2 * start : 2 * (start + sec)] = head[2 * start : 2 * (start + sec)]
+        outs.append(torch.nn.functional.pad(masked.repeat(rotary_n // head_dim), (0, nonrotary_n)))
+        start += sec
+    return tuple(outs)
+
+
+def make_xpos_log_scale(head_dim, q_n, k_n=0, nonscaled_n=0, gamma=0.4, device=None):
+    """Per-column log2(zeta) table for xpos_posfreq_epi.
+
+    zeta_j = (2j + gamma*head_dim) / ((1 + gamma)*head_dim) per rotation pair
+    (the torchscale convention, gamma=0.4). The first q_n columns get
+    +log2(zeta) (query side, decay zeta^+dpos), the next k_n get -log2(zeta)
+    (key side, zeta^-dpos), the last nonscaled_n get 0 (exp2(0) = 1 — the V
+    block of a packed QKV projection passes through unscaled). For separate
+    Q / K projections build two tables (q_n=n / k_n=n)."""
+    import torch
+
+    assert q_n % head_dim == 0 and k_n % head_dim == 0, "q_n/k_n must be whole heads"
+    assert nonscaled_n % 2 == 0, "nonscaled_n must be even (columns are processed in pairs)"
+    j2 = torch.arange(0, head_dim, 2, dtype=torch.float64, device=device)
+    zeta = (j2 + gamma * head_dim) / ((1 + gamma) * head_dim)
+    logz = torch.log2(zeta).float().repeat_interleave(2)  # both pair lanes share it
+    return torch.cat(
+        [
+            logz.repeat(q_n // head_dim),
+            -logz.repeat(k_n // head_dim),
+            logz.new_zeros(nonscaled_n),
+        ]
+    )
 
 
 def make_interleaved_cos_sin(cos, sin):

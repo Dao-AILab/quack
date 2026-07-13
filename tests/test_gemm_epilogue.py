@@ -19,7 +19,17 @@ from quack.gemm_dact import gemm_dact
 from quack.gemm_norm_act import gemm_norm_act_fn
 from quack.gemm_sq_reduce import gemm_sq_reduce
 from quack.epilogue.head_rmsnorm import HeadRMSNormStats  # noqa: F401
-from quack.epilogue.rotary import rope_table_epi, rope_table_ldg_epi
+from quack.epilogue.rotary import (
+    make_interleaved_inv_freq,
+    make_mrope_inv_freq,
+    make_xpos_log_scale,
+    mrope_posfreq_epi,
+    rope_posfreq_epi,
+    rope_posfreq_scaled_epi,
+    rope_table_epi,
+    rope_table_ldg_epi,
+    xpos_posfreq_epi,
+)
 from quack.epilogues import (
     amax_epi,
     dgelu_mod,
@@ -1077,6 +1087,307 @@ def test_epi_mod_rope_table_op(tile_N, tma):
     xp = x.unflatten(-1, (heads, head_dim // 2, 2))
     c = ang.cos()[None, :, None, :]
     s = ang.sin()[None, :, None, :]
+    ref = torch.empty_like(xp)
+    ref[..., 0] = xp[..., 0] * c - xp[..., 1] * s
+    ref[..., 1] = xp[..., 0] * s + xp[..., 1] * c
+    _rel_check(D, ref.reshape(l, m, n), "D")
+
+
+# 96 is deliberately NOT head_dim-aligned — the table ops forbid it, but the
+# posfreq variant bakes the head wrap into the freq vector, so any tile_N works.
+@pytest.mark.parametrize("tile_N", [96, 128, 256])
+def test_epi_mod_rope_posfreq(tile_N):
+    device = "cuda"
+    torch.random.manual_seed(16)
+    l, m, k, head_dim, heads = 2, 384, 736, 128, 6  # m != n keeps bias inference unambiguous
+    n = head_dim * heads
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    bias = torch.randn((l, n), device=device, dtype=torch.float32)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    # Per-batch position offsets: expressible here (pos is (l, m)), not with
+    # the shared (seqlen, head_dim) table. The 2^24 offset (the float32
+    # position ceiling) encodes the accuracy contract vs the f64 reference:
+    # the in-kernel float-float angle (Dekker product + freq_lo correction +
+    # Cody-Waite mod 2pi) stays at ~1e-6 of scale there, where any plain-f32
+    # angle path — raw or CW-reduced — is off by ~0.67 of scale and fails.
+    pos = (
+        torch.arange(m, device=device, dtype=torch.float32)[None, :]
+        + torch.tensor([0.0, 2.0**24 - m], device=device)[:, None]
+    )
+    pos = pos.contiguous()
+    inv_freq = 10000.0 ** (
+        -torch.arange(head_dim // 2, device=device, dtype=torch.float64) / (head_dim // 2)
+    )
+    freq = make_interleaved_inv_freq(inv_freq, n)
+
+    rope_posfreq_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(pos=pos, freq=freq.expand(l, n), bias=bias),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) + bias.unsqueeze(-2)
+    xp = x.unflatten(-1, (heads, head_dim // 2, 2))
+    ang = pos.double()[:, :, None] * inv_freq[None, None, :]  # (l, m, head_dim/2) f64
+    c = ang.cos().float()[:, :, None, :]
+    s = ang.sin().float()[:, :, None, :]
+    ref = torch.empty_like(xp)
+    ref[..., 0] = xp[..., 0] * c - xp[..., 1] * s
+    ref[..., 1] = xp[..., 0] * s + xp[..., 1] * c
+    _rel_check(D, ref.reshape(l, m, n), "D")
+
+
+# Packed QKV projection: RoPE on the Q/K block only, V passes through. The
+# behavior is pure data — zero-frequency columns rotate by angle 0, an exact
+# identity — so the kernel is the ordinary rope_posfreq_epi. tile_N 96 and 256
+# both put the rotary/non-rotary boundary (column 640) mid-tile.
+@pytest.mark.parametrize("tile_N", [96, 256])
+def test_epi_mod_rope_posfreq_packed_qkv(tile_N):
+    device = "cuda"
+    torch.random.manual_seed(16)
+    l, m, k, head_dim = 2, 384, 736, 128
+    q_heads, kv_heads = 4, 1  # MQA-shaped packed QKV: [Q x4 | K x1 | V x1]
+    qk_dim = (q_heads + kv_heads) * head_dim
+    v_dim = kv_heads * head_dim
+    n = qk_dim + v_dim
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    bias = torch.randn((l, n), device=device, dtype=torch.float32)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    pos = (
+        torch.arange(m, device=device, dtype=torch.float32)[None, :]
+        + torch.tensor([0.0, 2.0**24 - m], device=device)[:, None]
+    )
+    pos = pos.contiguous()
+    inv_freq = 10000.0 ** (
+        -torch.arange(head_dim // 2, device=device, dtype=torch.float64) / (head_dim // 2)
+    )
+    freq = make_interleaved_inv_freq(inv_freq, qk_dim, v_dim)
+
+    rope_posfreq_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(pos=pos, freq=freq.expand(l, n), bias=bias),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) + bias.unsqueeze(-2)
+    xqk = x[..., :qk_dim].unflatten(-1, (q_heads + kv_heads, head_dim // 2, 2))
+    ang = pos.double()[:, :, None] * inv_freq[None, None, :]  # (l, m, head_dim/2) f64
+    c = ang.cos().float()[:, :, None, :]
+    s = ang.sin().float()[:, :, None, :]
+    ref_qk = torch.empty_like(xqk)
+    ref_qk[..., 0] = xqk[..., 0] * c - xqk[..., 1] * s
+    ref_qk[..., 1] = xqk[..., 0] * s + xqk[..., 1] * c
+    _rel_check(D[..., :qk_dim], ref_qk.reshape(l, m, qk_dim), "QK")
+    # V block: the angle-0 rotation is exact in-kernel (MUFU sincos(0) is
+    # exactly (0, 1)), so this is plain GEMM + bias.
+    _rel_check(D[..., qk_dim:], x[..., qk_dim:], "V")
+
+
+# Partial rotary (GPT-J / Phi / GLM): only the first rotary_dim of each head
+# rotates. Pure data — head_dim= pads each head's freq tail with zeros.
+def test_epi_mod_rope_posfreq_partial():
+    device = "cuda"
+    torch.random.manual_seed(16)
+    l, m, k, head_dim, rotary_dim, heads = 2, 384, 736, 128, 64, 6
+    n = head_dim * heads
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    bias = torch.randn((l, n), device=device, dtype=torch.float32)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    pos = (
+        torch.arange(m, device=device, dtype=torch.float32)[None, :]
+        + torch.tensor([0.0, 2.0**24 - m], device=device)[:, None]
+    ).contiguous()
+    inv_freq = 10000.0 ** (
+        -torch.arange(rotary_dim // 2, device=device, dtype=torch.float64) / (rotary_dim // 2)
+    )
+    freq = make_interleaved_inv_freq(inv_freq, n, head_dim=head_dim)
+
+    rope_posfreq_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(pos=pos, freq=freq.expand(l, n), bias=bias),
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) + bias.unsqueeze(-2)
+    xh = x.unflatten(-1, (heads, head_dim))
+    xp = xh[..., :rotary_dim].unflatten(-1, (rotary_dim // 2, 2))
+    ang = pos.double()[:, :, None] * inv_freq[None, None, :]
+    c = ang.cos().float()[:, :, None, :]
+    s = ang.sin().float()[:, :, None, :]
+    ref_rot = torch.empty_like(xp)
+    ref_rot[..., 0] = xp[..., 0] * c - xp[..., 1] * s
+    ref_rot[..., 1] = xp[..., 0] * s + xp[..., 1] * c
+    ref = torch.cat([ref_rot.reshape(l, m, heads, rotary_dim), xh[..., rotary_dim:]], dim=-1)
+    _rel_check(D, ref.reshape(l, m, n), "D")
+
+
+# YaRN attention factor (DeepSeek-V2/V3, Qwen long-context): the mscale
+# multiplies the rotated output — one Scalar operand in the fn.
+def test_epi_mod_rope_posfreq_scaled():
+    device = "cuda"
+    torch.random.manual_seed(16)
+    l, m, k, head_dim, heads = 2, 384, 736, 128, 6
+    n = head_dim * heads
+    mscale = 1.2345
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    bias = torch.randn((l, n), device=device, dtype=torch.float32)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    pos = torch.arange(m, device=device, dtype=torch.float32)[None].expand(l, m).contiguous()
+    inv_freq = 10000.0 ** (
+        -torch.arange(head_dim // 2, device=device, dtype=torch.float64) / (head_dim // 2)
+    )
+    freq = make_interleaved_inv_freq(inv_freq, n)
+
+    rope_posfreq_scaled_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(pos=pos, freq=freq.expand(l, n), bias=bias, scale=mscale),
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) + bias.unsqueeze(-2)
+    xp = x.unflatten(-1, (heads, head_dim // 2, 2))
+    ang = pos.double()[:, :, None] * inv_freq[None, None, :]
+    c = ang.cos().float()[:, :, None, :]
+    s = ang.sin().float()[:, :, None, :]
+    ref = torch.empty_like(xp)
+    ref[..., 0] = (xp[..., 0] * c - xp[..., 1] * s) * mscale
+    ref[..., 1] = (xp[..., 0] * s + xp[..., 1] * c) * mscale
+    _rel_check(D, ref.reshape(l, m, n), "D")
+
+
+# xPos on a packed QKV projection: opposite decay signs for Q (+) and K (-)
+# are per-column data in the logz table; the V block is neither rotated nor
+# scaled (zero freq, zero logz — both exact identities).
+def test_epi_mod_xpos_posfreq_packed_qkv():
+    device = "cuda"
+    torch.random.manual_seed(16)
+    l, m, k, head_dim = 2, 384, 736, 128
+    q_heads, kv_heads = 4, 1
+    q_dim, k_dim, v_dim = q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim
+    n = q_dim + k_dim + v_dim
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    bias = torch.randn((l, n), device=device, dtype=torch.float32)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    pos = (
+        torch.arange(m, device=device, dtype=torch.float32)[None, :]
+        + torch.tensor([0.0, 8192.0], device=device)[:, None]
+    ).contiguous()
+    dpos = ((pos - 4096.0) / 512.0).contiguous()  # offset/rescaled decay exponent
+    inv_freq = 10000.0 ** (
+        -torch.arange(head_dim // 2, device=device, dtype=torch.float64) / (head_dim // 2)
+    )
+    freq = make_interleaved_inv_freq(inv_freq, q_dim + k_dim, v_dim)
+    logz = make_xpos_log_scale(head_dim, q_dim, k_dim, v_dim, device=device)
+
+    xpos_posfreq_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(
+            pos=pos, dpos=dpos, freq=freq.expand(l, n), logz=logz.expand(l, n), bias=bias
+        ),
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) + bias.unsqueeze(-2)
+    xqk = x[..., : q_dim + k_dim].unflatten(-1, (q_heads + kv_heads, head_dim // 2, 2))
+    ang = pos.double()[:, :, None] * inv_freq[None, None, :]
+    c = ang.cos().float()[:, :, None, :]
+    s = ang.sin().float()[:, :, None, :]
+    rot = torch.empty_like(xqk)
+    rot[..., 0] = xqk[..., 0] * c - xqk[..., 1] * s
+    rot[..., 1] = xqk[..., 0] * s + xqk[..., 1] * c
+    j2 = torch.arange(0, head_dim, 2, dtype=torch.float64, device=device)
+    zeta = (j2 + 0.4 * head_dim) / (1.4 * head_dim)  # (head_dim/2,)
+    z = zeta[None, None, None, :, None] ** dpos.double()[:, :, None, None, None]
+    sign = torch.where(
+        torch.arange(q_heads + kv_heads, device=device) < q_heads, 1.0, -1.0
+    ).double()[None, None, :, None, None]
+    ref_qk = (rot.double() * z**sign).float()
+    ref = torch.cat([ref_qk.reshape(l, m, q_dim + k_dim), x[..., q_dim + k_dim :]], dim=-1)
+    _rel_check(D, ref.reshape(l, m, n), "D")
+
+
+# mRoPE (Qwen2-VL): head-dim sections rotate by different position axes. The
+# section select lives in the per-axis freq tables (zero outside the section),
+# so the kernel is a three-term angle dot product — pure data.
+def test_epi_mod_mrope_posfreq():
+    device = "cuda"
+    torch.random.manual_seed(16)
+    l, m, k, head_dim, heads = 2, 384, 736, 128, 6
+    sections = (16, 24, 24)  # pairs per axis, Qwen2-VL style
+    n = head_dim * heads
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    bias = torch.randn((l, n), device=device, dtype=torch.float32)
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    # three independent position streams (t large to stress the compensation)
+    pos = {
+        name: torch.randint(0, hi, (l, m), device=device).float().contiguous()
+        for name, hi in [("pos_t", 2**24), ("pos_h", 1024), ("pos_w", 1024)]
+    }
+    inv_freq = 10000.0 ** (
+        -torch.arange(head_dim // 2, device=device, dtype=torch.float64) / (head_dim // 2)
+    )
+    freq_t, freq_h, freq_w = make_mrope_inv_freq(inv_freq, sections, n)
+
+    mrope_posfreq_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(
+            **pos,
+            freq_t=freq_t.expand(l, n),
+            freq_h=freq_h.expand(l, n),
+            freq_w=freq_w.expand(l, n),
+            bias=bias,
+        ),
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) + bias.unsqueeze(-2)
+    xp = x.unflatten(-1, (heads, head_dim // 2, 2))
+    # reference: pair j uses the position axis of its section
+    sec_of_pair = torch.repeat_interleave(
+        torch.arange(3, device=device), torch.tensor(sections, device=device)
+    )  # (head_dim/2,)
+    pos_stack = torch.stack(
+        [pos["pos_t"], pos["pos_h"], pos["pos_w"]], dim=-1
+    ).double()  # (l, m, 3)
+    ang = pos_stack[:, :, sec_of_pair] * inv_freq[None, None, :]  # (l, m, head_dim/2)
+    c = ang.cos().float()[:, :, None, :]
+    s = ang.sin().float()[:, :, None, :]
     ref = torch.empty_like(xp)
     ref[..., 0] = xp[..., 0] * c - xp[..., 1] * s
     ref[..., 1] = xp[..., 0] * s + xp[..., 1] * c

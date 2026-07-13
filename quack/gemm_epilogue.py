@@ -508,6 +508,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
     _epi_mod_prepass_operands = ()  # ((name, kind), ...) subset the prepass fn reads
     _epi_mod_prepass_outs = ()  # sink-op names the prepass fn returns
     _epi_mod_rounding = RoundingMode.RN  # kernel-global rounding (D store + default for TileStores)
+    _epi_mod_vectorize = None  # False = keep the SM100 loop vectorizer off (escape hatch)
     _extra_param_fields = ()  # the fn is a class attr, not a param
 
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
@@ -679,7 +680,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
             sink_tmps = self._make_sink_tmps(ops_by_name, tRS_rD.layout.shape)
             val_names = self._epi_mod_outputs + self._epi_mod_sinks
             val_frags = outs + sink_tmps
-            vectorize = const_expr(self.arch == 100)
+            vectorize = const_expr(self.arch == 100 and self._epi_mod_vectorize is not False)
             for i in cutlass.range(n_el, vectorize=vectorize):
                 kw = {
                     name: (
@@ -753,7 +754,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
                         views[name] = (_dense(p[0, ...]), _dense(p[1, ...]))
                     else:  # tile / c views are dense by construction
                         views[name] = (p[0, ...], p[1, ...])
-            vectorize = const_expr(self.arch == 100)
+            vectorize = const_expr(self.arch == 100 and self._epi_mod_vectorize is not False)
             for i in cutlass.range(cute.size(acc0), unroll_full=True, vectorize=vectorize):
                 kw = {
                     name: (
@@ -920,6 +921,7 @@ class EpiMod:
         prepass=None,
         prepass_outs=(),
         extra_ops=(),
+        vectorize=None,
     ):
         self.fn = fn
         # ``outputs`` entries are names or TileStore instances (per-op config:
@@ -954,6 +956,14 @@ class EpiMod:
         if self.mode not in _EPI_MODES:
             raise ValueError(f"unsupported epilogue mode {self.mode!r}; choose one of {_EPI_MODES}")
         self.paired = ("acc",) if self.mode == "acc_pair" else ()
+        # None = vectorize the fn loop where supported (SM100). False = keep
+        # the vectorizer off for this epilogue: escape hatch for the DSL
+        # vectorizer's crash bugs (fused sincos, arith values reused across
+        # pack lanes); free when the epilogue is mainloop-hidden, ~20pp of
+        # kernel time when epilogue-exposed (see gemm_epilogue docstring).
+        if vectorize not in (None, False):
+            raise ValueError("vectorize= accepts None (auto) or False (escape hatch)")
+        self.vectorize = vectorize
         self.prepass = prepass
         self.prepass_outs = tuple(prepass_outs)
         if (prepass is None) != (not self.prepass_outs):
@@ -1002,6 +1012,9 @@ class EpiMod:
             tuple(op.cache_key() for _, op in sorted(self.sinks.items())),
             tuple(op.cache_key() for _, op in sorted(self.output_ops.items())),
             tuple(op.cache_key() for op in self.extra_ops),
+            # Appended only when set so default-config digests (and their
+            # disk-cached kernels) are unchanged.
+            *(() if self.vectorize is None else (("vectorize", self.vectorize),)),
         )
         self.semantic_digest = hashlib.sha256(repr(self.semantic_key).encode()).hexdigest()
         self._ident = f"{fn.__name__}_{self.semantic_digest[:16]}"
@@ -1127,6 +1140,7 @@ class EpiMod:
                 "_epi_mod_prepass_operands": prepass_sig,
                 "_epi_mod_prepass_outs": self.prepass_outs,
                 "_epi_mod_rounding": rounding,
+                "_epi_mod_vectorize": self.vectorize,
                 "_extra_param_fields": (),
                 "_epi_mod_class_semantic_key": class_semantic_key,
                 "EpilogueArguments": Args,
@@ -1459,6 +1473,7 @@ def gemm_epilogue(
     prepass=None,
     prepass_outs=(),
     extra_ops=(),
+    vectorize=None,
 ):
     """Decorator: turn an elementwise fn into a fused GEMM epilogue. See module
     docstring for the contract. ``ops`` pins operand names to explicit EpiOp
@@ -1475,7 +1490,18 @@ def gemm_epilogue(
     operands as one scalar since they broadcast along N). Use
     ``mode='packed_cd_b16x2'`` for dgated:
     ``x, y = unpack(c)`` + ``"D": pack(dx, dy)`` with C/D passed as their
-    natural 16-bit n-major tensors at twice GEMM-N."""
+    natural 16-bit n-major tensors at twice GEMM-N.
+
+    ``vectorize=False`` keeps the SM100 fn-loop vectorizer off for this
+    epilogue (no effect on other archs — only SM100 vectorizes this loop).
+    Escape hatch for the upstream DSL vectorizer's crash bugs (fused
+    two-result ``cute.math.sincos``; an arith-computed value reused in both
+    ``pack()`` lanes — nondeterministic segfault/double-free/compile hang).
+    It disables f32x2 packing of the fn math: free while the epilogue hides
+    under the mainloop (rope_posfreq B300 K=4096: novec +0.01% vs vectorized
+    +0.46% over bias-only), expensive once exposed (K=512: +72% vs +51% — the
+    unpacked stream goes issue-bound). Escape hatch, not a tuning knob.
+    Changing it changes the kernel cache key."""
 
     def wrap(fn):
         return EpiMod(
@@ -1489,6 +1515,7 @@ def gemm_epilogue(
             prepass=prepass,
             prepass_outs=prepass_outs,
             extra_ops=extra_ops,
+            vectorize=vectorize,
         )
 
     return wrap
