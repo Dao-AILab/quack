@@ -224,6 +224,17 @@ class GemmGatedMixin(GemmActMixin):
         TileStore("mAuxOut", epi_tile_fn=_gated_epi_tile_fn),
     )
 
+    def _valid_2cta_m(self):
+        # mma_tiler_m=128 with 2-CTA gives cta_tile_m=64, which forces a (2, 2)
+        # epilogue warp shape in compute_epilogue_tile_shape. The non-contiguous
+        # epi_tile_n that this layout produces (e.g. shape (32, 2) stride (1, 128))
+        # is recast by `_gated_epi_tile_fn` for the half-N postact tile, but the
+        # resulting smem/TMA partitioning miscomputes preact and postact (the
+        # corruption builds across persistent-kernel iterations). Until the
+        # gated epi_visit_subtile and aux-out r2s copy are taught about the
+        # (2, 2) layout, restrict 2-CTA to mma_tiler_m=256 for gated.
+        return (256,)
+
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
