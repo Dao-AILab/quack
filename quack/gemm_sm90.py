@@ -17,7 +17,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Float16, Boolean, const_expr
-from cutlass.utils import LayoutEnum, SmemPartition
+from cutlass.memory import SmemPartition
+from cutlass.tensor_utils import LayoutEnum
 
 
 from quack import layout_utils
@@ -220,7 +221,7 @@ class GemmSm90(GemmTmaBase):
         assert self.mma_warp_groups in [1, 2, 3]
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
-        self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_90")
         self.num_epi_warps = (self.mma_warp_groups if not self.pingpong else 1) * 4
         self.epilogue_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierGemm.Epilogue),
@@ -338,7 +339,7 @@ class GemmSm90(GemmTmaBase):
             self.d_dtype,
             self.c_dtype,
             epilogue_args,
-            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
+            cutlass.memory.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
         )
@@ -602,7 +603,7 @@ class GemmSm90(GemmTmaBase):
                     cpasync.prefetch_descriptor(tma_atom)
 
         # Alloc and init AB full/empty + ACC full mbar (pipeline)
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         ab_pipeline = self.make_ab_pipeline(

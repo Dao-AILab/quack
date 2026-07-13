@@ -49,7 +49,7 @@ def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
     if stage is None:
         stage = gemm.epi_stage
     dtype = tensor.element_type
-    layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
+    layout = cutlass.tensor_utils.LayoutEnum.from_tensor(tensor)
     utils_cls = sm100_utils if gemm.arch >= 100 else sm90_utils
     smem_layout_staged = utils_cls.make_smem_layout_epi(dtype, layout, epi_tile, stage)
     # Ragging-for-TMA is for varlen_m stores that need a per-batch row offset baked

@@ -86,7 +86,7 @@ class GemmSqReduceMixin(GemmActMixin):
         self.rounding_mode = args.rounding_mode
         if args.mAuxOut is not None:
             self.aux_out_dtype = args.mAuxOut.element_type
-            self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+            self.aux_out_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(args.mAuxOut)
             self.cta_tile_shape_aux_out_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         return self.EpilogueParams(**d)

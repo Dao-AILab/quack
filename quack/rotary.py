@@ -148,7 +148,7 @@ class RotaryKernel:
         tiler_mnh = (tiler_mn[0], tiler_mn[1], self.tile_h)
         tiler_cossin = (tiler_mn[0], tiler_mn[1] // 2)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sX = None
         if const_expr(not self.interleaved):
             sX = smem.allocate_tensor(

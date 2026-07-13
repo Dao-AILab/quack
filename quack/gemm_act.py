@@ -78,7 +78,7 @@ class GemmActMixin(ComposableEpiMixin):
     def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
         self.aux_out_dtype = args.mAuxOut.element_type
-        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        self.aux_out_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(args.mAuxOut)
         self.cta_tile_shape_aux_out_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
@@ -99,7 +99,7 @@ class GemmActMixin(ComposableEpiMixin):
         else:
             return copy_utils.get_smem_store_atom(
                 self.aux_out_dtype,
-                transpose=self.aux_out_layout != cutlass.utils.LayoutEnum.ROW_MAJOR,
+                transpose=self.aux_out_layout != cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
                 major_mode_size=cute.size(params.epi_tile_mAuxOut, mode=[1])
                 // self.atom_layout_mnk[1],
             )
@@ -231,14 +231,14 @@ class GemmGatedMixin(GemmActMixin):
             "GemmGated only supports 16bit postact for now"
         )
         assert self.d_layout is None or self.d_layout.is_n_major_c()
-        assert cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut).is_n_major_c()
+        assert cutlass.tensor_utils.LayoutEnum.from_tensor(args.mAuxOut).is_n_major_c()
         if self.arch == 90:
             assert self.cta_tile_shape_mnk[1] % 32 == 0, (
                 "GemmGatedSm90 requires tileN to be divisible by 32"
             )
         self.rounding_mode = args.rounding_mode
         self.aux_out_dtype = args.mAuxOut.element_type
-        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        self.aux_out_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(args.mAuxOut)
         self.cta_tile_shape_aux_out_mn = (
             self.cta_tile_shape_mnk[0],
             self.cta_tile_shape_mnk[1] // 2,
