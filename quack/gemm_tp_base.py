@@ -1,8 +1,8 @@
 # Referenced-from: quack/gemm_base.py (GemmTmaBase)
-"""GemmReduceTmaBase: quack's GemmTmaBase + fused-communication epilogues (two_shot
+"""GemmTpTmaBase: quack's GemmTmaBase + fused-communication epilogues (two_shot
 reduce_scatter / all_reduce)."""
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -13,16 +13,34 @@ from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 import quack.copy_utils as copy_utils
-from quack.cute_dsl_utils import ParamsBase
+from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm  # noqa: F401 (re-exported)
 from quack.rounding import RoundingMode, epilogue_sr_seed
+from quack.tile_scheduler import (
+    StaticPersistentTileSchedulerFromCLCParams as EpiReduceSchedulerParams,  # noqa: F401
+)
 from quack.varlen_utils import VarlenManager
 
 # epi_reduce warp-group sync barrier (NamedBarrierGemm is an IntEnum, not subclassable)
 EPI_REDUCE_BARRIER_ID = max(NamedBarrierGemm).value + 1
 
 
-class GemmReduceTmaBase(GemmTmaBase):
+def _multimem_ld_reduce_128b(dtype):
+    """128-bit multimem.ld_reduce(add) variant for dtype; all return 4x b32 (x, y, z, w)."""
+    if dtype == cutlass.Float16:
+        return utils.distributed.multimem_ld_reduce_8xf16
+    if dtype == cutlass.Float32:
+        return utils.distributed.multimem_ld_reduce_4xf32
+    if dtype == cutlass.BFloat16:
+        return utils.distributed.multimem_ld_reduce_8xbf16
+    if dtype == cutlass.Float8E4M3FN:
+        return utils.distributed.multimem_ld_reduce_16xe4m3
+    if dtype == cutlass.Float8E5M2:
+        return utils.distributed.multimem_ld_reduce_16xe5m2
+    raise NotImplementedError(f"epilogue_reduce: unsupported D dtype {dtype}")
+
+
+class GemmTpTmaBase(GemmTmaBase):
     """
     epilogue_skip_evt() performs D_store; EVT and C_load postponed to epilogue_reduce().
     Its parameter list matches GemmBase.epilogue so the epilog-warp call site selects
@@ -44,6 +62,20 @@ class GemmReduceTmaBase(GemmTmaBase):
     #   C / EpiOp aux -> epi_reduce_tile (epi_reduce warps)
     use_epi_reduce = None
     epi_reduce_tile = None
+
+    @mlir_namedtuple
+    class EpiReduceArguments(NamedTuple):
+        """Comm-side tensors for use_epi_reduce. tile_flags/counters are sized to one
+        problem shape (the tile->slot mapping); sync_barrier is per resident epi-reduce
+        CTA slot, with num_sms allocation remaining a safe upper bound."""
+
+        mD_mc: Optional[cute.Tensor] = None  # multicast view of symmetric D
+        mD_peers: Optional[tuple] = None  # per-rank views of symmetric D
+        tile_flags: Optional[cute.Tensor] = None  # producer->consumer, ceil(M/cta_M)*ceil(N/cta_N)*L
+        tile_flags_mc: Optional[cute.Tensor] = None
+        sync_barrier: Optional[cute.Tensor] = None  # exit barrier, one slot per resident CTA
+        sync_barrier_mc: Optional[cute.Tensor] = None
+        consumer_counters: Optional[cute.Tensor] = None  # consumer-private, slab_tiles_m*ceil(N/cta_N)*L
 
     @cute.jit
     def epilogue_skip_evt(
@@ -143,6 +175,9 @@ class GemmReduceTmaBase(GemmTmaBase):
         epi_tile: cute.Tile,
         frgD_mc: cute.Tensor,
         frgD_peer: cute.Tensor,
+        frgD_crd: cute.Tensor,
+        row_limit: Int32,
+        col_limit: Int32,
         tSR_sC: Optional[cute.Tensor],
         copy_C: Optional[Callable],
         tiled_copy_fake: cute.TiledCopy,
@@ -206,9 +241,10 @@ class GemmReduceTmaBase(GemmTmaBase):
             if const_expr(use_tma_c):
                 epilogue_barrier.arrive_and_wait()
 
-        # frgD_* shape = (atom, loop_m, loop_n); each epi_idx owns chunk = loop_m // TP rows.
+        # frgD_* shape = (atom, loop_m, loop_n); each epi_idx owns chunk = loop_m // epi_tile_num rows.
         _atom, loop_m, loop_n = frgD_mc.shape
-        chunk = loop_m // self.num_ranks
+        chunk = loop_m // epi_tile_num
+        ld_reduce = _multimem_ld_reduce_128b(self.d_dtype)
 
         # C fragment per epi_reduce_tile; hier shape must match the reduce fragment's.
         tRS_rC, tSR_rC = None, None
@@ -256,16 +292,25 @@ class GemmReduceTmaBase(GemmTmaBase):
                     )
 
             # (1) multimem reduce this epi-subtile across ranks into registers.
+            # Rows/cols past row/col_limit (partial slab tile / N tail) are zeroed: keeps
+            # visit reductions exact. N % (16B/elem) keeps vectors from straddling the edge.
             tmp_results = cute.make_rmem_tensor((4, chunk, loop_n), cutlass.Int32)
             for ii in cutlass.range_constexpr(chunk):
                 i = epi_idx * chunk + ii
                 for j in cutlass.range_constexpr(loop_n):
-                    mc_ptr = frgD_mc[None, i, j].iterator
-                    x, y, z, w = utils.distributed.multimem_ld_reduce_8xbf16(mc_ptr)
-                    tmp_results[0, ii, j] = x
-                    tmp_results[1, ii, j] = y
-                    tmp_results[2, ii, j] = z
-                    tmp_results[3, ii, j] = w
+                    crd = frgD_crd[((0, 0), i, j)]
+                    if crd[0] < row_limit and crd[1] < col_limit:
+                        mc_ptr = frgD_mc[None, i, j].iterator
+                        x, y, z, w = ld_reduce(mc_ptr)
+                        tmp_results[0, ii, j] = x
+                        tmp_results[1, ii, j] = y
+                        tmp_results[2, ii, j] = z
+                        tmp_results[3, ii, j] = w
+                    else:
+                        tmp_results[0, ii, j] = Int32(0)
+                        tmp_results[1, ii, j] = Int32(0)
+                        tmp_results[2, ii, j] = Int32(0)
+                        tmp_results[3, ii, j] = Int32(0)
             tmp_rD = cute.recast_tensor(tmp_results, self.d_dtype)
 
             # (2) post-reduce EVT. Fragment must keep the partition's hier atom mode ((1, 8), ...):
@@ -327,30 +372,34 @@ class GemmReduceTmaBase(GemmTmaBase):
             for ii in cutlass.range_constexpr(chunk):
                 i = epi_idx * chunk + ii
                 for j in cutlass.range_constexpr(loop_n):
-                    if const_expr(self.use_epi_reduce == "all_reduce"):
-                        utils.distributed.multimem_st_4xb32(
-                            frgD_mc[None, i, j].iterator,
-                            out_i32[0, ii, j].ir_value(),
-                            out_i32[1, ii, j].ir_value(),
-                            out_i32[2, ii, j].ir_value(),
-                            out_i32[3, ii, j].ir_value(),
-                        )
-                    else:
-                        ptr_int = frgD_peer[None, i, j].iterator.toint().ir_value()
-                        x, y, z, w = (
-                            out_i32[0, ii, j].ir_value(),
-                            out_i32[1, ii, j].ir_value(),
-                            out_i32[2, ii, j].ir_value(),
-                            out_i32[3, ii, j].ir_value(),
-                        )
-                        llvm.inline_asm(
-                            T.i32(),
-                            [ptr_int, x, y, z, w],
-                            "st.global.sys.relaxed.v4.f32 [$1], {$2, $3, $4, $5};",
-                            "=r,l,r,r,r,r",
-                            has_side_effects=True,
-                            asm_dialect=0,
-                        )
+                    # Skip rows past the slab (a foreign-row store races the owner's reduce)
+                    # and cols past N (n-major D: an OOB column wraps into the next row).
+                    crd = frgD_crd[((0, 0), i, j)]
+                    if crd[0] < row_limit and crd[1] < col_limit:
+                        if const_expr(self.use_epi_reduce == "all_reduce"):
+                            utils.distributed.multimem_st_4xb32(
+                                frgD_mc[None, i, j].iterator,
+                                out_i32[0, ii, j].ir_value(),
+                                out_i32[1, ii, j].ir_value(),
+                                out_i32[2, ii, j].ir_value(),
+                                out_i32[3, ii, j].ir_value(),
+                            )
+                        else:
+                            ptr_int = frgD_peer[None, i, j].iterator.toint().ir_value()
+                            x, y, z, w = (
+                                out_i32[0, ii, j].ir_value(),
+                                out_i32[1, ii, j].ir_value(),
+                                out_i32[2, ii, j].ir_value(),
+                                out_i32[3, ii, j].ir_value(),
+                            )
+                            llvm.inline_asm(
+                                T.i32(),
+                                [ptr_int, x, y, z, w],
+                                "st.global.sys.relaxed.v4.f32 [$1], {$2, $3, $4, $5};",
+                                "=r,l,r,r,r,r",
+                                has_side_effects=True,
+                                asm_dialect=0,
+                            )
 
         return epi_read_state, epi_producer_state
 
@@ -363,7 +412,7 @@ class GemmReduceTmaBase(GemmTmaBase):
     ):
         """
         For use_epi_reduce path, C_load in epilogue_reduce() is staged per epi_reduce_tile =
-        (cta_M/TP, cta_N), rather than epi_tile = (cta_M, cta_N/num_epi_subtiles) used by the
+        (32, cta_N), rather than epi_tile = (cta_M, cta_N/num_epi_subtiles) used by the
         epilogue warps. D_store is unchanged (epi_tile).
         """
         tma_atom_d, tma_tensor_d = None, None

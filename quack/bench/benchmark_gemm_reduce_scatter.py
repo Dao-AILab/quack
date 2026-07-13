@@ -32,7 +32,6 @@ from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import make_scheduler_args, make_varlen_args
 
 ab_dtype = cutlass.BFloat16
-d_dtype = cutlass.BFloat16
 acc_dtype = cutlass.Float32
 
 
@@ -67,6 +66,12 @@ def parse_arguments() -> argparse.Namespace:
         default=(2, 1),
         help="Cluster shape M,N (comma-separated)",
     )
+    parser.add_argument(
+        "--d_dtype",
+        type=str,
+        default="BFloat16",
+        help="Output dtype (also the two_shot partials dtype): BFloat16/Float16/Float32.",
+    )
     parser.add_argument("--tolerance", type=float, default=3e-02, help="Tolerance for validation")
     parser.add_argument("--warmup_iterations", type=int, default=5, help="Warmup iterations")
     parser.add_argument("--iterations", type=int, default=30, help="Benchmark iterations")
@@ -92,20 +97,30 @@ def init_distributed_nvshmem():
     return rank, world_size
 
 
-def make_symmetric_mc_tensor(shape, torch_dtype, dtype, leading_dim):
-    """Symmetric tensor + multicast view + per-rank peer views, as cute tensors."""
-    torch_gpu = nvshmem.core.tensor(shape, dtype=torch_dtype)
+def make_symmetric_mc_tensor(shape_lmn, torch_dtype, dtype, leading_dim):
+    """Symmetric tensor + multicast view + per-rank peer views, as cute tensors.
+    Allocated (l, m, n) contiguous; the cute views are (m, n, l) n-major permutes."""
+    torch_gpu = nvshmem.core.tensor(shape_lmn, dtype=torch_dtype)
     torch_gpu_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, torch_gpu)
     peer_torch = [nvshmem.core.get_peer_tensor(torch_gpu, r) for r in range(dist.get_world_size())]
-    tensor = from_dlpack(torch_gpu, assumed_align=16)
+    view = torch_gpu.permute(1, 2, 0)
+    tensor = from_dlpack(view, assumed_align=16)
     tensor.element_type = dtype
     tensor = tensor.mark_layout_dynamic(leading_dim=leading_dim)
-    tensor = cutlass_torch.convert_cute_tensor(torch_gpu, tensor, dtype, is_dynamic_layout=True)
-    tensor_mc = from_dlpack(torch_gpu_mc, assumed_align=16).mark_layout_dynamic(
+    tensor = cutlass_torch.convert_cute_tensor(view, tensor, dtype, is_dynamic_layout=True)
+    tensor_mc = from_dlpack(torch_gpu_mc.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(
         leading_dim=leading_dim
     )
-    peer_tensors = [from_dlpack(t) for t in peer_torch]
+    peer_tensors = [from_dlpack(t.permute(1, 2, 0)) for t in peer_torch]
     return tensor, tensor_mc, peer_tensors, torch_gpu, torch_gpu_mc
+
+
+def make_barrier_flags(num):
+    """Zero-initialized int32 symmetric flag array + multicast view, as cute tensors."""
+    t = nvshmem.core.tensor((num,), dtype=torch.int32)
+    t.fill_(0)
+    t_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, t)
+    return t, t_mc, from_dlpack(t).mark_layout_dynamic(), from_dlpack(t_mc).mark_layout_dynamic()
 
 
 def run(args):
@@ -115,13 +130,12 @@ def run(args):
     assert sm_major in (10, 11), f"GEMM+RS requires SM100 (B200/B300); got SM{sm_major}x"
 
     m, n, k, l = args.mnkl
-    assert l == 1, "GEMM+RS benchmark supports l=1 only"
+    d_dtype = cutlass.dtype(args.d_dtype)
     tile_M, tile_N = args.tile_shape_mnk[:2]
     cluster_M, cluster_N = args.cluster_shape_mnk[:2]
-    assert m % (tile_M * world_size) == 0, (
-        f"m ({m}) must be divisible by mma_tile_M * world_size ({tile_M} * {world_size}): "
-        "output ownership is MMA-tile-granular in the slab scheduler"
-    )
+    vec = 128 // d_dtype.width  # one 16B multimem vector
+    assert m % world_size == 0, f"m ({m}) must be divisible by world_size ({world_size})"
+    assert n % vec == 0, f"n ({n}) must be divisible by {vec} (16B multimem vectors)"
     k_local = k // world_size
     m_per_rank = m // world_size
 
@@ -149,19 +163,30 @@ def run(args):
         b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
     d_tensor, d_tensor_mc, d_peer_tensors, d_torch_gpu, d_torch_gpu_mc = make_symmetric_mc_tensor(
-        (m, n, l), cutlass_torch.dtype(d_dtype), d_dtype, leading_dim=1
+        (l, m, n), cutlass_torch.dtype(d_dtype), d_dtype, leading_dim=1
     )
 
-    # Per-tile producer flags (one per CTA tile) + per-SM exit-barrier flags.
+    # Per-CTA-tile producer flags, the per-SM sync barrier (own tensor: shape-independent),
+    # and per-consumer-tile counters (local-only); see EpiReduceArguments.
     use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
     cta_m = tile_M // (2 if use_2cta else 1)
-    num_tiles = (m // cta_m) * (n // tile_N)
+    n_tiles = (n + tile_N - 1) // tile_N
+    num_tiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    bf_torch = nvshmem.core.tensor((num_tiles + num_sms,), dtype=torch.int32)
-    bf_torch.fill_(0)
-    bf_torch_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, bf_torch)
-    bf = from_dlpack(bf_torch).mark_layout_dynamic()
-    bf_mc = from_dlpack(bf_torch_mc).mark_layout_dynamic()
+    tf_torch, tf_torch_mc, tile_flags, tile_flags_mc = make_barrier_flags(num_tiles)
+    sb_torch, sb_torch_mc, sync_barrier, sync_barrier_mc = make_barrier_flags(num_sms)
+    slab_tiles_m = (m_per_rank + cta_m - 1) // cta_m
+    counters_torch = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
+    counters = from_dlpack(counters_torch).mark_layout_dynamic()
+    epi_reduce_args = GemmDefaultSm100.EpiReduceArguments(
+        mD_mc=d_tensor_mc,
+        mD_peers=tuple(d_peer_tensors),
+        tile_flags=tile_flags,
+        tile_flags_mc=tile_flags_mc,
+        sync_barrier=sync_barrier,
+        sync_barrier_mc=sync_barrier_mc,
+        consumer_counters=counters,
+    )
 
     gemm = GemmDefaultSm100(
         acc_dtype=acc_dtype,
@@ -180,7 +205,7 @@ def run(args):
 
     compiled_gemm = cute.compile(
         gemm, a_tensor, b_tensor, d_tensor, None, epi_args, sched_args, varlen_args,
-        current_stream, None, None, d_tensor_mc, d_peer_tensors, bf, bf_mc,
+        current_stream, None, None, epi_reduce_args,
     )
 
     # No host-side barriers in the loop: the kernel owns cross-invocation sync
@@ -189,17 +214,20 @@ def run(args):
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         compiled_gemm(
             a_tensor, b_tensor, d_tensor, None, epi_args, sched_args, varlen_args,
-            stream, None, None, d_tensor_mc, d_peer_tensors, bf, bf_mc,
+            stream, None, None, epi_reduce_args,
         )
 
-    A = a_torch_cpu.permute(2, 0, 1).contiguous().cuda()
-    B = b_torch_cpu.permute(2, 0, 1).contiguous().cuda()
-    D_full = torch.empty(l, m, n, dtype=torch_ab, device="cuda")
-    D_rs = torch.empty(l, m_per_rank, n, dtype=torch_ab, device="cuda")
+    torch_d = cutlass_torch.dtype(d_dtype)
+    A = a_torch_cpu.permute(2, 0, 1).contiguous().cuda().to(torch_d)
+    B = b_torch_cpu.permute(2, 0, 1).contiguous().cuda().to(torch_d)
+    D_full = torch.empty(l, m, n, dtype=torch_d, device="cuda")
+    D_rs = torch.empty(l, m_per_rank, n, dtype=torch_d, device="cuda")
 
     def fn_baseline():
         torch.bmm(A, B.mT, out=D_full)
-        dist.reduce_scatter_tensor(D_rs, D_full)
+        # Per-batch: reduce_scatter_tensor splits dim 0, and the slab dim is m.
+        for i in range(l):
+            dist.reduce_scatter_tensor(D_rs[i], D_full[i])
 
     if not args.skip_ref_check:
         fn()
@@ -207,7 +235,7 @@ def run(args):
         dist.barrier()
         fn_baseline()
         torch.cuda.synchronize()
-        slab = d_torch_gpu.permute(2, 0, 1)[:, rank * m_per_rank : (rank + 1) * m_per_rank]
+        slab = d_torch_gpu[:, rank * m_per_rank : (rank + 1) * m_per_rank]
         torch.testing.assert_close(slab, D_rs, atol=args.tolerance, rtol=1e-3)
         if rank == 0:
             print("Ref check PASSED")
@@ -223,7 +251,7 @@ def run(args):
         print(f"  (quack speedup vs cuBLAS+NCCL: {t_base / t_quack:.2f}x)")
 
     dist.barrier()
-    for t in (bf_torch_mc, bf_torch, d_torch_gpu_mc, d_torch_gpu):
+    for t in (tf_torch_mc, tf_torch, sb_torch_mc, sb_torch, d_torch_gpu_mc, d_torch_gpu):
         nvshmem.core.free_tensor(t)
     nvshmem.core.finalize()
     dist.destroy_process_group()

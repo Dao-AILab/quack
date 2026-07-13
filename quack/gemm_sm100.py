@@ -38,10 +38,14 @@ from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
-from quack.tile_scheduler import TileSchedulerOptions
+from quack.tile_scheduler import (
+    TileSchedulerOptions,
+    StaticPersistentTileSchedulerFromCLC,
+    StaticPersistentTileSchedulerFromCLCParams as EpiReduceSchedulerParams,
+)
 from quack.varlen_utils import VarlenArguments, VarlenManager
-from quack.gemm_reduce_base import (
-    GemmReduceTmaBase,
+from quack.gemm_tp_base import (  # quack GemmTmaBase + the epi_reduce extension
+    GemmTpTmaBase,
     NamedBarrierGemm,
     EPI_REDUCE_BARRIER_ID,
 )
@@ -94,7 +98,7 @@ Constraints:
 """
 
 
-class GemmSm100(GemmReduceTmaBase):
+class GemmSm100(GemmTpTmaBase):
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
 
@@ -144,8 +148,8 @@ class GemmSm100(GemmReduceTmaBase):
 
     arch = 100
 
-    EpilogueArguments = GemmReduceTmaBase.EpilogueArguments
-    EpilogueParams = GemmReduceTmaBase.EpilogueParams
+    EpilogueArguments = GemmTpTmaBase.EpilogueArguments
+    EpilogueParams = GemmTpTmaBase.EpilogueParams
 
     def __init__(
         self,
@@ -225,7 +229,7 @@ class GemmSm100(GemmReduceTmaBase):
         # For gather_A: separate A-index prefetch warp (was the empty warp)
         self.a_prefetch_warp_id = self.scheduler_warp_id + 1 if self.gather_A else None
         # Reduce scatter and gather A are mutually exclusive for now
-        # No register reallocation for reduce scatter, gated by self.gather_A
+        # No register reallocation for epi_reduce, gated by self.gather_A
         assert not (self.use_epi_reduce and self.gather_A)
         self.epi_reduce_warp_ids = (
             tuple(range(self.scheduler_warp_id + 1, self.scheduler_warp_id + 5))
@@ -435,14 +439,11 @@ class GemmSm100(GemmReduceTmaBase):
             )
             self.epi_tile = (self.epi_tile[0], cute.coalesce(epi_tile_n_layout))
 
-        # epi_reduce tile (cta_M/TP, cta_N): the epi_reduce warps' reduce/visit unit. C and
-        # EpiOp aux tensors are staged per this tile under use_epi_reduce.
+        # epi_reduce tile (32, cta_N): the epi_reduce warps' reduce/visit unit and the C/aux
+        # staging unit; a fixed band keeps the register/smem footprint TP-independent.
         self.epi_reduce_tile = None
         if const_expr(self.use_epi_reduce is not None):
-            self.epi_reduce_tile = (
-                self.cta_tile_shape_mnk[0] // self.num_ranks,
-                self.cta_tile_shape_mnk[1],
-            )
+            self.epi_reduce_tile = (32, self.cta_tile_shape_mnk[1])
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         prefetch_A_idx = (
@@ -576,10 +577,7 @@ class GemmSm100(GemmReduceTmaBase):
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
-        mD_mc: Optional[cute.Tensor] = None,
-        d_peer_tensors: Optional[list] = None,
-        barrier_flag: Optional[cute.Tensor] = None,
-        barrier_flag_mc: Optional[cute.Tensor] = None,
+        epi_reduce_args: Optional[tuple] = None,  # EpiReduceArguments (RS/AR comm tensors)
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -612,7 +610,21 @@ class GemmSm100(GemmReduceTmaBase):
         ]
         # Setup static attributes before smem/grid/tma computation
         if const_expr(self.use_epi_reduce is not None):
-            assert mD is not None, "reduce_scatter requires an output tensor mD"
+            assert mD is not None, "use_epi_reduce requires an output tensor mD"
+            assert epi_reduce_args is not None, "use_epi_reduce requires EpiReduceArguments"
+            assert varlen_args is None or varlen_args.mCuSeqlensM is None, (
+                "use_epi_reduce does not support varlen_m (slab math needs static M)"
+            )
+        mD_mc = d_peer_tensors = tile_flags = tile_flags_mc = None
+        sync_barrier = sync_barrier_mc = epi_reduce_counters = None
+        if const_expr(epi_reduce_args is not None):
+            mD_mc, d_peer_tensors = epi_reduce_args.mD_mc, epi_reduce_args.mD_peers
+            tile_flags, tile_flags_mc = epi_reduce_args.tile_flags, epi_reduce_args.tile_flags_mc
+            sync_barrier, sync_barrier_mc = (
+                epi_reduce_args.sync_barrier,
+                epi_reduce_args.sync_barrier_mc,
+            )
+            epi_reduce_counters = epi_reduce_args.consumer_counters
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
         self.d_dtype = mD.element_type if mD is not None else None
@@ -799,22 +811,20 @@ class GemmSm100(GemmReduceTmaBase):
         grid = TileSchedulerCls.get_grid_shape(
             tile_sched_params, scheduler_args.max_active_clusters
         )
-        # The reduce-scatter warps iterate the output tiles with a plain static persistent
-        # scheduler while the main GEMM uses quack's CLC scheduler.
+        # epi_reduce warps get their own static persistent scheduler (the GEMM keeps
+        # quack's CLC): it walks this rank's M/TP-row slab in (cta_M, cta_N) tiles
+        # starting at the slab's first row; the last M tile may be partial.
         epi_reduce_sched_params = None
-        persistent_grid_dim = None
         if const_expr(self.use_epi_reduce is not None):
-            # The RS scheduler enumerates only this rank's output slab (M/TP rows): each
-            # scheduled tile is one slab tile, reduced directly (no remap/chunk in the warps).
             full_ntile = tile_sched_args.problem_shape_ntile_mnl
-            slab_ntile = (full_ntile[0] // self.num_ranks, full_ntile[1], full_ntile[2])
-            epi_reduce_sched_params = utils.PersistentTileSchedulerParams(
-                slab_ntile, self.cluster_shape_mnk
+            slab_m = mD.shape[0] // self.num_ranks
+            slab_ntile = (
+                cute.ceil_div(slab_m, self.cta_tile_shape_mnk[0]),
+                full_ntile[1],
+                full_ntile[2],
             )
-            # CLC launches a full-size grid; the RS static scheduler needs the persistent
-            # (SM-sized) grid so resident CTAs loop over their stride and cover the slab.
-            persistent_grid_dim = utils.StaticPersistentTileScheduler.get_grid_shape(
-                epi_reduce_sched_params, scheduler_args.max_active_clusters
+            epi_reduce_sched_params = EpiReduceSchedulerParams.create(
+                slab_ntile, self.cluster_shape_mnk, scheduler_args.max_active_clusters
             )
 
         self.buffer_align_bytes = 1024
@@ -917,10 +927,12 @@ class GemmSm100(GemmReduceTmaBase):
             TileSchedulerCls,
             mD_mc,
             d_peer_tensors,
-            barrier_flag,
-            barrier_flag_mc,
+            tile_flags,
+            tile_flags_mc,
+            sync_barrier,
+            sync_barrier_mc,
+            epi_reduce_counters,
             epi_reduce_sched_params,
-            persistent_grid_dim,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -964,11 +976,13 @@ class GemmSm100(GemmReduceTmaBase):
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
         mD_mc: Optional[cute.Tensor],
-        d_peer_tensors: Optional[list],
-        barrier_flag: Optional[cute.Tensor],
-        barrier_flag_mc: Optional[cute.Tensor],
+        d_peer_tensors: Optional[tuple],
+        tile_flags: Optional[cute.Tensor],
+        tile_flags_mc: Optional[cute.Tensor],
+        sync_barrier: Optional[cute.Tensor],
+        sync_barrier_mc: Optional[cute.Tensor],
+        epi_reduce_counters: Optional[cute.Tensor],
         epi_reduce_sched_params=None,
-        persistent_grid_dim=None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1038,7 +1052,7 @@ class GemmSm100(GemmReduceTmaBase):
             sched_pipeline = self.make_sched_pipeline(
                 self.cluster_shape_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
-                # Under RS the epi-load warp is not a CLC consumer (slab scheduler).
+                # Under epi_reduce the epi-load warp is not a CLC consumer (slab scheduler).
                 has_C=has_epi_load and self.use_epi_reduce is None,
             )
             sched_data = storage.sched_data.get_tensor((12, self.sched_stage))
@@ -1458,74 +1472,73 @@ class GemmSm100(GemmReduceTmaBase):
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
                 )
                 do_epi_load_barrier_wait = Boolean(True)
-                # Under RS: walk the RS warps' slab scheduler and stage C per epi_reduce_tile.
+                # Under epi_reduce: walk its warps' slab scheduler and stage C per epi_reduce_tile.
                 epi_load_tile = (
                     self.epi_reduce_tile if const_expr(self.use_epi_reduce is not None) else epi_tile
                 )
                 if const_expr(self.use_epi_reduce is not None):
-                    bidx, bidy, _ = cute.arch.block_idx()
-                    cl_m = self.cluster_shape_mnk[0]
-                    tile_scheduler = utils.StaticPersistentTileScheduler.create(
-                        epi_reduce_sched_params,
-                        (bidx % cl_m, bidy, bidx // cl_m),
-                        persistent_grid_dim,
+                    tile_scheduler = StaticPersistentTileSchedulerFromCLC.create(
+                        epi_reduce_sched_params
+                    )
+                    slab_tiles_m = cute.ceil_div(
+                        mD_mnl.shape[0] // self.num_ranks, self.cta_tile_shape_mnk[0]
                     )
                 else:
                     tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
                 while work_tile.is_valid_tile:
                     # Get tile coord from tile scheduler
+                    in_slab = Boolean(True)
                     if const_expr(self.use_epi_reduce is not None):
-                        # Slab-local CTA coord: C is (m/TP)-shaped, no rank-slab offset.
+                        # tile_coord_mnkl is coord within rank's slab.
                         slab_coord = work_tile.tile_idx
-                        thr_id = cute.size(tiled_mma.thr_id.shape)
-                        tile_coord_mnkl = (
-                            (slab_coord[0] // thr_id) * thr_id + mma_tile_coord_v,
-                            slab_coord[1],
-                            Int32(0),
-                            slab_coord[2],
-                        )
+                        tile_coord_mnkl = (slab_coord[0], slab_coord[1], Int32(0), slab_coord[2])
+                        # Odd slab_tiles_m: the last cluster's CTA 1 gets a phantom coord — skip,
+                        # mirroring the epi_reduce warps' skip so epi_pipeline stage accounting
+                        # stays aligned.
+                        in_slab = tile_coord_mnkl[0] < slab_tiles_m
                     else:
                         tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
-                    copy_C = None
-                    if const_expr(has_C):
-                        copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
-                            tma_atom_c,
-                            varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
-                            self.cta_tile_shape_mnk[:2],
-                            epi_load_tile,
-                            sC,
+                    if in_slab:
+                        copy_C = None
+                        if const_expr(has_C):
+                            copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
+                                tma_atom_c,
+                                varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
+                                self.cta_tile_shape_mnk[:2],
+                                epi_load_tile,
+                                sC,
+                                tile_coord_mnkl,
+                            )
+                            copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
+                        tile_load_copy_fns = self.epi_tile_load_g2s_copy_fns(
+                            epilogue_params,
+                            epi_smem_tensors,
                             tile_coord_mnkl,
+                            varlen_manager,
+                            epi_pipeline,
                         )
-                        copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
-                    tile_load_copy_fns = self.epi_tile_load_g2s_copy_fns(
-                        epilogue_params,
-                        epi_smem_tensors,
-                        tile_coord_mnkl,
-                        varlen_manager,
-                        epi_pipeline,
-                    )
-                    copy_epi_load = copy_utils.chain_tma_producer_copy_fns(
-                        (copy_C, *tile_load_copy_fns)
-                    )
-                    if do_epi_load_barrier_wait:
-                        epi_load_barrier.arrive_and_wait()
-                        do_epi_load_barrier_wait = Boolean(False)
-                    epi_tile_num = const_expr(
-                        cute.size(
-                            cute.zipped_divide(
-                                cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_load_tile
-                            ),
-                            mode=[1],
+                        copy_epi_load = copy_utils.chain_tma_producer_copy_fns(
+                            (copy_C, *tile_load_copy_fns)
                         )
-                    )
-                    for epi_idx in cutlass.range(epi_tile_num, unroll=1):
-                        epi_pipeline.producer_acquire(epi_producer_state)
-                        copy_epi_load(src_idx=epi_idx, producer_state=epi_producer_state)
-                        # Epi pipeline's producer commit is a NOP
-                        epi_pipeline.producer_commit(epi_producer_state)
-                        epi_producer_state.advance()
+                        if do_epi_load_barrier_wait:
+                            epi_load_barrier.arrive_and_wait()
+                            do_epi_load_barrier_wait = Boolean(False)
+                        epi_tile_num = const_expr(
+                            cute.size(
+                                cute.zipped_divide(
+                                    cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_load_tile
+                                ),
+                                mode=[1],
+                            )
+                        )
+                        for epi_idx in cutlass.range(epi_tile_num, unroll=1):
+                            epi_pipeline.producer_acquire(epi_producer_state)
+                            copy_epi_load(src_idx=epi_idx, producer_state=epi_producer_state)
+                            # Epi pipeline's producer commit is a NOP
+                            epi_pipeline.producer_commit(epi_producer_state)
+                            epi_producer_state.advance()
                     # Advance to next tile
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
@@ -1697,7 +1710,7 @@ class GemmSm100(GemmReduceTmaBase):
             )
             tRS_rC, tSR_rC, tSR_sC = None, None, None
             tiled_copy_s2r = None
-            # Under RS, C belongs to the RS warps (sC is epi_reduce_tile-shaped: partitioning it
+            # Under epi_reduce, C belongs to its warps (sC is epi_reduce_tile-shaped: partitioning it
             # against the epi_tile t2r copy wouldn't even trace); epilogue warps store
             # partial D only.
             if const_expr(mC_mnl is not None and self.use_epi_reduce is None):
@@ -1763,7 +1776,7 @@ class GemmSm100(GemmReduceTmaBase):
                 )
 
                 iket.range_push("epilogue")
-                # Under use_epi_reduce, EVT/C are postponed to the RS warps (epilogue_reduce).
+                # Under use_epi_reduce, EVT/C are postponed to the epi_reduce warps (epilogue_reduce).
                 epilogue_fn = (
                     self.epilogue_skip_evt
                     if const_expr(self.use_epi_reduce is not None)
@@ -1799,21 +1812,28 @@ class GemmSm100(GemmReduceTmaBase):
                 acc_consumer_state.advance()
                 iket.range_pop()
 
-                # Signal reduce-scatter warps that this tile's output is in memory.
+                # Signal the epi_reduce warps that this tile's output is in memory.
                 # Flag index = M-major CTA-tile linear id, computed identically here
-                # and in the reduce-scatter warps so the per-tile handshake lines up.
+                # and in the epi_reduce warps so the per-tile handshake lines up.
                 if const_expr(self.use_epi_reduce is not None):
-                    cta_tiles_m = mD_mnl.shape[0] // self.cta_tile_shape_mnk[0]
-                    tile_id = Int32(tile_coord_mnkl[0] + tile_coord_mnkl[1] * cta_tiles_m)
+                    cta_tiles_m = cute.ceil_div(mD_mnl.shape[0], self.cta_tile_shape_mnk[0])
+                    cta_tiles_n = cute.ceil_div(mD_mnl.shape[1], self.cta_tile_shape_mnk[1])
+                    tile_id = Int32(
+                        tile_coord_mnkl[0]
+                        + cta_tiles_m * (tile_coord_mnkl[1] + cta_tiles_n * tile_coord_mnkl[3])
+                    )
                     if warp_idx == self.epilog_warp_id[0]:
                         cute.arch.cp_async_bulk_wait_group(0, read=False)
-                        with cute.arch.elect_one():
-                            flag = barrier_flag_mc.iterator + tile_id
-                            utils.distributed.multimem_red_add1(
-                                lock_ptr=flag,
-                                scope="gpu",
-                                order="release",
-                            )
+                        # A fully-OOB CTA half (partial MMA tile) has no rows to announce:
+                        # skip, so its coord doesn't alias a flag in the next column.
+                        if tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0] < mD_mnl.shape[0]:
+                            with cute.arch.elect_one():
+                                flag = tile_flags_mc.iterator + tile_id
+                                utils.distributed.multimem_red_add1(
+                                    lock_ptr=flag,
+                                    scope="gpu",
+                                    order="release",
+                                )
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
@@ -1828,28 +1848,17 @@ class GemmSm100(GemmReduceTmaBase):
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
         
-        #
-        # Reduce scatter warps
-        #
+        # Epilogue reduce warps
         if cutlass.const_expr(self.use_epi_reduce is not None):
             if warp_idx >= self.epi_reduce_warp_ids[0]:
                 # PDL: wait for prior kernel before touching flags/partials — an early-launched
-                # RS warp is a second concurrent consumer on the same flags (double-consume).
+                # epi_reduce warp is a second concurrent consumer on the same flags (double-consume).
                 if const_expr(self.use_pdl):
                     cute.arch.griddepcontrol_wait()
                 rank_id = self.rank_id
-                num_ranks = Int32(self.num_ranks)
                 lane_id = cute.arch.lane_idx()
 
-                # CLC packs the cluster index in gridDim.x; remap it to bidz (what the static
-                # scheduler reads from block_idx) and use persistent_grid_dim (z=num_persist)
-                # so the resident CTAs loop over their stride and cover every tile.
-                bidx, bidy, _ = cute.arch.block_idx()
-                cl_m, cl_n = self.cluster_shape_mnk[0], self.cluster_shape_mnk[1]
-                epi_reduce_block_idx = (bidx % cl_m, bidy, bidx // cl_m)
-                tile_sched = utils.StaticPersistentTileScheduler.create(
-                    epi_reduce_sched_params, epi_reduce_block_idx, persistent_grid_dim
-                )
+                tile_sched = StaticPersistentTileSchedulerFromCLC.create(epi_reduce_sched_params)
                 work_tile = tile_sched.initial_work_tile_info()
 
                 # we want 128bit ld/st for better performance
@@ -1862,25 +1871,40 @@ class GemmSm100(GemmReduceTmaBase):
                 copy_atom_load = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mD_mc.element_type)
                 tiled_copy_fake = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
 
-                # Slab scheduler gives only this rank's tiles; map to global coord for flags.
+                # Tile D from this rank's slab start; rows past the slab in the last
+                # M tile are predicated in epilogue_reduce.
+                cta_m, cta_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
+                slab_m = mD_mc.shape[0] // self.num_ranks
+                slab_row0 = rank_id * slab_m
                 gD_mc = cute.local_tile(
-                    mD_mc, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                    cute.domain_offset((slab_row0, 0, 0), mD_mc), (cta_m, cta_n), (None, None, None)
                 )
                 gD_peer = cute.local_tile(
-                    d_peer_tensors[rank_id], cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                    cute.domain_offset((slab_row0, 0, 0), d_peer_tensors[rank_id]),
+                    (cta_m, cta_n),
+                    (None, None, None),
                 )
-                tCgD_mc = thr_mma.partition_C(gD_mc)
-                tCgD_peer = thr_mma.partition_C(gD_peer)
 
-                thr_id = cute.size(tiled_mma.thr_id.shape)
-                m_tiles_in_total = gD_mc.shape[2]
-                n_tiles_in_total = gD_mc.shape[3]
-                m_tiles_per_rank = m_tiles_in_total // self.num_ranks
+                # Producer tiles (and their flags) are anchored at global row 0; consumer
+                # tiles at the slab start, which need not be a multiple of cta_m. Same
+                # shape, out of phase: a consumer tile's valid rows span 1-2 producer
+                # tiles (exactly 1 when M % (TP*cta_m) == 0).
+                cta_tiles_m_total = cute.ceil_div(mD_mc.shape[0], cta_m)
+                n_tiles_in_total = cute.ceil_div(mD_mc.shape[1], cta_n)
+                slab_tiles_m = cute.ceil_div(slab_m, cta_m)
+
+                # Passed as args: DSL control flow can't close over outer variables.
+                def spin_flag(flag, base, num_ranks):
+                    # Wrap-safe: compare the difference, never absolute values.
+                    res = base
+                    while res - base < num_ranks:
+                        res = cute.arch.load(flag.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
 
                 epi_reduce_store_pipeline = self.make_epi_reduce_store_pipeline()
 
                 epi_reduce_tidx = tidx - self.epi_reduce_warp_ids[0] * 32
                 thr_copy_fake = tiled_copy_fake.get_slice(epi_reduce_tidx)
+                frgD_crd = thr_copy_fake.partition_S(cute.make_identity_tensor((cta_m, cta_n)))
                 # C is staged per epi_reduce_tile by the epi-load warp (same slab order).
                 tSR_sC = None
                 epi_read_state = None
@@ -1891,77 +1915,101 @@ class GemmSm100(GemmReduceTmaBase):
                     )
 
                 while work_tile.is_valid_tile:
-                    iket.range_push("reduce_scatter")
-
                     slab_coord = work_tile.tile_idx
-                    mma_tile_coord_mnkl = (
-                        self.rank_id * m_tiles_per_rank + slab_coord[0] // thr_id,
-                        slab_coord[1],
-                        Int32(0),
-                        slab_coord[2],
-                    )
+                    # If slab_tiles_m is odd, the last cluster's CTA 1 has no tile: skip.
+                    in_slab = slab_coord[0] < slab_tiles_m
+                    if in_slab:
+                        iket.range_push("epi_reduce")
+                        row0 = slab_coord[0] * cta_m
+                        row_limit = slab_m - row0
+                        col_limit = mD_mc.shape[1] - slab_coord[1] * cta_n
+                        rows_here = Int32(cta_m)
+                        if row_limit < cta_m:
+                            rows_here = row_limit
+                        # First/last producer M-tile overlapped by this slab tile's valid
+                        # rows (at most 2: slab tiles and producer tiles share cta_m).
+                        g_row0 = slab_row0 + row0
+                        prod_m0 = g_row0 // cta_m
+                        prod_m1 = (g_row0 + rows_here - 1) // cta_m
+                        slab_linear = slab_coord[0] + slab_tiles_m * (
+                            slab_coord[1] + n_tiles_in_total * slab_coord[2]
+                        )
+                        flag_base = cta_tiles_m_total * (
+                            slab_coord[1] + n_tiles_in_total * slab_coord[2]
+                        )
+                        # One counter per consumer tile: each producer signal is +1, so every
+                        # flag grows by exactly num_ranks per launch and both checks share
+                        # one baseline. Never reset flags: PDL overlaps launches, so the next
+                        # launch's +1 can land before a store-0 reset (erased signal = hang),
+                        # and a twice-visited flag would over-drain under per-visit
+                        # subtraction. Counters are single-writer; int32 wrap harmless
+                        # (differences only).
+                        if warp_idx == self.epi_reduce_warp_ids[0]:
+                            if lane_id == 0:
+                                counter = epi_reduce_counters.iterator + slab_linear
+                                base = cute.arch.load(
+                                    counter.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu"
+                                )
+                                spin_flag(
+                                    tile_flags.iterator + prod_m0 + flag_base,
+                                    base,
+                                    self.num_ranks,
+                                )
+                                if prod_m1 != prod_m0:
+                                    spin_flag(
+                                        tile_flags.iterator + prod_m1 + flag_base,
+                                        base,
+                                        self.num_ranks,
+                                    )
+                                cute.arch.atomic_add(
+                                    counter.llvm_ptr, Int32(self.num_ranks), sem="relaxed", scope="gpu"
+                                )
+                        cute.arch.barrier(
+                            barrier_id=self.epi_reduce_sync_bar_id,
+                            number_of_threads=32 * len(self.epi_reduce_warp_ids),
+                        )
 
-                    tile_id = mma_tile_coord_mnkl[0] + mma_tile_coord_mnkl[1] * m_tiles_in_total
-                    tile_id = tile_id * thr_id
-                    if not is_leader_cta:
-                        tile_id = tile_id + 1
-
-                    # System barrier to make sure that data from each GPU is in memory before Reduce Scatter
-                    flag = barrier_flag.iterator + tile_id
-
-                    if warp_idx == self.epi_reduce_warp_ids[0]:
-                        if lane_id == 0:
-                            res = 0
-                            while res < self.num_ranks:
-                                res = cute.arch.load(flag.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
-                            # slab visits each flag once → atomically consume this iter's num_ranks
-                            # tokens (NOT store 0, which would clobber a peer's next-iter multicast add)
-                            cute.arch.atomic_add(flag.llvm_ptr, Int32(-self.num_ranks), sem="relaxed", scope="sys")
-                    cute.arch.barrier(
-                        barrier_id=self.epi_reduce_sync_bar_id,
-                        number_of_threads=32 * len(self.epi_reduce_warp_ids),
-                    )
-
-                    tCgD_mc_slice = tCgD_mc[
-                        ((None, None), 0, 0, mma_tile_coord_mnkl[0], mma_tile_coord_mnkl[1], mma_tile_coord_mnkl[3])
-                    ]
-                    tCgD_peer_slice = tCgD_peer[
-                        ((None, None), 0, 0, mma_tile_coord_mnkl[0], mma_tile_coord_mnkl[1], mma_tile_coord_mnkl[3])
-                    ]
-                    frgD_mc = thr_copy_fake.partition_S(tCgD_mc_slice)
-                    frgD_peer = thr_copy_fake.partition_S(tCgD_peer_slice)
-                    # Epilogue coords are slab-local CTA units (C/colvec/aux are m/TP-shaped);
-                    # the comm addressing above stays global.
-                    cta_tile_coord_mnkl = (
-                        (slab_coord[0] // thr_id) * thr_id + mma_tile_coord_v,
-                        mma_tile_coord_mnkl[1],
-                        Int32(0),
-                        mma_tile_coord_mnkl[3],
-                    )
-                    copy_C = None  # We're using a separate warp to load C
-                    epi_read_state, _ = self.epilogue_reduce(
-                        epilogue_params,
-                        epi_smem_tensors,
-                        epi_pipeline,
-                        epi_reduce_store_pipeline,
-                        epi_read_state,
-                        None,  # epi_producer_state (only for inline_epi_load)
-                        self.epi_reduce_tile,
-                        frgD_mc,
-                        frgD_peer,
-                        tSR_sC,
-                        copy_C,
-                        tiled_copy_fake,
-                        cta_tile_coord_mnkl,
-                        varlen_manager,
-                        self.epi_reduce_barrier,
-                        tile_sched,
-                        epi_reduce_tidx,
-                        warp_idx == self.epi_reduce_warp_ids[0],
-                    )
+                        frgD_mc = thr_copy_fake.partition_S(
+                            gD_mc[None, None, slab_coord[0], slab_coord[1], slab_coord[2]]
+                        )
+                        frgD_peer = thr_copy_fake.partition_S(
+                            gD_peer[None, None, slab_coord[0], slab_coord[1], slab_coord[2]]
+                        )
+                        # Epilogue coords are slab-local (C/colvec/aux are m/TP-shaped, with
+                        # quack's own boundary predication); comm addressing stays global.
+                        cta_tile_coord_mnkl = (
+                            slab_coord[0],
+                            slab_coord[1],
+                            Int32(0),
+                            slab_coord[2],
+                        )
+                        copy_C = None  # We're using a separate warp to load C
+                        epi_read_state, _ = self.epilogue_reduce(
+                            epilogue_params,
+                            epi_smem_tensors,
+                            epi_pipeline,
+                            epi_reduce_store_pipeline,
+                            epi_read_state,
+                            None,  # epi_producer_state (only for inline_epi_load)
+                            self.epi_reduce_tile,
+                            frgD_mc,
+                            frgD_peer,
+                            frgD_crd,
+                            row_limit,
+                            col_limit,
+                            tSR_sC,
+                            copy_C,
+                            tiled_copy_fake,
+                            cta_tile_coord_mnkl,
+                            varlen_manager,
+                            self.epi_reduce_barrier,
+                            tile_sched,
+                            epi_reduce_tidx,
+                            warp_idx == self.epi_reduce_warp_ids[0],
+                        )
+                        iket.range_pop()
 
                     # Advance to next tile
-                    iket.range_pop()
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
 
@@ -1973,32 +2021,22 @@ class GemmSm100(GemmReduceTmaBase):
                     barrier_id=self.epi_reduce_sync_bar_id,
                     number_of_threads=32 * len(self.epi_reduce_warp_ids),
                 )
-                # No bar_a/bar_b bracket (exception): tile flags gate the reduce on all ranks'
-                # MMA partial stores (no stale peer reads); this spin-lock exit barrier plays bar_b.
+                # Tile flags gate the reduce on all ranks' MMA partial stores (no stale peer
+                # reads); this spin-lock exit barrier provides the cross-launch sync.
                 if warp_idx == self.epi_reduce_warp_ids[0]:
                     with cute.arch.elect_one():
-                        # The per-SM flags live past the full per-tile flag region, so offset by
-                        # the full (not slab) tile count.
-                        last_tile_id_linear = m_tiles_in_total * n_tiles_in_total * thr_id
-                        # Linear id of current SM.
-                        sm_id_linear = (
-                            cute.arch.block_idx()[0]
-                            + cute.arch.block_idx()[1] * cute.arch.grid_dim()[0]
-                            + cute.arch.block_idx()[2]
-                            * cute.arch.grid_dim()[0]
-                            * cute.arch.grid_dim()[1]
+                        exit_slot = StaticPersistentTileSchedulerFromCLC.resident_cta_slot(
+                            epi_reduce_sched_params
                         )
                         # Release flag with sys scope
                         utils.distributed.multimem_red_add1(
-                            lock_ptr=barrier_flag_mc.iterator
-                            + last_tile_id_linear
-                            + sm_id_linear,
+                            lock_ptr=sync_barrier_mc.iterator + exit_slot,
                             scope="sys",
                             order="release",
                         )
                         # ≥-wait + add-consume (not CAS==): a fast rank's next-invocation +1
                         # banks instead of wedging, so back-to-back calls need no entry fence.
-                        exit_flag = barrier_flag.iterator + last_tile_id_linear + sm_id_linear
+                        exit_flag = sync_barrier.iterator + exit_slot
                         utils.distributed.spin_lock_ld_lt_relaxed_wait(
                             lock_ptr=exit_flag,
                             expected_val=self.num_ranks,
@@ -3001,6 +3039,8 @@ class GemmSm100(GemmReduceTmaBase):
         a_major: str,
         b_major: str,
         d_major: str,
+        use_epi_reduce: Optional[str] = None,
+        num_ranks: int = 1,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -3046,5 +3086,8 @@ class GemmSm100(GemmReduceTmaBase):
         if not GemmSm100.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major
         ):
+            can_implement = False
+        # Skip epi-reduce shapes we can't slab (m % ranks) or vectorize (16B multimem along contiguous n)
+        if use_epi_reduce is not None and (m % num_ranks != 0 or d_major != "n"):
             can_implement = False
         return can_implement
