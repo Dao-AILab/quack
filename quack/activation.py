@@ -7,7 +7,7 @@ from functools import partial
 import cutlass.cute as cute
 from cutlass import Float32, Boolean, const_expr
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import nvvm
+from cutlass._mlir.dialects import arith, nvvm
 from cutlass._mlir_helpers import math as mlir_math
 
 
@@ -85,14 +85,23 @@ def dsigmoid_from_output(out: Float32, dout: Float32, *, loc=None, ip=None) -> F
 
 @dsl_user_op
 def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
-    # nvvm.fmax (one FMNMX), NOT cutlass.max: the latter lowers to
-    # setp+selp, which ptxas (CUDA 13.3, sm_100+) fuses into a following
-    # cvt.rs stochastic-rounding convert as F2FP.RELU..RS while REPLACING the
-    # live rbits operand with RZ — silently turning SR into truncation, even
-    # through inline asm. fmax also saves an instruction. NaN corner: max.f32
-    # returns the non-NaN operand, so relu(NaN) = 0 here (selp gave NaN).
+    # arith.maxnumf (-> PTX max.f32, one FMNMX), NOT cutlass.max: the latter
+    # lowers to setp+selp, which ptxas (CUDA 13.3, sm_100+) fuses into a
+    # following cvt.rs stochastic-rounding convert as F2FP.RELU..RS while
+    # REPLACING the live rbits operand with RZ — silently turning SR into
+    # truncation, even through inline asm. maxnumf also saves an instruction.
+    # (Not nvvm.fmax: the DSL vectorizer only handles arith ops, and the
+    # gated act loops run vectorize=True.) NaN corner: maxnum returns the
+    # non-NaN operand, so relu(NaN) = 0 here where selp gave NaN.
     if const_expr(not isinstance(x, tuple)):
-        return cute.arch.fmax(x, Float32(0.0), loc=loc, ip=ip)
+        return Float32(
+            arith.maxnumf(
+                Float32(x).ir_value(loc=loc, ip=ip),
+                Float32(0.0).ir_value(loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
+        )
     else:
         return relu(x[0], loc=loc, ip=ip), relu(x[1], loc=loc, ip=ip)
 
