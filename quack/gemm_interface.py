@@ -618,6 +618,7 @@ def _gemm_act_call(
     SFB: Optional[Tensor] = None,
     concat_layout: tuple | None = None,
     dynamic_scheduler: bool,
+    alpha: float | Tensor = 1.0,
     tuned: bool,
     config: Optional[GemmConfig] = None,
 ) -> None:
@@ -629,6 +630,7 @@ def _gemm_act_call(
         # structurally excluded on the concat path (it vetoes b_kn).
         bias, concat_layout = _act_concat_bias(bias, concat_layout, False)
         concat_layout = tuple(sorted(concat_layout)) if concat_layout else None
+    has_alpha = scalar_mode(alpha) != 0
     mod = linear_act_mod(
         activation,
         gated=activation in gated_to_pytorch_fn_map,
@@ -636,6 +638,7 @@ def _gemm_act_call(
         has_rowvec=bias is not None,
         has_colvec=False,
         sr=False,
+        has_alpha=has_alpha,
     )
     outs = {"mAuxOut": postact_out}
     store_d = preact_out is not None
@@ -644,6 +647,8 @@ def _gemm_act_call(
     operands = {}
     if bias is not None:
         operands["mRowVecBroadcast"] = bias
+    if has_alpha:
+        operands["alpha"] = alpha
     mod(
         A,
         B,
@@ -1498,6 +1503,7 @@ def gemm_act(
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Activation = None,
+    alpha: float | Tensor = 1.0,  # pre-activation accumulator scale
     preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
@@ -1512,7 +1518,12 @@ def gemm_act(
     split_k: Optional[int] = 1,
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[Optional[Tensor], Tensor]:
-    """GEMM with activation (or gated activation) and optional output tensors."""
+    """GEMM with activation (or gated activation) and optional output tensors.
+
+    ``alpha`` scales the accumulator before the activation
+    (``postact = act(alpha * A @ B + C + bias)``). It is applied in fp32 and
+    may be a float or a 1-element CUDA tensor; 1.0 keeps the alpha-free epilogue.
+    """
     _check_split_k_unsupported("gemm_act", split_k)
     A, SFA = _unpack_operand(A)
     B, SFB = _unpack_operand(B)
@@ -1569,6 +1580,8 @@ def gemm_act(
             tuned,
             SFA=SFA,
             SFB=SFB,
+            alpha=alpha if isinstance(alpha, float) else 1.0,
+            alpha_tensor=alpha if not isinstance(alpha, float) else None,
             **kwargs,
         )
         return preact_out, postact_out
@@ -1586,6 +1599,7 @@ def gemm_act(
         SFB=SFB,
         concat_layout=concat_layout if is_gated else None,
         dynamic_scheduler=dynamic_scheduler,
+        alpha=alpha,
         tuned=tuned,
         config=config,
     )
@@ -1599,7 +1613,7 @@ gemm_gated = gemm_act
     "quack::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
 )
 def gemm_act_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1615,6 +1629,8 @@ def gemm_act_out(
     tuned: bool = True,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
 ) -> None:
     """GEMM with activation and pre-allocated output tensors."""
     _gemm_act_call(
@@ -1630,6 +1646,7 @@ def gemm_act_out(
         SFA=_sf_decode(SFA),
         SFB=_sf_decode(SFB),
         dynamic_scheduler=dynamic_scheduler,
+        alpha=_merge_tensor(alpha, alpha_tensor),
         tuned=tuned,
     )
 
@@ -1640,6 +1657,7 @@ def gemm_act_ref(
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Activation = None,
+    alpha: float | Tensor = 1.0,  # pre-activation accumulator scale
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     out_dtype: Optional[torch.dtype] = None,
@@ -1652,11 +1670,24 @@ def gemm_act_ref(
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
         preact = gemm_ref(
-            A, B, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, concat_layout=concat_layout
+            A,
+            B,
+            bias=bias,
+            alpha=alpha,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            concat_layout=concat_layout,
         )
     else:
         preact = gemm_add_ref(
-            A, B, C, bias=bias, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, concat_layout=concat_layout
+            A,
+            B,
+            C,
+            bias=bias,
+            alpha=alpha,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            concat_layout=concat_layout,
         )
     if is_gated:
         # With concat=("B",), gemm_ref already interleaves the output columns,
@@ -2054,7 +2085,7 @@ def gemm_symmetric(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2071,6 +2102,8 @@ def gemm_gated_out(
     concat_layout: Optional[str] = None,
     SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
     SFB: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     _gemm_act_call(
@@ -2087,6 +2120,7 @@ def gemm_gated_out(
         SFB=_sf_decode(SFB),
         concat_layout=_parse_concat_layout(concat_layout),
         dynamic_scheduler=dynamic_scheduler,
+        alpha=_merge_tensor(alpha, alpha_tensor),
         tuned=tuned,
     )
 

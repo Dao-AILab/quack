@@ -9,6 +9,7 @@ from torch import Tensor
 
 from quack.activation import act_fn_map, gate_fn_map
 from quack.gemm_host import GemmEpiPlan, run_gemm_epi_plan
+from quack.gemm_tvm_ffi_utils import scalar_mode
 from quack.rounding import RoundingMode
 
 
@@ -31,6 +32,7 @@ def gemm_act(
     max_swizzle_size: int = 8,
     rowvec_bias: Optional[Tensor] = None,  # (l, n)
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
+    alpha: float | Tensor | None = None,  # pre-activation accumulator scale
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
     rounding_mode: int = RoundingMode.RN,
@@ -42,7 +44,10 @@ def gemm_act(
     b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
 ) -> GemmEpiPlan:
     """GEMM + activation (optionally gated), on the epilogue-mod path
-    (quack.epilogues.linear_act_mod)."""
+    (quack.epilogues.linear_act_mod). ``alpha`` scales the accumulator BEFORE
+    the activation (``aux = act(alpha * A @ B + ...)``) -- an output alpha
+    cannot produce that through the nonlinearity. Neutral values (None or
+    1.0) keep the alpha-free epilogue."""
     from quack.epilogues import linear_act_mod
 
     gated = activation in gate_fn_map
@@ -52,6 +57,8 @@ def gemm_act(
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
     sr = sr_seed_mode != 0
+    if alpha is not None and scalar_mode(alpha) == 0:
+        alpha = None  # neutral 1.0: keep the alpha-free epilogue
     mod = linear_act_mod(
         activation,
         gated=gated,
@@ -59,12 +66,15 @@ def gemm_act(
         has_rowvec=rowvec_bias is not None,
         has_colvec=colvec_bias is not None,
         sr=sr,
+        has_alpha=alpha is not None,
     )
     epi_args = dict(mAuxOut=PostAct)
     if rowvec_bias is not None:
         epi_args["mRowVecBroadcast"] = rowvec_bias
     if colvec_bias is not None:
         epi_args["mColVecBroadcast"] = colvec_bias
+    if alpha is not None:
+        epi_args["alpha"] = alpha
     if sr:
         epi_args["sr_seed"] = sr_seed
     return mod.gemm(
@@ -106,6 +116,7 @@ def run_gemm_act_plan(
     tile_count_semaphore: Optional[Tensor] = None,
     rowvec_bias: Optional[Tensor] = None,
     colvec_bias: Optional[Tensor] = None,
+    alpha: float | Tensor | None = None,
     sr_seed: int | Tensor = 0,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
@@ -128,6 +139,7 @@ def run_gemm_act_plan(
             mAuxOut=PostAct,
             mRowVecBroadcast=rowvec_bias,
             mColVecBroadcast=colvec_bias,
+            alpha=alpha if alpha is None or scalar_mode(alpha) != 0 else None,
             sr_seed=sr_seed,
         ),
         tile_count_semaphore=tile_count_semaphore,

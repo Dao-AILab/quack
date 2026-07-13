@@ -191,6 +191,58 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
         assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
 
 
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("alpha_kind", ["float", "tensor"])
+@pytest.mark.parametrize("activation", ["tanh", "relu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_act_alpha(input_dtype, activation, alpha_kind, has_bias):
+    """Pre-activation alpha: postact = act(alpha * A @ B + bias). The scale
+    is applied to the fp32 accumulator BEFORE the activation (and before
+    bias), which no output alpha can reproduce through the nonlinearity --
+    so parity against the alpha-carrying reference pins the application
+    point, not just the value."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, k, n = 512, 1024, 1504
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = (torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)).T
+    bias = torch.randn(n, device=device) if has_bias else None
+    alpha_val = 0.7371
+    alpha = (
+        alpha_val
+        if alpha_kind == "float"
+        else torch.tensor(alpha_val, device=device, dtype=torch.float32)
+    )
+    preact, postact = gemm_act(A, B, bias=bias, activation=activation, alpha=alpha, tuned=False)
+    preact_ref, postact_ref = gemm_act_ref(
+        A.float(), B.float(), bias=bias, activation=activation, alpha=alpha_val
+    )
+    preact_pt, postact_pt = gemm_act_ref(A, B, bias=bias, activation=activation, alpha=alpha_val)
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
+    # Warm-plan replay with a DIFFERENT alpha of the same mode: the scalar is
+    # a runtime argument (mode is what's compiled/keyed), so the cached
+    # interface plan must pick up the new value.
+    alpha2_val = 0.25
+    alpha2 = (
+        alpha2_val
+        if alpha_kind == "float"
+        else torch.tensor(alpha2_val, device=device, dtype=torch.float32)
+    )
+    _, postact2 = gemm_act(A, B, bias=bias, activation=activation, alpha=alpha2, tuned=False)
+    _, postact2_ref = gemm_act_ref(
+        A.float(), B.float(), bias=bias, activation=activation, alpha=alpha2_val
+    )
+    _, postact2_pt = gemm_act_ref(A, B, bias=bias, activation=activation, alpha=alpha2_val)
+    assert (postact2 - postact2_ref).abs().max() < 2 * (
+        postact2_pt - postact2_ref
+    ).abs().max() + 1e-6
+    # alpha=1.0 folds to the alpha-free epilogue: bitwise vs the no-alpha call.
+    _, postact_neutral = gemm_act(A, B, bias=bias, activation=activation, alpha=1.0, tuned=False)
+    _, postact_plain = gemm_act(A, B, bias=bias, activation=activation, tuned=False)
+    assert torch.equal(postact_neutral, postact_plain)
+
+
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx", "tanh"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("k", [736, 1024])
