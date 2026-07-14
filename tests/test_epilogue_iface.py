@@ -95,6 +95,13 @@ def test_rowvec_reduce_finalized():
     "see HANDOFF known issues (gated cluster_M=2 family)",
 )
 def test_rowvec_reduce_cluster_m2():
+    from quack.cute_dsl_utils import get_device_capacity
+
+    # The corruption is observed on SM100/SM110 only; other archs pass this
+    # kernel, which would strict-XPASS. Gate by quack capability (QUACK_ARCH
+    # aware) so the xfail encodes exactly the known-bad configuration.
+    if get_device_capacity(torch.device("cuda"))[0] not in (10, 11):
+        pytest.skip("cluster_M=2 RowVecReduce corruption is an SM100/SM110 bug")
     A, B = _inputs()
     res = _colsum(A, B, config=CFG)
     ref_d = A.float() @ B.float()
@@ -180,10 +187,13 @@ def test_from_class_static():
     the plan/run interface without the fn frontend. Power API: B arrives
     dispatch-shaped (n, k), epi_args explicit (all default-epi ops absent =
     plain D = A @ B)."""
+    from quack.cute_dsl_utils import get_device_capacity
     from quack.gemm import GemmDefaultSm100
     from quack.gemm_epilogue import epilogue_from_class
 
-    if torch.cuda.get_device_capability()[0] not in (10, 11):
+    # quack capability, not torch's: QUACK_ARCH overrides (e.g. the CI sm120
+    # legs) dispatch non-SM100 classes on SM100 hardware.
+    if get_device_capacity(torch.device("cuda"))[0] not in (10, 11):
         pytest.skip("SM100 class")
     A, B = _inputs()
     D = torch.empty(A.shape[0], B.shape[-1], device="cuda", dtype=torch.bfloat16)
