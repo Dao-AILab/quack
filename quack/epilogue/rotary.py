@@ -340,7 +340,7 @@ def rope_table_ldg_epi(acc, cs, bias):
 
 
 @gemm_epilogue(ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")}, mode="acc_pair")
-def rope_posfreq_epi(acc, pos, freq, bias):
+def rope_posfreq_epi(acc, pos, freq):
     """RoPE computing cos/sin in-kernel via ``sincos(pos * inv_freq)`` instead
     of loading the precomputed (seqlen_ro, head_dim) table.
 
@@ -390,7 +390,34 @@ def rope_posfreq_epi(acc, pos, freq, bias):
     # The angle helpers below compute this with three transformations that
     # lose no accuracy (turns units, float-float compensation, magic-bias
     # rounding) — see _angle_turns / _sincos_turns for the derivations.
+    x1, x2 = unpack(acc)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+
+
+@gemm_epilogue(ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")}, mode="acc_pair")
+def rope_posfreq_bias_epi(acc, pos, freq, bias):
+    """rope_posfreq_epi with a rowvec bias added before the rotation (biased
+    QKV projections; a separate mod because an absent operand must be absent
+    from the signature to compile the term out)."""
     x1, x2 = unpack(acc + bias)
+    s, c = _sincos_turns(*_angle_turns(pos, freq))
+    return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
+
+
+@gemm_epilogue(
+    ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq"), "rstd": ColVecLoad("rstd")},
+    mode="acc_pair",
+)
+def rstd_rope_posfreq_epi(acc, pos, freq, rstd):
+    """Mid-stack QKV epilogue of a Coda-style transformer block (deferred-rstd
+    boundary): scale rows by the boundary's rstd colvec (the producing GEMM
+    wrote a = h*gamma with the rstd deferred here — a row scale commutes
+    through the GEMM), then rotate. Rope applies to the Q/K columns and V
+    passes through bitwise via zero-frequency columns of the interleaved freq
+    table (see rope_posfreq_epi; the row scale commutes with the rotation, so
+    scaling before unpack is exact)."""
+    x1, x2 = unpack(acc * rstd)
     s, c = _sincos_turns(*_angle_turns(pos, freq))
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 

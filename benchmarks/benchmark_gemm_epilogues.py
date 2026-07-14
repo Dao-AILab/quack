@@ -24,11 +24,9 @@ import torch
 from quack.autotuner import _gpu_warmup
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import (
-    _gemm_rms_tuned,
     gemm_act,
-    gemm_act_tuned,
     gemm_norm_act,
-    gemm_norm_act_tuned,
+    gemm_rms,
 )
 from quack.gemm_sq_reduce import gemm_sq_reduce
 
@@ -176,28 +174,19 @@ def run_rms(args, config: GemmConfig):
     )
     out = torch.empty(args.m, args.n, device="cuda", dtype=args.dtype)
 
-    if config is None:
-        fn = lambda: _gemm_rms_tuned.fn(
-            a,
-            b,
-            out,
-            C=c,
-            norm_weight=norm_weight,
-            eps=args.eps,
-            dynamic_scheduler=args.dynamic_scheduler,
-            config=None,
-        )
-    else:
-        fn = lambda: _gemm_rms_tuned.fn(
-            a,
-            b,
-            out,
-            C=c,
-            norm_weight=norm_weight,
-            eps=args.eps,
-            dynamic_scheduler=args.dynamic_scheduler,
-            config=config,
-        )
+    # config=None rides the per-arch default (tuned=False), matching the old
+    # _gemm_rms_tuned.fn(config=None) behavior.
+    fn = lambda: gemm_rms(
+        a,
+        b,
+        C=c,
+        norm_weight=norm_weight,
+        out=out,
+        eps=args.eps,
+        dynamic_scheduler=args.dynamic_scheduler,
+        tuned=False,
+        config=config,
+    )
     if args.profile:
         profile_once(fn, args.profile_warmup)
         return {"ms": None}
@@ -231,15 +220,17 @@ def run_norm_act(args, config: GemmConfig):
             tuned=args.tuned,
         )
     else:
-        fn = lambda: gemm_norm_act_tuned.fn(
+        fn = lambda: gemm_norm_act(
             a,
             b,
-            preact_out,
-            postact_out,
             C=c,
             rstd=rstd,
             activation=args.activation,
+            preact_out=preact_out,
+            postact_out=postact_out,
+            store_preact=True,
             dynamic_scheduler=args.dynamic_scheduler,
+            tuned=False,
             config=config,
         )
     if args.profile:
@@ -331,14 +322,15 @@ def run_act(args, config: GemmConfig):
             tuned=args.tuned,
         )
     else:
-        fn = lambda: gemm_act_tuned.fn(
+        fn = lambda: gemm_act(
             a,
             b,
-            preact_out,
-            postact_out,
             C=c,
             activation=args.activation,
+            preact_out=preact_out,
+            postact_out=postact_out,
             dynamic_scheduler=args.dynamic_scheduler,
+            tuned=False,
             config=config,
         )
     if args.profile:

@@ -73,8 +73,38 @@ class GemmBase:
     split_k = 1
     split_k_mode = SplitKMode.SERIAL
     # mB arrives (l, k, n) and is transposed to (n, k, l) at trace time when set
-    # (see rotate_batch_last); compile_gemm_kernel sets it per compiled variant.
+    # (see rotate_batch_last); compile_gemm_kernel sets these per compiled
+    # variant. All three are trace-time relabels replacing per-call host
+    # views: b_transposed for B crossing as (l, k, n); a_transposed for the
+    # swap-at-trace kernel-A slot (caller B crossing as (l, k, m_kernel));
+    # cd_transposed for swap-at-trace D/C/tile-epi tensors crossing in caller
+    # (n_kernel, m_kernel) orientation.
     b_transposed = False
+    a_transposed = False
+    cd_transposed = False
+    # dgated packed-native: D/C cross the FFI boundary in their RAW 16-bit
+    # dtype with 2 lanes packed per f32 element; rotate_batch_last recasts
+    # them to the f32 view the epilogue expects. "n": lanes pack along the
+    # contiguous N dim; "m": along the contiguous M dim (the AB-swapped-caller
+    # layout). Replaces the per-call torch .view(float32) host views.
+    cd_packed = None
+
+    def _recast_packed_cd(self, mT):
+        """Trace-time f32 view of a kernel-order 16-bit packed tensor: halve
+        the packed extent and every dynamic stride (element counts halve when
+        re-typed 32-bit; the contiguous dim keeps its static stride 1). Host
+        validation guarantees evenness; the divby assume preserves the 16 B
+        alignment knowledge the old f32 host views carried (raw strides are
+        8-element-divisible fakes, so halves are 4-divisible)."""
+        packed_dim = 1 if self.cd_packed == "n" else 0
+        shape = tuple(s // 2 if i == packed_dim else s for i, s in enumerate(mT.shape))
+        stride = tuple(
+            s if const_expr(cute.is_static(s)) else cute.assume(s // 2, divby=4) for s in mT.stride
+        )
+        return cute.make_tensor(
+            cute.recast_ptr(mT.iterator, dtype=cutlass.Float32),
+            cute.make_layout(shape, stride=stride),
+        )
 
     def rotate_batch_last(self, mA, mB, mD, mC, epilogue_args, append_batch_if_2d=False):
         """Rotate all batched inputs from caller order (l, x, y) to kernel order (x, y, l).
@@ -96,8 +126,20 @@ class GemmBase:
         (n, k, l) here, saving the host a per-call .mT view.
         """
         mA, mB, mD, mC = (self.permute_batch_last(t, append_batch_if_2d) for t in (mA, mB, mD, mC))
+        if const_expr(self.a_transposed):
+            mA = layout_utils.select(mA, [1, 0, 2])
         if const_expr(self.b_transposed):
             mB = layout_utils.select(mB, [1, 0, 2])
+        if const_expr(self.cd_transposed):
+            if const_expr(mD is not None):
+                mD = layout_utils.select(mD, [1, 0, 2])
+            if const_expr(mC is not None):
+                mC = layout_utils.select(mC, [1, 0, 2])
+        if const_expr(self.cd_packed is not None):
+            if const_expr(mD is not None):
+                mD = self._recast_packed_cd(mD)
+            if const_expr(mC is not None):
+                mC = self._recast_packed_cd(mC)
         return mA, mB, mD, mC, self.permute_batch_last_epi_args(epilogue_args, append_batch_if_2d)
 
     def permute_batch_last(
@@ -142,6 +184,8 @@ class GemmBase:
                     rotated[name] = layout_utils.select(v, [1, 2, 0])
                 elif append_batch_if_2d and cute.rank(v) == 2:
                     rotated[name] = layout_utils.expand(v, 2, 1)
+                if const_expr(self.cd_transposed) and name in rotated:
+                    rotated[name] = layout_utils.select(rotated[name], [1, 0, 2])
             elif name in reduce_fields and append_batch_if_2d and cute.rank(v) == 2:
                 rotated[name] = layout_utils.expand(v, 0, 1)
         return epilogue_args._replace(**rotated) if rotated else epilogue_args

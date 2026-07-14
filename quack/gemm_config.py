@@ -2,7 +2,7 @@
 import itertools
 from enum import IntEnum
 from typing import Optional, List
-from functools import partial
+from functools import lru_cache, partial
 from dataclasses import dataclass
 
 
@@ -235,3 +235,85 @@ def get_all_configs(
         + _get_sm100_configs(epilogue)
         + _get_sm120_configs(epilogue, tune_coop)
     )
+
+
+def default_config(device) -> GemmConfig:
+    """Per-arch default config (canonical home; gemm_interface re-exports)."""
+    from quack.cute_dsl_utils import get_device_capacity
+
+    return _default_config_for_cap(get_device_capacity(device)[0])
+
+
+def blockscaled_default_config(m: int, n: int) -> GemmConfig:
+    """Default SM100 config for blockscaled GEMM.
+
+    Large shapes use a (256, 256) tile: it makes num_acc_stage == 1, which turns
+    on ``overlap_accum_sf`` (a second TMEM accumulator stage) so the per-tile
+    scale-apply + TMEM drain overlaps the next tile's MMA instead of
+    serializing after it.
+    """
+    if m >= 512 and n >= 256:
+        tile_m, tile_n, cluster = 256, 256, (2, 1)
+    elif m >= 512 and n >= 128:
+        tile_m, tile_n, cluster = 256, 128, (2, 1)
+    else:
+        tile_m, tile_n, cluster = 128, 128, (1, 1)
+    return _blockscaled_config(tile_m, tile_n, cluster)
+
+
+@lru_cache(maxsize=None)
+def _blockscaled_config(tile_m, tile_n, cluster):
+    return GemmConfig(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        cluster_m=cluster[0],
+        cluster_n=cluster[1],
+        pingpong=False,
+        is_dynamic_persistent=True,
+        device_capacity=10,
+    )
+
+
+@lru_cache(maxsize=None)
+def _default_config_for_cap(cap):
+    if cap == 8:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            tile_k=32,
+            num_warps=4,
+            cluster_m=1,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=False,
+            device_capacity=8,
+        )
+    elif cap in [10, 11]:
+        return GemmConfig(
+            tile_m=256,
+            tile_n=256,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=True,
+            device_capacity=10,
+        )
+    elif cap == 12:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            cluster_m=1,
+            cluster_n=1,
+            pingpong=True,
+            is_dynamic_persistent=True,
+            device_capacity=12,
+        )
+    else:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=192,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=True,
+            is_dynamic_persistent=False,
+        )

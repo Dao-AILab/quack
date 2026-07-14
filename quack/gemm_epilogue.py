@@ -170,15 +170,17 @@ from quack.epi_ops import (
     Scalar,
     TileLoad,
     TileStore,
+    VecLoad,
+    VecReduce,
 )
 from quack.gemm_host import (
     GemmClassRef,
     GemmEpiPlan,
     build_gemm_epi_plan,
-    gemm_epi_plan_key,
     register_local_epi_mod,
     run_gemm_epi_plan,
 )
+from quack.gemm_config import blockscaled_default_config, default_config
 from quack.gemm_tvm_ffi_utils import tensor_key
 from quack.gemm_sm80 import GemmSm80
 import quack.layout_utils as layout_utils
@@ -906,6 +908,29 @@ def _validate_packed_tensor(name, tensor):
         raise ValueError(f"{name} storage offset and outer strides must permit a float32 view")
 
 
+def _mod_gemm_key(A, B, D, C, epi_args, epi_key_overrides, *tail) -> tuple:
+    """Plan-cache key for EpiMod.gemm, built from raw call inputs only (no
+    validation, no kind inference): full tensor metadata for the GEMM operands
+    and every epi_args entry (tensor metadata subsumes the inferred kinds and
+    the shape checks; scalars key by presence — their compile mode arrives via
+    epi_key_overrides), plus the config tail. A hit is exactly a replay of a
+    previously validated call with different data pointers."""
+    epi_meta = tuple(
+        (name, tensor_key(v) if hasattr(v, "stride") else v is not None)
+        for name, v in sorted(epi_args.items())
+    )
+    overrides = tuple(sorted((epi_key_overrides or {}).items()))
+    return (
+        tensor_key(A),
+        tensor_key(B),
+        tensor_key(D),
+        tensor_key(C),
+        epi_meta,
+        overrides,
+        *tail,
+    )
+
+
 class EpiMod:
     """A user epilogue function plus the machinery to mint and launch kernels."""
 
@@ -1020,6 +1045,7 @@ class EpiMod:
         self._ident = f"{fn.__name__}_{self.semantic_digest[:16]}"
         self._minted = {}
         self._plan_cache = {}
+        self._call_cache = {}  # eager __call__ fast path: metadata -> launch recipe
 
     def __getstate__(self):
         # Shipped by value (cloudpickle) to async-compile workers when there
@@ -1082,6 +1108,12 @@ class EpiMod:
                 op = self.ops[name]
                 if not isinstance(op, EpiOp) or op.name != name:
                     raise ValueError(f"op for {name!r} must be an EpiOp named {name!r}")
+                if type(op) in (ColVecLoad, RowVecLoad) and _pinned_visit_kind(op) != kind:
+                    # Swap-at-trace flipped this pin into kernel coords; the
+                    # visit-kind entry is authoritative so async-worker
+                    # re-mints from the mint_key alone reconstruct the same
+                    # class.
+                    op = _KIND_TO_OP[kind](name)
                 epi_ops.append(op)
             elif kind != "c":
                 epi_ops.append(_KIND_TO_OP[kind](name))
@@ -1154,6 +1186,14 @@ class EpiMod:
         self._minted[key] = cls
         return cls
 
+    def gemm_tuned(self, A, B, D, C=None, *, epi_args: dict, b_kn: bool = False):
+        """Autotuned gemm(): config-space sweep via quack.epi_autotune (lazy
+        import — this module sits below gemm_config in the import graph).
+        Returns TunedModGemm(plan, config, sinks); see tuned_mod_gemm."""
+        from quack.epi_autotune import tuned_mod_gemm
+
+        return tuned_mod_gemm(self, A, B, D, C, epi_args=epi_args, b_kn=b_kn)
+
     def gemm(
         self,
         A,
@@ -1181,6 +1221,8 @@ class EpiMod:
         concat_layout=None,
         SFA=None,  # blockscaled scale factors, see quack.gemm
         SFB=None,
+        swap_ab=False,  # swap-at-trace: requires b_kn (B given (k, n)); dense element mode
+        _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
         varlen_m = cu_seqlens_m is not None
         gather_A = A_idx is not None
@@ -1188,8 +1230,63 @@ class EpiMod:
         concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
         if tile_count_semaphore is not None and not is_dynamic_persistent:
             raise ValueError("tile_count_semaphore requires is_dynamic_persistent=True")
-        if b_kn and varlen_m:
-            raise ValueError("b_kn does not support varlen")
+        if swap_ab:
+            # Swap-at-trace contract: dense, element-mode, sink-less, B (k, n).
+            if not b_kn:
+                raise ValueError("swap_ab requires b_kn=True (B passed (k, n))")
+            if varlen_m or gather_A or blockscaled or concat_key:
+                raise ValueError("swap_ab: dense non-blockscaled only")
+            if self.mode != "element" or self.sinks:
+                raise ValueError("swap_ab supports element-mode sink-less epilogues only")
+        # Warm fast path: probe the plan cache on raw-input metadata before any
+        # validation or kind inference — a hit is exactly a replay of a
+        # previously validated call (the key subsumes everything validation
+        # reads), so only the per-call views and the launch remain. The key
+        # matches the cold path's record below.
+        key = _mod_gemm_key(
+            A,
+            B,
+            D,
+            C,
+            epi_args,
+            epi_key_overrides,
+            tile_M,
+            tile_N,
+            tile_K,
+            cluster_M,
+            cluster_N,
+            pingpong,
+            persistent,
+            is_dynamic_persistent,
+            max_swizzle_size,
+            A.device,
+            tensor_key(cu_seqlens_m),
+            gather_A,
+            rounding_mode,
+            b_kn,
+            use_tma_gather,
+            concat_key,
+            tensor_key(SFA),
+            tensor_key(SFB),
+            swap_ab,
+        )
+        plan = self._plan_cache.get(key)
+        if plan is not None:
+            if _launch:
+                run_gemm_epi_plan(
+                    plan,
+                    B if swap_ab else A,
+                    A if swap_ab else B,
+                    D,
+                    C,
+                    epi_args,
+                    tile_count_semaphore=tile_count_semaphore,
+                    cu_seqlens_m=cu_seqlens_m,
+                    A_idx=A_idx,
+                    SFA=SFA,
+                    SFB=SFB,
+                )
+            return plan
         if blockscaled:
             if varlen_m or gather_A:
                 raise ValueError("blockscaled GEMM does not support varlen/gather yet")
@@ -1200,6 +1297,13 @@ class EpiMod:
         if varlen_m:
             if not persistent:
                 raise ValueError("varlen_m requires persistent=True")
+            num_seqs = cu_seqlens_m.shape[0] - 1
+            if B.ndim != 3 or B.shape[0] != num_seqs:
+                raise ValueError(
+                    f"varlen_m B is per-sequence indexed: expected (num_seqs={num_seqs}, "
+                    f"...) got {tuple(B.shape)}; broadcast a shared B zero-copy via "
+                    "B.unsqueeze(0).expand(num_seqs, -1, -1)"
+                )
             if A.ndim != 2 or A.stride(-1) != 1:
                 raise ValueError("varlen_m: A is (total_m, k), k-major")
             if D is not None and (D.ndim != 2 or D.stride(-1) != 1):
@@ -1212,19 +1316,25 @@ class EpiMod:
             if cluster_N != 1:
                 raise ValueError("gather_A requires cluster_N=1")
         n_gemm = B.shape[-1] if b_kn else B.shape[-2]
+        # Kernel coords under swap-at-trace: kernel m = caller n, kernel n =
+        # caller m. Shape checks on D/C/outputs stay caller-oriented (the
+        # tensors cross natively; the trace transposes); operand-kind
+        # inference and vec shape checks use kernel coords.
         paired_acc = self.mode == "acc_pair"
         packed_c = self.mode == "packed_cd_b16x2"
         if paired_acc and (n_gemm % 2 or tile_N % 2):
             raise ValueError("acc_pair mode requires even GEMM N and tile_N")
         post_init_attrs = ()
-        packed_key = None
+        packed_form = None
         if packed_c:
             import torch
 
             # Callers pass C (preact pairs) and D (dx/dy out) in their natural
-            # 16-bit dtype; the kernel sees them as f32 with 2 lanes packed per
-            # element. The original dtype travels to the trace via post_init
-            # (implicit_dtype) exactly like the hand-written dgated host path.
+            # 16-bit dtype; the tensors cross the boundary RAW and the trace
+            # recasts them to the f32 packed view (GemmBase._recast_packed_cd
+            # via cd_packed — no per-call torch views). The original dtype
+            # travels to the trace via post_init (implicit_dtype) exactly like
+            # the hand-written dgated host path.
             if "c" not in self.operand_names:
                 raise ValueError("packed_cd_b16x2 mode requires a 'c' fn parameter")
             if C is None or D is None:
@@ -1233,7 +1343,6 @@ class EpiMod:
                 raise ValueError("packed C requires a matching D of the same dtype and shape")
             if C.dtype not in (torch.float16, torch.bfloat16):
                 raise TypeError("C must be float16 or bfloat16 in packed_cd_b16x2 mode")
-            packed_key = C.dtype
             post_init_attrs = (("implicit_dtype", torch2cute_dtype_map[C.dtype]),)
         n = n_gemm
         if varlen_m:
@@ -1245,6 +1354,9 @@ class EpiMod:
             m = ref_t.shape[0]
         else:
             m = A.shape[-2]
+        # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
+        # stays caller-oriented (swap-at-trace transposes those at trace).
+        m_i, n_i = (n_gemm, m) if swap_ab else (m, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
         if packed_c:
@@ -1254,19 +1366,23 @@ class EpiMod:
                 _require_shape("D", D, packed_shape)
                 _validate_packed_tensor("C", C)
                 _validate_packed_tensor("D", D)
-                C = C.view(torch.float32)
-                D = D.view(torch.float32)
+                packed_form = "n"
             else:
                 # AB-swapped callers pass m-major C/D: the 16-bit pairs pack
-                # along the contiguous M dim, so the f32 view goes through .mT
-                # (same trick as the hand-written dgated host).
+                # along the contiguous M dim (the trace halves M instead of N;
+                # same layout the hand-written dgated host's .mT views built).
                 packed_shape = _tile_shape(batch, 2 * m, n_gemm, varlen_m)
                 _require_shape("C", C, packed_shape)
                 _require_shape("D", D, packed_shape)
                 if C.stride(-2) != 1 or D.stride(-2) != 1:
                     raise ValueError("packed m-major C/D must be contiguous along M")
-                C = C.mT.view(torch.float32).mT
-                D = D.mT.view(torch.float32).mT
+                if C.storage_offset() % 2 or D.storage_offset() % 2:
+                    raise ValueError("packed m-major C/D storage offsets must permit a f32 view")
+                if any(s % 2 for s in (*C.stride()[-1:], *D.stride()[-1:])) or (
+                    batch is not None and any(s % 2 for s in (C.stride(0), D.stride(0)))
+                ):
+                    raise ValueError("packed m-major C/D outer strides must permit a f32 view")
+                packed_form = "m"
         else:
             _require_shape("C", C, base_shape)
             _require_shape("D", D, base_shape)
@@ -1281,6 +1397,21 @@ class EpiMod:
                     raise TypeError("acc_pair auxiliary output must have a 16-bit dtype")
                 if aux.stride(-1) != 1 or (D is not None and D.stride(-1) != 1):
                     raise ValueError("acc_pair auxiliary output and D must be N-major")
+        # Swap-at-trace relabels pinned vec pins into KERNEL coordinates: a
+        # caller colvec is the swapped kernel's rowvec (and vice versa), so the
+        # pin's class flips for this call. Other orientation-sensitive vec pins
+        # (varlen subclasses, reduces) have no swapped form and fail loudly.
+        pins = {}
+        for name, op in self.ops.items():
+            if swap_ab and type(op) in (ColVecLoad, RowVecLoad):
+                pins[name] = (RowVecLoad if type(op) is ColVecLoad else ColVecLoad)(name)
+            elif swap_ab and isinstance(op, (VecLoad, VecReduce)):
+                raise ValueError(
+                    f"swap_ab: pinned vec op {name!r} of type {type(op).__name__} "
+                    "has no swapped orientation"
+                )
+            else:
+                pins[name] = op
         epi_values = {}
         kind_sig = []
         for name in self.operand_names:
@@ -1292,24 +1423,24 @@ class EpiMod:
             if name not in epi_args:
                 raise ValueError(f"missing epilogue operand '{name}'")
             kind = (
-                "pinned" if name in self.ops else _infer_kind(name, epi_args[name], m, n, varlen_m)
+                "pinned" if name in pins else _infer_kind(name, epi_args[name], m_i, n_i, varlen_m)
             )
             if varlen_m and kind == "tile":
                 raise ValueError(f"operand '{name}': TileLoad does not support varlen_m yet")
-            visit_kind = _pinned_visit_kind(self.ops[name]) if kind == "pinned" else kind
+            visit_kind = _pinned_visit_kind(pins[name]) if kind == "pinned" else kind
             batch_l = B.shape[0] if B.ndim == 3 else 1
             # Pinned ops own their host schema (host_arg_key validates the
             # value); the built-in shape rules only apply to inferred kinds.
             if kind == "pinned":
                 pass
             elif visit_kind == "row":
-                _require_shape(name, epi_args[name], (batch_l, n))
+                _require_shape(name, epi_args[name], (batch_l, n_i))
             elif visit_kind == "col":
-                expected = (m,) if varlen_m else (batch_l, m)
+                expected = (m_i,) if varlen_m else (batch_l, m_i)
                 _require_shape(name, epi_args[name], expected)
             elif visit_kind == "tile":
                 _require_shape(name, epi_args[name], base_shape)
-            kind_sig.append((name, kind if kind != "pinned" else self.ops[name].__class__.__name__))
+            kind_sig.append((name, kind if kind != "pinned" else pins[name].__class__.__name__))
             epi_values[name] = epi_args[name]
         for out_name in self.outputs:
             epi_values[out_name] = epi_args[out_name]
@@ -1335,113 +1466,495 @@ class EpiMod:
                 epi_values[op.name] = epi_args[op.name]
         kind_sig = tuple(kind_sig)
 
-        config = (
-            tile_M,
-            tile_N,
-            tile_K,
-            cluster_M,
-            cluster_N,
-            pingpong,
-            persistent,
-            is_dynamic_persistent,
-            max_swizzle_size,
-            A.device,
-            packed_key,
-            paired_acc,
-            tensor_key(cu_seqlens_m),
-            gather_A,
-            rounding_mode,
-            b_kn,
-            use_tma_gather,
-            concat_key,
-            tensor_key(SFA),
-            tensor_key(SFB),
-        )
-        key = gemm_epi_plan_key(A, B, D, C, epi_values, epi_key_overrides, kind_sig, *config)
-        plan = self._plan_cache.get(key)
-        if plan is None:
-            device_capacity = get_device_capacity(A.device)
-            if is_dynamic_persistent and device_capacity[0] == 9 and tile_count_semaphore is None:
-                raise ValueError("SM90 dynamic persistent scheduling requires tile_count_semaphore")
-            if paired_acc and self.outputs and device_capacity[0] == 9 and tile_N % 32:
-                raise ValueError("SM90 acc_pair auxiliary output requires tile_N divisible by 32")
-            sf_dtype = sf_vec_size = None
-            if blockscaled:
-                from quack.gemm_tvm_ffi_utils import validate_blockscaled_sf
+        device_capacity = get_device_capacity(A.device)
+        if is_dynamic_persistent and device_capacity[0] == 9 and tile_count_semaphore is None:
+            raise ValueError("SM90 dynamic persistent scheduling requires tile_count_semaphore")
+        if paired_acc and self.outputs and device_capacity[0] == 9 and tile_N % 32:
+            raise ValueError("SM90 acc_pair auxiliary output requires tile_N divisible by 32")
+        sf_dtype = sf_vec_size = None
+        if blockscaled:
+            from quack.gemm_tvm_ffi_utils import validate_blockscaled_sf
 
-                sf_dtype, sf_vec_size = validate_blockscaled_sf(
-                    A, B, SFA, SFB, device_capacity, b_kn=b_kn
-                )
-            # Re-map pinned ops' kind for the device loop: explicit pins still
-            # need a fragment kind; VecLoads present as their dim.
-            visit_sig = tuple(
-                (name, _pinned_visit_kind(self.ops[name]) if name in self.ops else kind)
-                for name, kind in kind_sig
+            sf_dtype, sf_vec_size = validate_blockscaled_sf(
+                A, B, SFA, SFB, device_capacity, b_kn=b_kn
             )
-            prepass_sig = ()
-            if self.prepass is not None:
-                if packed_c:
-                    raise ValueError("prepass + packed C: not supported")
-                unknown = set(self.prepass_operand_names) - {n for n, _ in visit_sig}
-                if unknown:
-                    raise ValueError(f"prepass fn reads undeclared operands {unknown}")
-                for out_name in self.prepass_outs:
-                    if out_name not in {n for n, _ in visit_sig} | set(self.sinks):
-                        raise ValueError(f"prepass out '{out_name}' must be a declared op")
-                prepass_sig = tuple((n, k) for n, k in visit_sig if n in self.prepass_operand_names)
-            mint_key = (
-                visit_sig,
-                device_capacity[0],
-                paired_acc,
-                packed_c,
-                prepass_sig,
-                rounding_mode,
-            )
-            GemmCls = self._mint(*mint_key)
-            plan = build_gemm_epi_plan(
-                GemmCls,
-                device_capacity,
-                A,
-                B,
-                D,
-                C,
-                epi_values=epi_values,
-                epi_key_overrides=epi_key_overrides,
-                tile_M=tile_M,
-                tile_N=tile_N,
-                cluster_M=cluster_M,
-                cluster_N=cluster_N,
-                tile_K=tile_K,
-                pingpong=pingpong,
-                persistent=persistent,
-                is_dynamic_persistent=is_dynamic_persistent,
-                max_swizzle_size=max_swizzle_size,
-                varlen_m=varlen_m,
-                gather_A=gather_A,
-                b_kn=b_kn,
-                use_tma_gather=use_tma_gather,
-                concat_layout=concat_key,
-                sf_dtype=sf_dtype,
-                sf_vec_size=sf_vec_size,
-                sf_batched=SFA.ndim == 6 if blockscaled else True,
-                post_init_attrs=post_init_attrs,
-                gemm_cls_ref=self._class_ref(mint_key),
-            )
-            self._plan_cache[key] = plan
-        run_gemm_epi_plan(
-            plan,
-            A,
-            B,
+        # Re-map pinned ops' kind for the device loop: explicit pins still
+        # need a fragment kind; VecLoads present as their dim.
+        visit_sig = tuple(
+            (name, _pinned_visit_kind(pins[name]) if name in pins else kind)
+            for name, kind in kind_sig
+        )
+        prepass_sig = ()
+        if self.prepass is not None:
+            if packed_c:
+                raise ValueError("prepass + packed C: not supported")
+            unknown = set(self.prepass_operand_names) - {n for n, _ in visit_sig}
+            if unknown:
+                raise ValueError(f"prepass fn reads undeclared operands {unknown}")
+            for out_name in self.prepass_outs:
+                if out_name not in {n for n, _ in visit_sig} | set(self.sinks):
+                    raise ValueError(f"prepass out '{out_name}' must be a declared op")
+            prepass_sig = tuple((n, k) for n, k in visit_sig if n in self.prepass_operand_names)
+        mint_key = (
+            visit_sig,
+            device_capacity[0],
+            paired_acc,
+            packed_c,
+            prepass_sig,
+            rounding_mode,
+        )
+        GemmCls = self._mint(*mint_key)
+        A_s, B_s = (B, A) if swap_ab else (A, B)
+        plan = build_gemm_epi_plan(
+            GemmCls,
+            device_capacity,
+            A_s,
+            B_s,
             D,
             C,
-            epi_values,
-            tile_count_semaphore=tile_count_semaphore,
+            epi_values=epi_values,
+            epi_key_overrides=epi_key_overrides,
+            tile_M=tile_M,
+            tile_N=tile_N,
+            cluster_M=cluster_M,
+            cluster_N=cluster_N,
+            tile_K=tile_K,
+            pingpong=pingpong,
+            persistent=persistent,
+            is_dynamic_persistent=is_dynamic_persistent,
+            max_swizzle_size=max_swizzle_size,
+            varlen_m=varlen_m,
+            gather_A=gather_A,
+            b_kn=b_kn and not swap_ab,  # slot-A relabels via a_transposed instead
+            swap_ab=swap_ab,
+            use_tma_gather=use_tma_gather,
+            concat_layout=concat_key,
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            sf_batched=SFA.ndim == 6 if blockscaled else True,
+            post_init_attrs=post_init_attrs,
+            gemm_cls_ref=self._class_ref(mint_key),
+            packed_cd=packed_form,
+        )
+        self._plan_cache[key] = plan
+        if _launch:
+            run_gemm_epi_plan(
+                plan,
+                B if swap_ab else A,
+                A if swap_ab else B,
+                D,
+                C,
+                epi_values,
+                tile_count_semaphore=tile_count_semaphore,
+                cu_seqlens_m=cu_seqlens_m,
+                A_idx=A_idx,
+                SFA=SFA,
+                SFB=SFB,
+            )
+        return plan
+
+    # ── Torch-facing interface (Tier 4 surface) ──────────────────────────
+    # One interface parameterized by the epilogue object (see HANDOFF Tier 4):
+    # eager ``__call__`` (autotunes via quack.epi_autotune, allocates missing
+    # outputs), ``plan()`` -> EpiPlan (resolve once; ``run()`` makes zero host
+    # decisions). B is (k, n) logical at this surface — the torch convention —
+    # with the physical layout free.
+
+    def _lead_shape(self, A, cu_seqlens_m, A_idx):
+        if cu_seqlens_m is not None:
+            return ((A_idx.shape[0] if A_idx is not None else A.shape[0]),)
+        return tuple(A.shape[:-1])
+
+    def _alloc_outputs(self, out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx):
+        """Fill in the outputs the caller left out; out= buffers win."""
+        import torch
+
+        out = dict(out) if out else {}
+        n = B.shape[-1]
+        lead = self._lead_shape(A, cu_seqlens_m, A_idx)
+        dt = out_dtype if out_dtype is not None else A.dtype
+        if store_d and out.get("D") is None:
+            if self.mode == "packed_cd_b16x2":
+                if C is None:
+                    raise ValueError("packed_cd_b16x2 requires C; D matches its shape/dtype")
+                out["D"] = torch.empty_like(C)
+            else:
+                out["D"] = torch.empty((*lead, n), dtype=dt, device=A.device)
+        n_store = n // 2 if self.mode == "acc_pair" else n
+        for name in self.outputs:
+            if out.get(name) is None:
+                out[name] = torch.empty((*lead, n_store), dtype=dt, device=A.device)
+        return out
+
+    def _alloc_sinks(self, epi_args, lead, n, config, device):
+        """Reduce partials are config-shaped scratch, not outputs: allocated
+        per call (stream-safe, graph-pool friendly). A caller-provided buffer
+        (same name in operands) is used as-is and returned raw."""
+        import torch
+
+        bufs = {}
+        for name, op in self.sinks.items():
+            if epi_args.get(name) is not None:
+                continue
+            if op.dim == 0:
+                shape = (*lead, -(-n // config.tile_n))
+            else:
+                shape = (*lead[:-1], -(-lead[-1] // config.tile_m), n)
+            bufs[name] = epi_args[name] = torch.empty(shape, dtype=torch.float32, device=device)
+        return bufs
+
+    def _iface_execute(self, config, dynamic_scheduler, ctx, _launch=True):
+        import torch
+
+        A, C, D = ctx["A"], ctx.get("C"), ctx.get("D")
+        dyn = dynamic_scheduler or config.is_dynamic_persistent
+        epi_args = dict(ctx["operands"])
+        for name in self.outputs:
+            epi_args[name] = ctx["out"][name]
+        sink_bufs = self._alloc_sinks(epi_args, ctx["lead"], ctx["n"], config, A.device)
+        semaphore = (
+            torch.zeros(1, dtype=torch.int32, device=A.device)
+            if dyn and get_device_capacity(A.device)[0] == 9
+            else None
+        )
+        blockscaled = ctx.get("SFA") is not None
+        plan = self.gemm(
+            A,
+            ctx["B_d"],
+            D,
+            C,
+            epi_args=epi_args,
+            tile_M=config.tile_m,
+            tile_N=config.tile_n,
+            tile_K=None if blockscaled else config.tile_k,
+            cluster_M=config.cluster_m,
+            cluster_N=config.cluster_n,
+            pingpong=config.pingpong,
+            persistent=True,
+            is_dynamic_persistent=dyn,
+            max_swizzle_size=config.max_swizzle_size,
+            tile_count_semaphore=semaphore,
+            cu_seqlens_m=ctx.get("cu_seqlens_m"),
+            A_idx=ctx.get("A_idx"),
+            SFA=ctx.get("SFA"),
+            SFB=ctx.get("SFB"),
+            rounding_mode=ctx["rounding_mode"],
+            epi_key_overrides=ctx["epi_key_overrides"],
+            b_kn=ctx["b_kn"],
+            swap_ab=config.swap_ab,
+            use_tma_gather=config.use_tma_gather,
+            concat_layout=ctx.get("concat_layout"),
+            _launch=_launch,
+        )
+        return config, dyn, plan, sink_bufs
+
+    def __call__(
+        self,
+        A,
+        B,  # (k, n) or (l, k, n) — torch convention; physical layout free
+        C=None,
+        *,
+        out=None,  # {name: buffer} incl. "D"; missing entries are allocated
+        out_dtype=None,
+        store_d=True,
+        config=None,  # explicit GemmConfig pins; None + tuned=True autotunes
+        tuned=True,
+        dynamic_scheduler=False,
+        cu_seqlens_m=None,
+        A_idx=None,
+        SFA=None,
+        SFB=None,
+        rounding_mode=RoundingMode.RN,
+        epi_key_overrides=None,
+        concat_layout=None,  # tensors whose non-contiguous dim is concat [gate; up]
+        **operands,  # epilogue operand tensors/scalars by fn-parameter name
+    ):
+        """Eager torch-facing call: resolve config (autotune via
+        quack.epi_autotune on first sight of a metadata class), allocate
+        missing outputs, launch. Returns {"D": ..., <declared outputs>,
+        <finalized reduces>}; reduce sinks come back finalized via their op's
+        ``host_finalize`` (partials are internal scratch) unless the caller
+        passed the partial buffer as an operand.
+
+        The tuned path covers the non-SR surface (see quack.epi_autotune,
+        incl. varlen/gather/blockscaled/concat and dynamic_scheduler=True);
+        other calls resolve with the explicit ``config=`` or the per-arch
+        default.
+
+        Under torch.compile the call records the single ``quack::gemm_epi``
+        custom op (see quack.epi_torch_op); with reduce sinks the config is
+        pinned there (partials must be graph-allocated at exact shapes)."""
+        import torch
+
+        if torch.compiler.is_compiling():
+            if dynamic_scheduler or epi_key_overrides is not None:
+                raise NotImplementedError(
+                    "dynamic_scheduler/epi_key_overrides under torch.compile: not supported yet"
+                )
+            from quack.epi_torch_op import compile_call
+
+            return compile_call(
+                self,
+                A,
+                B,
+                C,
+                out=out,
+                out_dtype=out_dtype,
+                store_d=store_d,
+                config=config,
+                tuned=tuned,
+                cu_seqlens_m=cu_seqlens_m,
+                A_idx=A_idx,
+                SFA=SFA,
+                SFB=SFB,
+                rounding_mode=rounding_mode,
+                operands=operands,
+            )
+
+        # ── Eager warm fast path: one metadata key -> captured launch recipe.
+        # Everything metadata-derived (config resolution incl. the autotuned
+        # winner, output recipes, sink shapes, slot order) was recorded by a
+        # previous identical-metadata call; only allocation + launch remain.
+        # packed_cd rides it too (the f32 recast is trace-level, cd_packed);
+        # concat is excluded (its per-call B views live in mod.gemm).
+        ck = None
+        if concat_layout is None:
+            ck = (
+                tensor_key(A),
+                tensor_key(B),
+                tensor_key(C),
+                tuple(
+                    sorted(
+                        (kk, tensor_key(v) if hasattr(v, "stride") else v is not None)
+                        for kk, v in operands.items()
+                    )
+                ),
+                None
+                if out is None
+                else tuple(sorted((kk, tensor_key(v)) for kk, v in out.items())),
+                out_dtype,
+                store_d,
+                # Pinned configs key by identity: they are module-level
+                # constants in practice; a recreated equal config just
+                # re-records (correct, one extra cold pass).
+                None if config is None else id(config),
+                tuned,
+                dynamic_scheduler,
+                tensor_key(cu_seqlens_m),
+                tensor_key(A_idx),
+                tensor_key(SFA),
+                tensor_key(SFB),
+                rounding_mode,
+                None if epi_key_overrides is None else tuple(sorted(epi_key_overrides.items())),
+            )
+            entry = self._call_cache.get(ck)
+            if entry is not None:
+                import torch as _t
+
+                plan, recipes, sink_shapes, b_kn_c, swapped, sem_dyn = entry
+                outs = dict(out) if out else {}
+                for name, shape, dt in recipes:
+                    if outs.get(name) is None:
+                        outs[name] = _t.empty(shape, dtype=dt, device=A.device)
+                epi_values = dict(operands)
+                for name in self.outputs:
+                    epi_values[name] = outs[name]
+                sink_bufs = {}
+                for name, shape in sink_shapes:
+                    if epi_values.get(name) is None:
+                        buf = _t.empty(shape, dtype=_t.float32, device=A.device)
+                        sink_bufs[name] = epi_values[name] = buf
+                B_w = B if b_kn_c else B.mT
+                sem = _t.zeros(1, dtype=_t.int32, device=A.device) if sem_dyn else None
+                run_gemm_epi_plan(
+                    plan,
+                    B_w if swapped else A,
+                    A if swapped else B_w,
+                    outs.get("D") if store_d else None,
+                    C,
+                    epi_values,
+                    tile_count_semaphore=sem,
+                    cu_seqlens_m=cu_seqlens_m,
+                    A_idx=A_idx,
+                    SFA=SFA,
+                    SFB=SFB,
+                )
+                result = dict(outs) if store_d else {kk: v for kk, v in outs.items() if kk != "D"}
+                for name, buf in sink_bufs.items():
+                    finalize = getattr(self.sinks[name], "host_finalize", None)
+                    result[name] = finalize(buf) if finalize is not None else buf
+                return result
+
+        varlen_m = cu_seqlens_m is not None
+        # concat reads B (k, n) through per-call views, so it vetoes the b_kn
+        # trace-time relabel (the interleave lives in mod.gemm).
+        b_kn = get_device_capacity(A.device)[0] >= 9 and not concat_layout
+        B_d = B if b_kn else B.mT
+        provided_out = frozenset(k for k, v in (out or {}).items() if v is not None)
+        out = self._alloc_outputs(out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx)
+        D = out.get("D") if store_d else None
+        lead = self._lead_shape(A, cu_seqlens_m, A_idx)
+        n = B.shape[-1]
+        use_tuner = (
+            tuned
+            and config is None
+            and rounding_mode == RoundingMode.RN
+            and epi_key_overrides is None
+        )
+        if use_tuner:
+            from quack.epi_autotune import sink_arg_shapes, tuned_mod_gemm
+
+            epi_args = dict(operands)
+            for name in self.outputs:
+                epi_args[name] = out[name]
+            owned_sinks = {}
+            if self.sinks:
+                # sink_arg_shapes walks the full config space — cache the
+                # worst-case shapes per metadata (it's on the warm path).
+                l = lead[0] if len(lead) == 2 else None
+                shape_key = (lead[-1], n, l, str(A.device))
+                cache = self.__dict__.setdefault("_sink_shape_cache", {})
+                shapes = cache.get(shape_key)
+                if shapes is None:
+                    shapes = sink_arg_shapes(self, lead[-1], n, l=l, device=A.device)
+                    cache[shape_key] = shapes
+                for name, shape in shapes.items():
+                    if epi_args.get(name) is None:
+                        epi_args[name] = torch.empty(shape, dtype=torch.float32, device=A.device)
+                        owned_sinks[name] = True
+            res = tuned_mod_gemm(
+                self,
+                A,
+                B_d,
+                D,
+                C,
+                epi_args=epi_args,
+                b_kn=b_kn,
+                cu_seqlens_m=cu_seqlens_m,
+                A_idx=A_idx,
+                dynamic_scheduler=dynamic_scheduler,
+                SFA=SFA,
+                SFB=SFB,
+                concat_layout=concat_layout,
+            )
+            sink_bufs = {name: res.sinks[name] for name in owned_sinks}
+            cfg_used, plan_used = res.config, res.plan
+        else:
+            ctx = dict(
+                A=A,
+                B_d=B_d,
+                C=C,
+                D=D,
+                out=out,
+                operands=dict(operands),
+                n=n,
+                lead=lead,
+                b_kn=b_kn,
+                cu_seqlens_m=cu_seqlens_m,
+                A_idx=A_idx,
+                SFA=SFA,
+                SFB=SFB,
+                rounding_mode=rounding_mode,
+                epi_key_overrides=epi_key_overrides,
+                concat_layout=concat_layout,
+            )
+            if config is not None:
+                cfg = config
+            elif SFA is not None:
+                cfg = blockscaled_default_config(A.shape[-2], n)
+            else:
+                cfg = default_config(A.device)
+            _, _, plan_used, sink_bufs = self._iface_execute(cfg, dynamic_scheduler, ctx)
+            cfg_used = cfg
+        if ck is not None:
+            # Record the launch recipe for identical-metadata replays. Sink
+            # shapes come from the winning config's buffers (tuned sweeps
+            # allocate worst-case; the recipe stores the exact live shape).
+            recipes = tuple(
+                (name, tuple(t.shape), t.dtype)
+                for name, t in out.items()
+                if name not in provided_out
+            )
+            # tuned sink_bufs are already the winning config's exact slices
+            sink_shapes = tuple((name, tuple(b.shape)) for name, b in sink_bufs.items())
+            self._call_cache[ck] = (
+                plan_used,
+                recipes,
+                sink_shapes,
+                b_kn,
+                cfg_used.swap_ab,
+                (dynamic_scheduler or cfg_used.is_dynamic_persistent)
+                and get_device_capacity(A.device)[0] == 9,
+            )
+        result = dict(out) if store_d else {k: v for k, v in out.items() if k != "D"}
+        for name, buf in sink_bufs.items():
+            finalize = getattr(self.sinks[name], "host_finalize", None)
+            result[name] = finalize(buf) if finalize is not None else buf
+        return result
+
+    def plan(
+        self,
+        A,
+        B,  # (k, n) logical, as in __call__
+        C=None,
+        *,
+        out,  # REQUIRED: buffers for D + every declared output (their
+        #        metadata selects the kernel); no "D" entry = no D store
+        config=None,  # explicit GemmConfig; None = per-arch default. No
+        #               autotuning here (autotune via an eager call, or pass
+        #               the tuned config) — plan() never launches.
+        dynamic_scheduler=False,
+        cu_seqlens_m=None,
+        A_idx=None,
+        SFA=None,
+        SFB=None,
+        rounding_mode=RoundingMode.RN,
+        epi_key_overrides=None,
+        **operands,
+    ):
+        """Resolve (and compile on a cold cache) WITHOUT launching; returns an
+        :class:`EpiPlan` whose ``run()`` makes zero host decisions. Default
+        reduce scratch is allocated here and attached to the plan (pass fresh
+        ``scratch=`` to run() for concurrent streams)."""
+        varlen_m = cu_seqlens_m is not None
+        b_kn = get_device_capacity(A.device)[0] >= 9
+        B_d = B if b_kn else B.mT
+        cfg = config if config is not None else default_config(A.device)
+        dyn = dynamic_scheduler or cfg.is_dynamic_persistent
+        out = dict(out)
+        D = out.get("D")
+        for name in self.outputs:
+            if out.get(name) is None:
+                raise ValueError(f"plan() requires a buffer for output {name!r}")
+        ctx = dict(
+            A=A,
+            B_d=B_d,
+            C=C,
+            D=D,
+            out=out,
+            operands=dict(operands),
+            n=B.shape[-1],
+            lead=self._lead_shape(A, cu_seqlens_m, A_idx),
+            b_kn=b_kn,
             cu_seqlens_m=cu_seqlens_m,
             A_idx=A_idx,
             SFA=SFA,
             SFB=SFB,
+            rounding_mode=rounding_mode,
+            epi_key_overrides=epi_key_overrides,
         )
-        return plan
+        _, _, gemm_plan, sink_bufs = self._iface_execute(cfg, dyn, ctx, _launch=False)
+        return EpiPlan(
+            gemm_plan=gemm_plan,
+            config=cfg,
+            out_names=tuple(self.outputs),
+            b_kn=b_kn,
+            swapped=cfg.swap_ab,
+            scratch={
+                **sink_bufs,
+                **{k: v for k, v in ctx["operands"].items() if k in self.sinks},
+            },
+        )
 
 
 def _pinned_visit_kind(op):
@@ -1519,3 +2032,126 @@ def gemm_epilogue(
         )
 
     return wrap
+
+
+class EpiPlan:
+    """Prepared launch for one metadata class (the decode / CUDA-graph entry
+    point). ``run()`` performs zero host decisions by construction: no key, no
+    compile-cache probe, no allocation — only the B relabel the compiled
+    signature demands (off SM90+/varlen) and the launch. Tensors must match
+    the metadata plan() saw; that promise is the caller's (an interface layer
+    holding this plan keys for it)."""
+
+    __slots__ = ("gemm_plan", "config", "out_names", "b_kn", "scratch", "swapped")
+
+    def __init__(self, *, gemm_plan, config, out_names, b_kn, scratch, swapped=False):
+        self.gemm_plan = gemm_plan
+        self.config = config
+        self.out_names = out_names
+        self.b_kn = b_kn
+        self.swapped = swapped
+        # Default reduce partial buffers, allocated at plan(). Shared across
+        # run() calls on one stream; pass scratch= for concurrent streams.
+        self.scratch = scratch
+
+    def run(
+        self,
+        A,
+        B,  # (k, n) logical, as given to plan()
+        C=None,
+        *,
+        out,
+        scratch=None,
+        tile_count_semaphore=None,
+        cu_seqlens_m=None,
+        A_idx=None,
+        SFA=None,
+        SFB=None,
+        **operands,
+    ):
+        D = out.get("D")
+        if not self.b_kn:
+            B = B.mT
+        epi_values = dict(self.scratch if scratch is None else scratch)
+        epi_values.update(operands)
+        for name in self.out_names:
+            v = out.get(name)
+            if v is not None:
+                epi_values[name] = v
+        run_gemm_epi_plan(
+            self.gemm_plan,
+            B if self.swapped else A,
+            A if self.swapped else B,
+            D,
+            C,
+            epi_values,
+            tile_count_semaphore=tile_count_semaphore,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            SFA=SFA,
+            SFB=SFB,
+        )
+
+
+class StaticEpi:
+    """Rung-3 escape hatch: the same plan/run interface for a hand-written
+    GEMM class (custom EpiOps, dataflow the fn contract can't express). Power
+    API: no operand inference and no allocation — B arrives dispatch-shaped
+    (n, k) unless b_kn, epi_args are explicit, outputs are epi_args entries.
+    Requires every op with a host argument to implement the host schema trio
+    (host_arg_key / host_fake_arg / host_call_arg)."""
+
+    def __init__(self, GemmCls):
+        self.GemmCls = GemmCls
+
+    def plan(
+        self,
+        A,
+        B,
+        D,
+        C=None,
+        *,
+        epi_args,
+        config=None,
+        dynamic_scheduler=False,
+        b_kn=False,
+        varlen_m=False,
+        gather_A=False,
+        epi_key_overrides=None,
+    ):
+        cfg = config if config is not None else default_config(A.device)
+        dyn = dynamic_scheduler or cfg.is_dynamic_persistent
+        gemm_plan = build_gemm_epi_plan(
+            self.GemmCls,
+            get_device_capacity(A.device),
+            A,
+            B,
+            D,
+            C,
+            epi_values=epi_args,
+            epi_key_overrides=epi_key_overrides,
+            tile_M=cfg.tile_m,
+            tile_N=cfg.tile_n,
+            tile_K=cfg.tile_k,
+            cluster_M=cfg.cluster_m,
+            cluster_N=cfg.cluster_n,
+            pingpong=cfg.pingpong,
+            persistent=True,
+            is_dynamic_persistent=dyn,
+            max_swizzle_size=cfg.max_swizzle_size,
+            varlen_m=varlen_m,
+            gather_A=gather_A,
+            b_kn=b_kn,
+        )
+        return EpiPlan(
+            gemm_plan=gemm_plan,
+            config=cfg,
+            out_names=(),
+            b_kn=True,  # B is already dispatch-shaped: run() must not relabel
+            scratch={},
+        )
+
+
+def epilogue_from_class(GemmCls) -> StaticEpi:
+    """Wrap a hand-written epilogue GEMM class in the plan/run interface."""
+    return StaticEpi(GemmCls)

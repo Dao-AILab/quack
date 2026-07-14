@@ -357,22 +357,35 @@ def make_fake_gemm_tensors(
     gather_A=False,
     batched=True,
     b_kn=False,
+    swap_ab=False,
+    packed_cd=None,
 ):
     """Create fake tensors for mA, mB, mD, mC with shared sym_ints.
     Pass dtype=None to get None for that tensor (e.g. optional C).
     Returns (mA, mB, mD, mC, m, n, k, l).
     When varlen_m, m is total_m (flattened M of D/C). When varlen_k, k is total_k.
 
+    ``packed_cd`` ("n" | "m", dgated packed-native): D/C cross in their RAW
+    16-bit dtype with the packed extent DOUBLE the f32 view's — it gets its
+    OWN sym (no 2n = 2*n compile-time link); the trace derives the f32 view
+    by halving (GemmBase._recast_packed_cd).
+
     3D tensors are built batch-first (l, x, y); see :func:`fake_batched`.
     ``batched=False`` (dense only) builds 2D (x, y) operand fakes: the kernel
     appends a trivial batch mode at trace time (GemmBase.permute_batch_last),
     so hosts pass unbatched torch tensors without .unsqueeze() views.
-    ``b_kn`` (dense only) builds mB as (l, k, n) / (k, n) — B crosses the
-    boundary in the caller's (K, N) orientation and the kernel transposes it to
-    (n, k, l) at trace time (GemmBase.rotate_batch_last), saving a .mT view.
+    ``b_kn`` builds mB as (l, k, n) / (k, n) — B crosses the boundary in the
+    caller's (K, N) orientation and the kernel transposes it to (n, k, l) at
+    trace time (GemmBase.rotate_batch_last), saving a .mT view. Supported for
+    dense and varlen_m (B is batched rank-3 there, so the same trace-time
+    select applies); varlen_k keeps the host relabel (its B is the rank-2
+    flattened operand, outside rotate_batch_last's transpose path).
     """
     assert batched or not (varlen_m or varlen_k), "varlen operands are 2D already"
-    assert not (b_kn and (varlen_m or varlen_k)), "b_kn is dense-only"
+    assert not (b_kn and varlen_k), "b_kn does not support varlen_k"
+    assert not (swap_ab and (varlen_m or varlen_k or b_kn)), "swap_ab: dense, b_kn folded in"
+    assert packed_cd is None or (not swap_ab and not varlen_k), "packed_cd: dense/varlen_m only"
+    assert packed_cd != "m" or not varlen_m, "varlen packed C/D is n-major"
     a_leading = 1 if a_major == "k" else 0
     b_leading = 1 if b_major == "k" else 0
     d_leading = 1 if d_major == "n" else 0
@@ -386,14 +399,20 @@ def make_fake_gemm_tensors(
     div_b = div_for_dtype(b_dtype)
     div_d = div_for_dtype(d_dtype) if d_dtype is not None else 1
     div_c = div_for_dtype(c_dtype) if c_dtype is not None else 1
+    # Doubled packed extent for raw 16-bit D/C — its own independent sym.
+    pd = cute.sym_int() if packed_cd is not None else None
     if varlen_m:
         # m is total_m in this case: the flattened M dimension of D/C
         m = cute.sym_int()
         a_m = cute.sym_int() if gather_A else m
         mA = fake_batched(a_dtype, a_m, k, None, a_leading, div_a)
-        mB = fake_batched(b_dtype, n, k, l, b_leading, div_b)
-        mD = fake_batched(d_dtype, m, n, None, d_leading, div_d)
-        mC = fake_batched(c_dtype, m, n, None, c_leading, div_c)
+        if b_kn:
+            mB = fake_batched(b_dtype, k, n, l, 1 - b_leading, div_b)
+        else:
+            mB = fake_batched(b_dtype, n, k, l, b_leading, div_b)
+        dc_n = pd if packed_cd is not None else n  # "n" form only under varlen
+        mD = fake_batched(d_dtype, m, dc_n, None, d_leading, div_d)
+        mC = fake_batched(c_dtype, m, dc_n, None, c_leading, div_c)
     elif varlen_k:
         # k is total_k in this case: the flattened K dimension of A/B
         k = cute.sym_int()
@@ -404,6 +423,19 @@ def make_fake_gemm_tensors(
         mC = fake_batched(c_dtype, m, n, l, c_leading, div_c)
     else:
         bl = l if batched else None
+        if swap_ab:
+            # Swap-at-trace (dims are KERNEL m/n; m = caller n). Slot-A is the
+            # caller's (k, n) B crossing natively -> a_transposed relabels to
+            # (m, k, l); slot-B is the caller's (m, k) A, already kernel-
+            # ordered (n_k, k); D/C cross caller-oriented (n_k, m_k) ->
+            # cd_transposed. The caller-stride major labels flip with the
+            # shape order, so the standard leading formulas hold (build_
+            # gemm_epi_plan flips d/c majors, the only non-cancelling pair).
+            mA = fake_batched(a_dtype, k, m, bl, 1 - a_leading, div_a)
+            mB = fake_batched(b_dtype, n, k, bl, b_leading, div_b)
+            mD = fake_batched(d_dtype, n, m, bl, 1 - d_leading, div_d)
+            mC = fake_batched(c_dtype, n, m, bl, 1 - c_leading, div_c)
+            return mA, mB, mD, mC, m, n, k, l
         mA = fake_batched(a_dtype, m, k, bl, a_leading, div_a)
         if b_kn:
             # (k, n) orientation: b_major is still the logical (n, k) label, so
@@ -411,8 +443,9 @@ def make_fake_gemm_tensors(
             mB = fake_batched(b_dtype, k, n, bl, 1 - b_leading, div_b)
         else:
             mB = fake_batched(b_dtype, n, k, bl, b_leading, div_b)
-        mD = fake_batched(d_dtype, m, n, bl, d_leading, div_d)
-        mC = fake_batched(c_dtype, m, n, bl, c_leading, div_c)
+        dc_x, dc_y = (m, pd) if packed_cd == "n" else (pd, n) if packed_cd == "m" else (m, n)
+        mD = fake_batched(d_dtype, dc_x, dc_y, bl, d_leading, div_d)
+        mC = fake_batched(c_dtype, dc_x, dc_y, bl, c_leading, div_c)
     return mA, mB, mD, mC, m, n, k, l
 
 
@@ -467,6 +500,9 @@ def compile_gemm_kernel(
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
     b_transposed=False,
+    a_transposed=False,
+    cd_transposed=False,
+    cd_packed=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     split_k_kwargs = {}
@@ -496,8 +532,12 @@ def compile_gemm_kernel(
         concat_layout=concat_layout,
     )
     # mB crosses the boundary as (l, k, n); rotate_batch_last transposes it to
-    # kernel order (n, k, l) at trace time.
+    # kernel order (n, k, l) at trace time. a/cd_transposed are the
+    # swap-at-trace analogues (see GemmBase).
     gemm_obj.b_transposed = b_transposed
+    gemm_obj.a_transposed = a_transposed
+    gemm_obj.cd_transposed = cd_transposed
+    gemm_obj.cd_packed = cd_packed
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

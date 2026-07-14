@@ -544,6 +544,8 @@ class VecLoad(EpiOp):
 
     def _get_gmem_vec(self, param, ctx):
         """Get the global memory vector for this tile. Override for varlen."""
+        if cute.rank(param) == 1:
+            return param  # rank-1 (vec,): one vector shared across the batch
         return param[ctx.batch_idx, None]
 
     @cute.jit
@@ -615,12 +617,15 @@ class ColVecLoad(VecLoad):
 
     @cute.jit
     def _get_gmem_vec(self, param, ctx):
-        if const_expr(not ctx.varlen_manager.varlen_m):
-            mVec = param[ctx.batch_idx, None]
-        else:
+        if const_expr(ctx.varlen_manager.varlen_m):
+            # varlen: rank-1 (total_m,) concatenated vector, offset per sequence
             mVec = cute.domain_offset(
                 (ctx.varlen_manager.params.cu_seqlens_m[ctx.batch_idx],), param
             )
+        elif const_expr(cute.rank(param) == 2):
+            mVec = param[ctx.batch_idx, None]
+        else:
+            mVec = param  # dense rank-1 (m,): one vector shared across the batch
         return mVec
 
     @cute.jit
@@ -752,6 +757,12 @@ class TileStore(EpiOp):
         n = cute.sym_int() if self.epi_tile_fn is not None else fctx.n
         leading = 1 if (major == "n" or self.epi_tile_fn is not None) else 0
         batch = fctx.l if (fctx.batched and not fctx.varlen_m) else None
+        if fctx.swapped:
+            # Crossing order is caller-oriented (n_k, m_k); the caller-stride
+            # major label flips with the shape order, so ``leading`` is
+            # unchanged (both flips cancel). Transposed at trace time.
+            assert self.epi_tile_fn is None, "swap_ab: reshaped tiles unsupported"
+            return fake_batched(dtype, fctx.n, fctx.m, batch, leading, div_for_dtype(dtype))
         return fake_batched(dtype, fctx.m, n, batch, leading, div_for_dtype(dtype))
 
     def param_fields(self):
@@ -1234,6 +1245,15 @@ class VecReduce(EpiOp):
 
     def config_key(self):
         return (self.combine, self.scaled)
+
+    def host_finalize(self, partials):
+        """Fold the per-tile partial buffer into the user-visible reduce value
+        (host side, after the kernel): colvec partials are (..., m, n_tiles),
+        rowvec partials (..., m_tiles, n). Subclasses whose partials need a
+        non-trivial fold (coupled accumulators) set ``host_finalize = None``
+        and the interface layer returns the raw buffer."""
+        axis = -1 if self.dim == 0 else -2
+        return partials.sum(dim=axis) if self.combine == "add" else partials.amax(dim=axis)
 
     @cute.jit
     def fn_sink_flush(self, gemm, state, frag, scale=None):
@@ -1780,6 +1800,9 @@ class GroupedColStatsBase(EpiOp):
 class OnlineLSEReduce(ColVecReduce):
     """Online log-sum-exp column reduction: out[m, n_tile] = log sum_n exp(v).
 
+    Host finalize is the logsumexp fold over the per-N-tile partials (see
+    ``VecReduce.host_finalize``).
+
     The coupled (running max, running sum) accumulator is what a plain
     ``combine=`` cannot express: every new value may rescale the sum. The fn
     just returns the logit under this op's name (sink port); numerical
@@ -1800,6 +1823,11 @@ class OnlineLSEReduce(ColVecReduce):
     def __init__(self, name, check_oob=True):
         super().__init__(name)
         self.check_oob = check_oob
+
+    def host_finalize(self, partials):
+        import torch
+
+        return torch.logsumexp(partials, dim=-1)
 
     def config_key(self):
         return (self.combine, self.check_oob)

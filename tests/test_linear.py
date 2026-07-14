@@ -17,7 +17,6 @@ from quack.gemm_interface import (
     default_config,
     gemm_dact,
     gemm_gated,
-    gemm_gated_tuned,
     gemm_dgated,
     gemm_ref,
     gemm_add_ref,
@@ -467,17 +466,14 @@ def test_gemm_gated_pingpong_configs(pingpong):
         cluster_n=1,
         device_capacity=device_capacity,
     )
-    gemm_gated_tuned.fn(
+    gemm_act(
         x,
         B,
-        preact,
-        postact,
-        None,
-        None,
-        "swiglu",
-        None,
-        None,
-        False,
+        activation="swiglu",
+        preact_out=preact,
+        postact_out=postact,
+        store_preact=True,
+        tuned=False,
         config=config,
     )
     preact_ref, postact_ref = gemm_gated_ref(
@@ -813,8 +809,6 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, premult_dtype, u
 @pytest.mark.parametrize("k", [4096])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_ab):
-    from quack.gemm_interface import gemm_norm_act_tuned
-
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1024
@@ -836,15 +830,16 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
     else:
         preact = torch.empty(m, n, device=device, dtype=input_dtype)
         postact = torch.empty(m, n, device=device, dtype=input_dtype)
-        gemm_norm_act_tuned.fn(
+        gemm_norm_act(
             A,
             B,
-            preact,
-            postact,
-            C,
-            rstd,
-            activation,
-            False,
+            rstd=rstd,
+            C=C,
+            activation=activation,
+            preact_out=preact,
+            postact_out=postact,
+            store_preact=True,
+            tuned=False,
             config=replace(default_config(torch.device(device)), swap_ab=True),
         )
     preact_ref, postact_ref = gemm_norm_act_ref(

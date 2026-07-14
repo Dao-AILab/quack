@@ -5,7 +5,6 @@ epilogue-mod path (quack.epilogues.dact_mod / dgated_mod)."""
 from __future__ import annotations
 from typing import Optional
 
-import torch
 from torch import Tensor
 
 from quack.activation import dact_fn_map, dgate_fn_map
@@ -48,7 +47,6 @@ def gemm_dact(
         mod = dact_mod(activation)
         epi_args = dict(mAuxOut=PostAct)
     else:
-        assert A.ndim == 3 or cu_seqlens_m is not None, "dgated requires batched (3D) operands"
         mod = dgated_mod(
             activation,
             has_scale=colvec_scale is not None,
@@ -96,17 +94,10 @@ def run_gemm_dact_plan(
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
 ) -> None:
-    """Launch a resolved mod plan: only per-call pointers (and the dgated f32
-    reinterpretation, which creates new tensor objects regardless) here."""
+    """Launch a resolved mod plan: only per-call pointers here (packed dgated
+    C/D cross raw — the f32 recast is compiled into the trace, cd_packed)."""
     from quack.gemm_host import run_gemm_epi_plan
 
-    if getattr(plan.gemm_cls, "_epi_mod_packed_cd", False):
-        if PreAct.stride(-1) == 1 or cu_seqlens_m is not None:
-            Out = Out.view(torch.float32)
-            PreAct = PreAct.view(torch.float32)
-        else:
-            Out = Out.mT.view(torch.float32).mT
-            PreAct = PreAct.mT.view(torch.float32).mT
     run_gemm_epi_plan(
         plan,
         A,

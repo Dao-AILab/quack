@@ -6,7 +6,7 @@ fn frontend must produce the same math the mixin produces.
 """
 
 import pytest
-from quack.epi_ops import ColVecReduce, OnlineLSEReduce, Scalar, TileLoad
+from quack.epi_ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
 from quack.gemm_epilogue import gemm_epilogue, pack, unpack
 from quack.gemm_host import resolve_gemm_class
 import math
@@ -24,6 +24,7 @@ from quack.epilogue.rotary import (
     make_mrope_inv_freq,
     make_xpos_log_scale,
     mrope_posfreq_epi,
+    rope_posfreq_bias_epi,
     rope_posfreq_epi,
     rope_posfreq_scaled_epi,
     rope_table_epi,
@@ -45,6 +46,9 @@ from quack.epilogues import (
     relu_mod,
     relu_sq_mod,
     residual_epi,
+    rms_bwd_apply_epi,
+    rms_bwd_apply_last_epi,
+    rms_bwd_entry_epi,
     rms_bwd_partial_epi,
     rms_fused,
     rms_partial_epi,
@@ -1121,7 +1125,7 @@ def test_epi_mod_rope_posfreq(tile_N):
     )
     freq = make_interleaved_inv_freq(inv_freq, n)
 
-    rope_posfreq_epi.gemm(
+    rope_posfreq_bias_epi.gemm(
         A,
         B,
         D,
@@ -1170,7 +1174,7 @@ def test_epi_mod_rope_posfreq_packed_qkv(tile_N):
     )
     freq = make_interleaved_inv_freq(inv_freq, qk_dim, v_dim)
 
-    rope_posfreq_epi.gemm(
+    rope_posfreq_bias_epi.gemm(
         A,
         B,
         D,
@@ -1215,7 +1219,7 @@ def test_epi_mod_rope_posfreq_partial():
     )
     freq = make_interleaved_inv_freq(inv_freq, n, head_dim=head_dim)
 
-    rope_posfreq_epi.gemm(
+    rope_posfreq_bias_epi.gemm(
         A,
         B,
         D,
@@ -1839,3 +1843,468 @@ def test_epi_mod_multi_output_mixed_dtype():
     _rel_check(D, ref, "D")
     _rel_check(y1, torch.nn.functional.gelu(ref, approximate="tanh"), "y1")
     _rel_check(y2, torch.relu(ref), "y2")
+
+
+def _rowsum_epi_fn(acc, y):
+    return {"D": acc, "colsum": (acc, y)}
+
+
+_rowsum_mod = gemm_epilogue(reduces={"colsum": RowVecReduce("colsum", scaled=True)})(_rowsum_epi_fn)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize(
+    "m,tile_M,tile_N,pingpong",
+    [
+        (384, 128, 256, False),
+        (440, 128, 192, False),  # ragged last M tile: OOB rows are add-identity zeros
+        (384, 192, 128, True),
+        (384, 128, 128, True),
+    ],
+)
+def test_epi_mod_rowvec_reduce(batched, m, tile_M, tile_N, pingpong):
+    """First RowVecReduce consumer: per-column partials (l, m_tiles, n) of a
+    scaled (acc, y) fold — the dgamma building block."""
+    device = "cuda"
+    torch.random.manual_seed(21)
+    l, n, k = 2, 1024, 512
+    shape3 = lambda *s: s if batched else s[1:]
+    A = torch.randn(shape3(l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn(shape3(l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    y = torch.randn(shape3(l, m, n), device=device, dtype=torch.bfloat16)
+    D = torch.empty(shape3(l, m, n), device=device, dtype=torch.bfloat16)
+    m_tiles = (m + tile_M - 1) // tile_M
+    colsum = torch.empty(shape3(l, m_tiles, n), device=device, dtype=torch.float32)
+
+    _rowsum_mod.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(y=y, colsum=colsum),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+        pingpong=pingpong,
+    )
+
+    eq = "lmk,lnk->lmn" if batched else "mk,nk->mn"
+    x = torch.einsum(eq, A.float(), B.float())
+    prod = x * y.float()
+    pad = m_tiles * tile_M - m
+    if pad:
+        prod = torch.nn.functional.pad(prod, (0, 0, 0, pad))
+    ref = prod.unflatten(-2, (m_tiles, tile_M)).sum(-2)
+    _rel_check(D, x, "D")
+    _rel_check(colsum, ref, "colsum", tol=1e-3)
+
+
+@pytest.mark.parametrize("last", [False, True])
+def test_epi_mod_rms_bwd_apply(last):
+    """Deferred-rstd norm-bwd apply (mid-stack / final boundary): closed-form
+    D and dgamma partials; the full-chain semantics are pinned by the block
+    pipeline test."""
+    device = "cuda"
+    torch.random.manual_seed(22)
+    l, m, k, n = 2, 384, 512, 1024
+    tile_M, tile_N = 128, 256
+    dgu = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    Wt = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    y = torch.randn((l, m, n), device=device, dtype=torch.bfloat16)  # saved residual h
+    w = torch.randn((l, n), device=device, dtype=torch.float32)
+    corr = torch.randn((l, m), device=device, dtype=torch.float32) * 0.1
+    c = torch.randn((l, m, n), device=device, dtype=torch.bfloat16)  # residual grad
+
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    m_tiles = m // tile_M
+    dw = torch.empty((l, m_tiles, n), device=device, dtype=torch.float32)
+    mod = rms_bwd_apply_last_epi if last else rms_bwd_apply_epi
+    epi_args = dict(y=y, w=w, corr=corr, dw=dw)
+    mod.gemm(
+        dgu,
+        Wt,
+        D,
+        None if last else c,
+        epi_args=epi_args,
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    da = torch.einsum("lmk,lnk->lmn", dgu.float(), Wt.float())
+    ref = da * w.unsqueeze(-2) + y.float() * corr.unsqueeze(-1)
+    if not last:
+        ref = ref + c.float()
+    _rel_check(D, ref, "D")
+    dw_ref = (da * y.float()).unflatten(-2, (m_tiles, tile_M)).sum(-2)
+    _rel_check(dw, dw_ref, "dw", tol=1e-3)
+
+
+def test_epi_mod_rms_bwd_entry():
+    """Entry-boundary norm bwd (conventional full rmsnorm in fwd): dual sink
+    (dots ColVecReduce + dw RowVecReduce); assembled dh checked against torch
+    autograd of rmsnorm, dgamma against autograd of the weight."""
+    device = "cuda"
+    torch.random.manual_seed(23)
+    l, m, k, n = 2, 384, 512, 1024
+    tile_M, tile_N, eps = 128, 256, 1e-6
+    dqkv = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    Wt = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    y = torch.randn((l, m, n), device=device, dtype=torch.bfloat16)  # h0 (embedding out)
+    w = torch.randn((l, n), device=device, dtype=torch.float32).abs() + 0.5
+    rstd = torch.rsqrt(y.float().pow(2).mean(-1) + eps)
+    c = torch.randn((l, m, n), device=device, dtype=torch.bfloat16)  # residual grad
+
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    n_tiles, m_tiles = n // tile_N, m // tile_M
+    dots = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
+    dw = torch.empty((l, m_tiles, n), device=device, dtype=torch.float32)
+    rms_bwd_entry_epi.gemm(
+        dqkv,
+        Wt,
+        D,
+        c,
+        epi_args=dict(y=y, rstd=rstd, w=w, dots=dots, dw=dw),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    da = torch.einsum("lmk,lnk->lmn", dqkv.float(), Wt.float())
+    t = da * w.unsqueeze(-2)
+    xhat = y.float() * rstd.unsqueeze(-1)
+    _rel_check(D, t * rstd.unsqueeze(-1) + c.float(), "D")
+    _rel_check(dots, (t * xhat).unflatten(-1, (n_tiles, tile_N)).sum(-1), "dots", tol=1e-3)
+    _rel_check(dw, (da * xhat).unflatten(-2, (m_tiles, tile_M)).sum(-2), "dw", tol=1e-3)
+
+    # Terminal correction assembles dh; check vs autograd (+ the c passthrough).
+    dh = D.float() - xhat * rstd.unsqueeze(-1) * (dots.sum(-1) / n).unsqueeze(-1)
+    yg = y.float().detach().requires_grad_()
+    wg = w.detach().requires_grad_()
+    out = yg * torch.rsqrt(yg.pow(2).mean(-1, keepdim=True) + eps) * wg.unsqueeze(-2)
+    out.backward(da)
+    err = (dh - c.float() - yg.grad).abs().max().item()
+    scale = yg.grad.abs().max().item()
+    assert err < 2e-2 * scale + 1e-2, f"assembled dh: err {err} vs scale {scale}"
+    _rel_check(dw.sum(1), wg.grad, "dgamma (finalized)", tol=1e-3)
+
+
+@pytest.mark.parametrize("with_rstd", [False, True])
+@pytest.mark.parametrize("tile_N", [128, 256])
+def test_epi_mod_rstd_rope_posfreq(with_rstd, tile_N):
+    """Block QKV epilogues: plain (entry boundary, bias-less) and deferred-rstd
+    (mid-stack) rope over a packed QKV projection — Q/K rotated, V passthrough
+    = exactly rstd*acc via zero-freq columns."""
+    device = "cuda"
+    torch.random.manual_seed(24)
+    from quack.epilogue.rotary import rstd_rope_posfreq_epi
+
+    l, m, k, head_dim = 2, 384, 512, 64
+    q_heads, kv_heads = 4, 2
+    qk_dim = (q_heads + kv_heads) * head_dim
+    v_dim = kv_heads * head_dim
+    n = qk_dim + v_dim
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    pos = (
+        torch.arange(m, device=device, dtype=torch.float32)[None, :]
+        + torch.tensor([0.0, 2.0**24 - m], device=device)[:, None]
+    ).contiguous()
+    inv_freq = 10000.0 ** (
+        -torch.arange(head_dim // 2, device=device, dtype=torch.float64) / (head_dim // 2)
+    )
+    freq = make_interleaved_inv_freq(inv_freq, qk_dim, v_dim)
+    rstd = torch.rand((l, m), device=device, dtype=torch.float32) + 0.5
+
+    epi_args = dict(pos=pos, freq=freq.expand(l, n))
+    if with_rstd:
+        epi_args["rstd"] = rstd
+    mod = rstd_rope_posfreq_epi if with_rstd else rope_posfreq_epi
+    mod.gemm(A, B, D, epi_args=epi_args, tile_M=128, tile_N=tile_N, cluster_M=1, cluster_N=1)
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    if with_rstd:
+        x = x * rstd.unsqueeze(-1)
+    xqk = x[..., :qk_dim].unflatten(-1, (q_heads + kv_heads, head_dim // 2, 2))
+    ang = pos.double()[:, :, None] * inv_freq[None, None, :]
+    c = ang.cos().float()[:, :, None, :]
+    s = ang.sin().float()[:, :, None, :]
+    ref_qk = torch.empty_like(xqk)
+    ref_qk[..., 0] = xqk[..., 0] * c - xqk[..., 1] * s
+    ref_qk[..., 1] = xqk[..., 0] * s + xqk[..., 1] * c
+    _rel_check(D[..., :qk_dim], ref_qk.reshape(l, m, qk_dim), "QK")
+    _rel_check(D[..., qk_dim:], x[..., qk_dim:], "V passthrough")
+
+
+def test_epi_mod_rstd_swiglu_preact():
+    """Training-mode gate_up epilogue: D = raw unscaled preact pairs, postact
+    = swiglu(rstd * pairs)."""
+    device = "cuda"
+    torch.random.manual_seed(25)
+    from quack.epilogues import rstd_swiglu_preact_epi
+
+    l, m, k, pairs = 2, 384, 512, 512
+    n = 2 * pairs
+    tile_N = 256
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    rstd = torch.rand((l, m), device=device, dtype=torch.float32) + 0.5
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    postact = torch.empty((l, m, pairs), device=device, dtype=torch.bfloat16)
+
+    rstd_swiglu_preact_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(rstd=rstd, postact=postact),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    xs = x * rstd.unsqueeze(-1)
+    g, u = xs[..., 0::2], xs[..., 1::2]
+    _rel_check(D, x, "D (unscaled preact)")
+    _rel_check(postact, torch.nn.functional.silu(g) * u, "postact")
+
+
+@pytest.mark.parametrize("tile_N", [192, 256])
+def test_epi_mod_dswiglu_rstd_preact(tile_N):
+    """Backward of s = swiglu(rstd*GU) (scale-before-activation): D = dGU with
+    rstd folded, postact = exact s recompute, dsum partials -> drstd. All three
+    checked against torch autograd."""
+    device = "cuda"
+    torch.random.manual_seed(26)
+    from quack.epilogues import dswiglu_rstd_preact_mod
+
+    l, m, n, k = 2, 384, 1536, 512
+    ds_in = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    W = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    preact = torch.randn((l, m, 2 * n), device=device, dtype=torch.bfloat16)
+    rstd = torch.rand((l, m), device=device, dtype=torch.float32) + 0.5
+    dGU = torch.empty_like(preact)
+    postact = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    n_tiles = (n + tile_N - 1) // tile_N
+    dsum = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
+
+    dswiglu_rstd_preact_mod.gemm(
+        ds_in,
+        W,
+        dGU,
+        preact,
+        epi_args=dict(rstd=rstd, postact=postact, dsum=dsum),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    ds = torch.einsum("lmk,lnk->lmn", ds_in.float(), W.float())
+    GU = preact.float().detach().requires_grad_()
+    rstd_g = rstd.detach().requires_grad_()
+    g, u = GU[..., 0::2], GU[..., 1::2]
+    gs, us = g * rstd_g.unsqueeze(-1), u * rstd_g.unsqueeze(-1)
+    s = torch.nn.functional.silu(gs) * us
+    s.backward(ds)
+    _rel_check(dGU, GU.grad, "dGU")
+    _rel_check(postact, s, "postact (recomputed s)")
+    _rel_check(dsum.sum(-1), rstd_g.grad, "dsum -> drstd", tol=1e-3)
+
+
+@pytest.mark.parametrize("regime", ["normal", "negative"])
+def test_epi_mod_rstd_lse(regime):
+    """LM-head epilogue: deferred-rstd scale + online LSE partials; CE-fwd loss
+    assembled host-side matches F.cross_entropy. The negative regime is the
+    sharp OOB-predication regression (see test_epi_mod_online_lse)."""
+    device = "cuda"
+    torch.random.manual_seed(27)
+    from quack.epilogues import rstd_lse_epi
+
+    l, m, n, k = 2, 384, 1160, 512  # ragged last N tile (1160 = 4*256 + 136)
+    tile_N = 256
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    if regime == "negative":
+        A, B = A.abs(), -B.abs()
+    rstd = torch.rand((l, m), device=device, dtype=torch.float32) + 0.5
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    n_tiles = (n + tile_N - 1) // tile_N
+    lse = torch.empty((l, m, n_tiles), device=device, dtype=torch.float32)
+
+    rstd_lse_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(rstd=rstd, lse=lse),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    logits = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) * rstd.unsqueeze(-1)
+    if regime == "negative":
+        assert logits.max().item() < 0
+    _rel_check(D, logits, "D (logits)")
+    final = torch.logsumexp(lse, dim=-1)
+    ref = torch.logsumexp(logits, dim=-1)
+    assert (final - ref).abs().max().item() < 1e-2, "finalized lse"
+    # CE forward as the harness assembles it: lse - logits[target].
+    target = torch.randint(0, n, (l, m), device=device)
+    loss = final - D.float().gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    ce_ref = torch.nn.functional.cross_entropy(
+        logits.flatten(0, 1), target.flatten(), reduction="none"
+    ).unflatten(0, (l, m))
+    # The gathered logit is bf16 (D's dtype): allow its quantization on top of
+    # the f32 lse tolerance.
+    tol = 1e-2 + 2.0**-8 * logits.abs().max().item()
+    err = (loss - ce_ref).abs().max().item()
+    assert err < tol, f"CE loss err {err} (tol {tol})"
+
+
+@pytest.mark.parametrize("gelu", [False, True])
+def test_epi_mod_ln_affine(gelu):
+    """Deferred-LayerNorm consuming affine (SigLIP qkv / fc1): D = s*acc -
+    t*wg + wb (+ tanh-GELU postact for fc1)."""
+    device = "cuda"
+    torch.random.manual_seed(28)
+    from quack.epilogues import ln_affine_epi, ln_affine_gelu_epi
+
+    m, n, k = 384, 1024, 512
+    A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    s = torch.rand((1, m), device=device) + 0.5
+    t = torch.randn((1, m), device=device) * 0.3
+    wg = torch.randn((1, n), device=device)
+    wb = torch.randn((1, n), device=device)
+    D = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    args = dict(s=s, t=t, wg=wg, wb=wb)
+    if gelu:
+        postact = torch.empty_like(D)
+        args["postact"] = postact
+    mod = ln_affine_gelu_epi if gelu else ln_affine_epi
+    mod.gemm(A, B, D, epi_args=args, tile_M=128, tile_N=256, cluster_M=1, cluster_N=1)
+
+    x = A.float() @ B.float().mT
+    z = x * s[0][:, None] - t[0][:, None] * wg[0] + wb[0]
+    _rel_check(D, z, "D (preact)" if gelu else "D")
+    if gelu:
+        _rel_check(postact, torch.nn.functional.gelu(z, approximate="tanh"), "postact")
+
+
+def test_epi_mod_ln_partial():
+    """Producing boundary GEMM (SigLIP out_proj/fc2): bias + residual + gamma
+    apply + DUAL colvec stats (sum and sqsum partials -> mu/sig)."""
+    device = "cuda"
+    torch.random.manual_seed(29)
+    from quack.epilogues import ln_partial_epi
+
+    m, n, k = 384, 1024, 512
+    tile_N = 256
+    A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    C = torch.randn((m, n), device=device, dtype=torch.bfloat16)
+    bias = torch.randn((1, n), device=device)
+    weight = torch.randn((1, n), device=device)
+    D = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    resid = torch.empty_like(D)
+    n_tiles = n // tile_N
+    hsum = torch.empty((m, n_tiles), device=device, dtype=torch.float32)
+    sqsum = torch.empty_like(hsum)
+    ln_partial_epi.gemm(
+        A,
+        B,
+        D,
+        C,
+        epi_args=dict(bias=bias, weight=weight, resid_out=resid, hsum=hsum, sqsum=sqsum),
+        tile_M=128,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    y = A.float() @ B.float().mT + bias[0] + C.float()
+    _rel_check(resid, y, "resid_out")
+    _rel_check(D, y * weight[0], "D")
+    _rel_check(hsum.sum(-1), y.sum(-1), "hsum", tol=1e-3)
+    _rel_check(sqsum.sum(-1), (y**2).sum(-1), "sqsum", tol=1e-3)
+
+
+def test_epi_mod_dgelu_ln_stats():
+    """SigLIP fc2-dgrad: dz through tanh-GELU', sig folded into D, plus the
+    boundary-bwd stats (1 colvec + 2 rowvec reduces)."""
+    device = "cuda"
+    torch.random.manual_seed(30)
+    from quack.epilogues import dgelu_ln_stats_epi
+
+    m, n, k = 384, 1024, 512
+    tile_M, tile_N = 128, 256
+    A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    z = torch.randn((m, n), device=device, dtype=torch.bfloat16)  # saved preact
+    s = torch.rand((1, m), device=device) + 0.5
+    t = torch.randn((1, m), device=device) * 0.3
+    D = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    r1 = torch.empty((m, n // tile_N), device=device, dtype=torch.float32)
+    dwb = torch.empty((m // tile_M, n), device=device, dtype=torch.float32)
+    dwg = torch.empty_like(dwb)
+    dgelu_ln_stats_epi.gemm(
+        A,
+        B,
+        D,
+        z,
+        epi_args=dict(s=s, t=t, r1=r1, dwb=dwb, dwg=dwg),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    dp = A.float() @ B.float().mT
+    zf = z.float().detach().requires_grad_()
+    torch.nn.functional.gelu(zf, approximate="tanh").backward(dp)
+    dz = zf.grad
+    _rel_check(D, dz * s[0][:, None], "D (sig*dz)")
+    _rel_check(r1.sum(-1), (dz * z.float()).sum(-1), "r1", tol=1e-3)
+    _rel_check(dwb.sum(0), dz.sum(0), "dwb", tol=1e-3)
+    _rel_check(dwg.sum(0), (dz * t[0][:, None]).sum(0), "dwg", tol=1e-3)
+
+
+def test_epi_mod_ln_bwd_apply():
+    """LN-bwd apply: two corr colvecs (mul and broadcast-add) + dual rowvec
+    sinks incl. a computed-value sink (dbias = column-sums of the OUTPUT)."""
+    device = "cuda"
+    torch.random.manual_seed(31)
+    from quack.epilogues import ln_bwd_apply_epi
+
+    m, n, k = 384, 1024, 512
+    tile_M, tile_N = 128, 256
+    A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    C = torch.randn((m, n), device=device, dtype=torch.bfloat16)
+    y = torch.randn((m, n), device=device, dtype=torch.bfloat16)
+    w = torch.randn((1, n), device=device)
+    cm = torch.randn((1, m), device=device) * 0.1
+    ca = torch.randn((1, m), device=device) * 0.1
+    D = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    dw = torch.empty((m // tile_M, n), device=device, dtype=torch.float32)
+    dbias = torch.empty_like(dw)
+    ln_bwd_apply_epi.gemm(
+        A,
+        B,
+        D,
+        C,
+        epi_args=dict(y=y, w=w, corr_mul=cm, corr_add=ca, dw=dw, dbias=dbias),
+        tile_M=tile_M,
+        tile_N=tile_N,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    da = A.float() @ B.float().mT
+    dh = da * w[0] + C.float() + y.float() * cm[0][:, None] + ca[0][:, None]
+    _rel_check(D, dh, "D (dh)")
+    _rel_check(dw.sum(0), (da * y.float()).sum(0), "dw", tol=1e-3)
+    _rel_check(dbias.sum(0), dh.sum(0), "dbias", tol=1e-3)

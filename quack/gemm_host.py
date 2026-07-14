@@ -42,7 +42,11 @@ from quack.gemm_tvm_ffi_utils import (
 
 
 class FakeArgCtx(NamedTuple):
-    """Shared symbolic dims + flags handed to EpiOp.host_fake_arg."""
+    """Shared symbolic dims + flags handed to EpiOp.host_fake_arg.
+
+    ``swapped`` (swap-at-trace): m/n are KERNEL dims (m = caller n); tile-
+    shaped args cross the boundary caller-oriented, i.e. (l, n, m) in kernel
+    labels, and are transposed at trace time (GemmBase.cd_transposed)."""
 
     m: object
     n: object
@@ -50,6 +54,7 @@ class FakeArgCtx(NamedTuple):
     l: object  # noqa: E741
     batched: bool
     varlen_m: bool
+    swapped: bool = False
 
 
 class GemmClassRef(NamedTuple):
@@ -178,12 +183,14 @@ def _compile_gemm_epi(
     batched,
     b_kn,
     epi_keys,  # ((op_name, op.host_arg_key(value)), ...) — name-sorted
+    swap_ab=False,
     use_tma_gather=False,
     concat_layout=(),
     sf_dtype=None,
     sf_vec_size=None,
     sf_batched=True,
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
+    packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -204,8 +211,10 @@ def _compile_gemm_epi(
         gather_A=gather_A,
         batched=batched,
         b_kn=b_kn,
+        swap_ab=swap_ab,
+        packed_cd=packed_cd,
     )
-    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m)
+    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab)
     ops = _ops_by_name(GemmCls)
     fields = {}
     for name, key in epi_keys:
@@ -251,6 +260,9 @@ def _compile_gemm_epi(
         concat_layout=concat_layout or None,
         sf_vec_size=sf_vec_size,
         b_transposed=b_kn,
+        a_transposed=swap_ab,
+        cd_transposed=swap_ab,
+        cd_packed=packed_cd,
     )
 
 
@@ -272,9 +284,12 @@ class GemmEpiPlan(NamedTuple):
     scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
     scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
     epi_arg_keys: tuple  # ((op_name, key), ...) as compiled
-    # Launch-overhead precomputation (host hot path): resolved (name, op, key)
-    # triples and an all-None EpilogueArguments field template, so warm calls
-    # do a dict .copy() + per-op conversion instead of rebuilding both dicts.
+    # Launch-overhead precomputation (host hot path): (name, converter, key)
+    # triples — converter is the op's bound ``host_call_arg``, or None when the
+    # op inherits the identity default (the value passes straight through) —
+    # plus an all-None EpilogueArguments field template in field order, so warm
+    # calls do a dict .copy() + positional ``_make`` instead of rebuilding both
+    # dicts and parsing kwargs.
     call_ops: tuple = ()
     arg_template: dict = {}
 
@@ -305,6 +320,7 @@ def build_gemm_epi_plan(
     varlen_m=False,
     gather_A=False,
     b_kn=False,
+    swap_ab=False,  # swap-at-trace: slot tensors in, caller-oriented D/C
     use_tma_gather=False,
     concat_layout=(),
     sf_dtype=None,
@@ -312,6 +328,7 @@ def build_gemm_epi_plan(
     sf_batched=True,
     post_init_attrs=(),
     gemm_cls_ref=None,
+    packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
@@ -324,6 +341,15 @@ def build_gemm_epi_plan(
         b_major = "n" if B.stride(-1) == 1 else "k"
     d_major = _get_major(D, "m", "n") if D is not None else None
     c_major = _get_major(C, "m", "n") if C is not None else None
+    if swap_ab:
+        # Slot tensors: A-slot = caller B (k, n) native (a_transposed relabels
+        # at trace) — kernel-A is (m_k, k) with m_k the caller n, so the label
+        # flips vs the standard derivation. B-slot = caller A (m, k) is
+        # already kernel-ordered (n_k, k): the standard formula holds. D/C
+        # cross caller-oriented, so their kernel labels flip like A's.
+        a_major = "m" if A.stride(-1) == 1 else "k"
+        d_major = ("m" if D.stride(-1) == 1 else "n") if D is not None else None
+        c_major = ("m" if C.stride(-1) == 1 else "n") if C is not None else None
     a_dtype = torch2cute_dtype_map[A.dtype]
     b_dtype = torch2cute_dtype_map[B.dtype]
     d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
@@ -361,12 +387,14 @@ def build_gemm_epi_plan(
         batched,
         b_kn,
         epi_keys,
+        swap_ab=swap_ab,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout,
         sf_dtype=sf_dtype,
         sf_vec_size=sf_vec_size,
         sf_batched=sf_batched,
         post_init_attrs=post_init_attrs,
+        packed_cd=packed_cd,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -378,11 +406,23 @@ def build_gemm_epi_plan(
         if not scheduler_uses_semaphore
         else None
     )
+    from quack.epi_ops import EpiOp
+
     plan_ops = _ops_by_name(GemmCls)
+    call_ops = tuple(
+        (
+            name,
+            None
+            if type(plan_ops[name]).host_call_arg is EpiOp.host_call_arg
+            else plan_ops[name].host_call_arg,
+            key,
+        )
+        for name, key in epi_keys
+    )
     return GemmEpiPlan(
         compiled_fn=compiled_fn,
         gemm_cls=GemmCls,
-        call_ops=tuple((name, plan_ops[name], key) for name, key in epi_keys),
+        call_ops=call_ops,
         arg_template={name: None for name in GemmCls.EpilogueArguments._fields},
         is_sm100_family=device_capacity[0] in [10, 11],
         max_active_clusters=max_active_clusters,
@@ -414,12 +454,16 @@ def run_gemm_epi_plan(
     wrapper guarantees that via its plan-cache key). Constexpr fields are
     passed None — they are baked into the compiled kernel.
     """
+    # arg_template preserves EpilogueArguments field order, so the values()
+    # view feeds _make positionally (no kwargs parsing).
     fields = plan.arg_template.copy()
-    for name, op, key in plan.call_ops:
-        value = op.host_call_arg(epi_values.get(name), key)
+    for name, convert, key in plan.call_ops:
+        value = epi_values.get(name)
+        if convert is not None:
+            value = convert(value, key)
         if value is not None:
             fields[name] = value
-    epi_args = plan.gemm_cls.EpilogueArguments(**fields)
+    epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
     scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
     launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
