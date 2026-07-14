@@ -339,20 +339,7 @@ def rope_table_ldg_epi(acc, cs, bias):
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 
 
-# vectorize=False (here and on every epilogue built on _angle_turns): the
-# SM100 loop vectorizer heap-corrupts on this body — the magic-bias round
-# reuses t across two arith consumers, minimal repro `pack(x1 + t, x2 + t)`
-# (segfault / double-free / compile hang, nondeterministic). The hatch is
-# free while the epilogue is mainloop-hidden (B300 K=4096: +1.9% vs
-# bias-only) and costs ~14pp of kernel time when epilogue-exposed (K=512:
-# +65% vs +51% for a vectorized roundeven variant) — when the upstream
-# vectorizer is fixed, remove it and re-bench magic-bias vs FRND under
-# vectorization.
-@gemm_epilogue(
-    ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")},
-    mode="acc_pair",
-    vectorize=False,
-)
+@gemm_epilogue(ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")}, mode="acc_pair")
 def rope_posfreq_epi(acc, pos, freq, bias):
     """RoPE computing cos/sin in-kernel via ``sincos(pos * inv_freq)`` instead
     of loading the precomputed (seqlen_ro, head_dim) table.
@@ -430,13 +417,21 @@ def _sincos_turns(t, lo):
     Turns make range reduction exact: theta mod 1 is a round and a subtract,
     no Cody-Waite constant splitting — and turns are the hardware's native
     unit (MUFU.SIN takes turns; ptxas prepends x*(1/2pi) to every radians
-    sin.approx). The round uses the magic-bias adds because MUFU.SIN/COS and
+    sin.approx). The round uses the magic-bias add because MUFU.SIN/COS and
     FRND all issue on the quarter-rate XU pipe, the epilogue's math
-    bottleneck (the 2 MUFU are its floor) — two full-rate FADDs beat FRND."""
+    bottleneck (the 2 MUFU are its floor) — full-rate FMA-pipe ops beat FRND
+    (B300 128x256 k=512 exposed overhead vs bias-only: +47.7% vs +49.5%)."""
     # Round-to-nearest-even via the magic bias: exact for |t| < 2^22 (here
     # t < 2^24/2pi), because adding 1.5*2^23 shifts the integer part onto the
     # mantissa boundary. t - q is then exact (both are multiples of ulp(t)).
-    q = (t + 12582912.0) - 12582912.0
+    # The biasing add is written as a math-dialect fma (t*1.0 + M, bitwise
+    # identical to t + M; ptxas strength-reduces it back to FADD) so the
+    # SM100 loop vectorizer scalarizes it: written as arith `(t + M) - M`,
+    # t gets two vectorized-arith consumers, the dataflow shape that
+    # heap-corrupts the closed vectorizer pass (segfault/double-free/compile
+    # hang; minimal repro `pack(x1 + t, x2 + t)`). Same reason the sin/cos
+    # below are separate calls, not the fused two-result cute.math.sincos.
+    q = cute.math.fma(t, 1.0, 12582912.0) - 12582912.0
     r = (t - q) + lo  # theta mod 1, plus the compensation term
     # sin.approx wants radians and ptxas rescales by 1/2pi for MUFU; the
     # cancelling multiply pair is PTX's toll — there is no turns-domain PTX.
@@ -450,11 +445,7 @@ def _sincos_turns(t, lo):
     return s, c
 
 
-@gemm_epilogue(
-    ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")},
-    mode="acc_pair",
-    vectorize=False,  # SM100 vectorizer bug — see note above rope_posfreq_epi
-)
+@gemm_epilogue(ops={"pos": ColVecLoad("pos"), "freq": RowVecLoad("freq")}, mode="acc_pair")
 def rope_posfreq_scaled_epi(acc, pos, freq, bias, scale):
     """rope_posfreq_epi with an attention-temperature factor on the rotated
     output: D = scale * rope(acc + bias). This is YaRN's mscale (DeepSeek-V2/
@@ -479,7 +470,6 @@ def rope_posfreq_scaled_epi(acc, pos, freq, bias, scale):
         "freq_w": RowVecLoad("freq_w"),
     },
     mode="acc_pair",
-    vectorize=False,  # SM100 vectorizer bug — see note above rope_posfreq_epi
 )
 def mrope_posfreq_epi(acc, pos_t, pos_h, pos_w, freq_t, freq_h, freq_w, bias):
     """Multimodal 3D RoPE (Qwen2-VL mRoPE): head-dim sections rotate by
@@ -498,7 +488,14 @@ def mrope_posfreq_epi(acc, pos_t, pos_h, pos_w, freq_t, freq_h, freq_w, bias):
     t1, lo1 = _angle_turns(pos_t, freq_t)
     t2, lo2 = _angle_turns(pos_h, freq_h)
     t3, lo3 = _angle_turns(pos_w, freq_w)
-    s, c = _sincos_turns((t1 + t2) + t3, (lo1 + lo2) + lo3)
+    # The t sums are math-dialect fmas (bitwise == the adds), NOT arith `+`:
+    # each t_i already feeds its Dekker negf, and a second vectorized-arith
+    # consumer is the SM100 vectorizer's crash shape (see _sincos_turns).
+    # The lo_i are math.fma results — their arith sums are single-consumer
+    # and pack fine.
+    t12 = cute.math.fma(t1, 1.0, t2)
+    t = cute.math.fma(t3, 1.0, t12)
+    s, c = _sincos_turns(t, (lo1 + lo2) + lo3)
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 
 
@@ -510,7 +507,6 @@ def mrope_posfreq_epi(acc, pos_t, pos_h, pos_w, freq_t, freq_h, freq_w, bias):
         "logz": RowVecLoad("logz"),
     },
     mode="acc_pair",
-    vectorize=False,  # SM100 vectorizer bug — see note above rope_posfreq_epi
 )
 def xpos_posfreq_epi(acc, pos, dpos, freq, logz, bias):
     """xPos (length-extrapolatable RoPE, Sun et al. 2022): the rope_posfreq
