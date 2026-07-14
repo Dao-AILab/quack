@@ -66,7 +66,7 @@ class VariantSpec(NamedTuple):
     # B caller-shaped (k, n) for the trace-time relabel; else B is .mT'd here.
     # varlen_m rides the relabel too since 2026-07-14 (the fake builder's
     # varlen path gained b_kn); varlen_k callers pass their own rule.
-    b_kn_rule: Callable = lambda sm90_plus, varlen_m, swap_ab, ctx: (sm90_plus and not swap_ab)
+    b_kn_rule: Callable = lambda sm90_plus, varlen_m, swap_ab, ctx: sm90_plus and not swap_ab
     # Veto for the dense-2D passthrough beyond the shared conditions
     # (act vetoes it under concat_layout): ctx -> bool (True = allow).
     dense_2d_ok: Callable = lambda ctx: True

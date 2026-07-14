@@ -1865,6 +1865,8 @@ _rowsum_mod = gemm_epilogue(reduces={"colsum": RowVecReduce("colsum", scaled=Tru
 def test_epi_mod_rowvec_reduce(batched, m, tile_M, tile_N, pingpong):
     """First RowVecReduce consumer: per-column partials (l, m_tiles, n) of a
     scaled (acc, y) fold — the dgamma building block."""
+    if tile_M == 192 and _quack_capability() in (10, 11):
+        pytest.skip("tile_M=192 has no SM100/SM110 tcgen05 MMA M-mode (64/128 only)")
     device = "cuda"
     torch.random.manual_seed(21)
     l, n, k = 2, 1024, 512
