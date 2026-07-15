@@ -258,8 +258,8 @@ def _reject_blockscaled(op_name: str, **operands) -> None:
 def _reserve_blockscaled_out(out_dtype) -> None:
     """``out_dtype`` may name a BlockScaledFormat to request a blockscaled output
     (the call then returns a BlockScaledOperand). API reserved here; the
-    SF-generation epilogue that implements it is milestone M5
-    (AI/blockscaled_api.md section 8)."""
+    SF-generation epilogue that implements it is designed in
+    AI/blockscaled_api.md section 7."""
     if isinstance(out_dtype, (BlockScaledFormat, str)):
         fmt_d = (
             out_dtype
@@ -268,7 +268,7 @@ def _reserve_blockscaled_out(out_dtype) -> None:
         )
         raise NotImplementedError(
             f"blockscaled output (out_dtype={fmt_d.name}) requires the SF-generation "
-            f"epilogue - milestone M5 in AI/blockscaled_api.md section 8"
+            f"epilogue - see AI/blockscaled_api.md section 7"
         )
 
 

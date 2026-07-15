@@ -186,11 +186,12 @@ class BlockScaledOperand:
   kernel classes. **`gemm_act.py` is a full second blockscaled dispatch path** (its
   own `validate_blockscaled_sf` call and `_compile_gemm_act` cache keys) and gets
   identical treatment.
-- `_compile_gemm` / `_compile_gemm_act` cache keys: `(sf_dtype, sf_vec_size)`,
-  derived from `fmt` at the caller - unambiguous for every combination the kernel
-  classes admit (fp6 e2m3/e3m2 would collide on these keys, one reason fp6 sits
-  outside the SM100 matrix; admitting it requires descriptor-driven keys carrying
-  the MMA dtype). The AB cute dtype comes from `torch2cute_dtype_map[A.dtype]`
+- `_compile_gemm` / `_compile_gemm_act` cache keys: `(sf_dtype, sf_vec_size,
+  a_mma_dtype, b_mma_dtype)`, all derived from `fmt` at the caller. Both compile
+  paths are `@jit_cache`-keyed on their full argument tuples INCLUDING the MMA
+  dtypes, so same-storage formats that differ only in element type (fp6
+  e2m3/e3m2, byte-fp4 vs fp8) key distinctly - no collision when the per-arch
+  gate admits them. The AB cute dtype comes from `torch2cute_dtype_map[A.dtype]`
   (correct for all admitted formats). For byte-container sub-byte operands,
   `GemmSm100` separates the MMA dtype from the copy dtype: `a/b_mma_dtype`
   (threaded through both compile paths) drives the MMA builder and dtype-validity

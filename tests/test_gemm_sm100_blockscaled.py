@@ -1103,3 +1103,31 @@ def test_mxfp8_split_k_staged_rejected():
             split_k_mode=SplitKMode.SEPARATE,
             tuned=False,
         )
+
+
+def test_mma_kind_mirrors_kernel_inst_k():
+    """The tcgen05 kind rules are encoded at two layers that key on different
+    things: quack.blockscaled.operand.mma_kind_for_pair (format names, torch
+    layer) and GemmSm100._blockscaled_mma_inst_k (storage cutlass dtypes,
+    kernel layer). Pin the mirror so they cannot drift apart: every
+    hardware-representable pair must get the instruction K of its kind
+    (mxf4/mxf4nvf4 -> 64, mxf8f6f4 -> 32). Host-only, no GPU needed."""
+    from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
+    from quack.cute_dsl_utils import torch2cute_dtype_map
+
+    kind_inst_k = {"mxf4": 64, "mxf4nvf4": 64, "mxf8f6f4": 32}
+    fmts = list(BLOCKSCALED_FORMAT_REGISTRY.values())
+    for fmt_a in fmts:
+        for fmt_b in fmts:
+            try:
+                kind = mma_kind_for_pair(fmt_a, fmt_b)
+            except ValueError:
+                continue  # not hardware-representable; no instruction to agree on
+            inst_k = GemmDefaultSm100._blockscaled_mma_inst_k(
+                torch2cute_dtype_map[fmt_a.qdata_dtype],
+                torch2cute_dtype_map[fmt_b.qdata_dtype],
+            )
+            assert inst_k == kind_inst_k[kind], (
+                f"{fmt_a.name} x {fmt_b.name}: kind {kind} implies inst_k "
+                f"{kind_inst_k[kind]}, kernel derives {inst_k}"
+            )

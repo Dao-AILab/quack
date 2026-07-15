@@ -176,6 +176,13 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
     PTX rules: ``kind::mxf4nvf4`` (e4m3 scales, vec 16) requires fp4 on both
     operands; ``kind::mxf4`` covers both-fp4 with e8m0 scales; ``kind::mxf8f6f4``
     admits any mix of fp8/fp6/fp4 element types (e8m0 scales, vec 32).
+
+    The kind rules are encoded in three places that must stay in sync (this
+    function cannot be shared: the kernel layer keys on cutlass dtypes and must
+    not import torch-level format descriptors): here (format names), instruction-K
+    in ``GemmSm100._blockscaled_mma_inst_k`` (storage dtypes), and the per-arch
+    subset in ``GemmSm100.is_valid_dtypes_and_scale_factor_vec_size`` (MMA
+    dtypes). ``test_mma_kind_mirrors_kernel_inst_k`` pins the first mirror.
     """
     if fmt_a.name == "nvfp4" or fmt_b.name == "nvfp4":
         if fmt_a.name == fmt_b.name:
@@ -198,8 +205,9 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
         raise ValueError(
             f"{packed} (packed fp4x2 storage) cannot join a mixed pair with {other}: "
             f"the mixed-capable mxf8f6f4 MMA kind reads sub-byte elements from 8-bit "
-            f"SMEM containers, which packed gmem storage cannot feed; a byte-container "
-            f"fp4 format is backlog (AI/blockscaled_api.md)"
+            f"SMEM containers, which packed gmem storage cannot feed; requantize as "
+            f"mxfp4_byte (byte-container fp4) for mixed pairs "
+            f"(AI/blockscaled_api.md section 6)"
         )
     # fp8/fp6 byte-width element types mix freely under mxf8f6f4 (all e8m0 / vec 32).
     return "mxf8f6f4"
@@ -228,11 +236,19 @@ def _packed_dim(qdata: torch.Tensor, fmt: BlockScaledFormat) -> int:
     Convention: the unit-stride dim. Packing is always along the quantization
     (K) axis, and packed (fp4) formats are required K-major by the kernel, so
     unit-stride == packed == K. Scanned from the last dim so fully-contiguous
-    qdata resolves to the innermost dim.
+    qdata resolves to the innermost dim. Size-1 dims report arbitrary strides
+    (a (Kp, 1) K-major operand can present stride 1 on BOTH dims), so dims with
+    extent > 1 take precedence; if every unit-stride dim is size-1 the tensor is
+    degenerate and any choice is equivalent - the innermost wins.
     """
+    fallback = None
     for d in range(qdata.ndim - 1, -1, -1):
         if qdata.stride(d) == 1:
-            return d
+            if qdata.shape[d] != 1:
+                return d
+            fallback = d if fallback is None else fallback
+    if fallback is not None:
+        return fallback
     raise ValueError(
         f"qdata has no unit-stride dim: shape={tuple(qdata.shape)}, stride={qdata.stride()}"
     )
@@ -426,15 +442,10 @@ class BlockScaledOperand:
             return cls.quantize(xt, fmt, per_tensor_scale=per_tensor_scale).mT
         quantizer = QUANTIZERS.get(fmt.name)
         if quantizer is None:
+            # Every registered format except mxfp8_e5m2 has a quantizer; to_mx has
+            # no e5m2 encoder, so from_parts is the e5m2 construction path.
             raise NotImplementedError(
-                f"no in-repo quantizer for {fmt.name}; construct pre-quantized data via "
-                f"from_parts"
-                + (
-                    " (mxfp6 quantization lands with the fp6 kernel enablement, "
-                    "AI/blockscaled_api.md section 7)"
-                    if fmt.elem_bits == 6
-                    else ""
-                )
+                f"no in-repo quantizer for {fmt.name}; construct pre-quantized data via from_parts"
             )
         if per_tensor_scale is not None and not fmt.has_per_tensor_scale:
             raise ValueError(f"{fmt.name} does not take a per_tensor_scale")

@@ -2673,7 +2673,9 @@ class GemmSm100(GemmTmaBase):
         instruction; kind::mxf8f6f4 (everything else, incl. mixed A/B and
         byte-container sub-byte operands whose storage is Uint8) consumes 32.
         Keyed on the storage dtypes precisely so byte-container fp4 takes the 32
-        path. Mirrors quack.blockscaled.operand.mma_kind_for_pair.
+        path. Mirrors quack.blockscaled.operand.mma_kind_for_pair (which keys on
+        format names at the torch layer) - keep the two in sync;
+        test_mma_kind_mirrors_kernel_inst_k pins the correspondence.
         """
         both_packed_fp4 = (
             a_copy_dtype is cutlass.Float4E2M1FN and b_copy_dtype is cutlass.Float4E2M1FN
@@ -2695,7 +2697,9 @@ class GemmSm100(GemmTmaBase):
         THIS kernel implements. ``a_dtype``/``b_dtype`` are the MMA element types;
         ``a/b_copy_dtype`` the storage dtypes (None: same - byte-container sub-byte
         formats store Uint8). (Hardware pair legality is a separate, wider set -
-        see quack.blockscaled.operand.mma_kind_for_pair.)
+        see quack.blockscaled.operand.mma_kind_for_pair; the vec-16-requires-fp4
+        and mixed-pair constraints below are this kernel's subset of those kind
+        rules and must stay consistent with them.)
 
         :param a_dtype: The data type of the A operand
         :type a_dtype: Type[cutlass.Numeric]

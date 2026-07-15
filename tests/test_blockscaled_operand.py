@@ -3,7 +3,7 @@
 
 Covers construction validation, the logical-metadata surface, transpose
 semantics, serialization/pytree, and the format registry - see
-AI/blockscaled_api.md section 3 and section 10.
+AI/blockscaled_api.md section 3 and section 8.
 """
 
 import copy
@@ -337,3 +337,16 @@ def test_from_parts_quant_dim():
     _, t4 = _quantize(MXFP4)
     with pytest.raises(ValueError, match="packed dim"):
         BlockScaledOperand.from_parts(t4.qdata, t4.scale, MXFP4, quant_dim=-2)
+
+
+def test_packed_dim_ignores_size_one_dims():
+    """A (Kp, 1) K-major fp4 operand can present stride 1 on BOTH dims (size-1
+    dims report arbitrary strides); the packed (quantized) dim is the extent>1
+    one. Regression: the unit-stride scan used to pick the size-1 dim and
+    reject quant_dim=-2."""
+    _, t = _quantize(MXFP4, m=1, k=256)
+    q = t.qdata.reshape(-1).unsqueeze(-1)  # (Kp, 1) with strides (1, 1)
+    assert q.stride() == (1, 1)
+    b = BlockScaledOperand.from_parts(q, t.scale, MXFP4, quant_dim=-2)
+    assert b.quant_dim == -2 and b.shape == (256, 1)
+    assert torch.equal(b.dequantize(torch.float32), t.dequantize(torch.float32).mT)
