@@ -908,6 +908,57 @@ def test_blockscaled_varlen_k_public_api(seqlens_k):
 
 
 @pytest.mark.parametrize(
+    "a_fmt,b_fmt",
+    [("mxfp8_e4m3", "mxfp8_e5m2"), ("mxfp8_e5m2", "mxfp8_e4m3")],
+)
+@pytest.mark.parametrize("seqlens_k", [[128, 128, 128], [96, 160, 128]])
+def test_blockscaled_varlen_k_mixed_dtype(seqlens_k, a_fmt, b_fmt):
+    """varlen_k with mixed fp8 operand dtypes (mxf8f6f4 kind). Only fp8 pairs
+    are possible here: varlen_k needs m-major A / n-major B, while packed
+    sub-byte (fp4/fp6) operands must be K-major."""
+    _skip_if_not_sm100()
+    from quack.gemm import gemm as gemm_public
+    from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY
+
+    a_dtype = BLOCKSCALED_FORMAT_REGISTRY[a_fmt].to_cutlass_dtype()
+    b_dtype = BLOCKSCALED_FORMAT_REGISTRY[b_fmt].to_cutlass_dtype()
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
+        create_blockscaled_varlen_k_operands(
+            num_experts, 0, m, n, sf_vec, a_dtype, seqlens_k=seqlens_k, b_dtype=b_dtype
+        )
+    )
+    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,  # (m, total_k) m-major
+        mB,  # (n, total_k) n-major
+        mD,  # (L, m, n); gemm() permutes to (m, n, L) internally
+        None,
+        None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        cu_seqlens_k=cu_seqlens_k,
+        SFA=a_sc_contig,
+        SFB=b_sc_contig,
+        bs_format_a=a_fmt,
+        bs_format_b=b_fmt,
+    )
+    torch.cuda.synchronize()
+
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        err = (mD[i].float() - ref_i).abs().max().item()
+        assert err < 5e-3, (
+            f"varlen_k mixed a={a_fmt} b={b_fmt} seqlens_k={seqlens_k} expert={i} max_err={err}"
+        )
+
+
+@pytest.mark.parametrize(
     "tile_cluster",
     [((128, 128), (1, 1)), ((128, 256), (1, 2)), ((256, 128), (2, 1)), ((256, 256), (2, 2))],
 )

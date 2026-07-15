@@ -555,8 +555,13 @@ def create_blockscaled_varlen_k_operands(
     randn_std: Optional[float] = None,
     seqlens_k: Optional[list] = None,
     sf_pad_byte: int = 0,
+    b_dtype: Optional[Type[cutlass.Numeric]] = None,
 ):
     """Generate bf16 randn + quantize for a varlen_k blockscaled GEMM.
+
+    Pass b_dtype != ab_dtype for mixed-precision mxf8f6f4 (fp8 pairs only:
+    varlen_k needs m-major A / n-major B, and packed sub-byte operands must be
+    K-major).
 
     Per-expert `k_i` is arbitrary (any positive int): neither `sf_vec_size` nor
     `sf_vec_size * 4` (= 128 for MXFP8) alignment is required. A non-multiple-of-32
@@ -584,12 +589,17 @@ def create_blockscaled_varlen_k_operands(
       b_sc_contig: (1, rn, total_padded_rk, 32, 4, 4) K-padded SFB (tile-aligned per batch).
       cu_seqlens_k: (num_experts+1,) int32.
     """
+    fp8_dtypes = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+    b_dtype = b_dtype if b_dtype is not None else ab_dtype
     if not (
-        ab_dtype == cutlass.Float8E4M3FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32
+        ab_dtype in fp8_dtypes
+        and b_dtype in fp8_dtypes
+        and sf_dtype == cutlass.Float8E8M0FNU
+        and sf_vec_size == 32
     ):
         raise NotImplementedError(
-            f"varlen_k currently only supports MXFP8 (got ab={ab_dtype}, sf={sf_dtype}, "
-            f"vec={sf_vec_size}). FP4 is k-major-only and not wired up."
+            f"varlen_k currently only supports MXFP8 e4m3/e5m2 (got a={ab_dtype}, b={b_dtype}, "
+            f"sf={sf_dtype}, vec={sf_vec_size}). Packed fp4/fp6 are k-major-only and not wired up."
         )
     if seqlens_k is None:
         seqlens_k = [k_per] * num_experts
@@ -603,7 +613,7 @@ def create_blockscaled_varlen_k_operands(
 
     from quack.blockscaled.quantize import to_mx_compiled
 
-    def quantize(mn, k_i):
+    def quantize(mn, k_i, elem_dtype):
         # The quantizer reshapes K into sf_vec_size chunks, so zero-pad k_i up to a
         # multiple of it; zeros never raise a chunk amax, so the real elements
         # quantize identically. Values are sliced back to k_i; scales keep the
@@ -611,7 +621,7 @@ def create_blockscaled_varlen_k_operands(
         k_q = (k_i + sf_vec_size - 1) // sf_vec_size * sf_vec_size
         hp = torch.zeros(mn, k_q, dtype=torch.bfloat16, device="cuda")
         hp[:, :k_i] = torch.randn(mn, k_i, dtype=torch.bfloat16, device="cuda") * std
-        q, sc = to_mx_compiled(hp, sf_vec_size)
+        q, sc = to_mx_compiled(hp, sf_vec_size, elem_dtype=torch_dtype_for_cutlass(elem_dtype))
         q = q[:, :k_i]
         ref = q.float() * sc.float().repeat_interleave(sf_vec_size, dim=-1)[:, :k_i]
         return q, sc, ref
@@ -619,12 +629,12 @@ def create_blockscaled_varlen_k_operands(
     a_q_list, a_sc_list, a_ref_list = [], [], []
     b_q_list, b_sc_list, b_ref_list = [], [], []
     for k_i in seqlens_k:
-        a_q, a_sc, a_ref = quantize(m, k_i)
+        a_q, a_sc, a_ref = quantize(m, k_i, ab_dtype)
         a_q_list.append(a_q)
         a_sc_list.append(a_sc)
         a_ref_list.append(a_ref)
 
-        b_q, b_sc, b_ref = quantize(n, k_i)
+        b_q, b_sc, b_ref = quantize(n, k_i, b_dtype)
         b_q_list.append(b_q)
         b_sc_list.append(b_sc)
         b_ref_list.append(b_ref)
