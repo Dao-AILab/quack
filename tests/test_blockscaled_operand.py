@@ -350,3 +350,30 @@ def test_packed_dim_ignores_size_one_dims():
     b = BlockScaledOperand.from_parts(q, t.scale, MXFP4, quant_dim=-2)
     assert b.quant_dim == -2 and b.shape == (256, 1)
     assert torch.equal(b.dequantize(torch.float32), t.dequantize(torch.float32).mT)
+
+
+def test_format_without_dsl_element_type():
+    """cutlass_dtype_name=None marks a host-side-only format (e.g. a future
+    e3m4): it must fail loudly at the kernel seam (to_cutlass_dtype) and at
+    kind selection (no silent mxf8f6f4 fall-through), and a registered
+    DSL-typeless format must not break registry-wide dtype lookup for the
+    formats that do have DSL types. See AI/blockscaled_recipes.md."""
+    from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
+
+    weird = BlockScaledFormat("e3m4_test", torch.uint8, None, 8, 1, torch.float8_e8m0fnu, 32)
+    with pytest.raises(ValueError, match="no CuTe-DSL element type"):
+        weird.to_cutlass_dtype()
+    with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
+        mma_kind_for_pair(weird, MXFP8_E4M3)
+    with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
+        mma_kind_for_pair(MXFP8_E4M3, weird)
+    import cutlass
+
+    BLOCKSCALED_FORMAT_REGISTRY[weird.name] = weird
+    try:
+        assert (
+            BlockScaledFormat.from_cutlass_dtypes(cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32)
+            is MXFP8_E4M3
+        )
+    finally:
+        del BLOCKSCALED_FORMAT_REGISTRY[weird.name]

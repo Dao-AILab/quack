@@ -68,7 +68,11 @@ class BlockScaledFormat:
 
     name: str
     qdata_dtype: torch.dtype
-    cutlass_dtype_name: str  # CuTe-DSL MMA element type (may differ from storage: fp6)
+    # CuTe-DSL MMA element type (may differ from storage: fp6). None marks a format
+    # with no DSL element type at all — host-side complete (quantize/dequantize/
+    # serialize) but consumable by a kernel only once that kernel declares its own
+    # (copy dtype, MMA dtype, convert) triple. See AI/blockscaled_recipes.md.
+    cutlass_dtype_name: Optional[str]
     elem_bits: int
     elems_per_container: int  # logical elements per qdata element (2 for fp4x2)
     scale_dtype: torch.dtype
@@ -78,6 +82,8 @@ class BlockScaledFormat:
     def to_cutlass_dtype(self):
         """The CuTe-DSL element type for the MMA instruction (not the storage/copy
         dtype: MXFP6 stores uint8 byte containers but computes as Float6*)."""
+        if self.cutlass_dtype_name is None:
+            raise ValueError(f"{self.name} has no CuTe-DSL element type")
         import cutlass  # lazy: keep this module importable without the DSL
 
         return getattr(cutlass, self.cutlass_dtype_name)
@@ -101,7 +107,8 @@ class BlockScaledFormat:
 
         for fmt in BLOCKSCALED_FORMAT_REGISTRY.values():
             if (
-                fmt.to_cutlass_dtype() == ab_dtype
+                fmt.cutlass_dtype_name is not None  # DSL-typeless formats can't match
+                and fmt.to_cutlass_dtype() == ab_dtype
                 and torch2cute_dtype_map[fmt.scale_dtype] == sf_dtype
                 and fmt.sf_vec_size == sf_vec_size
             ):
@@ -210,7 +217,30 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
             f"(AI/blockscaled_api.md section 6)"
         )
     # fp8/fp6 byte-width element types mix freely under mxf8f6f4 (all e8m0 / vec 32).
+    # Gate on the MMA element class explicitly: a format without a tcgen05-
+    # representable element type (no DSL type, or a non-fp8/6/4 one) must fail
+    # HERE, not by falling through to a kind its elements cannot join. Software
+    # kinds (blockwise promotion: fp32-scale fp8, one-sided bf16, int4) are a
+    # follow-up with their own kind names — see AI/blockscaled_recipes.md.
+    for fmt in (fmt_a, fmt_b):
+        if _mma_element_class(fmt) is None:
+            raise ValueError(
+                f"{fmt.name} has no tcgen05 MMA element type "
+                f"(cutlass_dtype_name={fmt.cutlass_dtype_name}): no hardware "
+                f"blockscaled MMA kind exists for this format"
+            )
     return "mxf8f6f4"
+
+
+def _mma_element_class(fmt: "BlockScaledFormat") -> Optional[str]:
+    """The tcgen05 element class ("f8" | "f6" | "f4") of a format's MMA type, or
+    None when the format has no hardware-representable element type. Derived from
+    the DSL type name: PTX kind legality is a property of the MMA element type."""
+    name = fmt.cutlass_dtype_name
+    for prefix, cls in (("Float8", "f8"), ("Float6", "f6"), ("Float4", "f4")):
+        if name is not None and name.startswith(prefix):
+            return cls
+    return None
 
 
 def _coerce_format(format) -> BlockScaledFormat:

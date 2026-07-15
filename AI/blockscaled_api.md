@@ -149,6 +149,32 @@ class BlockScaledOperand:
   `weights_only=True` loading.
 - `repr` is metadata-only (no storage access).
 
+
+### Extension seams (forward pointers)
+
+The descriptor bundles two orthogonal things: the *element encoding*
+(qdata dtype, bits, packing, DSL type) and the *scale recipe* (scale dtype,
+`sf_vec_size` = the K-extent of a `(1, sf_vec_size)` block grid). Two more
+axes are deliberately NOT in this PR but have reserved seams
+(AI/blockscaled_recipes.md is the worked design; consumers: the SM90
+blockwise-promotion GEMM and the SM100 linear-SF loader):
+
+- **2D scale grids** (DeepSeek-style 128x128 weight scales): an `sf_block_mn`
+  extent alongside `sf_vec_size`. `quant_dim` and the `.mT` scale-carry trick
+  generalize to 2D grids unchanged.
+- **Physical scale layouts**: the blocked `(rm, rk, 32, 4, 4)` atom is the
+  tcgen05 consumption layout, not a property of the format; the *linear*
+  `(MN, K/vec)` layout (FlashInfer/TRT-LLM `layout_linear`, torchao "plain")
+  becomes a per-OPERAND tag, never inferred from rank.
+- **DSL-typeless formats**: `cutlass_dtype_name=None` marks a format with no
+  CuTe-DSL element type (host-side complete; a consuming kernel declares its
+  own copy/MMA/convert triple). `mma_kind_for_pair` gates on the MMA element
+  class explicitly, so such formats fail at kind selection, not by falling
+  into a kind their elements cannot join.
+- **Sided-ness is per-kind**: hardware kinds require SF on both operands; the
+  software promotion kind admits one-sided (bf16 elements + per-K-block fp32
+  scales on A only), so the both-or-neither check lives with the kind rules.
+
 ## 4. GEMM interface integration (`quack/gemm_interface.py`)
 
 - `_unpack_operand(X)` -> `_Operand(data, sf, fmt, pts, quant_dim)` NamedTuple; accepts
