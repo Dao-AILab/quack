@@ -15,18 +15,42 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
-# Blockscaled scale-factor dtype determines the quantization block size along K:
-# e8m0 -> MX formats (32-element blocks), e4m3 -> NVFP4 (16-element blocks).
-SF_DTYPE_TO_VEC_SIZE = {
-    torch.float8_e8m0fnu: 32,
-    torch.float8_e4m3fn: 16,
-}
+
+def resolve_blockscaled_formats(bs_format_a, bs_format_b):
+    """Resolve a blockscaled GEMM's per-operand format names into descriptors,
+    checking presence and hardware pair legality. Single owner of this step for
+    both the gemm_interface path and direct kernel-layer callers
+    (quack.gemm.gemm / quack.gemm_act.gemm_act)."""
+    if bs_format_a is None or bs_format_b is None:
+        raise ValueError(
+            "blockscaled GEMM requires bs_format_a and bs_format_b (BlockScaledFormat "
+            "names, e.g. 'mxfp8_e4m3'); pass BlockScaledOperand operands to the "
+            "quack.gemm_interface entry points, or set them explicitly here"
+        )
+    # Lazy import: blockscaled/__init__ pulls blockscaled/utils, which imports
+    # this module - a top-level import here would be circular.
+    from quack.blockscaled.operand import BlockScaledFormat, mma_kind_for_pair
+
+    fmt_a = BlockScaledFormat.from_name(bs_format_a)
+    fmt_b = BlockScaledFormat.from_name(bs_format_b)
+    mma_kind_for_pair(fmt_a, fmt_b)
+    return fmt_a, fmt_b
 
 
 def validate_blockscaled_sf(
-    A, B, SFA, SFB, device_capacity, num_batches=None, varlen_k=False, b_kn=False
+    A, B, SFA, SFB, device_capacity, num_batches=None, varlen_k=False, b_kn=False, *, fmt_a, fmt_b
 ):
     """Validate blockscaled scale factors against kernel-layout operands.
+
+    ``fmt_a`` / ``fmt_b`` are the (independent) A / B
+    :class:`quack.blockscaled.operand.BlockScaledFormat` descriptors - the single
+    source of scale vec size / scale dtype / element packing per operand. Nothing
+    here may re-derive format properties from tensor dtypes. Pair LEGALITY
+    (hardware representability) was already checked upstream via
+    ``mma_kind_for_pair``; whether a legal (A, B, D) dtype combination is
+    IMPLEMENTED is enforced per-architecture by the gemm_smXXX kernel classes
+    (e.g. GemmSm100's blockscaled setup assert) - this function validates only
+    layout/consistency.
 
     A is (l, m, k[/2 if fp4]) and B is (l, n, k[/2]); SFA/SFB are
     (l, rm/rn, rk, 32, 4, 4) with the inner (32, 4, 4) block contiguous
@@ -54,18 +78,38 @@ def validate_blockscaled_sf(
     assert not varlen_k or num_batches is not None, "varlen_k requires num_batches"
     assert SFB is not None, "SFA and SFB must be provided together"
     assert device_capacity[0] in [10, 11], "Blockscaled GEMM requires SM100/SM110"
-    assert SFA.dtype == SFB.dtype, f"SF dtype mismatch: {SFA.dtype} vs {SFB.dtype}"
-    assert SFA.dtype in SF_DTYPE_TO_VEC_SIZE, f"unsupported SF dtype: {SFA.dtype}"
-    sf_vec_size = SF_DTYPE_TO_VEC_SIZE[SFA.dtype]
-    sf_dtype = torch2cute_dtype_map[SFA.dtype]
-    # A.shape[-1] is packed K for fp4 (two elements per byte) while dlpack presents
-    # the logical extent to the kernel, so validate rk against logical K.
-    k_logical = A.shape[-1] * (2 if A.dtype == torch.float4_e2m1fn_x2 else 1)
+    # Per-instruction the scale config is shared: every legal pair has matching
+    # scale dtype and vec size (nvfp4 only pairs with itself; all other formats
+    # are e8m0 / vec 32).
+    assert fmt_a.scale_dtype == fmt_b.scale_dtype and fmt_a.sf_vec_size == fmt_b.sf_vec_size
+    assert SFA.dtype == fmt_a.scale_dtype and SFB.dtype == fmt_b.scale_dtype, (
+        f"SF dtype mismatch: {SFA.dtype} / {SFB.dtype} vs "
+        f"{fmt_a.name}/{fmt_b.name} scales {fmt_a.scale_dtype}/{fmt_b.scale_dtype}"
+    )
+    assert A.dtype == fmt_a.qdata_dtype, (
+        f"A dtype mismatch: {A.dtype} vs {fmt_a.name} qdata {fmt_a.qdata_dtype}"
+    )
+    assert B.dtype == fmt_b.qdata_dtype, (
+        f"B dtype mismatch: {B.dtype} vs {fmt_b.name} qdata {fmt_b.qdata_dtype}"
+    )
+    sf_vec_size = fmt_a.sf_vec_size
+    sf_dtype = torch2cute_dtype_map[fmt_a.scale_dtype]
+    # Operand shapes carry packed K (fp4x2: two elements per byte) while dlpack
+    # presents the logical extent to the kernel, so validate rk against logical K,
+    # and cross-check that A and B agree on it (their packings may differ).
+    # Under b_kn, B crosses as (k, n[, l]).
+    b_storage_k = B.shape[-2] if b_kn else B.shape[-1]
+    k_logical = A.shape[-1] * fmt_a.elems_per_container
+    k_logical_b = b_storage_k * fmt_b.elems_per_container
+    assert k_logical == k_logical_b, (
+        f"logical K mismatch: A {A.shape[-1]} x{fmt_a.elems_per_container} ({fmt_a.name}) "
+        f"vs B {b_storage_k} x{fmt_b.elems_per_container} ({fmt_b.name})"
+    )
     rk = (k_logical + 4 * sf_vec_size - 1) // (4 * sf_vec_size)
     if varlen_k:
-        assert A.dtype != torch.float4_e2m1fn_x2, (
-            "varlen_k blockscaled supports MXFP8 only: fp4 operands must be K-major, "
-            "but varlen_k requires m-major A / n-major B"
+        assert fmt_a.elems_per_container == 1 and fmt_b.elems_per_container == 1, (
+            "varlen_k blockscaled supports byte-container formats only: fp4 operands "
+            "must be K-major, but varlen_k requires m-major A / n-major B"
         )
         assert A.ndim == 2 and B.ndim == 2, (
             f"varlen_k expects A (m, total_k) and B (n, total_k), "
@@ -392,8 +436,10 @@ def make_fake_gemm_tensors(
     c_leading = 1 if c_major == "n" else 0
     m, n, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
     # Sub-byte (fp4) tensors need their contiguous extent statically divisible by the
-    # packing factor; fp4 operands are k-major, so mark k. Harmless for 8-bit+ dtypes.
-    k_div = div_for_dtype(a_dtype) if a_dtype.width < 8 else 1
+    # packing factor; fp4 operands are k-major, so mark k. A and B may have different
+    # widths (mixed-format pairs): take the strictest sub-byte requirement of either.
+    # Harmless for 8-bit+ dtypes.
+    k_div = max((div_for_dtype(dt) for dt in (a_dtype, b_dtype) if dt.width < 8), default=1)
     k = cute.sym_int(divisibility=k_div)
     div_a = div_for_dtype(a_dtype)
     div_b = div_for_dtype(b_dtype)
@@ -503,6 +549,8 @@ def compile_gemm_kernel(
     a_transposed=False,
     cd_transposed=False,
     cd_packed=None,
+    a_mma_dtype=None,
+    b_mma_dtype=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     split_k_kwargs = {}
@@ -521,6 +569,8 @@ def compile_gemm_kernel(
             use_clc_persistence=is_dynamic_persistent,
             use_tma_gather=use_tma_gather,
             sf_vec_size=sf_vec_size,
+            a_mma_dtype=a_mma_dtype,
+            b_mma_dtype=b_mma_dtype,
             **split_k_kwargs,
         )
     gemm_obj = GemmCls(

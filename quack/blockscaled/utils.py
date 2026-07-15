@@ -16,10 +16,21 @@ from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_config import SplitKMode
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
-from quack.blockscaled.quantize import (
+from quack.blockscaled.operand import (
+    BLOCKSCALED_FORMAT_REGISTRY,
+    BlockScaledOperand,
+    legacy_format_name,
+)
+from quack.blockscaled.quantize import (  # noqa: F401  (pure-torch helpers re-exported)
+    FP4_E2M1FN_VALUES,
+    QUANTIZERS,
+    _fp4_unpacked_to_value,
+    dequant_operand,
+    pack_scale_2d_to_blocked_contig,
     to_mx_compiled,
     to_mxfp4_compiled,
     to_nvfp4_compiled,
+    unpack_scale_blocked_to_2d,
 )
 from quack.varlen_utils import VarlenArguments
 
@@ -39,26 +50,6 @@ FLOAT8_DTYPES = {
     torch.float8_e5m2,
     torch.float8_e8m0fnu,
 }
-
-
-FP4_E2M1FN_VALUES = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -248,65 +239,13 @@ def create_blockscaled_scale_tensor(
     return ref, packed
 
 
-def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
-    """Rearrange a (l, mn, sf_k) or (mn, sf_k) e8m0 scale tensor into the
-    contiguous (l, rm, rk, 32, 4, 4) blocked layout shared by the quack kernel
-    and cuBLAS's block-scaling. Each inner (32, 4, 4) atom (512 B) holds one
-    128 MN × 4 K swizzled tile. Pads `mn` to a multiple of 128 and `sf_k` to a
-    multiple of 4 with zeros."""
-    if scale_2d.dim() == 2:
-        scale_2d = scale_2d.unsqueeze(0)
-    assert scale_2d.dim() == 3, f"expected (l, mn, sf_k), got shape {tuple(scale_2d.shape)}"
-    orig_dtype = scale_2d.dtype
-    l, mn, sf_k = scale_2d.shape
-    rm = ceil_div(mn, 128)
-    rk = ceil_div(sf_k, 4)
-    mn_pad = rm * 128
-    sf_k_pad = rk * 4
-    u8 = scale_2d.contiguous().view(torch.uint8)
-    if mn_pad != mn or sf_k_pad != sf_k:
-        padded = torch.zeros(l, mn_pad, sf_k_pad, device=scale_2d.device, dtype=torch.uint8)
-        padded[:, :mn, :sf_k] = u8
-    else:
-        padded = u8
-    # (l, mn_pad, sf_k_pad) -> (l, rm, 128, rk, 4) -> (l, rm, rk, 128, 4)
-    blocks = padded.view(l, rm, 128, rk, 4).permute(0, 1, 3, 2, 4)
-    # split 128 into (4 outer, 32 inner), then swap to (32, 4)
-    blocks = blocks.reshape(l, rm, rk, 4, 32, 4).transpose(3, 4).contiguous()
-    return blocks.view(orig_dtype)
-
-
-def unpack_scale_blocked_to_2d(blocked: torch.Tensor, mn: int, sf_k: int) -> torch.Tensor:
-    """Unswizzle (l, rm, rk, 32, 4, 4) blocked scale factors to (l, mn, sf_k)."""
-    l, rm, rk = blocked.shape[:3]
-    assert tuple(blocked.shape[3:]) == (32, 4, 4)
-    orig_dtype = blocked.dtype
-    u8 = blocked.view(torch.uint8)
-    # (32=m%32, 4=m//32, 4=k%4) -> (4, 32, 4) -> (l, rm, rk, 128, 4) -> (l, mn_pad, sf_k_pad)
-    u8 = u8.transpose(3, 4).reshape(l, rm, rk, 128, 4)
-    u8 = u8.permute(0, 1, 3, 2, 4).reshape(l, rm * 128, rk * 4)
-    return u8[:, :mn, :sf_k].contiguous().view(orig_dtype)
-
-
-def dequant_operand(x: torch.Tensor) -> torch.Tensor:
-    """Dequantize an operand tensor to float32 values (without scale factors).
-
-    fp8 tensors convert directly; ``float4_e2m1fn_x2`` tensors unpack two codes
-    per byte (low nibble = even K, high nibble = odd K), doubling the last dim.
-    """
-    if x.dtype == torch.float4_e2m1fn_x2:
-        u8 = x.view(torch.uint8)
-        lo = _fp4_unpacked_to_value(u8 & 0x0F)
-        hi = _fp4_unpacked_to_value((u8 >> 4) & 0x0F)
-        return torch.stack([lo, hi], dim=-1).reshape(*x.shape[:-1], x.shape[-1] * 2)
-    return x.float()
-
-
+# Legacy short-name view over the descriptor registry (quantizer-backed formats):
+# format: (torch operand dtype, torch SF dtype, sf_vec_size). Derived - the
+# descriptors in quack.blockscaled.operand are the single source of truth.
 BLOCKSCALED_FORMATS = {
-    # format: (torch operand dtype, torch SF dtype, sf_vec_size)
-    "mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, 32),
-    "mxfp4": (torch.float4_e2m1fn_x2, torch.float8_e8m0fnu, 32),
-    "nvfp4": (torch.float4_e2m1fn_x2, torch.float8_e4m3fn, 16),
+    legacy_format_name(f): (f.qdata_dtype, f.scale_dtype, f.sf_vec_size)
+    for f in BLOCKSCALED_FORMAT_REGISTRY.values()
+    if f.name in QUANTIZERS
 }
 
 
@@ -321,34 +260,20 @@ _pack_scale_compiled = torch.compile(
 def blockscaled_quantize(
     x: torch.Tensor, format: str = "mxfp8", per_tensor_scale: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a (M, K) or (L, M, K) bf16/fp32 tensor along K for blockscaled GEMM.
+    """Raw-parts quantizer: thin wrapper over
+    :meth:`BlockScaledOperand.quantize` (the canonical API).
 
-    Returns ``(q, sf)`` ready to pass as an ``(A, SFA)`` / ``(B, SFB)`` tuple to
-    :func:`quack.gemm_interface.gemm`:
-      q:  same leading shape as ``x``; fp8 for mxfp8 (M, K), packed fp4x2 for
-          mxfp4/nvfp4 (M, K/2), K-contiguous.
-      sf: blocked scale factors, (rm, rk, 32, 4, 4) or (L, rm, rk, 32, 4, 4).
-    For nvfp4, ``per_tensor_scale`` (scalar fp32) folds the global scale; pass the
-    product of A's and B's per-tensor scales as ``alpha`` to the GEMM.
+    Returns ``(q, sf)`` quantizer outputs, NOT a GEMM operand: quack GEMMs take
+    only BlockScaledOperand containers, so wrap the parts via
+    ``BlockScaledOperand.from_parts(q, sf, format)`` (or quantize with
+    :meth:`BlockScaledOperand.quantize` directly). For nvfp4,
+    ``per_tensor_scale`` (scalar fp32) folds the global scale into the block
+    scales; the per-tensor scale itself is not part of the returned parts, so
+    pass it to ``from_parts`` (or use ``BlockScaledOperand.quantize``, which
+    stores it and folds it into GEMM alpha automatically).
     """
-    from quack.blockscaled.quantize import to_mx_compiled, to_mxfp4_compiled, to_nvfp4_compiled
-
-    assert format in BLOCKSCALED_FORMATS, f"unknown blockscaled format: {format}"
-    q_dtype, sf_dtype, sf_vec = BLOCKSCALED_FORMATS[format]
-    assert x.shape[-1] % sf_vec == 0, f"K ({x.shape[-1]}) must be divisible by {sf_vec}"
-    batched = x.ndim == 3
-    l, mn, k = x.shape if batched else (1, *x.shape)
-    x_flat = x.reshape(l * mn, k)
-    if format == "mxfp8":
-        q, sc = to_mx_compiled(x_flat, sf_vec)
-    elif format == "mxfp4":
-        q, sc = to_mxfp4_compiled(x_flat, sf_vec)
-    else:
-        q, sc, _ = to_nvfp4_compiled(x_flat, sf_vec, per_tensor_scale)
-    q = q.view(torch.uint8).view(q_dtype) if q_dtype == torch.float4_e2m1fn_x2 else q
-    q = q.reshape(*x.shape[:-1], -1)
-    sf = _pack_scale_compiled(sc.view(l, mn, k // sf_vec))
-    return q, sf if batched else sf.squeeze(0)
+    t = BlockScaledOperand.quantize(x, format, per_tensor_scale=per_tensor_scale)
+    return t.qdata, t.scale
 
 
 def blockscaled_quantize_dim0(
@@ -357,12 +282,13 @@ def blockscaled_quantize_dim0(
     """Quantize a (M, K) bf16/fp32 tensor along M (dim 0) for a blockscaled GEMM
     whose reduction dim is M — the dgrad/wgrad orientations of training linears.
 
-    Returns ``(q, sf)``:
-      q:  (M, K) fp8, same row-major layout as ``x``. Pass it directly as an
-          MN-major B operand (reduction dim first), or ``q.mT`` as an MN-major
-          A operand.
+    Returns ``(q, sf)`` quantizer outputs, NOT a GEMM operand:
+      q:  (M, K) fp8, same row-major layout as ``x``.
       sf: blocked (rm, rk, 32, 4, 4) scale factors for the logical operand
-          (mn=K, sf_k=M/32) — the same tensor serves both usages above.
+          (mn=K, sf_k=M/32) - the same tensor serves both usages below.
+    Wrap for the GEMM as ``op = BlockScaledOperand.from_parts(q, sf, "mxfp8",
+    quant_dim=-2)`` (scales run along M, dim 0): pass ``op`` as an MN-major B
+    operand (reduction dim first), or ``op.mT`` as an MN-major A operand.
     """
     from quack.blockscaled.quantize import to_mx_dim0_compiled
 
@@ -404,28 +330,25 @@ def scale_blocked_for_cublas(
     return scale_contig[l_idx].reshape(-1)
 
 
-_FP4_E2M1_CODE_TO_VALUE = torch.tensor(FP4_E2M1FN_VALUES, dtype=torch.float32)
-
-
-def _fp4_unpacked_to_value(codes_u8: torch.Tensor) -> torch.Tensor:
-    """Convert FP4 E2M1 codes in [0,16) to signed float values via table lookup.
-    Code layout: bit 3 = sign, bits 0-2 = magnitude index into {0,.5,1,1.5,2,3,4,6}."""
-    table = _FP4_E2M1_CODE_TO_VALUE.to(codes_u8.device)
-    return table[codes_u8.long()]
-
-
 def _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size) -> str:
-    """Identify which blockscaled format the (ab, sf, vec) tuple corresponds to."""
-    if ab_dtype == cutlass.Float8E4M3FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32:
-        return "mxfp8"
-    if ab_dtype == cutlass.Float4E2M1FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32:
-        return "mxfp4"
-    if ab_dtype == cutlass.Float4E2M1FN and sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 16:
-        return "nvfp4"
-    raise ValueError(
-        f"init=quant does not support (ab={ab_dtype}, sf={sf_dtype}, vec={sf_vec_size}). "
-        f"Supported: MXFP8 (e4m3+e8m0+32), MXFP4 (e2m1+e8m0+32), NVFP4 (e2m1+e4m3+16)."
-    )
+    """Identify which quantizer-backed format the (ab, sf, vec) tuple corresponds to.
+
+    Thin shim over :meth:`BlockScaledFormat.from_cutlass_dtypes` returning the legacy short
+    name this module's test/bench generators branch on. Formats without an
+    in-repo quantizer (e5m2, fp6) are rejected - init=quant cannot produce them.
+    """
+    from quack.blockscaled.operand import BlockScaledFormat
+
+    try:
+        fmt = BlockScaledFormat.from_cutlass_dtypes(ab_dtype, sf_dtype, sf_vec_size)
+    except ValueError:
+        fmt = None
+    if fmt is None or fmt.name not in QUANTIZERS:
+        raise ValueError(
+            f"init=quant does not support (ab={ab_dtype}, sf={sf_dtype}, vec={sf_vec_size}). "
+            f"Supported: MXFP8 (e4m3+e8m0+32), MXFP4 (e2m1+e8m0+32), NVFP4 (e2m1+e4m3+16)."
+        )
+    return legacy_format_name(fmt)
 
 
 def create_blockscaled_operand_quantized(
@@ -768,6 +691,10 @@ def compile_blockscaled_gemm_tvm_ffi(
     views (a free .permute). Rank-2 (varlen-flattened) operands and the SF
     tensors pass through untouched (the kernel does not rotate SFA/SFB).
 
+    This direct TVM-FFI path takes plain tensors only (raw qdata + scale buffers
+    with explicit cutlass dtypes). BlockScaledOperand operands are
+    the quack.gemm_interface layer's job; unwrap before calling this.
+
     When varlen_m: mA is (total_m, k) K-major, mD is (total_m, n) N-major,
     mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
     When varlen_k: mA is (m, total_k), mB is (n, total_k), mD is (m, n, l);
@@ -780,6 +707,10 @@ def compile_blockscaled_gemm_tvm_ffi(
     partials workspace per call (mirroring quack.gemm.gemm) and threads them through.
     SERIAL/PARALLEL only — SEPARATE needs a block-scaled reduction-kernel path.
     """
+    assert not isinstance(mA, BlockScaledOperand) and not isinstance(mB, BlockScaledOperand), (
+        "compile_blockscaled_gemm_tvm_ffi takes plain tensors; unwrap BlockScaledOperand "
+        "(use .qdata / .scale) or call quack.gemm"
+    )
     device_capacity = get_device_capacity(mA.device)
     if device_capacity[0] not in (10, 11):
         raise RuntimeError("Blockscaled SM100 GEMM requires SM100/SM110")

@@ -54,18 +54,19 @@ _converter_module._convert_single_arg = _patched_convert_single_arg
 
 
 torch2cute_dtype_map = {
+    torch.uint8: cutlass.Uint8,
+    # Packed fp4: dlpack presents the logical (doubled) K extent to the DSL.
+    torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
     torch.float8_e4m3fn: Float8E4M3FN,
     torch.float8_e5m2: Float8E5M2,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
+    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
     torch.float16: Float16,
     torch.bfloat16: BFloat16,
     torch.float32: Float32,
     torch.int32: Int32,
     torch.int64: Int64,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e5m2: cutlass.Float8E5M2,
-    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
-    # Packed fp4: dlpack presents the logical (doubled) K extent to the DSL.
-    torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
 }
 
 

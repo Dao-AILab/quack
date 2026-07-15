@@ -278,6 +278,7 @@ def _run_blockscaled(args):
         )
     if not GemmDefaultSm100.can_implement_blockscaled(
         ab_dtype,
+        ab_dtype,
         sf_dtype,
         sf_vec_size,
         d_dtype,
@@ -298,6 +299,9 @@ def _run_blockscaled(args):
         )
 
     assert k % sf_vec_size == 0, f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size})"
+    from quack.blockscaled.operand import BlockScaledFormat
+
+    bs_format = BlockScaledFormat.from_cutlass_dtypes(ab_dtype, sf_dtype, sf_vec_size).name
     if args.varlen_m:
         # varlen_m: l is num_experts, m is per-expert m, total_m = m * l.
         # Supports MXFP8 / MXFP4 / NVFP4 (fp4 operands must be K-major).
@@ -340,6 +344,8 @@ def _run_blockscaled(args):
                 cu_seqlens_m=cu_seqlens_m,
                 SFA=mSFA,
                 SFB=mSFB,
+                bs_format_a=bs_format,
+                bs_format_b=bs_format,
             )
     else:
         a_ref, mA, a_sc_contig = create_blockscaled_operand_quantized(
@@ -389,6 +395,8 @@ def _run_blockscaled(args):
                 max_swizzle_size=args.max_swizzle_size,
                 SFA=mSFA,
                 SFB=mSFB,
+                bs_format_a=bs_format,
+                bs_format_b=bs_format,
             )
 
     if not args.skip_ref_check:

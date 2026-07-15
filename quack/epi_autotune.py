@@ -191,6 +191,8 @@ def _make_tuned_fn(mod, epi_names):
         dynamic_scheduler=False,
         SFA=None,
         SFB=None,
+        bs_format_a=None,
+        bs_format_b=None,
         concat_layout=None,
         config=None,
         **epi_flat,
@@ -238,6 +240,8 @@ def _make_tuned_fn(mod, epi_names):
                 A_idx=A_idx,
                 SFA=SFA,
                 SFB=SFB,
+                bs_format_a=bs_format_a,
+                bs_format_b=bs_format_b,
                 concat_layout=concat_layout,
                 b_kn=b_kn,
                 swap_ab=c.swap_ab,
@@ -251,7 +255,20 @@ def _make_tuned_fn(mod, epi_names):
     kw = inspect.Parameter.KEYWORD_ONLY
     params = [
         inspect.Parameter(n, kw, default=None)
-        for n in ("A", "B", "D", "C", "mod_digest", "cu_seqlens_m", "A_idx", "SFA", "SFB", "config")
+        for n in (
+            "A",
+            "B",
+            "D",
+            "C",
+            "mod_digest",
+            "cu_seqlens_m",
+            "A_idx",
+            "SFA",
+            "SFB",
+            "bs_format_a",
+            "bs_format_b",
+            "config",
+        )
     ]
     params.append(inspect.Parameter("b_kn", kw, default=False))
     params.append(inspect.Parameter("dynamic_scheduler", kw, default=False))
@@ -270,7 +287,14 @@ def _get_tuner(mod, epi_names, has_c, device):
     if tuner is None:
         tuner = Autotuner(
             _make_tuned_fn(mod, epi_names),
-            key=["mod_digest", "b_kn", "dynamic_scheduler", "concat_layout"],
+            key=[
+                "mod_digest",
+                "b_kn",
+                "dynamic_scheduler",
+                "concat_layout",
+                "bs_format_a",
+                "bs_format_b",
+            ],
             configs=[AutotuneConfig(config=c) for c in _config_space(mod, device)],
             prune_configs_by={"early_config_prune": partial(_prune_for_mod, mod)},
             cache_results=True,
@@ -293,6 +317,8 @@ def tuned_mod_gemm(
     dynamic_scheduler=False,
     SFA=None,
     SFB=None,
+    bs_format_a=None,
+    bs_format_b=None,
     concat_layout=None,
 ):
     """Autotuned ``mod.gemm``: sweep the arch's config space on the first call
@@ -314,6 +340,8 @@ def tuned_mod_gemm(
         dynamic_scheduler=dynamic_scheduler,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         concat_layout=concat_layout,
         **epi_args,
     )

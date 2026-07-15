@@ -189,6 +189,10 @@ def _compile_gemm_epi(
     sf_dtype=None,
     sf_vec_size=None,
     sf_batched=True,
+    # Blockscaled MMA element types when they differ from the storage dtypes
+    # (byte-container sub-byte formats); None: same as the tensor dtypes.
+    a_mma_dtype=None,
+    b_mma_dtype=None,
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
 ):
@@ -259,6 +263,8 @@ def _compile_gemm_epi(
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
         sf_vec_size=sf_vec_size,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
         b_transposed=b_kn,
         a_transposed=swap_ab,
         cd_transposed=swap_ab,
@@ -326,6 +332,8 @@ def build_gemm_epi_plan(
     sf_dtype=None,
     sf_vec_size=None,
     sf_batched=True,
+    a_mma_dtype=None,
+    b_mma_dtype=None,
     post_init_attrs=(),
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
@@ -393,6 +401,8 @@ def build_gemm_epi_plan(
         sf_dtype=sf_dtype,
         sf_vec_size=sf_vec_size,
         sf_batched=sf_batched,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
         post_init_attrs=post_init_attrs,
         packed_cd=packed_cd,
     )

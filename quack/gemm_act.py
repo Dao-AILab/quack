@@ -41,6 +41,10 @@ def gemm_act(
     concat_layout: tuple | None = None,
     SFA: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) blocked scale factors, or 5-D if 2D A
     SFB: Optional[Tensor] = None,  # (l, rn, rk, 32, 4, 4)
+    # BlockScaledFormat names for A / B (independent); required when SFA/SFB are
+    # passed (see quack.gemm.gemm).
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
     b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
 ) -> GemmEpiPlan:
     """GEMM + activation (optionally gated), on the epilogue-mod path
@@ -101,6 +105,8 @@ def gemm_act(
         concat_layout=tuple(sorted(concat_layout)) if concat_layout else None,
         SFA=SFA,
         SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         b_kn=b_kn,
     )
 

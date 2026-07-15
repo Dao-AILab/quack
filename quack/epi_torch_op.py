@@ -29,8 +29,23 @@ from typing import Optional
 
 import torch
 
+from quack.blockscaled.operand import BlockScaledFormat
 from quack.gemm_config import GemmConfig, default_config
 from quack.rounding import RoundingMode
+
+
+def _sf_encode(SF: torch.Tensor) -> torch.Tensor:
+    """e8m0 -> uint8 view across the mutable custom-op boundary (the Inductor
+    decompose_auto_functionalized workaround; same seam as
+    gemm_interface._sf_encode). Decoded format-driven in the op body."""
+    return SF.view(torch.uint8) if SF.dtype == torch.float8_e8m0fnu else SF
+
+
+def _sf_decode(SF, bs_format):
+    if SF is not None and SF.dtype == torch.uint8:
+        SF = SF.view(BlockScaledFormat.from_name(bs_format).scale_dtype)
+    return SF
+
 
 # digest -> EpiMod, populated by the compile-path wrapper (same process) or
 # lazily by import through the meta locator.
@@ -86,8 +101,10 @@ def _gemm_epi(digest: str, ins: list[torch.Tensor], outs: list[torch.Tensor], me
         tuned=m["tuned"],
         cu_seqlens_m=named.get("cu_seqlens_m"),
         A_idx=named.get("A_idx"),
-        SFA=named.get("SFA"),
-        SFB=named.get("SFB"),
+        SFA=_sf_decode(named.get("SFA"), m.get("bs_format_a")),
+        SFB=_sf_decode(named.get("SFB"), m.get("bs_format_b")),
+        bs_format_a=m.get("bs_format_a"),
+        bs_format_b=m.get("bs_format_b"),
         rounding_mode=m["rounding_mode"],
         **operands,
     )
@@ -115,6 +132,8 @@ def compile_call(
     A_idx,
     SFA,
     SFB,
+    bs_format_a,
+    bs_format_b,
     rounding_mode,
     operands,
 ):
@@ -147,8 +166,8 @@ def compile_call(
         ("C", C),
         ("cu_seqlens_m", cu_seqlens_m),
         ("A_idx", A_idx),
-        ("SFA", SFA),
-        ("SFB", SFB),
+        ("SFA", _sf_encode(SFA) if SFA is not None else None),
+        ("SFB", _sf_encode(SFB) if SFB is not None else None),
         *((f"op__{k}", v) for k, v in operands.items() if isinstance(v, torch.Tensor)),
     ):
         if t is not None:
@@ -169,6 +188,8 @@ def compile_call(
             tuned=bool(tuned),
             config=None if cfg is None else cfg.__dict__,
             rounding_mode=int(rounding_mode),
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
             scalar_ops=scalar_ops,
             locator=mod._module_locator(),
         )
