@@ -148,6 +148,16 @@ def pytest_handlecrashitem(crashitem, report, sched):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "dist: distributed multi-GPU torchrun test; excluded by default, run with `pytest --dist-only` (no -n/xdist)",
+    )
+    if config.getoption("--dist-only") and (
+        os.environ.get("PYTEST_XDIST_WORKER") or config.getoption("numprocesses", None)
+    ):
+        raise pytest.UsageError(
+            "--dist-only tests launch torchrun themselves and cannot run under pytest-xdist (-n)"
+        )
     # Compile-only context lifecycle is owned by quack.testing.pytest_plugin.
     # This hook handles only project-specific concerns: xdist GPU assignment
     # logging. The actual assignment happens at conftest import time above so
@@ -185,6 +195,26 @@ def pytest_collection_finish(session):
         f"Collected {total} tests: {json.dumps(summary, indent=2)}"
     )
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--dist-only",
+        action="store_true",
+        default=False,
+        help="Run only distributed torchrun tests (marked @pytest.mark.dist); "
+        "optionally pin GPUs with CUDA_VISIBLE_DEVICES",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Two-mode selection: default runs exclude dist tests; --dist-only runs only them."""
+    run_dist = config.getoption("--dist-only")
+    selected, deselected = [], []
+    for item in items:
+        is_dist = item.get_closest_marker("dist") is not None
+        (selected if is_dist == run_dist else deselected).append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
 
 # Compile-only error-swallow hooks live in quack.testing.pytest_plugin. The
 # only normal-mode hook we keep here is the OOM-retry, which is QuACK-specific.

@@ -1,8 +1,7 @@
-"""Distributed correctness tests for fused GEMM + reduce-scatter epilogues.
+"""Distributed correctness tests for fused GEMM + reduce epilogues (RS / AR).
 
-Run this file on its own, not under pytest-xdist. The conftest xdist hook
-narrows CUDA_VISIBLE_DEVICES to one GPU per worker, while this test needs one
-pytest process to launch multiple torchrun ranks.
+Marked `dist`: deselected by default, run with `pytest --dist-only` (never
+under pytest-xdist — one pytest process launches multiple torchrun ranks).
 """
 
 import argparse
@@ -14,34 +13,34 @@ import pytest
 import torch
 
 
-WORLD = int(os.environ.get("QUACK_DIST_WORLD_SIZE", "2"))
-CASES = [(4096, 4096, 4096), (8192, 4096, 4096), (4104, 4096, 4096)]
+WORLD_SIZES = [4]  # 4 is good default, 2 ranks can miss numerical/ordering bugs, 8 occupies full node
+# (m, n, k, l, ab_dtype, d_dtype); dtypes per quack gemm test convention (bf16
+# baseline, fp16 inputs, fp32 out), each non-bf16 pair on its own hard shape
+CASES = [
+    (4096, 4096, 4096, 1, "bfloat16", "bfloat16"),  # baseline
+    (488, 1024, 1024, 2, "bfloat16", "bfloat16"),  # m_per_rank < cta_m: tiny grid, batched
+    (528, 4104, 736, 3, "bfloat16", "bfloat16"),  # partial M/N tiles + K residue, batched
+    (1032, 2056, 928, 2, "float16", "float16"),  # partial M/N tiles + K residue, batched
+    (520, 1028, 672, 3, "bfloat16", "float32"),  # fp32 vec=4 path
+]
+CASE_IDS = [
+    "4096x4096x4096-bf16",
+    "488x1024x1024-l2-bf16",
+    "528x4104x736-l3-bf16",
+    "1032x2056x928-l2-fp16",
+    "520x1028x672-l3-bf16-fp32",
+]
 TOLERANCES = {
     torch.bfloat16: (3e-2, 1e-3),
     torch.float16: (3e-2, 1e-3),
     torch.float32: (1e-4, 1e-4),
 }
 
+pytestmark = pytest.mark.dist
 
-def _dist_skip_reason():
-    if os.environ.get("QUACK_RUN_DIST_TESTS") != "1":
-        return "set QUACK_RUN_DIST_TESTS=1 to run distributed tests"
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        return "distributed torchrun tests must run outside pytest-xdist"
-    if not torch.cuda.is_available():
-        return "CUDA required"
-    if torch.cuda.device_count() < WORLD:
-        return f"requires >= {WORLD} visible GPUs"
-    if torch.cuda.get_device_capability(0)[0] not in (10, 11):
-        return "requires SM100/SM110"
-    return None
-
-
-_SKIP_REASON = _dist_skip_reason()
-pytestmark = [pytest.mark.skip(reason=_SKIP_REASON)] if _SKIP_REASON else []
-
-
-def _run_gemm_epi_reduce(m, n, k, l=1):
+def _run_gemm_epi_reduce(
+    m, n, k, l=1, ab_dtype="bfloat16", d_dtype="bfloat16", use_epi_reduce="reduce_scatter"
+):
     import cuda.bindings.driver as cuda
     import torch.distributed as dist
 
@@ -69,13 +68,21 @@ def _run_gemm_epi_reduce(m, n, k, l=1):
     assert m % world_size == 0, f"m ({m}) must be divisible by world_size ({world_size})"
     assert k % world_size == 0, f"k ({k}) must be divisible by world_size ({world_size})"
 
-    ab_dtype = cutlass.BFloat16
+    dtype_map = {
+        "bfloat16": cutlass.BFloat16,
+        "float16": cutlass.Float16,
+        "float32": cutlass.Float32,
+    }
+    ab_dtype, d_dtype = dtype_map[ab_dtype], dtype_map[d_dtype]
     acc_dtype = cutlass.Float32
-    d_dtype = cutlass.BFloat16
     tile_m, tile_n = 256, 256
     cluster_m, cluster_n = 2, 1
     vec = 128 // d_dtype.width
     assert n % vec == 0, f"n ({n}) must be divisible by {vec} (16B multimem vectors)"
+    ab_vec = 128 // ab_dtype.width
+    assert (k // world_size) % ab_vec == 0, (
+        f"k_local ({k // world_size}) must be divisible by {ab_vec} (16B TMA alignment on A/B)"
+    )
 
     k_local = k // world_size
     m_per_rank = m // world_size
@@ -98,7 +105,7 @@ def _run_gemm_epi_reduce(m, n, k, l=1):
         .mul_(1.0 / (k**0.5))
         .to(torch_ab)
     )
-    a_tensor, _ = cutlass_torch.cute_tensor_like(
+    a_tensor, a_gpu = cutlass_torch.cute_tensor_like(
         a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
     b_tensor, _ = cutlass_torch.cute_tensor_like(
@@ -134,7 +141,7 @@ def _run_gemm_epi_reduce(m, n, k, l=1):
         a_dtype=ab_dtype,
         mma_tiler_mnk=(tile_m, tile_n),
         cluster_shape_mnk=(cluster_m, cluster_n, 1),
-        use_epi_reduce="reduce_scatter",
+        use_epi_reduce=use_epi_reduce,
     )
     epi_args = GemmDefaultSm100.EpilogueArguments()
     max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
@@ -159,7 +166,7 @@ def _run_gemm_epi_reduce(m, n, k, l=1):
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled_gemm(
+    launch = lambda: compiled_gemm(
         a_tensor,
         b_tensor,
         d_tensor,
@@ -172,21 +179,64 @@ def _run_gemm_epi_reduce(m, n, k, l=1):
         None,
         epi_reduce_args,
     )
-    torch.cuda.synchronize()
+    # d_torch_gpu is the (m, n, l) view, permuted to (l, m, n): RS owns its m-slab;
+    # AR holds the full reduced D on every rank after the multicast broadcast.
+    if use_epi_reduce == "reduce_scatter":
+        out = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
+    else:
+        out = d_torch_gpu.permute(2, 0, 1)
+
+    # r2r: relaunch reuses tile_flags/sync_barrier/counters in place (stale-flag bugs
+    # are invisible to a single launch); identical inputs must be bit-identical.
+    runs = []
+    for _ in range(2):
+        launch()
+        torch.cuda.synchronize()
+        dist.barrier()
+        runs.append(out.clone())
+    assert torch.equal(runs[0], runs[1]), "r2r: relaunch not bit-identical"
+
+    # Mutation loop: negate A each iter (bit-exact in every dtype) so stale/raced
+    # values differ from expected; rotate a forced-skew straggler; no barrier between iters.
+    expected = runs[1].clone()
+    for it in range(4 * world_size):
+        a_gpu.neg_()
+        expected.neg_()
+        if it % world_size == rank:
+            torch.cuda._sleep(50_000_000)  # ~25 ms straggler: dwarfs one launch
+        launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected), f"mutation loop iter {it}: stale or raced value"
+    dist.barrier()
+
+    # Flag wrap: tile flags/counters are never reset (monotonic, +num_ranks per launch),
+    # so int32 wrap is reachable in long-lived processes. Seed both just below the wrap
+    # and relaunch across it: launch 1 hits INT32_MAX exactly, launch 2 crosses, 3 runs
+    # in the negative regime. A is back to its original bits, so output must equal run 1.
+    seed = torch.iinfo(torch.int32).max - world_size
+    tf_torch.fill_(seed)
+    counters_torch.fill_(seed)
+    dist.barrier()
+    for it in range(3):
+        launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out, runs[1]), f"flag-wrap launch {it}: mismatch"
     dist.barrier()
 
     a_ref = a_torch_cpu.permute(2, 0, 1).contiguous().cuda().to(torch_d)
     b_ref = b_torch_cpu.permute(2, 0, 1).contiguous().cuda().to(torch_d)
     d_full = torch.empty(l, m, n, dtype=torch_d, device="cuda")
-    d_rs = torch.empty(l, m_per_rank, n, dtype=torch_d, device="cuda")
     torch.bmm(a_ref, b_ref.mT, out=d_full)
-    for i in range(l):
-        dist.reduce_scatter_tensor(d_rs[i], d_full[i])
+    if use_epi_reduce == "reduce_scatter":
+        d_ref = torch.empty(l, m_per_rank, n, dtype=torch_d, device="cuda")
+        for i in range(l):
+            dist.reduce_scatter_tensor(d_ref[i], d_full[i])
+    else:
+        dist.all_reduce(d_full)
+        d_ref = d_full
     torch.cuda.synchronize()
 
-    # d_torch_gpu is the (m, n, l) view; own slab is on the m dim, permute to (l, m, n).
-    slab = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
-    torch.testing.assert_close(slab, d_rs, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, d_ref, atol=atol, rtol=rtol)
     if rank == 0:
         print("Ref check PASSED")
 
@@ -194,8 +244,12 @@ def _run_gemm_epi_reduce(m, n, k, l=1):
     torchrun_finalize_nvshmem()
 
 
-@pytest.mark.parametrize("m,n,k", CASES)
-def test_gemm_epi_reduce(m, n, k):
+@pytest.mark.parametrize("world_size", WORLD_SIZES, ids=lambda w: f"world{w}")
+@pytest.mark.parametrize("mode", ["reduce_scatter", "all_reduce"], ids=["rs", "ar"])
+@pytest.mark.parametrize("m,n,k,l,ab_dtype,d_dtype", CASES, ids=CASE_IDS)
+def test_gemm_epi_reduce(m, n, k, l, ab_dtype, d_dtype, mode, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} GPUs")
     env = {
         **os.environ,
         "PYTHONUNBUFFERED": "1",
@@ -205,14 +259,10 @@ def test_gemm_epi_reduce(m, n, k):
         "-m",
         "torch.distributed.run",
         "--nproc_per_node",
-        str(WORLD),
+        str(world_size),
         __file__,
-        "--m",
-        str(m),
-        "--n",
-        str(n),
-        "--k",
-        str(k),
+        *["--m", str(m), "--n", str(n), "--k", str(k), "--l", str(l)],
+        *["--ab_dtype", ab_dtype, "--d_dtype", d_dtype, "--mode", mode],
     ]
     result = subprocess.run(
         cmd,
@@ -234,9 +284,15 @@ def _parse_args():
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--l", type=int, default=1)
+    dtypes = ["bfloat16", "float16", "float32"]
+    parser.add_argument("--ab_dtype", choices=dtypes, default="bfloat16")
+    parser.add_argument("--d_dtype", choices=dtypes, default="bfloat16")
+    parser.add_argument("--mode", choices=["reduce_scatter", "all_reduce"], default="reduce_scatter")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    _run_gemm_epi_reduce(args.m, args.n, args.k, args.l)
+    _run_gemm_epi_reduce(
+        args.m, args.n, args.k, args.l, args.ab_dtype, args.d_dtype, args.mode
+    )
