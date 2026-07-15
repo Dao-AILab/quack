@@ -335,9 +335,8 @@ def _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size) -> str:
     """Identify which quantizer-backed format the (ab, sf, vec) tuple corresponds to.
 
     Thin shim over :meth:`BlockScaledFormat.from_cutlass_dtypes` returning the legacy short
-    name this module's test/bench generators branch on. Formats without an
-    direct-compiler storage path (e5m2, packed fp6) are rejected. Packed fp6
-    requires the unified API's separate storage and MMA dtype plumbing.
+    name this module's test/bench generators branch on. Packed fp6 is rejected:
+    it requires the unified API's separate storage and MMA dtype plumbing.
     """
     from quack.blockscaled.operand import BlockScaledFormat
 
@@ -345,10 +344,10 @@ def _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size) -> str:
         fmt = BlockScaledFormat.from_cutlass_dtypes(ab_dtype, sf_dtype, sf_vec_size)
     except ValueError:
         fmt = None
-    if fmt is None or fmt.name not in {"mxfp8_e4m3", "mxfp4", "nvfp4"}:
+    if fmt is None or fmt.name not in {"mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "nvfp4"}:
         raise ValueError(
             f"init=quant does not support (ab={ab_dtype}, sf={sf_dtype}, vec={sf_vec_size}). "
-            f"Supported: MXFP8 (e4m3+e8m0+32), MXFP4 (e2m1+e8m0+32), "
+            f"Supported: MXFP8 (e4m3/e5m2+e8m0+32), MXFP4 (e2m1+e8m0+32), "
             f"NVFP4 (e2m1+e4m3+16)."
         )
     return legacy_format_name(fmt)
@@ -375,7 +374,8 @@ def create_blockscaled_operand_quantized(
            `scale_blocked_for_cublas` for cuBLAS.
     """
     fmt = _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size)
-    if is_mn_major and fmt != "mxfp8":
+    is_mxfp8 = fmt in ("mxfp8", "mxfp8_e5m2")
+    if is_mn_major and not is_mxfp8:
         raise NotImplementedError(
             f"is_mn_major=True is only supported for MXFP8 (tcgen05 MMA requires "
             f"K-major for MXFP4/NVFP4 operands); got fmt={fmt}"
@@ -387,8 +387,9 @@ def create_blockscaled_operand_quantized(
     x_hp = (torch.randn(l, mn, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
     x_flat = x_hp.view(l * mn, k)
 
-    if fmt == "mxfp8":
-        q_flat, scale_2d = to_mx_compiled(x_flat, sf_vec_size)  # (l*mn, k), (l*mn, sf_k)
+    if is_mxfp8:
+        to_fp8 = to_mx_compiled if fmt == "mxfp8" else QUANTIZERS["mxfp8_e5m2"][1]
+        q_flat, scale_2d = to_fp8(x_flat, sf_vec_size)  # (l*mn, k), (l*mn, sf_k)
         if is_mn_major:
             # Operand: (mn, k, l) MN-major. Start from (l, mn, k) contig, transpose
             # to (l, k, mn) contig, then permute to (mn, k, l) with strides (1, mn, mn*k).
@@ -460,9 +461,8 @@ def create_blockscaled_varlen_m_operands(
       cu_seqlens_m: (num_experts+1,) int32
 
     Supports all kernel-ready SM100 formats. Packed fp4/fp6 formats require
-    b_major="k". MXFP8 E5M2 is constructed by quantizing as E4M3 and value-casting
-    the codes, matching the dense benchmark path. NVFP4 uses no per-tensor scale
-    here (it would just fold into alpha).
+    b_major="k". NVFP4 uses no per-tensor scale here (it would just fold into
+    alpha).
     """
     assert k % sf_vec_size == 0
     if seqlens_m is None:
@@ -481,11 +481,7 @@ def create_blockscaled_varlen_m_operands(
     def quantize(x2d):
         """(rows, k) bf16 -> packed qdata, 2D scales, and dequantized reference."""
         if fmt.name in ("mxfp8_e4m3", "mxfp8_e5m2"):
-            q, sc = to_mx_compiled(x2d, sf_vec_size)
-            if fmt.name == "mxfp8_e5m2":
-                # There is no in-repo E5M2 encoder. Match the dense benchmark:
-                # quantize to E4M3, then value-cast the stored codes to E5M2.
-                q = q.float().to(torch.float8_e5m2)
+            q, sc = QUANTIZERS[fmt.name][1](x2d, sf_vec_size)
             vals = q.float()
         elif fmt.name in ("mxfp4", "nvfp4"):
             if fmt.name == "mxfp4":

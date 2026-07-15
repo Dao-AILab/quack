@@ -751,8 +751,8 @@ class BlockScaledOperand:
             }.get(fmt.cutlass_dtype_name, fmt.name)
         quantizer = QUANTIZERS.get(quantizer_name)
         if quantizer is None:
-            # Every registered format except mxfp8_e5m2 has a quantizer; to_mx has
-            # no e5m2 encoder, so from_parts is the e5m2 construction path.
+            # Every registered format has a quantizer; this is the path for
+            # custom (unregistered) descriptors.
             raise NotImplementedError(
                 f"no in-repo quantizer for {fmt.name}; construct pre-quantized data via from_parts"
             )

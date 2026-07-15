@@ -235,16 +235,7 @@ def _quantize_dense_operand(l, mn, k, mn_major, fmt):
     from quack.blockscaled.operand import BlockScaledOperand
 
     x = (torch.randn(l, mn, k, device="cuda", dtype=torch.bfloat16) * k**-0.5).contiguous()
-    if fmt.name == "mxfp8_e5m2":
-        # No in-repo e5m2 quantizer: re-encode e4m3 codes as e5m2 (rounds some
-        # mantissas, but self-consistent - the reference dequantizes the e5m2
-        # bits). Same trick as the mixed-input interface tests.
-        t4 = BlockScaledOperand.quantize(x, "mxfp8_e4m3")
-        op = BlockScaledOperand.from_parts(
-            t4.qdata.float().to(torch.float8_e5m2), t4.scale, fmt, orig_dtype=x.dtype
-        )
-    else:
-        op = BlockScaledOperand.quantize(x, fmt)
+    op = BlockScaledOperand.quantize(x, fmt)
     ref_mkl = op.dequantize(torch.float32).permute(1, 2, 0).contiguous()
     q = op.qdata  # (l, mn, k_storage) contiguous, K innermost
     if mn_major:

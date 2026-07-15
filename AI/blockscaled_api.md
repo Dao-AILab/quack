@@ -77,7 +77,6 @@ constraints anchor the rationale where noted.
   activations or accept dim1-requant error (the standard MX tradeoff).
 - **NVFP4 outputs with a computed global amax** (needs a delayed or two-pass amax;
   section 7 requires an explicitly provided per-tensor scale instead).
-- **An e5m2 `to_mx` encoder** (`from_parts` is the e5m2 construction path).
 
 ## 3. `BlockScaledFormat` and `BlockScaledOperand` (`quack/blockscaled/operand.py`)
 
@@ -110,8 +109,8 @@ class BlockScaledFormat:
   GEMM can execute a given (A, B, D) dtype combination is asserted per-architecture
   inside the `gemm_smXXX` classes (SM100 accepts any fp8/fp6/fp4 mix under
   kind::mxf8f6f4 - see section 6).
-- E5M2: descriptor + `from_parts` work (the kernel admits e5m2); `quantize` raises
-  because `to_mx` has no e5m2 encoder - `from_parts` is the e5m2 construction path.
+- E5M2: `quantize` encodes via `to_mx(..., elem_dtype=torch.float8_e5m2)`
+  (fp8_max 57344, max_pow2 15); `from_parts` also works for pre-quantized data.
 - `mxfp4_byte` and unversioned byte-container MXFP6 checkpoints retain their logical
   shape and dequantization after load. They are host-side compatibility formats only;
   `BlockScaledOperand.to_packed()` preserves their codes/scales exactly for GEMM use.
@@ -443,7 +442,7 @@ but that is the D5 trap again and breaks on the first same-rank layout.
   (e8m0 keeps the floor rule). bf16 and int-group formats RAISE - floating-
   point relative precision is scale-invariant and group scales are upstream-
   structural (GPTQ/AWQ groups, folded norms), so `from_parts` is the
-  construction path (the e5m2 precedent).
+  construction path.
 
 ### 9.4 Scale layouts (per-operand)
 

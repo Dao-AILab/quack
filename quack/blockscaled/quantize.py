@@ -20,6 +20,8 @@ import torch
 
 F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 F8E4M3_MAX_POW2 = 8
+F8E5M2_MAX = torch.finfo(torch.float8_e5m2).max  # 57344.0
+F8E5M2_MAX_POW2 = 15
 E8M0_EXPONENT_BIAS = 127
 E8M0_EXPONENT_NAN_VAL = 255
 F32_EXP_BIAS = 127
@@ -40,26 +42,40 @@ def _n_ones(n: int) -> int:
     return (1 << n) - 1
 
 
-def to_mx(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rceil"):
-    """MXFP8-e4m3 quantization.
+def to_mx(
+    data_hp: torch.Tensor,
+    block_size: int = 32,
+    scaling_mode: str = "rceil",
+    elem_dtype: torch.dtype = torch.float8_e4m3fn,
+):
+    """MXFP8 quantization (e4m3 or e5m2 target).
 
     Args:
         data_hp: (..., K) bf16 or fp32 tensor, contiguous, K % block_size == 0.
         scaling_mode:
-            "rceil" (default): scale = 2^ceil(log2(max_abs / 448)), the OCP MX
-                hardware-conversion rule — the smallest power of two such that
-                the block max never saturates e4m3. NVIDIA's MXFP8 pretraining
-                recipe (arXiv:2506.08027) requires this for bf16 loss parity.
-            "floor": scale = 2^(floor(log2(max_abs)) - 8), torchao's MX default;
-                clips block maxima in (448, 512)·2^e. Kept for torchao parity.
+            "rceil" (default): scale = 2^ceil(log2(max_abs / fp8_max)), the OCP
+                MX hardware-conversion rule — the smallest power of two such
+                that the block max never saturates the target fp8 type.
+                NVIDIA's MXFP8 pretraining recipe (arXiv:2506.08027) requires
+                this for bf16 loss parity.
+            "floor": scale = 2^(floor(log2(max_abs)) - max_pow2), torchao's MX
+                default; clips block maxima in (fp8_max, 2^(max_pow2+1))·2^e.
+                Kept for torchao parity.
+        elem_dtype: float8_e4m3fn (default) or float8_e5m2 (fp8_max 448 / 57344).
     Returns:
-        qdata: (..., K) float8_e4m3fn
+        qdata: (..., K) elem_dtype
         scale: (..., K // block_size) float8_e8m0fnu
     """
     assert data_hp.dtype in (torch.bfloat16, torch.float32)
     assert data_hp.shape[-1] % block_size == 0
     assert data_hp.is_contiguous()
     assert scaling_mode in ("rceil", "floor")
+    assert elem_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    fp8_max, fp8_max_pow2 = (
+        (F8E4M3_MAX, F8E4M3_MAX_POW2)
+        if elem_dtype == torch.float8_e4m3fn
+        else (F8E5M2_MAX, F8E5M2_MAX_POW2)
+    )
 
     orig_shape = data_hp.shape
     data_hp = data_hp.reshape(*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
@@ -69,9 +85,9 @@ def to_mx(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rcei
     max_abs = max_abs.to(torch.float32)
 
     if scaling_mode == "rceil":
-        scale_e8m0_biased = _compute_e8m0_scale_rceil(max_abs, F8E4M3_MAX)
+        scale_e8m0_biased = _compute_e8m0_scale_rceil(max_abs, fp8_max)
     else:
-        scale_e8m0_biased = _compute_e8m0_scale_floor(max_abs, F8E4M3_MAX_POW2)
+        scale_e8m0_biased = _compute_e8m0_scale_floor(max_abs, fp8_max_pow2)
 
     # reconstruct fp32 scale from biased exponent
     scale_fp32 = (torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)).view(
@@ -83,11 +99,17 @@ def to_mx(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rcei
     data_lp = data_hp / scale_fp32
     # eager fp8 cast is unsaturated; clamp explicitly
     if not torch._dynamo.is_compiling():
-        data_lp = torch.clamp(data_lp, min=-F8E4M3_MAX, max=F8E4M3_MAX)
+        data_lp = torch.clamp(data_lp, min=-fp8_max, max=fp8_max)
 
-    qdata = data_lp.to(torch.float8_e4m3fn).reshape(orig_shape)
+    qdata = data_lp.to(elem_dtype).reshape(orig_shape)
     scale = scale_e8m0_biased.view(torch.float8_e8m0fnu).squeeze(-1)
     return qdata, scale
+
+
+def to_mx_e5m2(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rceil"):
+    """MXFP8-e5m2 quantization: :func:`to_mx` with the e5m2 target (fp8_max
+    57344), positional-signature-compatible with the QUANTIZERS registry."""
+    return to_mx(data_hp, block_size, scaling_mode, elem_dtype=torch.float8_e5m2)
 
 
 def to_mx_dim0(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rceil"):
@@ -434,14 +456,14 @@ def to_nvfp4(x: torch.Tensor, block_size: int = 16, per_tensor_scale=None):
 _COMPILE_KW = dict(dynamic=False, recompile_limit=64)
 
 to_mx_compiled = torch.compile(to_mx, **_COMPILE_KW)
+to_mx_e5m2_compiled = torch.compile(to_mx_e5m2, **_COMPILE_KW)
 to_mx_dim0_compiled = torch.compile(to_mx_dim0, **_COMPILE_KW)
 to_mxfp4_compiled = torch.compile(to_mxfp4, **_COMPILE_KW)
 to_nvfp4_compiled = torch.compile(to_nvfp4, **_COMPILE_KW)
 
 # In-repo quantizers by canonical format name: (eager fn, torch.compile'd fn).
 # Membership is the single source of "which formats can be quantized in-repo";
-# formats without an entry (mxfp8_e5m2) are from_parts-only until an encoder
-# lands.
+# formats without an entry are from_parts-only until an encoder lands.
 to_mxfp6_e2m3_compiled = torch.compile(to_mxfp6_e2m3, dynamic=True)
 to_mxfp6_e3m2_compiled = torch.compile(to_mxfp6_e3m2, dynamic=True)
 to_mxfp6_e2m3_packed_compiled = torch.compile(to_mxfp6_e2m3_packed, dynamic=True)
@@ -452,6 +474,7 @@ to_mxfp6_e3m2_byte_compiled = to_mxfp6_e3m2_compiled
 
 QUANTIZERS = {
     "mxfp8_e4m3": (to_mx, to_mx_compiled),
+    "mxfp8_e5m2": (to_mx_e5m2, to_mx_e5m2_compiled),
     "mxfp4": (to_mxfp4, to_mxfp4_compiled),
     "mxfp4_byte": (to_mxfp4_byte, to_mxfp4_byte_compiled),
     "mxfp6_e2m3": (to_mxfp6_e2m3, to_mxfp6_e2m3_compiled),

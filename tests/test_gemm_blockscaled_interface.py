@@ -474,19 +474,7 @@ def test_uint8_scale_view_construction():
     assert torch.equal(out, ref)
 
 
-def _e5m2_operand(rows, k, seed=0):
-    """mxfp8_e5m2 has no quantizer; build one by value-casting an e4m3
-    quantization (kernel and dequant reference then see identical stored data)."""
-    torch.manual_seed(seed)
-    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
-    t = BlockScaledOperand.quantize(x, "mxfp8_e4m3")
-    q5 = t.qdata.float().to(torch.float8_e5m2)
-    return BlockScaledOperand.from_parts(q5, t.scale, "mxfp8_e5m2")
-
-
 def _mixed_operand(fmt, rows, k, seed=0):
-    if fmt == "mxfp8_e5m2":
-        return _e5m2_operand(rows, k, seed)
     torch.manual_seed(seed)
     x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
     return BlockScaledOperand.quantize(x, fmt)
@@ -727,9 +715,9 @@ def test_blockscaled_out_dtype_reserved():
 
 
 def test_e5m2_from_parts_kernel():
-    """mxfp8_e5m2 has no in-repo quantizer but the kernel accepts it; construct
-    via from_parts with unit e8m0 scales and check against the dequant reference.
-    (First e5m2 blockscaled kernel coverage in-repo.)"""
+    """from_parts stays a valid e5m2 construction path (pre-quantized data
+    with caller-provided scales): unit e8m0 scales, checked against the
+    dequant reference."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)

@@ -343,14 +343,36 @@ def test_to_packed_canonicalizes_interim_name_and_rejects_custom_recipe():
         custom.to_packed()
 
 
-def test_e5m2_from_parts_but_no_quantizer():
+def test_e5m2_from_parts_and_quantizer():
+    # from_parts remains a valid construction path for pre-quantized e5m2 data
     _, t = _quantize(MXFP8_E4M3)
     q = t.qdata.view(torch.uint8).view(torch.float8_e5m2)
     t5 = BlockScaledOperand.from_parts(q, t.scale, MXFP8_E5M2)
     assert t5.format is MXFP8_E5M2
-    x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="e5m2"):
-        BlockScaledOperand.quantize(x, MXFP8_E5M2)
+    # the real e5m2 encoder: to_mx with the e5m2 target (fp8_max 57344)
+    torch.manual_seed(0)
+    x = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+    t5q = BlockScaledOperand.quantize(x, MXFP8_E5M2)
+    assert t5q.format is MXFP8_E5M2 and t5q.qdata.dtype == torch.float8_e5m2
+    qf = t5q.qdata.float()
+    # RCEIL scales guarantee the block max never saturates e5m2 (no inf codes)
+    assert torch.isfinite(qf).all()
+    dq = t5q.dequantize(torch.float32)
+    xf = x.float()
+    # 2 mantissa bits: <= 2^-3 rel error per element on normal values
+    # (measured on randn: rel_max ~0.11, rel_norm ~0.053)
+    rel_max = ((dq - xf).abs().max() / xf.abs().max()).item()
+    rel_norm = ((dq - xf).norm() / xf.norm()).item()
+    assert rel_max < 0.13, f"e5m2 round-trip rel_max={rel_max}"
+    assert rel_norm < 0.06, f"e5m2 round-trip rel_norm={rel_norm}"
+    # eager and compiled encoders agree bit-exactly
+    from quack.blockscaled.quantize import QUANTIZERS
+
+    eager_fn, compiled_fn = QUANTIZERS["mxfp8_e5m2"]
+    q_e, s_e = eager_fn(x, 32)
+    q_c, s_c = compiled_fn(x, 32)
+    assert torch.equal(q_e.view(torch.uint8), q_c.view(torch.uint8))
+    assert torch.equal(s_e.view(torch.uint8), s_c.view(torch.uint8))
 
 
 # -- logical metadata & transpose semantics ----------------------------------
