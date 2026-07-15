@@ -145,9 +145,11 @@ def _create_fp4_operand_tensor(
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     if is_mode0_major:
         raise ValueError("Float4E2M1FN blockscaled operands must be K-major")
+    # (mn, k/2, l) K-major view of a contiguous (l, mn, k/2) buffer; allocating
+    # (mn, k/2, l) directly would put stride 1 on L instead of K for l > 1.
     tensor = torch.empty(
-        (mode0, ceil_div(mode1, 2), l), dtype=torch.float4_e2m1fn_x2, device="cuda"
-    )
+        (l, mode0, ceil_div(mode1, 2)), dtype=torch.float4_e2m1fn_x2, device="cuda"
+    ).permute(1, 2, 0)
     tensor.view(torch.uint8).zero_()
     if init == "empty":
         return None, tensor

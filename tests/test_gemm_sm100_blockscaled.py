@@ -405,6 +405,20 @@ def test_direct_quantized_generator_rejects_packed_fp6():
             256,
             1,
         ),
+        # batched packed fp4: pins the generator's K-majorness for l > 1
+        # (a (mn, k/2, l) contiguous alloc would put stride 1 on L, not K)
+        (
+            cutlass.Float4E2M1FN,
+            cutlass.Float8E8M0FNU,
+            32,
+            cutlass.Float32,
+            (128, 128),
+            (1, 1),
+            256,
+            256,
+            256,
+            2,
+        ),
         (
             cutlass.Float4E2M1FN,
             cutlass.Float8E8M0FNU,
