@@ -12,13 +12,10 @@ Usage:
 import argparse
 import os
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
 import cuda.bindings.driver as cuda
-import nvshmem.core
-from cuda.core.experimental import Device
 
 import cutlass
 import cutlass.cute as cute
@@ -26,7 +23,13 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils as cutlass_utils
 from cutlass.cute.runtime import from_dlpack
 
-from quack.bench.bench_utils import do_bench_all
+from quack.bench.bench_utils_dist import do_bench_all
+from quack.dist_utils import (
+    torchrun_init_nvshmem,
+    torchrun_finalize_nvshmem,
+    create_multicast_tensor,
+    make_barrier_flags,
+)
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import make_scheduler_args, make_varlen_args
@@ -82,49 +85,9 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def init_distributed_nvshmem():
-    dist.init_process_group(backend="cpu:gloo,cuda:nccl")
-    rank, world_size = dist.get_rank(), dist.get_world_size()
-    torch.cuda.set_device(rank)
-    dev = Device(rank)
-    dev.set_current()
-    uid = nvshmem.core.get_unique_id(empty=(rank != 0))
-    uid_tensor = torch.from_numpy(uid._data.view(np.uint8).copy()).cuda()
-    dist.broadcast(uid_tensor, src=0)
-    dist.barrier()
-    uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
-    nvshmem.core.init(device=dev, uid=uid, rank=rank, nranks=world_size, initializer_method="uid")
-    return rank, world_size
-
-
-def make_symmetric_mc_tensor(shape_lmn, torch_dtype, dtype, leading_dim):
-    """Symmetric tensor + multicast view + per-rank peer views, as cute tensors.
-    Allocated (l, m, n) contiguous; the cute views are (m, n, l) n-major permutes."""
-    torch_gpu = nvshmem.core.tensor(shape_lmn, dtype=torch_dtype)
-    torch_gpu_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, torch_gpu)
-    peer_torch = [nvshmem.core.get_peer_tensor(torch_gpu, r) for r in range(dist.get_world_size())]
-    view = torch_gpu.permute(1, 2, 0)
-    tensor = from_dlpack(view, assumed_align=16)
-    tensor.element_type = dtype
-    tensor = tensor.mark_layout_dynamic(leading_dim=leading_dim)
-    tensor = cutlass_torch.convert_cute_tensor(view, tensor, dtype, is_dynamic_layout=True)
-    tensor_mc = from_dlpack(torch_gpu_mc.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(
-        leading_dim=leading_dim
-    )
-    peer_tensors = [from_dlpack(t.permute(1, 2, 0)) for t in peer_torch]
-    return tensor, tensor_mc, peer_tensors, torch_gpu, torch_gpu_mc
-
-
-def make_barrier_flags(num):
-    """Zero-initialized int32 symmetric flag array + multicast view, as cute tensors."""
-    t = nvshmem.core.tensor((num,), dtype=torch.int32)
-    t.fill_(0)
-    t_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, t)
-    return t, t_mc, from_dlpack(t).mark_layout_dynamic(), from_dlpack(t_mc).mark_layout_dynamic()
-
-
 def run(args):
-    rank, world_size = init_distributed_nvshmem()
+    torchrun_init_nvshmem()
+    rank, world_size = dist.get_rank(), dist.get_world_size()
     assert world_size > 1, "launch with torchrun --nproc_per_node > 1"
     sm_major = get_device_capacity(torch.device("cuda"))[0]
     assert sm_major in (10, 11), f"GEMM+RS requires SM100 (B200/B300); got SM{sm_major}x"
@@ -162,8 +125,11 @@ def run(args):
     b_tensor, _ = cutlass_torch.cute_tensor_like(
         b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
-    d_tensor, d_tensor_mc, d_peer_tensors, d_torch_gpu, d_torch_gpu_mc = make_symmetric_mc_tensor(
-        (l, m, n), cutlass_torch.dtype(d_dtype), d_dtype, leading_dim=1
+    # D is (m, n, l) n-major: an (l, m, n)-contiguous source viewed as (m, n, l) gives that
+    # layout, which create_multicast_tensor preserves into symmetric memory (write-only here).
+    d_cpu = torch.empty(l, m, n, dtype=cutlass_torch.dtype(d_dtype)).permute(1, 2, 0)
+    d_tensor, d_tensor_mc, d_torch_gpu, _, _, d_peer_tensors = create_multicast_tensor(
+        d_cpu, d_dtype, leading_dim=1
     )
 
     # Per-CTA-tile producer flags, the per-SM sync barrier (own tensor: shape-independent),
@@ -235,7 +201,8 @@ def run(args):
         dist.barrier()
         fn_baseline()
         torch.cuda.synchronize()
-        slab = d_torch_gpu[:, rank * m_per_rank : (rank + 1) * m_per_rank]
+        # d_torch_gpu is the (m, n, l) view; own slab is on the m dim, permute to (l, m, n).
+        slab = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
         torch.testing.assert_close(slab, D_rs, atol=args.tolerance, rtol=1e-3)
         if rank == 0:
             print("Ref check PASSED")
@@ -251,10 +218,9 @@ def run(args):
         print(f"  (quack speedup vs cuBLAS+NCCL: {t_base / t_quack:.2f}x)")
 
     dist.barrier()
-    for t in (tf_torch_mc, tf_torch, sb_torch_mc, sb_torch, d_torch_gpu_mc, d_torch_gpu):
-        nvshmem.core.free_tensor(t)
-    nvshmem.core.finalize()
-    dist.destroy_process_group()
+    # create_multicast_tensor / make_barrier_flags registered their frees via on_finalize;
+    # this runs them (reverse order), then nvshmem.core.finalize() + destroy_process_group().
+    torchrun_finalize_nvshmem()
 
 
 if __name__ == "__main__":
