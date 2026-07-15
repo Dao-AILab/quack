@@ -16,13 +16,76 @@ import quack.copy_utils as copy_utils
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm  # noqa: F401 (re-exported)
 from quack.rounding import RoundingMode, epilogue_sr_seed
-from quack.tile_scheduler import (
-    StaticPersistentTileSchedulerFromCLCParams as EpiReduceSchedulerParams,  # noqa: F401
-)
 from quack.varlen_utils import VarlenManager
 
 # epi_reduce warp-group sync barrier (NamedBarrierGemm is an IntEnum, not subclassable)
 EPI_REDUCE_BARRIER_ID = max(NamedBarrierGemm).value + 1
+
+
+@mlir_namedtuple
+class EpiReduceSchedulerParams(NamedTuple):
+    tile_sched_params: utils.PersistentTileSchedulerParams
+    num_persistent_clusters: Int32
+
+    @staticmethod
+    def create(problem_shape_ntile_mnl, cluster_shape_mnk, max_active_clusters):
+        assert cluster_shape_mnk[2] == 1, (
+            "EpiReduceSchedulerParams assumes cluster_shape_mnk[2] == 1"
+        )
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            problem_shape_ntile_mnl, cluster_shape_mnk
+        )
+        num_persistent_clusters = cutlass.min(
+            cute.size(tile_sched_params.problem_layout_ncluster_mnl),
+            max_active_clusters,
+        )
+        return EpiReduceSchedulerParams(tile_sched_params, num_persistent_clusters)
+
+
+@cute.jit
+def clc_block_to_static_scheduler_coord(cluster_shape_mn):
+    """
+    CLC launch grid uses grid=(cl_m * logical_cluster_id_over_MN, cl_n, batch).
+    Convert this CTA's launch position to the static scheduler coordinate:
+    (linear persistent cluster id, CTA m in cluster, CTA n in cluster).
+    """
+    bidx, bidy, bidz = cute.arch.block_idx()
+    gdx, gdy, _ = cute.arch.grid_dim()
+    cl_m, cl_n = cluster_shape_mn
+    cluster_id = bidx // cl_m + (gdx // cl_m) * (
+        bidy // cl_n + (gdy // cl_n) * bidz
+    )
+    return cluster_id, bidx % cl_m, bidy % cl_n
+
+
+@cute.jit
+def static_scheduler_coord_to_slot(
+    cluster_id: Int32, cta_m: Int32, cta_n: Int32, cluster_shape_mn
+) -> Int32:
+    cl_m, cl_n = cluster_shape_mn
+    return cluster_id * (cl_m * cl_n) + cta_n * cl_m + cta_m
+
+
+@cute.jit
+def make_epi_reduce_tile_scheduler(params: EpiReduceSchedulerParams):
+    tile_sched_params = params.tile_sched_params
+    cluster_shape_mn = tile_sched_params.cluster_shape_mn
+    cl_m, cl_n = cluster_shape_mn
+    cluster_id, cta_m, cta_n = clc_block_to_static_scheduler_coord(cluster_shape_mn)
+    return utils.StaticPersistentTileScheduler.create(
+        tile_sched_params,
+        (cta_m, cta_n, cluster_id),
+        (cl_m, cl_n, params.num_persistent_clusters),
+    )
+
+
+@cute.jit
+def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
+    # Keep the block_idx-derived coords inside one jit: returning the tuple to the
+    # kernel and re-consuming it in a second jit mis-materializes the slot -> OOB write.
+    cluster_shape_mn = params.tile_sched_params.cluster_shape_mn
+    cluster_id, cta_m, cta_n = clc_block_to_static_scheduler_coord(cluster_shape_mn)
+    return static_scheduler_coord_to_slot(cluster_id, cta_m, cta_n, cluster_shape_mn)
 
 
 def _multimem_ld_reduce_128b(dtype):

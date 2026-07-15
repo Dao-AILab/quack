@@ -38,16 +38,15 @@ from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
-from quack.tile_scheduler import (
-    TileSchedulerOptions,
-    StaticPersistentTileSchedulerFromCLC,
-    StaticPersistentTileSchedulerFromCLCParams as EpiReduceSchedulerParams,
-)
+from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_tp_base import (  # quack GemmTmaBase + the epi_reduce extension
     GemmTpTmaBase,
     NamedBarrierGemm,
     EPI_REDUCE_BARRIER_ID,
+    EpiReduceSchedulerParams,
+    make_epi_reduce_tile_scheduler,
+    epi_reduce_exit_slot,
 )
 from quack import layout_utils
 import quack.copy_utils as copy_utils
@@ -1477,9 +1476,7 @@ class GemmSm100(GemmTpTmaBase):
                     self.epi_reduce_tile if const_expr(self.use_epi_reduce is not None) else epi_tile
                 )
                 if const_expr(self.use_epi_reduce is not None):
-                    tile_scheduler = StaticPersistentTileSchedulerFromCLC.create(
-                        epi_reduce_sched_params
-                    )
+                    tile_scheduler = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
                     slab_tiles_m = cute.ceil_div(
                         mD_mnl.shape[0] // self.num_ranks, self.cta_tile_shape_mnk[0]
                     )
@@ -1858,7 +1855,7 @@ class GemmSm100(GemmTpTmaBase):
                 rank_id = self.rank_id
                 lane_id = cute.arch.lane_idx()
 
-                tile_sched = StaticPersistentTileSchedulerFromCLC.create(epi_reduce_sched_params)
+                tile_sched = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
                 work_tile = tile_sched.initial_work_tile_info()
 
                 # we want 128bit ld/st for better performance
@@ -2025,9 +2022,7 @@ class GemmSm100(GemmTpTmaBase):
                 # reads); this spin-lock exit barrier provides the cross-launch sync.
                 if warp_idx == self.epi_reduce_warp_ids[0]:
                     with cute.arch.elect_one():
-                        exit_slot = StaticPersistentTileSchedulerFromCLC.resident_cta_slot(
-                            epi_reduce_sched_params
-                        )
+                        exit_slot = epi_reduce_exit_slot(epi_reduce_sched_params)
                         # Release flag with sys scope
                         utils.distributed.multimem_red_add1(
                             lock_ptr=sync_barrier_mc.iterator + exit_slot,

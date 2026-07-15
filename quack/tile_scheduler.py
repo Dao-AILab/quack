@@ -6,7 +6,6 @@ from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as cutlass_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass._mlir.dialects import nvvm
 
@@ -60,79 +59,6 @@ class TileSchedulerOptions(NamedTuple):
     max_swizzle_size: Int32 = Int32(8)
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
-
-
-@mlir_namedtuple
-class StaticPersistentTileSchedulerFromCLCParams(NamedTuple):
-    """Static-persistent scheduler params for an auxiliary loop inside a CLC launch.
-
-    CLC launches use grid.x for the logical cluster id and grid.z for batch. Auxiliary
-    loops such as fused reduce-scatter need a deterministic static-persistent walk, so
-    the resident stride is carried explicitly instead of being recovered from grid_dim().
-    """
-
-    tile_sched_params: cutlass_utils.PersistentTileSchedulerParams
-    num_persistent_clusters: Int32
-
-    @staticmethod
-    def create(problem_shape_ntile_mnl, cluster_shape_mnk, max_active_clusters):
-        assert cluster_shape_mnk[2] == 1, (
-            "StaticPersistentTileSchedulerFromCLC assumes cluster_shape_mnk[2] == 1"
-        )
-        tile_sched_params = cutlass_utils.PersistentTileSchedulerParams(
-            problem_shape_ntile_mnl, cluster_shape_mnk
-        )
-        num_persistent_clusters = cutlass.min(
-            cute.size(tile_sched_params.problem_layout_ncluster_mnl),
-            max_active_clusters,
-        )
-        return StaticPersistentTileSchedulerFromCLCParams(
-            tile_sched_params, num_persistent_clusters
-        )
-
-
-class StaticPersistentTileSchedulerFromCLC:
-    """Adapter from QuACK CLC launch coordinates to CUTLASS static scheduling."""
-
-    Params = StaticPersistentTileSchedulerFromCLCParams
-
-    @staticmethod
-    @cute.jit
-    def decode_clc_block(params: Params):
-        """Return (linear persistent cluster id, CTA m in cluster, CTA n in cluster)."""
-        tile_sched_params = params.tile_sched_params
-        bidx, bidy, bidz = cute.arch.block_idx()
-        gdx, gdy, _ = cute.arch.grid_dim()
-        cl_m, cl_n = tile_sched_params.cluster_shape_mn
-        cluster_id = bidx // cl_m + (gdx // cl_m) * (
-            bidy // cl_n + (gdy // cl_n) * bidz
-        )
-        return cluster_id, bidx % cl_m, bidy % cl_n
-
-    @staticmethod
-    @cute.jit
-    def create(params: Params):
-        tile_sched_params = params.tile_sched_params
-        cl_m, cl_n = tile_sched_params.cluster_shape_mn
-        cluster_id, cta_m, cta_n = StaticPersistentTileSchedulerFromCLC.decode_clc_block(
-            params
-        )
-        return cutlass_utils.StaticPersistentTileScheduler.create(
-            tile_sched_params,
-            (cta_m, cta_n, cluster_id),
-            (cl_m, cl_n, params.num_persistent_clusters),
-        )
-
-    @staticmethod
-    @cute.jit
-    def resident_cta_slot(params: Params) -> Int32:
-        """Barrier slot matching the static scheduler owner returned by create()."""
-        tile_sched_params = params.tile_sched_params
-        cl_m, cl_n = tile_sched_params.cluster_shape_mn
-        cluster_id, cta_m, cta_n = StaticPersistentTileSchedulerFromCLC.decode_clc_block(
-            params
-        )
-        return cluster_id * (cl_m * cl_n) + cta_n * cl_m + cta_m
 
 
 @dataclass

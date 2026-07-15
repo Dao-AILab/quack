@@ -5,7 +5,7 @@ epi_reduce warps multimem-reduce the partial D across ranks and each rank keeps 
 M-slab (m / world_size rows). Baseline: torch.bmm + dist.reduce_scatter_tensor.
 
 Usage:
-    torchrun --nproc_per_node=8 quack/bench/benchmark_gemm_reduce_scatter.py \
+    torchrun --nproc_per_node=8 benchmarks/benchmark_gemm_reduce_scatter.py \
         --mnkl 8192,4096,4096,1 --tile_shape_mnk 256,256 --cluster_shape_mnk 2,1
 """
 
