@@ -6,7 +6,7 @@ from functools import partial
 import torch
 
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, Float4E2M1FN
 from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -37,6 +37,35 @@ def resolve_blockscaled_formats(bs_format_a, bs_format_b):
     return fmt_a, fmt_b
 
 
+def _validate_tma_unpack_alignment(name, tensor, format_name):
+    """Validate the byte-addressing contract of U4/U6 TMA unpack tensor maps."""
+    alignment = 32
+    if tensor.data_ptr() % alignment != 0:
+        raise ValueError(
+            f"{name} ({format_name}) TMA-unpack base address must be {alignment}-byte aligned"
+        )
+    elem_bytes = tensor.element_size()
+    for dim, stride in enumerate(tensor.stride()):
+        stride_bytes = stride * elem_bytes
+        if stride_bytes != 1 and stride_bytes % alignment != 0:
+            raise ValueError(
+                f"{name} ({format_name}) TMA-unpack non-unit byte strides must be "
+                f"{alignment}-byte aligned, got stride[{dim}]={stride_bytes} bytes"
+            )
+
+
+def _validate_tma_unpack_operands(A, B):
+    """Per-launch guard for cached blockscaled plans, which do not key on pointers."""
+    fp4_dtype = torch.float4_e2m1fn_x2
+    subbyte_storage_dtypes = {fp4_dtype, torch.uint8}
+    both_fp4 = A.dtype == fp4_dtype and B.dtype == fp4_dtype
+    if both_fp4:
+        return
+    for name, tensor in (("A", A), ("B", B)):
+        if tensor.dtype in subbyte_storage_dtypes:
+            _validate_tma_unpack_alignment(name, tensor, str(tensor.dtype))
+
+
 def validate_blockscaled_sf(
     A, B, SFA, SFB, device_capacity, num_batches=None, varlen_k=False, b_kn=False, *, fmt_a, fmt_b
 ):
@@ -52,9 +81,10 @@ def validate_blockscaled_sf(
     (e.g. GemmSm100's blockscaled setup assert) - this function validates only
     layout/consistency.
 
-    A is (l, m, k[/2 if fp4]) and B is (l, n, k[/2]); SFA/SFB are
-    (l, rm/rn, rk, 32, 4, 4) with the inner (32, 4, 4) block contiguous
-    (strides (16, 4, 1) — one 512 B atom per 128 rows x 4 K-blocks).
+    A is (l, m, k_storage) and B is (l, n, k_storage), where k_storage is the
+    format's storage K extent (fp8: k; fp4x2: k/2; packed fp6: 3k/4 bytes);
+    SFA/SFB are (l, rm/rn, rk, 32, 4, 4) with the inner (32, 4, 4) block
+    contiguous (strides (16, 4, 1) - one 512 B atom per 128 rows x 4 K-blocks).
 
     When num_batches is not None and varlen_k is False (varlen_m), A is
     (total_m, k) and SFA must be a single M-padded buffer (tile-aligned
@@ -94,22 +124,41 @@ def validate_blockscaled_sf(
     )
     sf_vec_size = fmt_a.sf_vec_size
     sf_dtype = torch2cute_dtype_map[fmt_a.scale_dtype]
-    # Operand shapes carry packed K (fp4x2: two elements per byte) while dlpack
-    # presents the logical extent to the kernel, so validate rk against logical K,
-    # and cross-check that A and B agree on it (their packings may differ).
-    # Under b_kn, B crosses as (k, n[, l]).
+    # Operand shapes carry the storage K extent (fp4x2: K/2; packed fp6: 3K/4
+    # bytes) while dlpack presents the logical extent to the kernel, so validate
+    # rk against logical K, and cross-check that A and B agree on it (their
+    # packings may differ). Under b_kn, B crosses as (k, n[, l]).
     b_storage_k = B.shape[-2] if b_kn else B.shape[-1]
-    k_logical = A.shape[-1] * fmt_a.elems_per_container
-    k_logical_b = b_storage_k * fmt_b.elems_per_container
+    k_logical = fmt_a.logical_k(A.shape[-1])
+    k_logical_b = fmt_b.logical_k(b_storage_k)
     assert k_logical == k_logical_b, (
-        f"logical K mismatch: A {A.shape[-1]} x{fmt_a.elems_per_container} ({fmt_a.name}) "
-        f"vs B {b_storage_k} x{fmt_b.elems_per_container} ({fmt_b.name})"
+        f"logical K mismatch: A storage K {A.shape[-1]} ({fmt_a.name}) => {k_logical} "
+        f"vs B storage K {b_storage_k} ({fmt_b.name}) => {k_logical_b}"
     )
+    # Packed fp6 is TMA-unpacked through the 16U6_ALIGN16B tensormap, whose
+    # granule is 128 logical elements (96 bytes): fail here with a clear message
+    # rather than at the compiled arg-spec binding. (Mixed pairs with packed fp4
+    # need K % 128 too - already enforced by the arg spec's k divisibility.)
+    for fmt in (fmt_a, fmt_b):
+        if fmt.elem_bits == 6:
+            assert k_logical % 128 == 0, (
+                f"{fmt.name} operands require logical K divisible by 128 "
+                f"(TMA unpack tensormap granule), got K={k_logical}"
+            )
+    # Under kind::mxf8f6f4, packed fp4/fp6 operands use U4/U6 TMA unpack into
+    # byte-container SMEM. Validate addressing after logical shape/granule checks
+    # so malformed K reports the format constraint rather than a derived row pitch.
+    # Both-fp4 runs kind::mxf4nvf4 and keeps the ordinary 16-byte contract.
+    both_fp4 = fmt_a.elem_bits == 4 and fmt_b.elem_bits == 4
+    for name, tensor, fmt in (("A", A, fmt_a), ("B", B, fmt_b)):
+        if fmt.elem_bits < 8 and not both_fp4:
+            _validate_tma_unpack_alignment(name, tensor, fmt.name)
     rk = (k_logical + 4 * sf_vec_size - 1) // (4 * sf_vec_size)
     if varlen_k:
-        assert fmt_a.elems_per_container == 1 and fmt_b.elems_per_container == 1, (
-            "varlen_k blockscaled supports byte-container formats only: fp4 operands "
-            "must be K-major, but varlen_k requires m-major A / n-major B"
+        assert not fmt_a.is_packed and not fmt_b.is_packed, (
+            "varlen_k blockscaled supports 8-bit element formats only: packed "
+            "sub-byte operands (fp4/fp6) must be K-major, but varlen_k requires "
+            "m-major A / n-major B"
         )
         assert A.ndim == 2 and B.ndim == 2, (
             f"varlen_k expects A (m, total_k) and B (n, total_k), "
@@ -381,6 +430,8 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None):
 
 def launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None):
     """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB)."""
+    if SFA is not None:
+        _validate_tma_unpack_operands(A, B)
     if plan.is_sm100_family:
         plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
     else:
@@ -403,6 +454,8 @@ def make_fake_gemm_tensors(
     b_kn=False,
     swap_ab=False,
     packed_cd=None,
+    a_mma_dtype=None,
+    b_mma_dtype=None,
 ):
     """Create fake tensors for mA, mB, mD, mC with shared sym_ints.
     Pass dtype=None to get None for that tensor (e.g. optional C).
@@ -424,6 +477,9 @@ def make_fake_gemm_tensors(
     dense and varlen_m (B is batched rank-3 there, so the same trace-time
     select applies); varlen_k keeps the host relabel (its B is the rank-2
     flattened operand, outside rotate_batch_last's transpose path).
+    ``a/b_mma_dtype``: blockscaled MMA element types when they differ from the
+    storage dtypes - a width-6 MMA dtype marks a packed-fp6 operand whose
+    storage tensor is raw bytes.
     """
     assert batched or not (varlen_m or varlen_k), "varlen operands are 2D already"
     assert not (b_kn and varlen_k), "b_kn does not support varlen_k"
@@ -435,14 +491,34 @@ def make_fake_gemm_tensors(
     d_leading = 1 if d_major == "n" else 0
     c_leading = 1 if c_major == "n" else 0
     m, n, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
-    # Sub-byte (fp4) tensors need their contiguous extent statically divisible by the
-    # packing factor; fp4 operands are k-major, so mark k. A and B may have different
-    # widths (mixed-format pairs): take the strictest sub-byte requirement of either.
-    # Harmless for 8-bit+ dtypes.
-    k_div = max((div_for_dtype(dt) for dt in (a_dtype, b_dtype) if dt.width < 8), default=1)
+    a_packed_f6 = a_mma_dtype is not None and a_mma_dtype.width == 6
+    b_packed_f6 = b_mma_dtype is not None and b_mma_dtype.width == 6
+    # Sub-byte tensors need their contiguous extent statically divisible; sub-byte
+    # operands are k-major, so mark k. Both-packed-fp4 runs kind::mxf4nvf4 with
+    # packed smem (16-byte rule: 32 elements). A sub-byte operand in any other
+    # pair is TMA-unpacked under kind::mxf8f6f4: logical K must be a multiple of
+    # 128, and the FFI signature must enforce the unpack tensor map's 32-byte
+    # base/non-unit-stride contract.
+    both_fp4 = a_dtype is Float4E2M1FN and b_dtype is Float4E2M1FN
+    a_unpack = (a_dtype.width < 8 or a_packed_f6) and not both_fp4
+    b_unpack = (b_dtype.width < 8 or b_packed_f6) and not both_fp4
+    if (
+        any(dt.width < 8 for dt in (a_dtype, b_dtype)) or a_packed_f6 or b_packed_f6
+    ) and not both_fp4:
+        k_div = 128
+    else:
+        k_div = max((div_for_dtype(dt) for dt in (a_dtype, b_dtype) if dt.width < 8), default=1)
     k = cute.sym_int(divisibility=k_div)
-    div_a = div_for_dtype(a_dtype)
-    div_b = div_for_dtype(b_dtype)
+    # Packed-fp6 operands cross the FFI boundary as raw bytes (torch has no fp6
+    # dtype), so their K extent is 3k/4 bytes: an independent sym - the 4/3
+    # relation between shared syms is not expressible in the arg spec; logical-K
+    # consistency is validated host-side. 96-byte divisibility == 128 fp6
+    # elements (the unpack-tensormap granule), and rows of whole 96-byte groups
+    # also satisfy the tensormap's 32-byte stride rule.
+    a_k_sym = cute.sym_int(divisibility=96) if a_packed_f6 else k
+    b_k_sym = cute.sym_int(divisibility=96) if b_packed_f6 else k
+    div_a = 256 // a_dtype.width if a_unpack else div_for_dtype(a_dtype)
+    div_b = 256 // b_dtype.width if b_unpack else div_for_dtype(b_dtype)
     div_d = div_for_dtype(d_dtype) if d_dtype is not None else 1
     div_c = div_for_dtype(c_dtype) if c_dtype is not None else 1
     # Doubled packed extent for raw 16-bit D/C — its own independent sym.
@@ -451,11 +527,11 @@ def make_fake_gemm_tensors(
         # m is total_m in this case: the flattened M dimension of D/C
         m = cute.sym_int()
         a_m = cute.sym_int() if gather_A else m
-        mA = fake_batched(a_dtype, a_m, k, None, a_leading, div_a)
+        mA = fake_batched(a_dtype, a_m, a_k_sym, None, a_leading, div_a)
         if b_kn:
-            mB = fake_batched(b_dtype, k, n, l, 1 - b_leading, div_b)
+            mB = fake_batched(b_dtype, b_k_sym, n, l, 1 - b_leading, div_b)
         else:
-            mB = fake_batched(b_dtype, n, k, l, b_leading, div_b)
+            mB = fake_batched(b_dtype, n, b_k_sym, l, b_leading, div_b)
         dc_n = pd if packed_cd is not None else n  # "n" form only under varlen
         mD = fake_batched(d_dtype, m, dc_n, None, d_leading, div_d)
         mC = fake_batched(c_dtype, m, dc_n, None, c_leading, div_c)
@@ -477,18 +553,18 @@ def make_fake_gemm_tensors(
             # cd_transposed. The caller-stride major labels flip with the
             # shape order, so the standard leading formulas hold (build_
             # gemm_epi_plan flips d/c majors, the only non-cancelling pair).
-            mA = fake_batched(a_dtype, k, m, bl, 1 - a_leading, div_a)
-            mB = fake_batched(b_dtype, n, k, bl, b_leading, div_b)
+            mA = fake_batched(a_dtype, a_k_sym, m, bl, 1 - a_leading, div_a)
+            mB = fake_batched(b_dtype, n, b_k_sym, bl, b_leading, div_b)
             mD = fake_batched(d_dtype, n, m, bl, 1 - d_leading, div_d)
             mC = fake_batched(c_dtype, n, m, bl, 1 - c_leading, div_c)
             return mA, mB, mD, mC, m, n, k, l
-        mA = fake_batched(a_dtype, m, k, bl, a_leading, div_a)
+        mA = fake_batched(a_dtype, m, a_k_sym, bl, a_leading, div_a)
         if b_kn:
             # (k, n) orientation: b_major is still the logical (n, k) label, so
             # "k"-major means dim 0 of (k, n) is contiguous.
-            mB = fake_batched(b_dtype, k, n, bl, 1 - b_leading, div_b)
+            mB = fake_batched(b_dtype, b_k_sym, n, bl, 1 - b_leading, div_b)
         else:
-            mB = fake_batched(b_dtype, n, k, bl, b_leading, div_b)
+            mB = fake_batched(b_dtype, n, b_k_sym, bl, b_leading, div_b)
         dc_x, dc_y = (m, pd) if packed_cd == "n" else (pd, n) if packed_cd == "m" else (m, n)
         mD = fake_batched(d_dtype, dc_x, dc_y, bl, d_leading, div_d)
         mC = fake_batched(c_dtype, dc_x, dc_y, bl, c_leading, div_c)

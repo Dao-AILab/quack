@@ -18,6 +18,7 @@ from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
 from quack.blockscaled.operand import (
     BLOCKSCALED_FORMAT_REGISTRY,
+    BlockScaledFormat,
     BlockScaledOperand,
     legacy_format_name,
 )
@@ -144,9 +145,11 @@ def _create_fp4_operand_tensor(
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     if is_mode0_major:
         raise ValueError("Float4E2M1FN blockscaled operands must be K-major")
+    # (mn, k/2, l) K-major view of a contiguous (l, mn, k/2) buffer; allocating
+    # (mn, k/2, l) directly would put stride 1 on L instead of K for l > 1.
     tensor = torch.empty(
-        (mode0, ceil_div(mode1, 2), l), dtype=torch.float4_e2m1fn_x2, device="cuda"
-    )
+        (l, mode0, ceil_div(mode1, 2)), dtype=torch.float4_e2m1fn_x2, device="cuda"
+    ).permute(1, 2, 0)
     tensor.view(torch.uint8).zero_()
     if init == "empty":
         return None, tensor
@@ -334,8 +337,8 @@ def _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size) -> str:
     """Identify which quantizer-backed format the (ab, sf, vec) tuple corresponds to.
 
     Thin shim over :meth:`BlockScaledFormat.from_cutlass_dtypes` returning the legacy short
-    name this module's test/bench generators branch on. Formats without an
-    in-repo quantizer (e5m2, fp6) are rejected - init=quant cannot produce them.
+    name this module's test/bench generators branch on. Packed fp6 is rejected:
+    it requires the unified API's separate storage and MMA dtype plumbing.
     """
     from quack.blockscaled.operand import BlockScaledFormat
 
@@ -343,10 +346,11 @@ def _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size) -> str:
         fmt = BlockScaledFormat.from_cutlass_dtypes(ab_dtype, sf_dtype, sf_vec_size)
     except ValueError:
         fmt = None
-    if fmt is None or fmt.name not in QUANTIZERS:
+    if fmt is None or fmt.name not in {"mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "nvfp4"}:
         raise ValueError(
             f"init=quant does not support (ab={ab_dtype}, sf={sf_dtype}, vec={sf_vec_size}). "
-            f"Supported: MXFP8 (e4m3+e8m0+32), MXFP4 (e2m1+e8m0+32), NVFP4 (e2m1+e4m3+16)."
+            f"Supported: MXFP8 (e4m3/e5m2+e8m0+32), MXFP4 (e2m1+e8m0+32), "
+            f"NVFP4 (e2m1+e4m3+16)."
         )
     return legacy_format_name(fmt)
 
@@ -372,7 +376,8 @@ def create_blockscaled_operand_quantized(
            `scale_blocked_for_cublas` for cuBLAS.
     """
     fmt = _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size)
-    if is_mn_major and fmt != "mxfp8":
+    is_mxfp8 = fmt in ("mxfp8", "mxfp8_e5m2")
+    if is_mn_major and not is_mxfp8:
         raise NotImplementedError(
             f"is_mn_major=True is only supported for MXFP8 (tcgen05 MMA requires "
             f"K-major for MXFP4/NVFP4 operands); got fmt={fmt}"
@@ -384,8 +389,9 @@ def create_blockscaled_operand_quantized(
     x_hp = (torch.randn(l, mn, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
     x_flat = x_hp.view(l * mn, k)
 
-    if fmt == "mxfp8":
-        q_flat, scale_2d = to_mx_compiled(x_flat, sf_vec_size)  # (l*mn, k), (l*mn, sf_k)
+    if is_mxfp8:
+        to_fp8 = to_mx_compiled if fmt == "mxfp8" else QUANTIZERS["mxfp8_e5m2"][1]
+        q_flat, scale_2d = to_fp8(x_flat, sf_vec_size)  # (l*mn, k), (l*mn, sf_k)
         if is_mn_major:
             # Operand: (mn, k, l) MN-major. Start from (l, mn, k) contig, transpose
             # to (l, k, mn) contig, then permute to (mn, k, l) with strides (1, mn, mn*k).
@@ -420,7 +426,6 @@ def create_blockscaled_operand_quantized(
             q_packed.view(l, mn, k // 2).contiguous().permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
         )
         scale_2d = scale_2d.view(l, mn, sf_k)
-
     scale_contig = pack_scale_2d_to_blocked_contig(scale_2d)
     return ref_mkl, q_mkl, scale_contig
 
@@ -450,16 +455,16 @@ def create_blockscaled_varlen_m_operands(
     Returns (a_ref, b_ref, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_m):
       a_ref: (total_m, k) fp32 dequantized
       b_ref: (num_experts, n, k) fp32 dequantized
-      qa:   (total_m, k) 2D K-major quantized operand (fp8) or (total_m, k/2) (fp4)
-      qb:   (n, k, num_experts) 3D K-major quantized operand (fp8) or (n, k/2, num_experts) (fp4)
+      qa:   (total_m, k_storage) 2D K-major quantized operand
+      qb:   (n, k_storage, num_experts) 3D K-major quantized operand
       a_sc_contig: (1, total_padded_rm, rk, 32, 4, 4) — M-padded SFA (tile-aligned per batch).
         total_padded_rm = ((total_m + num_experts * 128) // 128).
       b_sc_contig: (num_experts, rn, rk, 32, 4, 4) — regular per-expert SFB.
       cu_seqlens_m: (num_experts+1,) int32
 
-    Supports MXFP8 / MXFP4 / NVFP4; fp4 formats require b_major="k" (tcgen05
-    MMA needs K-major fp4 operands). NVFP4 uses no per-tensor scale here (it
-    would just fold into alpha).
+    Supports all kernel-ready SM100 formats. Packed fp4/fp6 formats require
+    b_major="k". NVFP4 uses no per-tensor scale here (it would just fold into
+    alpha).
     """
     assert k % sf_vec_size == 0
     if seqlens_m is None:
@@ -471,29 +476,34 @@ def create_blockscaled_varlen_m_operands(
     std = randn_std if randn_std is not None else k**-0.5
     sf_k = k // sf_vec_size
 
-    fmt = _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size)
-    if fmt != "mxfp8":
-        assert b_major == "k", f"{fmt} requires K-major operands, got b_major={b_major!r}"
+    fmt = BlockScaledFormat.from_cutlass_dtypes(ab_dtype, sf_dtype, sf_vec_size)
+    if fmt.is_packed:
+        assert b_major == "k", f"{fmt.name} requires K-major operands, got {b_major=!r}"
 
     def quantize(x2d):
-        """(rows, k) bf16 -> (q, scale_2d, dequant_ref); q is fp8 (rows, k) or fp4x2 (rows, k/2)."""
-        if fmt == "mxfp8":
-            q, sc = to_mx_compiled(x2d, sf_vec_size)
+        """(rows, k) bf16 -> packed qdata, 2D scales, and dequantized reference."""
+        if fmt.name in ("mxfp8_e4m3", "mxfp8_e5m2"):
+            q, sc = QUANTIZERS[fmt.name][1](x2d, sf_vec_size)
             vals = q.float()
-        else:
-            if fmt == "mxfp4":
+        elif fmt.name in ("mxfp4", "nvfp4"):
+            if fmt.name == "mxfp4":
                 q_packed, sc = to_mxfp4_compiled(x2d, sf_vec_size)
-            else:  # nvfp4
+            else:
                 q_packed, sc, _ = to_nvfp4_compiled(x2d, sf_vec_size, None)
             q = q_packed.view(torch.uint8).view(torch.float4_e2m1fn_x2)
-            vals = dequant_operand(q)
+            vals = dequant_operand(q, fmt)
+        elif fmt.name in ("mxfp6_e2m3_packed", "mxfp6_e3m2_packed"):
+            q, sc = QUANTIZERS[fmt.name][1](x2d, sf_vec_size)
+            vals = dequant_operand(q, fmt)
+        else:
+            raise NotImplementedError(f"varlen_m operand generation does not support {fmt.name}")
         ref = vals * sc.float().repeat_interleave(sf_vec_size, dim=-1)
         return q, sc, ref
 
-    # Quantize A: (total_m, k) bf16 -> (total_m, k[/2]) K-major.
+    # Quantize A: (total_m, k) bf16 -> (total_m, k_storage) K-major.
     # A data itself is stored packed (no per-expert padding); only SFA is padded.
     a_hp = (torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
-    qa, sa_2d, a_ref = quantize(a_hp)  # (total_m, k[/2]), (total_m, sf_k), (total_m, k)
+    qa, sa_2d, a_ref = quantize(a_hp)
 
     # Build padded SFA storage (tile-aligned per-batch). Each expert's m_i rows of
     # scales are written at padded tile offset `cu_seqlens[i] // 128 + i`.
@@ -512,12 +522,12 @@ def create_blockscaled_varlen_m_operands(
         offset += m_i
     a_sc_contig = pack_scale_2d_to_blocked_contig(sa_2d_padded.view(1, total_padded_m, sf_k))
 
-    # Quantize B: (num_experts, n, k) bf16 -> (n, k[/2], num_experts). b_major selects
-    # k-major (stride (kb, 1, n*kb)) or n-major (stride (1, n, n*k), mxfp8 only).
+    # Quantize B: (num_experts, n, k) bf16 -> (n, k_storage, num_experts).
+    # b_major selects k-major or n-major (8-bit formats only).
     assert b_major in ("k", "n"), f"b_major must be 'k' or 'n', got {b_major!r}"
     b_hp = (torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda") * std).contiguous()
     qb_flat, sb_2d, b_ref_flat = quantize(b_hp.view(num_experts * n, k))
-    kb = qb_flat.shape[-1]  # k for fp8, k/2 for packed fp4
+    kb = qb_flat.shape[-1]
     if b_major == "k":
         qb = (
             qb_flat.view(num_experts, n, kb).contiguous().permute(1, 2, 0)
@@ -547,8 +557,13 @@ def create_blockscaled_varlen_k_operands(
     randn_std: Optional[float] = None,
     seqlens_k: Optional[list] = None,
     sf_pad_byte: int = 0,
+    b_dtype: Optional[Type[cutlass.Numeric]] = None,
 ):
     """Generate bf16 randn + quantize for a varlen_k blockscaled GEMM.
+
+    Pass b_dtype != ab_dtype for mixed-precision mxf8f6f4 (fp8 pairs only:
+    varlen_k needs m-major A / n-major B, and packed sub-byte operands must be
+    K-major).
 
     Per-expert `k_i` is arbitrary (any positive int): neither `sf_vec_size` nor
     `sf_vec_size * 4` (= 128 for MXFP8) alignment is required. A non-multiple-of-32
@@ -576,12 +591,17 @@ def create_blockscaled_varlen_k_operands(
       b_sc_contig: (1, rn, total_padded_rk, 32, 4, 4) K-padded SFB (tile-aligned per batch).
       cu_seqlens_k: (num_experts+1,) int32.
     """
+    fp8_dtypes = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+    b_dtype = b_dtype if b_dtype is not None else ab_dtype
     if not (
-        ab_dtype == cutlass.Float8E4M3FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32
+        ab_dtype in fp8_dtypes
+        and b_dtype in fp8_dtypes
+        and sf_dtype == cutlass.Float8E8M0FNU
+        and sf_vec_size == 32
     ):
         raise NotImplementedError(
-            f"varlen_k currently only supports MXFP8 (got ab={ab_dtype}, sf={sf_dtype}, "
-            f"vec={sf_vec_size}). FP4 is k-major-only and not wired up."
+            f"varlen_k currently only supports MXFP8 e4m3/e5m2 (got a={ab_dtype}, b={b_dtype}, "
+            f"sf={sf_dtype}, vec={sf_vec_size}). Packed fp4/fp6 are k-major-only and not wired up."
         )
     if seqlens_k is None:
         seqlens_k = [k_per] * num_experts
@@ -595,7 +615,7 @@ def create_blockscaled_varlen_k_operands(
 
     from quack.blockscaled.quantize import to_mx_compiled
 
-    def quantize(mn, k_i):
+    def quantize(mn, k_i, elem_dtype):
         # The quantizer reshapes K into sf_vec_size chunks, so zero-pad k_i up to a
         # multiple of it; zeros never raise a chunk amax, so the real elements
         # quantize identically. Values are sliced back to k_i; scales keep the
@@ -603,7 +623,7 @@ def create_blockscaled_varlen_k_operands(
         k_q = (k_i + sf_vec_size - 1) // sf_vec_size * sf_vec_size
         hp = torch.zeros(mn, k_q, dtype=torch.bfloat16, device="cuda")
         hp[:, :k_i] = torch.randn(mn, k_i, dtype=torch.bfloat16, device="cuda") * std
-        q, sc = to_mx_compiled(hp, sf_vec_size)
+        q, sc = to_mx_compiled(hp, sf_vec_size, elem_dtype=torch_dtype_for_cutlass(elem_dtype))
         q = q[:, :k_i]
         ref = q.float() * sc.float().repeat_interleave(sf_vec_size, dim=-1)[:, :k_i]
         return q, sc, ref
@@ -611,12 +631,12 @@ def create_blockscaled_varlen_k_operands(
     a_q_list, a_sc_list, a_ref_list = [], [], []
     b_q_list, b_sc_list, b_ref_list = [], [], []
     for k_i in seqlens_k:
-        a_q, a_sc, a_ref = quantize(m, k_i)
+        a_q, a_sc, a_ref = quantize(m, k_i, ab_dtype)
         a_q_list.append(a_q)
         a_sc_list.append(a_sc)
         a_ref_list.append(a_ref)
 
-        b_q, b_sc, b_ref = quantize(n, k_i)
+        b_q, b_sc, b_ref = quantize(n, k_i, b_dtype)
         b_q_list.append(b_q)
         b_sc_list.append(b_sc)
         b_ref_list.append(b_ref)

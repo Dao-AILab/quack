@@ -6,8 +6,9 @@ operand form ((data, scale_factor) tuples are rejected, see
 test_tuple_operand_rejected).
 
 Layout contract (see quack/gemm_interface.py and AI/blockscaled_api.md):
-  A:   (M, K) or (L, M, K)   fp8 e4m3 (mxfp8) or packed fp4x2 (mxfp4/nvfp4, K/2 bytes)
-  B:   (K, N) or (L, K, N)   same dtype as A, K-contiguous (pass W.mT of an (N, K) weight)
+  A:   (M, K) or (L, M, K)   fp8 e4m3/e5m2, packed fp4x2 (K/2 bytes), or packed fp6 (3K/4 bytes)
+  B:   (K, N) or (L, K, N)   K-contiguous (pass W.mT of an (N, K) weight); A/B formats are
+       independent under kind::mxf8f6f4 (nvfp4 pairs only with itself)
   SF:  (rm, rk, 32, 4, 4) or (L, rm, rk, 32, 4, 4) with rm = ceil(rows / 128),
        rk = ceil(K / VEC / 4); inner block strides (16, 4, 1) (one contiguous 512 B atom).
        All format properties come from the BlockScaledFormat descriptor.
@@ -473,29 +474,55 @@ def test_uint8_scale_view_construction():
     assert torch.equal(out, ref)
 
 
-def _e5m2_operand(rows, k, seed=0):
-    """mxfp8_e5m2 has no quantizer; build one by value-casting an e4m3
-    quantization (kernel and dequant reference then see identical stored data)."""
-    torch.manual_seed(seed)
-    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
-    t = BlockScaledOperand.quantize(x, "mxfp8_e4m3")
-    q5 = t.qdata.float().to(torch.float8_e5m2)
-    return BlockScaledOperand.from_parts(q5, t.scale, "mxfp8_e5m2")
-
-
 def _mixed_operand(fmt, rows, k, seed=0):
-    if fmt == "mxfp8_e5m2":
-        return _e5m2_operand(rows, k, seed)
     torch.manual_seed(seed)
     x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
     return BlockScaledOperand.quantize(x, fmt)
 
 
-@pytest.mark.parametrize("fmt_pair", [("mxfp8_e4m3", "mxfp8_e5m2"), ("mxfp8_e5m2", "mxfp8_e4m3")])
-def test_blockscaled_gemm_mixed_fp8(fmt_pair):
+def _relayout_packed_operand(op, offset_bytes, row_pad_bytes):
+    """Copy packed fp4/fp6 into a view with an explicit base offset and row pitch."""
+    rows, storage_k = op.qdata.shape
+    row_stride = storage_k + row_pad_bytes
+    raw = torch.empty(
+        offset_bytes + rows * row_stride,
+        dtype=op.qdata.dtype,
+        device=op.qdata.device,
+    )
+    qdata = raw[offset_bytes:].as_strided((rows, storage_k), (row_stride, 1))
+    qdata.view(torch.uint8).copy_(op.qdata.view(torch.uint8))
+    return BlockScaledOperand.from_parts(
+        qdata, op.scale, op.format, orig_dtype=op.orig_dtype
+    )
+
+
+@pytest.mark.parametrize(
+    "fmt_pair",
+    [
+        # fp8 x fp8 (independent a/b dtypes, no sub-byte unpack)
+        ("mxfp8_e4m3", "mxfp8_e5m2"),
+        ("mxfp8_e5m2", "mxfp8_e4m3"),
+        # packed fp4 x fp8 (sub-byte operand TMA-unpacked, both orders)
+        ("mxfp4", "mxfp8_e4m3"),
+        ("mxfp8_e4m3", "mxfp4"),
+        ("mxfp4", "mxfp8_e5m2"),
+        # packed fp6 x fp8 (both orders)
+        ("mxfp6_e2m3_packed", "mxfp8_e4m3"),
+        ("mxfp8_e4m3", "mxfp6_e2m3_packed"),
+        # both operands sub-byte: fp6 x fp6, fp6 x fp4, fp4 x fp6
+        ("mxfp6_e2m3_packed", "mxfp6_e3m2_packed"),
+        ("mxfp6_e2m3_packed", "mxfp4"),
+        ("mxfp4", "mxfp6_e3m2_packed"),
+    ],
+)
+def test_blockscaled_gemm_mixed(fmt_pair):
     """Mixed A/B element types on SM100 (tcgen05 kind::mxf8f6f4 takes independent
-    a/b dtypes): e4m3 x e5m2 in both orders, checked against the dequant
-    reference."""
+    a/b dtypes): fp8/fp4/fp6 pairings across {e4m3, e5m2, fp4, fp6_e2m3, fp6_e3m2},
+    including packed sub-byte operands (TMA-unpacked into 8-bit SMEM containers).
+    Checked against both the blockscaled reference and the dequantized product.
+    (Both-fp4 runs the single mxf4nvf4 atom - scale config from the format -
+    and is covered by test_blockscaled_gemm; nvfp4 pairs only with itself, see
+    test_mixed_format_pairs.)"""
     _skip_if_not_sm100()
     fmt_a, fmt_b = fmt_pair
     m, n, k = 256, 512, 512
@@ -510,12 +537,89 @@ def test_blockscaled_gemm_mixed_fp8(fmt_pair):
     assert rel_dq < 5e-3, f"{fmt_a} x {fmt_b}: rel_err vs dequant={rel_dq}"
 
 
+@pytest.mark.parametrize("unpack_side", ["a", "b"])
+@pytest.mark.parametrize("unpack_fmt", ["mxfp4", "mxfp6_e2m3_packed"])
+@pytest.mark.parametrize(
+    "offset_bytes,row_pad_bytes",
+    [(16, 0), (32, 16)],
+    ids=["misaligned-base", "misaligned-row-stride"],
+)
+def test_mixed_unpack_alignment_rejected(
+    unpack_side, unpack_fmt, offset_bytes, row_pad_bytes
+):
+    """U4/U6 TMA unpack rejects bad bases/pitches before issuing a device instruction."""
+    _skip_if_not_sm100()
+    m = n = 128
+    k = 512
+    A = _mixed_operand(unpack_fmt if unpack_side == "a" else "mxfp8_e4m3", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3" if unpack_side == "a" else unpack_fmt, n, k, seed=1)
+
+    # Populate the pointer-agnostic plan cache before the offset-only case. The
+    # compiled argument signature must still reject the misaligned replacement.
+    if row_pad_bytes == 0:
+        gemm(A, W.mT, tuned=False)
+        torch.cuda.synchronize()
+    if unpack_side == "a":
+        A = _relayout_packed_operand(A, offset_bytes, row_pad_bytes)
+    else:
+        W = _relayout_packed_operand(W, offset_bytes, row_pad_bytes)
+
+    unpack_qdata = A.qdata if unpack_side == "a" else W.qdata
+    if unpack_fmt == "mxfp4" and row_pad_bytes == 16:
+        assert unpack_qdata.stride(0) == 272
+
+    with pytest.raises(ValueError) as exc_info:
+        gemm(A, W.mT, tuned=False)
+    assert "32" in str(exc_info.value)
+    assert "cudaError" not in str(exc_info.value)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("unpack_side", ["a", "b"])
+@pytest.mark.parametrize("unpack_fmt", ["mxfp4", "mxfp6_e2m3_packed"])
+def test_mixed_unpack_aligned_padded_numeric(unpack_side, unpack_fmt):
+    """A 32-byte-offset/padded packed view remains a valid unpack source."""
+    _skip_if_not_sm100()
+    m = n = 128
+    k = 512
+    A = _mixed_operand(unpack_fmt if unpack_side == "a" else "mxfp8_e4m3", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3" if unpack_side == "a" else unpack_fmt, n, k, seed=1)
+    if unpack_side == "a":
+        A = _relayout_packed_operand(A, offset_bytes=32, row_pad_bytes=32)
+    else:
+        W = _relayout_packed_operand(W, offset_bytes=32, row_pad_bytes=32)
+
+    unpack_qdata = A.qdata if unpack_side == "a" else W.qdata
+    assert unpack_qdata.data_ptr() % 32 == 0
+    assert all(stride == 1 or stride % 32 == 0 for stride in unpack_qdata.stride())
+    out = gemm(A, W.mT, tuned=False)
+    ref = gemm_blockscaled_ref(A, W.mT)
+    rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
+    assert rel < 5e-3, f"aligned padded {unpack_fmt} on {unpack_side}: rel_err={rel}"
+
+
+def test_mixed_fp4_unpack_k_granule_rejected():
+    """Packed sub-byte operands in mixed pairs require logical K % 128 == 0 (the
+    TMA-unpack tensormap granule). K=320 satisfies the old quantization rule
+    (K % 32 == 0) but violates the unpack granule: the mixed fp4 x fp8 pair must
+    be rejected cleanly (ValueError from the compiled arg-spec binding for fp4,
+    AssertionError from validate_blockscaled_sf for fp6), not crash or corrupt."""
+    _skip_if_not_sm100()
+    m, n, k = 256, 256, 320
+    A = _mixed_operand("mxfp4", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
+    with pytest.raises((ValueError, AssertionError)):
+        gemm(A, W.mT, tuned=False)
+
+
 def test_mixed_format_pairs():
-    """A and B carry independent formats. Unrepresentable pairs raise ValueError
-    at the interface: nvfp4 pairs only with itself (mxf4nvf4), and packed-fp4x2
-    storage cannot feed the byte-container SMEM of the mixed mxf8f6f4 kind (a
-    byte-container fp4 format is backlog). Working mixed pairs are covered by
-    test_blockscaled_gemm_mixed_fp8."""
+    """A and B carry independent formats. nvfp4 pairs only with itself
+    (kind::mxf4nvf4 - the e4m3 scales / vec-16 config is per-instruction) and
+    is rejected with ValueError at the interface. Everything else - including
+    packed sub-byte operands - is hardware-legal under kind::mxf8f6f4: the
+    packed gmem operand is TMA-unpacked into 8-bit SMEM containers, so mixed
+    packed-fp4 x fp8 pairs must NOT be rejected. (End-to-end numerics for the
+    mixed matrix: test_blockscaled_gemm_mixed.)"""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A8, B8 = _quantized_operands("mxfp8", m, n, k, batched=False)
@@ -523,36 +627,73 @@ def test_mixed_format_pairs():
     # nvfp4's mxf4nvf4 kind requires nvfp4 on both operands
     with pytest.raises(ValueError, match="cannot pair"):
         gemm(A8, B4, tuned=False)
-    # packed fp4x2 cannot join a mixed (mxf8f6f4, byte-container) pair
-    Am4, Bm4 = _quantized_operands("mxfp4", m, n, k, batched=False)
-    with pytest.raises(ValueError, match="8-bit"):
-        gemm(Am4, B8, tuned=False)
-    with pytest.raises(ValueError, match="8-bit"):
-        gemm(A8, Bm4, tuned=False)
+    with pytest.raises(ValueError, match="cannot pair"):
+        gemm(A4, B8, tuned=False)
+    # mixed packed-fp4 pairs are legal: pair legality maps to kind::mxf8f6f4
+    from quack.blockscaled.operand import (
+        MXFP4,
+        MXFP6_E2M3_PACKED,
+        MXFP8_E4M3,
+        mma_kind_for_pair,
+    )
+
+    assert mma_kind_for_pair(MXFP4, MXFP8_E4M3) == "mxf8f6f4"
+    assert mma_kind_for_pair(MXFP8_E4M3, MXFP4) == "mxf8f6f4"
+    assert mma_kind_for_pair(MXFP4, MXFP6_E2M3_PACKED) == "mxf8f6f4"
 
 
 def test_sm100_dtype_gate():
-    """Kernel dtype support is a per-architecture assert (GemmSm100), not a
-    registry property: fp6 (uint8 byte containers) is constructible and flows
-    through interface + layout validation, then dies at the SM100 gate with a
-    message naming the unsupported combination."""
+    """Kernel dtype support is a per-architecture gate
+    (GemmSm100.is_valid_dtypes_and_scale_factor_vec_size), not a registry
+    property. New world: fp6 MMA dtypes are accepted with a Uint8 copy dtype
+    (packed fp6 crosses the FFI boundary as raw bytes and is TMA-unpacked
+    in-kernel) and mixed fp4/fp8 pairs are accepted with packed-fp4 storage;
+    byte-container (one code per uint8) sub-byte storage has no kernel path."""
+    import cutlass
+
+    from quack.gemm_sm100 import GemmSm100
+
+    ok = GemmSm100.is_valid_dtypes_and_scale_factor_vec_size
+    e8m0, e4m3, bf16 = cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, cutlass.BFloat16
+    f4, f6a, f6b, u8 = (
+        cutlass.Float4E2M1FN,
+        cutlass.Float6E2M3FN,
+        cutlass.Float6E3M2FN,
+        cutlass.Uint8,
+    )
+    # fp6 MMA dtypes with Uint8 copy dtype (packed 6-bit gmem, raw bytes at FFI)
+    assert ok(f6a, e4m3, e8m0, 32, bf16, a_copy_dtype=u8)
+    assert ok(e4m3, f6b, e8m0, 32, bf16, b_copy_dtype=u8)
+    assert ok(f6a, f6b, e8m0, 32, bf16, a_copy_dtype=u8, b_copy_dtype=u8)
+    # mixed packed fp4 x fp8 (TMA unpack under kind::mxf8f6f4) and pure packed fp4
+    assert ok(f4, e4m3, e8m0, 32, bf16)
+    assert ok(e4m3, f4, e8m0, 32, bf16)
+    assert ok(f4, f4, e8m0, 32, bf16)
+    assert ok(f4, f4, e4m3, 16, bf16)  # nvfp4
+    # copy dtype must be the storage the kernel implements: byte-container fp4
+    # (one code per uint8) and non-Uint8 fp6 copy dtypes have no kernel path
+    assert not ok(f4, e4m3, e8m0, 32, bf16, a_copy_dtype=u8)
+    assert not ok(f6a, e4m3, e8m0, 32, bf16, a_copy_dtype=e4m3)
+    # vec-16 (nvfp4 scale config) requires fp4 on BOTH operands
+    assert not ok(f4, e4m3, e4m3, 16, bf16)
+    assert not ok(f6a, f6a, e4m3, 16, bf16, a_copy_dtype=u8, b_copy_dtype=u8)
+
+
+def test_fp6_k_granule_rejected():
+    """fp6 operands require logical K % 128 == 0 (the TMA unpack tensormap
+    granule): host-side validation must fail with a clear message instead of a
+    spec-binding error at compile. K=192 is quantizable (K % 32 == 0) but not
+    unpackable."""
     _skip_if_not_sm100()
-    m, k = 256, 512
+    m, n, k = 256, 256, 192
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
-    sf = BlockScaledOperand.quantize(x, "mxfp8_e4m3").scale
-    t6 = BlockScaledOperand.from_parts(
-        torch.zeros(m, k, dtype=torch.uint8, device="cuda"), sf, "mxfp6_e2m3"
-    )
-    with pytest.raises(AssertionError, match="GemmSm100 blockscaled does not support"):
-        gemm(t6, t6.mT, tuned=False)
-    # byte-container fp4 in a mixed pair: hardware-legal (kind::mxf8f6f4), but
-    # CuTe-DSL 4.6 lacks the unpacksmem/TMA-expansion machinery - same gate.
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
-    a8 = BlockScaledOperand.quantize(x, "mxfp8_e4m3")
-    b4 = BlockScaledOperand.quantize(x, "mxfp4_byte")
-    with pytest.raises(AssertionError, match="GemmSm100 blockscaled does not support"):
-        gemm(a8, b4.mT, tuned=False)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
+    a6 = BlockScaledOperand.quantize(x, "mxfp6_e2m3_packed")
+    b6 = BlockScaledOperand.quantize(w, "mxfp6_e3m2_packed")
+    assert a6.qdata.shape == (m, 3 * k // 4)  # packed 6-bit storage
+    with pytest.raises(AssertionError, match="divisible by 128"):
+        gemm(a6, b6.mT, tuned=False)
 
 
 def test_blockscaled_out_dtype_reserved():
@@ -574,9 +715,9 @@ def test_blockscaled_out_dtype_reserved():
 
 
 def test_e5m2_from_parts_kernel():
-    """mxfp8_e5m2 has no in-repo quantizer but the kernel accepts it; construct
-    via from_parts with unit e8m0 scales and check against the dequant reference.
-    (First e5m2 blockscaled kernel coverage in-repo.)"""
+    """from_parts stays a valid e5m2 construction path (pre-quantized data
+    with caller-provided scales): unit e8m0 scales, checked against the
+    dequant reference."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)
@@ -596,21 +737,40 @@ def test_e5m2_from_parts_kernel():
     assert rel < 5e-3, f"e5m2: rel_err={rel}"
 
 
-def test_gemm_act_pts_rejected():
-    """gemm_act has no alpha to fold the NVFP4 per-tensor scale into."""
+@pytest.mark.parametrize("activation", ["relu", "swiglu"])
+def test_gemm_act_pts_alpha(activation):
+    """NVFP4 per-tensor scales compose with pre-activation alpha."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n, device="cuda", dtype=torch.float32)
     xq = BlockScaledOperand.quantize(
         x, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(x.float().abs().amax())
     )
     wq = BlockScaledOperand.quantize(
         w, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(w.float().abs().amax())
     )
-    with pytest.raises(NotImplementedError, match="per-tensor scale"):
-        gemm_act(xq, wq.mT, activation="relu", tuned=False)
+    alpha = 0.375
+    ref_pre = gemm_blockscaled_ref(xq, wq.mT, alpha=alpha, out_dtype=torch.float32) + bias
+    ref_post = (
+        F.silu(ref_pre[..., ::2]) * ref_pre[..., 1::2]
+        if activation == "swiglu"
+        else F.relu(ref_pre)
+    ).to(torch.bfloat16)
+
+    def f(a, b):
+        return gemm_act(a, b, bias=bias, activation=activation, alpha=alpha, tuned=False)
+
+    for fn in (f, torch.compile(f, dynamic=False, fullgraph=True)):
+        preact, postact = fn(xq, wq.mT)
+        rel_pre = (preact.float() - ref_pre).abs().max() / ref_pre.abs().max()
+        rel_post = (postact.float() - ref_post.float()).abs().max() / (
+            ref_post.float().abs().max() + 1e-9
+        )
+        assert rel_pre < 5e-3, f"{activation}: preact rel_err={rel_pre}"
+        assert rel_post < 1e-2, f"{activation}: postact rel_err={rel_post}"
 
 
 def test_blockscaled_gemm_torch_compile_container():

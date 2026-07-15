@@ -162,8 +162,9 @@ def _concat_interleave_bias(t):
 # K-blocks, matching torchao's ``to_blocked`` and ``torch._scaled_mm``.
 # All format properties (scale vec size, element packing, scale dtype) come from
 # the BlockScaledFormat descriptor; nothing below this layer may re-derive them
-# from tensor dtypes. fp4 operands use ``torch.float4_e2m1fn_x2`` storage: shapes
-# carry packed K (two elements per byte); K here always refers to logical K.
+# from tensor dtypes. Packed operands carry the storage K extent in their shapes
+# (fp4: ``torch.float4_e2m1fn_x2``, two elements per byte -> K/2; fp6: packed
+# 6-bit uint8 bit stream -> 3*K/4 bytes); K here always refers to logical K.
 
 
 def _launch(op):
@@ -1207,10 +1208,10 @@ def gemm_blockscaled_ref(
     SFB = opB.sf.unsqueeze(0) if opB.sf.ndim == 5 else opB.sf
     sf_vec = opA.fmt.sf_vec_size
     batched = A.ndim == 3
-    a3 = A if batched else A.unsqueeze(0)  # (l, m, k_packed)
-    b3 = (B if batched else B.unsqueeze(0)).mT  # (l, n, k_packed)
-    a_val = dequant_operand(a3)  # (l, m, k) fp32
-    b_val = dequant_operand(b3)
+    a3 = A if batched else A.unsqueeze(0)  # (l, m, k_storage)
+    b3 = (B if batched else B.unsqueeze(0)).mT  # (l, n, k_storage)
+    a_val = dequant_operand(a3, opA.fmt)  # (l, m, k) fp32
+    b_val = dequant_operand(b3, opB.fmt)
     l, m, k = a_val.shape
     n = b_val.shape[1]
     sfa = unpack_scale_blocked_to_2d(SFA, m, k // sf_vec).float()

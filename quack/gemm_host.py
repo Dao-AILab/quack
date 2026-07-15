@@ -189,8 +189,8 @@ def _compile_gemm_epi(
     sf_dtype=None,
     sf_vec_size=None,
     sf_batched=True,
-    # Blockscaled MMA element types when they differ from the storage dtypes
-    # (byte-container sub-byte formats); None: same as the tensor dtypes.
+    # Blockscaled MMA element types when they differ from the boundary dtypes
+    # (packed fp6 crosses TVM-FFI as raw uint8); None: same as the tensor dtypes.
     a_mma_dtype=None,
     b_mma_dtype=None,
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
@@ -217,6 +217,8 @@ def _compile_gemm_epi(
         b_kn=b_kn,
         swap_ab=swap_ab,
         packed_cd=packed_cd,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
     )
     fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab)
     ops = _ops_by_name(GemmCls)

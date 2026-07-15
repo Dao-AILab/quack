@@ -89,6 +89,30 @@ Constraints:
 """
 
 
+def _reinterpret_packed_fp6(mT, dtype):
+    """View a (mn, 3k/4[, l]) Uint8 tensor as a (mn, k[, l]) packed-fp6 tensor.
+
+    The byte tensor holds a little-endian 6-bit stream along K (element i at
+    bits [6i, 6i+6) of its row), so the K mode (mode 1, stride 1 - sub-byte
+    operands are K-major) scales by 8/6 in extent and keeps stride 1. The K
+    EXTENT conversion is exact: K % 128 makes every row whole 96-byte groups.
+
+    The non-K STRIDE conversion (x4//3, floor) is NOT exact for byte pitches
+    that aren't multiples of 3 (e.g. a padded 416 B row pitch -> 554.67 fp6
+    elements, floored to 554 = 415.5 B). This is safe because the FFI arg
+    spec admits only 32 B-aligned pitches and the tensormap encode rounds the
+    element stride back to the nearest TMA granule, recovering the true pitch
+    exactly: the residue is < 0.75 B either way (verified bit-exact with
+    poisoned padding at pitches 416/448/544/4128, both floor and ceil -
+    AI/probe_fp6_pitch.py). The 32 B stride validation is load-bearing for
+    correctness here, not just for the tensormap's alignment rule.
+    """
+    shape = tuple(s * 4 // 3 if i == 1 else s for i, s in enumerate(mT.shape))
+    stride = tuple(st if i == 1 else st * 4 // 3 for i, st in enumerate(mT.stride))
+    ptr = cute.recast_ptr(mT.iterator, dtype=dtype)
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+
+
 class GemmSm100(GemmTmaBase):
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -157,9 +181,9 @@ class GemmSm100(GemmTmaBase):
         split_k: int = 1,
         split_k_mode: int = SplitKMode.SERIAL,
         # MMA element types when they differ from the tensor (storage/copy) dtypes:
-        # byte-container sub-byte formats (fp6, byte-fp4 under kind::mxf8f6f4) store
-        # one code per uint8 in gmem/SMEM while the instruction computes in the
-        # sub-byte type. None: same as the tensor dtype.
+        # packed fp6 crosses the FFI boundary as raw uint8 bytes (torch has no fp6
+        # dtype) and is reinterpreted in-kernel to the fp6 MMA type. None: same as
+        # the tensor dtype.
         a_mma_dtype: Optional[Type[cutlass.Numeric]] = None,
         b_mma_dtype: Optional[Type[cutlass.Numeric]] = None,
     ):
@@ -345,7 +369,9 @@ class GemmSm100(GemmTmaBase):
                 f"(storage {self.a_dtype}), B={self.b_mma_dtype} (storage {self.b_dtype}), "
                 f"SF={self.sf_dtype}, sf_vec_size={self.sf_vec_size}, D={self.d_dtype}"
             )
-            self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            # quack's wrapper, not the DSL helper: both-fp4 pairs always run
+            # the single kind::mxf4nvf4 atom with the format's scale config.
+            self.tiled_mma = quack_sm100_utils.make_blockscaled_trivial_tiled_mma(
                 self.a_mma_dtype,
                 self.b_mma_dtype,
                 self.a_major_mode,
@@ -358,6 +384,12 @@ class GemmSm100(GemmTmaBase):
 
         # Compute mma/cluster/tile shapes
         if self.mma_tiler[2] > 0:
+            if const_expr(self.blockscaled):
+                sf_chunk_k = self.sf_vec_size * 4
+                assert self.mma_tiler[2] % sf_chunk_k == 0, (
+                    f"Blockscaled MMA tiler K ({self.mma_tiler[2]}) must be divisible by "
+                    f"the scale-factor chunk K ({sf_chunk_k})"
+                )
             assert self.mma_tiler[2] % self.mma_inst_shape_mnk[2] == 0, (
                 f"MMA tiler K ({self.mma_tiler[2]}) must be divisible by "
                 f"MMA instruction K ({self.mma_inst_shape_mnk[2]})"
@@ -460,8 +492,8 @@ class GemmSm100(GemmTmaBase):
             self.mma_tiler,
             self.cta_tile_shape_mnk,
             self.epi_tile,
-            self.a_dtype,
-            self.b_dtype,
+            self.a_smem_dtype,
+            self.b_smem_dtype,
             self.sf_dtype,
             self.sf_vec_size,
             self.d_dtype,
@@ -490,7 +522,7 @@ class GemmSm100(GemmTmaBase):
 
         # Compute A/B/SFA/SFB/C shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
+            self.tiled_mma, self.mma_tiler, self.a_smem_dtype, self.ab_stage
         )
         self.a_smem_load_layout_staged = self.a_smem_layout_staged
         if const_expr(self.gather_A):
@@ -503,7 +535,7 @@ class GemmSm100(GemmTmaBase):
                     self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
                 )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            self.tiled_mma, self.mma_tiler, self.b_dtype, self.ab_stage
+            self.tiled_mma, self.mma_tiler, self.b_smem_dtype, self.ab_stage
         )
         self.epi_smem_layout_staged = None
         if const_expr(self.d_dtype is not None):
@@ -618,13 +650,44 @@ class GemmSm100(GemmTmaBase):
             else mT
             for name, mT in [("A", mA), ("B", mB), ("out", mD), ("C", mC)]
         ]
+        # Packed 6-bit operands cross the FFI boundary as raw bytes (torch has
+        # no fp6 dtype): reinterpret (mn, 3k/4[, l]) Uint8 as (mn, k[, l]) fp6.
+        # The fp6-typed gmem tensor is what selects the U6_UNPACK_U8 unpack
+        # tensormap in the TMA atom builder.
+        if const_expr(self.a_mma_dtype is not None and self.a_mma_dtype.width == 6):
+            mA = _reinterpret_packed_fp6(mA, self.a_mma_dtype)
+        if const_expr(self.b_mma_dtype is not None and self.b_mma_dtype.width == 6):
+            mB = _reinterpret_packed_fp6(mB, self.b_mma_dtype)
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type  # storage/copy dtype (smem layouts, TMA, sizes)
         self.b_dtype = mB.element_type
         # MMA element types default to the storage dtypes (identical except for
-        # byte-container sub-byte formats).
+        # packed fp6, whose FFI-boundary dtype was Uint8 before the reinterpret
+        # above - post-reinterpret they coincide too).
         self.a_mma_dtype = self.a_mma_dtype if self.a_mma_dtype is not None else self.a_dtype
         self.b_mma_dtype = self.b_mma_dtype if self.b_mma_dtype is not None else self.b_dtype
+        # TMA-unpack operands: a packed sub-byte gmem operand under tcgen05
+        # kind::mxf8f6f4 (any blockscaled pair other than both-packed-fp4,
+        # which runs the denser kind::mxf4nvf4). TMA expands the packed
+        # stream to one byte of smem footprint per element (TmaDataFormat
+        # U4_UNPACK_U8/U6_UNPACK_U8 via internal_type=Uint8), so ALL smem-side
+        # accounting - layout atom selection, storage, capacity - is byte-domain
+        # (Uint8), mirroring CUTLASS C++ SmemAllocType. The sub-byte identity
+        # survives only in (1) the gmem tensor's element type (which selects the
+        # tensormap format) and (2) the MMA instruction descriptor via
+        # a/b_mma_dtype. The Uint8-typed smem tensor feeds make_fragment_A/B
+        # directly: the smem descriptor is built from width x stride products,
+        # and the byte layout is the convention kind::mxf8f6f4 expects.
+        if const_expr(self.blockscaled):
+            both_packed_fp4 = (
+                self.a_dtype is cutlass.Float4E2M1FN and self.b_dtype is cutlass.Float4E2M1FN
+            )
+            self.a_unpack = self.a_dtype.width < 8 and not both_packed_fp4
+            self.b_unpack = self.b_dtype.width < 8 and not both_packed_fp4
+        else:
+            self.a_unpack, self.b_unpack = False, False
+        self.a_smem_dtype = cutlass.Uint8 if self.a_unpack else self.a_dtype
+        self.b_smem_dtype = cutlass.Uint8 if self.b_unpack else self.b_dtype
         self.d_dtype = mD.element_type if mD is not None else None
         self.c_dtype = mC.element_type if mC is not None else None
         self.sf_dtype: Optional[Type[cutlass.Numeric]] = (
@@ -703,7 +766,13 @@ class GemmSm100(GemmTmaBase):
                 self.mma_tiler,
                 self.tiled_mma,
                 self.cluster_layout_vmnk.shape,
-                internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
+                # Uint8 internal type + sub-byte gmem element selects the
+                # U4/U6_UNPACK_U8 tensormap (packed gmem -> byte-container smem).
+                internal_type=(
+                    cutlass.Uint8
+                    if const_expr(self.a_unpack)
+                    else (cutlass.TFloat32 if mA.element_type is Float32 else None)
+                ),
             )
         elif const_expr(self.use_tma_gather):
             # gather4 descriptor: box has 1 in the gathered dim, tile size in the contiguous dim.
@@ -729,7 +798,11 @@ class GemmSm100(GemmTmaBase):
             self.mma_tiler,
             self.tiled_mma,
             self.cluster_layout_vmnk.shape,
-            internal_type=(cutlass.TFloat32 if mB.element_type is Float32 else None),
+            internal_type=(
+                cutlass.Uint8
+                if const_expr(self.b_unpack)
+                else (cutlass.TFloat32 if mB.element_type is Float32 else None)
+            ),
         )
 
         tma_atom_sfa, tma_tensor_sfa = None, None
@@ -791,6 +864,11 @@ class GemmSm100(GemmTmaBase):
                 sfb_window_layout.shape,
             )
 
+        # Transaction bytes are counted with the GMEM dtype: for unpack operands
+        # the layout is byte-domain (cosize == smem footprint bytes) but TMA
+        # reports only the packed data bytes it copies (elements x 4 or 6 bits;
+        # the intra-16B gaps are not written), matching CUTLASS C++
+        # (sizeof_bits<ElementA> x cosize of the uint8-alloc smem layout).
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         if const_expr(not self.gather_A or self.use_tma_gather):
             self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
@@ -883,12 +961,16 @@ class GemmSm100(GemmTmaBase):
             epi: self.epi_get_smem_struct(epilogue_params)
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
-                cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
+                cute.struct.MemRange[
+                    self.a_smem_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                ],
                 self.buffer_align_bytes,
             ]
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
-                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
+                cute.struct.MemRange[
+                    self.b_smem_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                ],
                 self.buffer_align_bytes,
             ]
             # (MMA, MMA_M, MMA_K, STAGE)
@@ -2668,14 +2750,13 @@ class GemmSm100(GemmTmaBase):
 
     @staticmethod
     def _blockscaled_mma_inst_k(a_copy_dtype, b_copy_dtype) -> int:
-        """Instruction K is a property of the MMA kind: kind::mxf4/mxf4nvf4 (both
-        operands PACKED fp4 - storage dtype Float4E2M1FN) consume 64 elements per
-        instruction; kind::mxf8f6f4 (everything else, incl. mixed A/B and
-        byte-container sub-byte operands whose storage is Uint8) consumes 32.
-        Keyed on the storage dtypes precisely so byte-container fp4 takes the 32
-        path. Mirrors quack.blockscaled.operand.mma_kind_for_pair (which keys on
-        format names at the torch layer) - keep the two in sync;
-        test_mma_kind_mirrors_kernel_inst_k pins the correspondence.
+        """Instruction K is a property of the MMA kind: kind::mxf4nvf4 (both
+        operands packed fp4 - ONE atom parameterized by the format's scale
+        config: vec 32 e8m0 = mxfp4, vec 16 = nvfp4) consumes 64 elements per
+        instruction; kind::mxf8f6f4 (everything else - mixed A/B pairs and fp6,
+        with sub-byte operands TMA-unpacked into byte-container smem) consumes
+        32. Mirrors quack.blockscaled.operand.mma_kind_for_pair; keep the two in
+        sync. test_mma_kind_mirrors_kernel_inst_k pins the correspondence.
         """
         both_packed_fp4 = (
             a_copy_dtype is cutlass.Float4E2M1FN and b_copy_dtype is cutlass.Float4E2M1FN
@@ -2695,11 +2776,10 @@ class GemmSm100(GemmTmaBase):
         """
         The per-architecture support gate: which (A, B, SF, D) dtype combinations
         THIS kernel implements. ``a_dtype``/``b_dtype`` are the MMA element types;
-        ``a/b_copy_dtype`` the storage dtypes (None: same - byte-container sub-byte
-        formats store Uint8). (Hardware pair legality is a separate, wider set -
-        see quack.blockscaled.operand.mma_kind_for_pair; the vec-16-requires-fp4
-        and mixed-pair constraints below are this kernel's subset of those kind
-        rules and must stay consistent with them.)
+        ``a/b_copy_dtype`` the storage dtypes as seen at the FFI boundary (None:
+        same; packed fp6 arrives as raw Uint8 bytes). (Hardware pair legality is
+        a separate, wider set - see quack.blockscaled.operand.mma_kind_for_pair;
+        this kernel's subset must stay consistent with those kind rules.)
 
         :param a_dtype: The data type of the A operand
         :type a_dtype: Type[cutlass.Numeric]
@@ -2719,26 +2799,24 @@ class GemmSm100(GemmTmaBase):
         a_copy_dtype = a_dtype if a_copy_dtype is None else a_copy_dtype
         b_copy_dtype = b_dtype if b_copy_dtype is None else b_copy_dtype
 
-        # Per-operand MMA element types this kernel implements. The hardware
-        # (tcgen05 kind::mxf8f6f4) admits any fp8/fp6/fp4 element mix with
-        # sub-byte elements in 8-bit SMEM containers, and CUTLASS C++ reaches it
-        # via *_unpacksmem_t element types + TMA sub-byte->container expansion
-        # (CU_TENSOR_MAP_DATA_TYPE_16U4/16U6_ALIGN16B). CuTe-DSL 4.6 ships NONE
-        # of that machinery (no unpacksmem analogue, no expansion tensormaps;
-        # its own blockscaled example enforces a_dtype == b_dtype), and both
-        # byte-container encodings fail empirically (wrong results / compiler
-        # ICE + misaligned address). Until the DSL grows this support, mixed
-        # pairs are fp8 x fp8 only, and sub-byte types run only via the packed
-        # both-fp4 kinds (mxf4/mxf4nvf4). The a/b_mma_dtype plumbing is in place
-        # for when it does.
+        # Per-operand MMA element types this kernel implements. Mixed A/B pairs
+        # (and any sub-byte operand outside both-packed-fp4) run tcgen05
+        # kind::mxf8f6f4: the packed sub-byte gmem operand is expanded by TMA
+        # into 8-bit smem containers (CU_TENSOR_MAP_DATA_TYPE_16U4/16U6_ALIGN16B,
+        # selected via internal_type=Uint8). Both-packed-fp4 runs the denser
+        # kind::mxf4nvf4 (one atom, scale config from the format). Storage must
+        # be the packed sub-byte dtype itself;
+        # byte-container (Uint8-per-element) storage has no kernel path.
         fp8 = {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
-        supported = fp8 | {cutlass.Float4E2M1FN}
+        sub_byte = {cutlass.Float4E2M1FN, cutlass.Float6E2M3FN, cutlass.Float6E3M2FN}
+        supported = fp8 | sub_byte
         if a_dtype not in supported or b_dtype not in supported:
             is_valid = False
-        if a_copy_dtype is not a_dtype or b_copy_dtype is not b_dtype:
-            is_valid = False  # byte-container storage: no DSL path (see above)
-        if a_dtype != b_dtype and not (a_dtype in fp8 and b_dtype in fp8):
-            is_valid = False
+        # Copy dtype: the packed sub-byte dtype itself, except packed fp6 which
+        # crosses the FFI boundary as raw bytes and is reinterpreted in-kernel.
+        for mma_dt, copy_dt in ((a_dtype, a_copy_dtype), (b_dtype, b_copy_dtype)):
+            if copy_dt is not mma_dt and not (mma_dt.width == 6 and copy_dt is cutlass.Uint8):
+                is_valid = False
 
         # Check valid sf_vec_size
         if sf_vec_size not in {16, 32}:
@@ -2866,7 +2944,9 @@ class GemmSm100(GemmTmaBase):
         def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
             major_mode_idx = 0 if is_mode0_major else 1
             num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
+            # fp6 has no 16-byte packing quantum (16 * 8 / 6 is fractional); its
+            # ALIGN16B unpack tensormap instead requires 128-element granularity.
+            num_contiguous_elements = 128 if dtype.width == 6 else 16 * 8 // dtype.width
             return num_major_elements % num_contiguous_elements == 0
 
         b_dtype = ab_dtype if b_dtype is None else b_dtype
@@ -2879,60 +2959,9 @@ class GemmSm100(GemmTmaBase):
         return is_valid
 
     @staticmethod
-    def can_implement_blockscaled(
-        a_dtype: Type[cutlass.Numeric],
-        b_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        d_dtype: Type[cutlass.Numeric],
-        mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]],
-        cluster_shape_mn: Tuple[int, int],
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        a_major: str,
-        b_major: str,
-        d_major: str,
-        a_copy_dtype: Optional[Type[cutlass.Numeric]] = None,
-        b_copy_dtype: Optional[Type[cutlass.Numeric]] = None,
-    ) -> bool:
-        can_implement = True
-        if not GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
-            a_dtype,
-            b_dtype,
-            sf_dtype,
-            sf_vec_size,
-            d_dtype,
-            a_copy_dtype=a_copy_dtype,
-            b_copy_dtype=b_copy_dtype,
-        ):
-            can_implement = False
-        sub_byte = {cutlass.Float4E2M1FN, cutlass.Float6E2M3FN, cutlass.Float6E3M2FN}
-        if (a_dtype in sub_byte or b_dtype in sub_byte) and not (a_major == "k" and b_major == "k"):
-            can_implement = False
-        if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
-            mma_tiler_mnk, cluster_shape_mn, blockscaled=True
-        ):
-            can_implement = False
-        if not GemmSm100.is_valid_tensor_alignment(
-            m,
-            n,
-            k,
-            l,
-            a_copy_dtype if a_copy_dtype is not None else a_dtype,
-            d_dtype,
-            a_major,
-            b_major,
-            d_major,
-            b_dtype=b_copy_dtype if b_copy_dtype is not None else b_dtype,
-        ):
-            can_implement = False
-        return can_implement
-
-    @staticmethod
     def can_implement(
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype,
+        b_dtype,
         acc_dtype: Type[cutlass.Numeric],
         d_dtype: Type[cutlass.Numeric],
         mma_tiler_mnk: Union[Tuple[int, int], Tuple[int, int, int]],
@@ -2948,8 +2977,17 @@ class GemmSm100(GemmTmaBase):
         """
         Check if the gemm can be implemented
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        Polymorphic over the operand kind: ``a_dtype`` / ``b_dtype`` are either
+        both plain cutlass dtypes, selecting the dense kernel checks, or both
+        :class:`quack.blockscaled.operand.BlockScaledFormat` descriptors,
+        selecting the blockscaled checks with all format properties (scale
+        config, storage dtype, packing) read from the descriptors. One of each
+        is rejected.
+
+        :param a_dtype: The data type of the A operand, or its blockscaled format
+        :type a_dtype: Union[Type[cutlass.Numeric], BlockScaledFormat]
+        :param b_dtype: The data type of the B operand, or its blockscaled format
+        :type b_dtype: Union[Type[cutlass.Numeric], BlockScaledFormat]
         :param acc_dtype: The data type of the accumulator
         :type acc_dtype: Type[cutlass.Numeric]
         :param d_dtype: The data type of the output tensor
@@ -2976,18 +3014,100 @@ class GemmSm100(GemmTmaBase):
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
         """
+        # Lazy import: blockscaled/__init__ pulls blockscaled/utils, which
+        # imports the kernel layer - a top-level import here would be circular.
+        from quack.blockscaled.operand import BlockScaledFormat
+        from quack.cute_dsl_utils import torch2cute_dtype_map
+
+        a_is_blockscaled = isinstance(a_dtype, BlockScaledFormat)
+        b_is_blockscaled = isinstance(b_dtype, BlockScaledFormat)
+        if a_is_blockscaled != b_is_blockscaled:
+            return False
+        if not a_is_blockscaled:
+            # Dense kernel: A and B must share one dtype.
+            if a_dtype is not b_dtype:
+                return False
+            ab_dtype = a_dtype
+            can_implement = True
+            # Skip unsupported types
+            if not GemmSm100.is_valid_dtypes(
+                ab_dtype, ab_dtype, acc_dtype, d_dtype, a_major, b_major
+            ):
+                can_implement = False
+            # Skip invalid mma tile shape and cluster shape
+            if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
+                mma_tiler_mnk, cluster_shape_mn, blockscaled=False
+            ):
+                can_implement = False
+            # Skip illegal problem shape for load/store alignment
+            if not GemmSm100.is_valid_tensor_alignment(
+                m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major
+            ):
+                can_implement = False
+            return can_implement
+        # Blockscaled: everything derives from the format descriptors.
+        fmt_a, fmt_b = a_dtype, b_dtype
+        # Deprecated byte-container sub-byte formats are host-side migration
+        # inputs only; actual dispatch rejects them before kernel selection.
+        if fmt_a.is_byte_container or fmt_b.is_byte_container:
+            return False
+        # tcgen05 blockscaled MMA accumulates in f32 only.
+        if acc_dtype is not Float32:
+            return False
+        # The scale config is instruction-wide: both operands must share the
+        # scale dtype and vec size (this also rejects nvfp4 mixed with anything
+        # else).
+        if fmt_a.scale_dtype != fmt_b.scale_dtype or fmt_a.sf_vec_size != fmt_b.sf_vec_size:
+            return False
+        a_mma_dtype = fmt_a.to_cutlass_dtype()
+        b_mma_dtype = fmt_b.to_cutlass_dtype()
+        a_copy_dtype = torch2cute_dtype_map[fmt_a.qdata_dtype]
+        b_copy_dtype = torch2cute_dtype_map[fmt_b.qdata_dtype]
+        sf_dtype = torch2cute_dtype_map[fmt_a.scale_dtype]
+        sf_vec_size = fmt_a.sf_vec_size
         can_implement = True
-        # Skip unsupported types
-        if not GemmSm100.is_valid_dtypes(ab_dtype, ab_dtype, acc_dtype, d_dtype, a_major, b_major):
-            can_implement = False
-        # Skip invalid mma tile shape and cluster shape
-        if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
-            mma_tiler_mnk, cluster_shape_mn, blockscaled=False
+        if (
+            len(mma_tiler_mnk) == 3
+            and mma_tiler_mnk[2] > 0
+            and mma_tiler_mnk[2] % (sf_vec_size * 4) != 0
         ):
             can_implement = False
-        # Skip illegal problem shape for load/store alignment
+        if not GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
+            a_mma_dtype,
+            b_mma_dtype,
+            sf_dtype,
+            sf_vec_size,
+            d_dtype,
+            a_copy_dtype=a_copy_dtype,
+            b_copy_dtype=b_copy_dtype,
+        ):
+            can_implement = False
+        sub_byte = {cutlass.Float4E2M1FN, cutlass.Float6E2M3FN, cutlass.Float6E3M2FN}
+        if (a_mma_dtype in sub_byte and a_major != "k") or (
+            b_mma_dtype in sub_byte and b_major != "k"
+        ):
+            can_implement = False
+        # TMA-unpack operands (sub-byte under kind::mxf8f6f4, i.e. any pair other
+        # than both-packed-fp4) use the ALIGN16B tensormap formats, which require
+        # the contiguous gmem extent to be a multiple of 128 elements.
+        both_fp4 = a_mma_dtype is cutlass.Float4E2M1FN and b_mma_dtype is cutlass.Float4E2M1FN
+        if (a_mma_dtype in sub_byte or b_mma_dtype in sub_byte) and not both_fp4 and k % 128 != 0:
+            can_implement = False
+        if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mnk, cluster_shape_mn, blockscaled=True
+        ):
+            can_implement = False
         if not GemmSm100.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major
+            m,
+            n,
+            k,
+            l,
+            a_copy_dtype,
+            d_dtype,
+            a_major,
+            b_major,
+            d_major,
+            b_dtype=b_copy_dtype,
         ):
             can_implement = False
         return can_implement
