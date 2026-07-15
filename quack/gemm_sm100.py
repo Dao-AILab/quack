@@ -94,9 +94,18 @@ def _reinterpret_packed_fp6(mT, dtype):
 
     The byte tensor holds a little-endian 6-bit stream along K (element i at
     bits [6i, 6i+6) of its row), so the K mode (mode 1, stride 1 - sub-byte
-    operands are K-major) scales by 8/6 in extent and keeps stride 1, while
-    the other modes' byte strides convert exactly to fp6-element strides
-    (x8/6): K %128 makes every row span whole 96-byte groups.
+    operands are K-major) scales by 8/6 in extent and keeps stride 1. The K
+    EXTENT conversion is exact: K % 128 makes every row whole 96-byte groups.
+
+    The non-K STRIDE conversion (x4//3, floor) is NOT exact for byte pitches
+    that aren't multiples of 3 (e.g. a padded 416 B row pitch -> 554.67 fp6
+    elements, floored to 554 = 415.5 B). This is safe because the FFI arg
+    spec admits only 32 B-aligned pitches and the tensormap encode rounds the
+    element stride back to the nearest TMA granule, recovering the true pitch
+    exactly: the residue is < 0.75 B either way (verified bit-exact with
+    poisoned padding at pitches 416/448/544/4128, both floor and ceil -
+    AI/probe_fp6_pitch.py). The 32 B stride validation is load-bearing for
+    correctness here, not just for the tensormap's alignment rule.
     """
     shape = tuple(s * 4 // 3 if i == 1 else s for i, s in enumerate(mT.shape))
     stride = tuple(st if i == 1 else st * 4 // 3 for i, st in enumerate(mT.stride))
