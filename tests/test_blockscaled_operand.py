@@ -15,8 +15,11 @@ import torch
 from quack.blockscaled.operand import (
     BLOCKSCALED_FORMAT_REGISTRY,
     MXFP4,
+    MXFP4_BYTE,
     MXFP6_E2M3,
+    MXFP6_E2M3_PACKED,
     MXFP6_E3M2,
+    MXFP6_E3M2_PACKED,
     MXFP8_E4M3,
     MXFP8_E5M2,
     NVFP4,
@@ -24,7 +27,15 @@ from quack.blockscaled.operand import (
     BlockScaledOperand,
 )
 
-FORMATS = [MXFP8_E4M3, MXFP4, NVFP4, MXFP6_E2M3, MXFP6_E3M2]
+FORMATS = [
+    MXFP8_E4M3,
+    MXFP4,
+    NVFP4,
+    MXFP6_E2M3,
+    MXFP6_E3M2,
+    MXFP6_E2M3_PACKED,
+    MXFP6_E3M2_PACKED,
+]
 
 
 def _quantize(fmt, m=256, k=256, batched=False, seed=0):
@@ -38,8 +49,15 @@ def _quantize(fmt, m=256, k=256, batched=False, seed=0):
 
 
 def test_format_registry_and_legacy_names():
+    import quack.blockscaled as blockscaled
+
     assert BlockScaledFormat.from_name("mxfp8") is MXFP8_E4M3  # legacy short name
     assert BlockScaledFormat.from_name("nvfp4") is NVFP4
+    assert BlockScaledFormat.from_name("mxfp6_e2m3") is MXFP6_E2M3
+    assert BlockScaledFormat.from_name("mxfp6_e2m3_packed") is MXFP6_E2M3_PACKED
+    assert MXFP6_E2M3.is_byte_container and not MXFP6_E2M3_PACKED.is_byte_container
+    assert blockscaled.MXFP4_BYTE is MXFP4_BYTE
+    assert blockscaled.to_mxfp4_byte is not None
     with pytest.raises(ValueError, match="unknown blockscaled format"):
         BlockScaledFormat.from_name("fp8")
     for fmt in BLOCKSCALED_FORMAT_REGISTRY.values():
@@ -49,17 +67,40 @@ def test_format_registry_and_legacy_names():
 def test_format_k_mapping():
     """logical<->storage K mapping derives from elem_bits and the torch storage
     element width: fp8 identity, fp4x2 ratio 2, packed fp6 (uint8) ratio 4/3."""
-    assert not MXFP8_E4M3.is_packed and MXFP4.is_packed and MXFP6_E2M3.is_packed
+    assert not MXFP8_E4M3.is_packed and MXFP4.is_packed and MXFP6_E2M3_PACKED.is_packed
     assert MXFP8_E4M3.storage_k(384) == 384 and MXFP8_E4M3.logical_k(384) == 384
     assert MXFP4.storage_k(384) == 192 and MXFP4.logical_k(192) == 384
     assert NVFP4.storage_k(384) == 192
-    for fmt in (MXFP6_E2M3, MXFP6_E3M2):
+    for fmt in (MXFP6_E2M3_PACKED, MXFP6_E3M2_PACKED):
         assert fmt.storage_k(384) == 288 and fmt.logical_k(288) == 384
+    for fmt in (MXFP4_BYTE, MXFP6_E2M3, MXFP6_E3M2):
+        assert not fmt.is_packed and fmt.is_byte_container
+        assert fmt.storage_k(384) == 384 and fmt.logical_k(384) == 384
     # non-whole mappings are loud errors (fp6 rows are whole 3-byte groups)
     with pytest.raises(ValueError, match="whole storage"):
-        MXFP6_E2M3.storage_k(30)  # 180 bits: not whole bytes
+        MXFP6_E2M3_PACKED.storage_k(30)  # 180 bits: not whole bytes
     with pytest.raises(ValueError, match="whole packed groups"):
-        MXFP6_E2M3.logical_k(100)  # 100 bytes: not whole 3-byte groups
+        MXFP6_E2M3_PACKED.logical_k(100)  # 100 bytes: not whole 3-byte groups
+
+
+def test_format_legacy_positional_order_and_validation():
+    """The public constructor keeps the origin/main positional field order."""
+    fmt = BlockScaledFormat(
+        "legacy_fp4", torch.uint8, "Float4E2M1FN", 4, 1, torch.float8_e8m0fnu, 32
+    )
+    assert fmt.elems_per_container == 1
+    assert fmt.scale_dtype == torch.float8_e8m0fnu and fmt.sf_vec_size == 32
+    assert fmt.storage_layout is None and fmt.is_byte_container
+    # A call written against the short-lived signature without
+    # elems_per_container must fail, not silently shift all later fields.
+    with pytest.raises(TypeError, match="elems_per_container"):
+        BlockScaledFormat(
+            "shifted", torch.uint8, None, 4, torch.float8_e8m0fnu, 32, False
+        )
+    with pytest.raises(ValueError, match="do not fit"):
+        BlockScaledFormat(
+            "overfull", torch.uint8, None, 6, 2, torch.float8_e8m0fnu, 32
+        )
 
 
 def test_format_from_cutlass_dtypes():
@@ -79,8 +120,9 @@ def test_format_from_cutlass_dtypes():
     )
     assert (
         BlockScaledFormat.from_cutlass_dtypes(cutlass.Float6E2M3FN, cutlass.Float8E8M0FNU, 32)
-        is MXFP6_E2M3
+        is MXFP6_E2M3_PACKED
     )
+    assert MXFP6_E2M3.is_byte_container  # byte descriptors are never inferred for GEMM
     with pytest.raises(ValueError, match="no blockscaled format"):
         BlockScaledFormat.from_cutlass_dtypes(cutlass.Float8E4M3FN, cutlass.Float8E4M3FN, 32)
 
@@ -181,8 +223,25 @@ def test_pack_uint6_bit_layout():
         unpack_uint6(torch.zeros(4, dtype=torch.uint8, device="cuda"))
 
 
+def test_unversioned_fp6_quantizer_keeps_byte_container_contract():
+    from quack.blockscaled.quantize import (
+        to_mxfp6_e2m3,
+        to_mxfp6_e2m3_packed,
+        unpack_uint6,
+    )
+
+    x = torch.randn(7, 128, dtype=torch.bfloat16, device="cuda").contiguous()
+    q_byte, sf_byte = to_mxfp6_e2m3(x)
+    q_packed, sf_packed = to_mxfp6_e2m3_packed(x)
+    assert q_byte.shape == x.shape
+    assert q_packed.shape == (7, 96)
+    assert torch.equal(unpack_uint6(q_packed), q_byte)
+    assert torch.equal(sf_packed.view(torch.uint8), sf_byte.view(torch.uint8))
+
+
 @pytest.mark.parametrize(
-    "fmt_name, max_tol, norm_tol", [("mxfp6_e2m3", 0.12, 0.05), ("mxfp6_e3m2", 0.25, 0.10)]
+    "fmt_name,max_tol,norm_tol",
+    [("mxfp6_e2m3_packed", 0.12, 0.05), ("mxfp6_e3m2_packed", 0.25, 0.10)],
 )
 def test_packed_fp6_quantize_roundtrip(fmt_name, max_tol, norm_tol):
     """Packed fp6 qdata is a uint8 6-bit bit stream: 4 codes per 3 bytes, so
@@ -213,6 +272,75 @@ def test_packed_fp6_quantize_roundtrip(fmt_name, max_tol, norm_tol):
     # transpose semantics hold for packed fp6 (quant_dim pinned to the packed dim)
     assert t.mT.shape == (k, m) and t.mT.quant_dim == -2
     assert torch.equal(t.mT.dequantize(torch.float32), dq.mT)
+
+
+@pytest.mark.parametrize(
+    "fmt,max_tol",
+    [(MXFP4_BYTE, 0.6), (MXFP6_E2M3, 0.12), (MXFP6_E3M2, 0.25)],
+    ids=lambda f: f.name if isinstance(f, BlockScaledFormat) else str(f),
+)
+def test_byte_container_compatibility_roundtrip_and_gemm_rejection(fmt, max_tol):
+    """Deprecated byte formats remain host-side lossless compatibility paths."""
+    from quack.blockscaled.operand import mma_kind_for_pair
+
+    m, k = 7, 96
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
+    t = BlockScaledOperand.quantize(x, fmt)
+    assert t.qdata.dtype == torch.uint8 and t.qdata.shape == (m, k)
+    assert t.shape == (m, k) and t.quant_dim == -1
+    dq = t.dequantize(torch.float32)
+    rel = ((dq - x.float()).abs().max() / x.float().abs().max()).item()
+    assert rel < max_tol
+    packed = t.to_packed()
+    target = {
+        MXFP4_BYTE: MXFP4,
+        MXFP6_E2M3: MXFP6_E2M3_PACKED,
+        MXFP6_E3M2: MXFP6_E3M2_PACKED,
+    }[fmt]
+    assert packed.format is target and packed.shape == t.shape
+    assert packed.qdata.shape[-1] == target.storage_k(k)
+    assert torch.equal(packed.dequantize(torch.float32), dq)
+    with pytest.raises(ValueError, match="byte-per-element.*host-side compatibility"):
+        mma_kind_for_pair(t.format, MXFP8_E4M3)
+
+
+def test_to_packed_canonicalizes_interim_name_and_rejects_custom_recipe():
+    x, byte = _quantize(MXFP6_E2M3, m=7, k=128)
+    packed = byte.to_packed()
+    interim_fmt = BlockScaledFormat(
+        "mxfp6_e2m3",
+        torch.uint8,
+        "Float6E2M3FN",
+        6,
+        1,
+        torch.float8_e8m0fnu,
+        32,
+        storage_layout="packed_lsb_v1",
+    )
+    interim = BlockScaledOperand.from_parts(packed.qdata, packed.scale, interim_fmt)
+    canonical = interim.to_packed()
+    assert canonical.format is MXFP6_E2M3_PACKED
+    assert canonical.qdata is interim.qdata and canonical.scale is interim.scale
+    assert torch.equal(canonical.dequantize(torch.float32), interim.dequantize(torch.float32))
+    quantized = BlockScaledOperand.quantize(x, interim_fmt)
+    explicit = BlockScaledOperand.quantize(x, MXFP6_E2M3_PACKED)
+    assert quantized.format is MXFP6_E2M3_PACKED and quantized.qdata.shape == (7, 96)
+    assert torch.equal(quantized.qdata, explicit.qdata)
+    assert torch.equal(quantized.scale.view(torch.uint8), explicit.scale.view(torch.uint8))
+
+    custom_vec64 = BlockScaledFormat(
+        "customer_fp6_vec64",
+        torch.uint8,
+        "Float6E2M3FN",
+        6,
+        1,
+        torch.float8_e8m0fnu,
+        64,
+    )
+    custom = BlockScaledOperand.from_parts(byte.qdata, byte.scale, custom_vec64)
+    with pytest.raises(ValueError, match="recipe.*does not match"):
+        custom.to_packed()
 
 
 def test_e5m2_from_parts_but_no_quantizer():
@@ -308,6 +436,134 @@ def test_save_load_weights_only():
     assert torch.equal(t2.scale.view(torch.uint8), t.scale.view(torch.uint8))
 
 
+def test_origin_main_byte_fp6_pickle_migrates_without_reinterpretation():
+    """An old descriptor has no storage_layout field and canonical fp6 name.
+
+    Loading must materialize the missing default as legacy byte-container
+    semantics. K=96 is deliberately divisible by three: blindly applying the
+    new packed ratio would look superficially valid while changing logical K
+    to 128.
+    """
+    import torch.utils._pytree as pytree
+
+    from quack.blockscaled.operand import _unflatten, mma_kind_for_pair
+
+    x = torch.randn(5, 96, device="cuda", dtype=torch.bfloat16)
+    byte_op = BlockScaledOperand.quantize(x, MXFP6_E2M3)
+    name_only = BlockScaledOperand.from_parts(
+        byte_op.qdata, byte_op.scale, "mxfp6_e2m3", orig_dtype=torch.bfloat16
+    )
+    assert name_only.format is MXFP6_E2M3 and name_only.shape == (5, 96)
+    assert torch.equal(name_only.dequantize(torch.float32), byte_op.dequantize(torch.float32))
+    old_fmt = object.__new__(BlockScaledFormat)
+    for name, value in (
+        ("name", "mxfp6_e2m3"),
+        ("qdata_dtype", torch.uint8),
+        ("cutlass_dtype_name", "Float6E2M3FN"),
+        ("elem_bits", 6),
+        ("elems_per_container", 1),
+        ("scale_dtype", torch.float8_e8m0fnu),
+        ("sf_vec_size", 32),
+        ("has_per_tensor_scale", False),
+    ):
+        object.__setattr__(old_fmt, name, value)
+    assert "storage_layout" not in old_fmt.__dict__
+    old_op = BlockScaledOperand.from_parts(
+        byte_op.qdata, byte_op.scale, old_fmt, orig_dtype=torch.bfloat16
+    )
+
+    buf = io.BytesIO()
+    torch.save(old_op, buf)
+    buf.seek(0)
+    loaded = torch.load(buf, weights_only=True)
+    assert loaded.format.name == "mxfp6_e2m3"
+    assert loaded.format.storage_layout is None
+    assert "storage_layout" in loaded.format.__dict__
+    assert loaded.format.is_byte_container and loaded.shape == (5, 96)
+    assert loaded.format == MXFP6_E2M3
+    assert hash(loaded.format) == hash(old_fmt)
+    assert torch.equal(loaded.dequantize(torch.float32), byte_op.dequantize(torch.float32))
+    migrated = loaded.to_packed()
+    assert migrated.format is MXFP6_E2M3_PACKED and migrated.shape == (5, 96)
+    assert migrated.qdata.shape == (5, 72)
+    assert torch.equal(migrated.dequantize(torch.float32), loaded.dequantize(torch.float32))
+
+    leaves, spec = pytree.tree_flatten(loaded)
+    rt = pytree.tree_unflatten(leaves, spec)
+    assert rt.format.storage_layout is None and rt.shape == (5, 96)
+    assert torch.equal(rt.dequantize(torch.float32), loaded.dequantize(torch.float32))
+
+    # Name-only TreeSpec contexts emitted by origin/main keep byte semantics.
+    old_tree_rt = _unflatten(
+        (loaded.qdata, loaded.scale, None),
+        ("mxfp6_e2m3", loaded.orig_dtype, loaded.quant_dim),
+    )
+    assert old_tree_rt.format.storage_layout is None and old_tree_rt.shape == (5, 96)
+    with pytest.raises(ValueError, match="byte-per-element.*host-side compatibility"):
+        mma_kind_for_pair(loaded.format, MXFP8_E4M3)
+    from quack.gemm_interface import gemm
+
+    with pytest.raises(ValueError, match="byte-per-element.*host-side compatibility"):
+        gemm(loaded, loaded.mT, tuned=False)
+
+
+def test_feature_head_packed_fp6_pickle_migrates_to_versioned_name():
+    """The feature schema omitted epc/layout and derived 6-bit packing by width."""
+    x = torch.randn(5, 96, device="cuda", dtype=torch.bfloat16)
+    packed = BlockScaledOperand.quantize(x, MXFP6_E2M3_PACKED)
+
+    feature_fmt = object.__new__(BlockScaledFormat)
+    for name, value in (
+        ("name", "mxfp6_e2m3"),
+        ("qdata_dtype", torch.uint8),
+        ("cutlass_dtype_name", "Float6E2M3FN"),
+        ("elem_bits", 6),
+        ("scale_dtype", torch.float8_e8m0fnu),
+        ("sf_vec_size", 32),
+        ("has_per_tensor_scale", False),
+    ):
+        object.__setattr__(feature_fmt, name, value)
+    assert "elems_per_container" not in feature_fmt.__dict__
+    assert "storage_layout" not in feature_fmt.__dict__
+
+    feature_op = object.__new__(BlockScaledOperand)
+    for name, value in (
+        ("qdata", packed.qdata),
+        ("scale", packed.scale),
+        ("format", feature_fmt),
+        ("per_tensor_scale", None),
+        ("orig_dtype", packed.orig_dtype),
+        ("quant_dim", packed.quant_dim),
+    ):
+        object.__setattr__(feature_op, name, value)
+
+    buf = io.BytesIO()
+    torch.save(feature_op, buf)
+    buf.seek(0)
+    loaded = torch.load(buf, weights_only=True)
+    assert loaded.format == MXFP6_E2M3_PACKED
+    assert loaded.format.name == "mxfp6_e2m3_packed"
+    assert loaded.format.elems_per_container == 1
+    assert loaded.format.storage_layout == "packed_lsb_v1"
+    assert loaded.qdata.shape == (5, 72) and loaded.shape == (5, 96)
+    assert torch.equal(loaded.dequantize(torch.float32), packed.dequantize(torch.float32))
+
+    feature_fp4 = object.__new__(BlockScaledFormat)
+    feature_fp4.__setstate__(
+        {
+            "name": "mxfp4",
+            "qdata_dtype": torch.float4_e2m1fn_x2,
+            "cutlass_dtype_name": "Float4E2M1FN",
+            "elem_bits": 4,
+            "scale_dtype": torch.float8_e8m0fnu,
+            "sf_vec_size": 32,
+            "has_per_tensor_scale": False,
+        }
+    )
+    assert feature_fp4 == MXFP4
+    assert feature_fp4.elems_per_container == 2 and feature_fp4.storage_layout is None
+
+
 def test_pytree_roundtrip():
     import torch.utils._pytree as pytree
 
@@ -321,6 +577,42 @@ def test_pytree_roundtrip():
     leaves, spec = pytree.tree_flatten(t.mT)
     rt = pytree.tree_unflatten(leaves, spec)
     assert rt.quant_dim == t.mT.quant_dim and rt.shape == t.mT.shape
+    # Packed FP6 carries its explicit storage-version name through the context.
+    _, t6 = _quantize(MXFP6_E2M3_PACKED, m=8, k=128)
+    leaves, spec = pytree.tree_flatten(t6)
+    rt6 = pytree.tree_unflatten(leaves, spec)
+    assert rt6.format is MXFP6_E2M3_PACKED
+    assert rt6.format.storage_layout == "packed_lsb_v1"
+    assert rt6.shape == t6.shape
+
+
+def test_pytree_treespec_json_roundtrip_preserves_custom_and_legacy_formats():
+    import json
+
+    import torch.utils._pytree as pytree
+
+    _, packed = _quantize(MXFP6_E2M3_PACKED, m=8, k=128)
+    custom_fmt = BlockScaledFormat(
+        "customer_fp6_packed_v7",
+        torch.uint8,
+        "Float6E2M3FN",
+        6,
+        1,
+        torch.float8_e8m0fnu,
+        32,
+        storage_layout="packed_lsb_v1",
+    )
+    custom = BlockScaledOperand.from_parts(packed.qdata, packed.scale, custom_fmt)
+
+    for op in (custom, BlockScaledOperand.quantize(packed.dequantize(), MXFP6_E2M3)):
+        leaves, spec = pytree.tree_flatten(op)
+        dumped = pytree.treespec_dumps(spec)
+        json.loads(dumped)  # the entire context must be JSON-safe
+        restored = pytree.tree_unflatten(leaves, pytree.treespec_loads(dumped))
+        assert restored.format == op.format
+        assert restored.format.storage_layout == op.format.storage_layout
+        assert restored.orig_dtype == op.orig_dtype and restored.quant_dim == op.quant_dim
+        assert restored.shape == op.shape
 
 
 # -- rejection guards at non-blockscaled entry points ------------------------
@@ -350,13 +642,15 @@ def test_mma_kind_for_pair():
     assert mma_kind_for_pair(MXFP8_E4M3, MXFP8_E4M3) == "mxf8f6f4"
     # fp8/fp6 mix freely under mxf8f6f4
     assert mma_kind_for_pair(MXFP8_E4M3, MXFP8_E5M2) == "mxf8f6f4"
-    assert mma_kind_for_pair(MXFP8_E4M3, MXFP6_E2M3) == "mxf8f6f4"
-    assert mma_kind_for_pair(MXFP6_E3M2, MXFP6_E2M3) == "mxf8f6f4"
+    assert mma_kind_for_pair(MXFP8_E4M3, MXFP6_E2M3_PACKED) == "mxf8f6f4"
+    assert mma_kind_for_pair(MXFP6_E3M2_PACKED, MXFP6_E2M3_PACKED) == "mxf8f6f4"
     # packed sub-byte operands join mixed pairs too: TMA unpack expands the
     # packed gmem into 8-bit smem containers under kind::mxf8f6f4
     assert mma_kind_for_pair(MXFP4, MXFP8_E4M3) == "mxf8f6f4"
     assert mma_kind_for_pair(MXFP8_E5M2, MXFP4) == "mxf8f6f4"
-    assert mma_kind_for_pair(MXFP4, MXFP6_E2M3) == "mxf8f6f4"
+    assert mma_kind_for_pair(MXFP4, MXFP6_E2M3_PACKED) == "mxf8f6f4"
+    with pytest.raises(ValueError, match="byte-per-element"):
+        mma_kind_for_pair(MXFP6_E2M3, MXFP8_E4M3)
     # nvfp4 pairs only with itself (e4m3 scales / vec 16 are per-kind)
     with pytest.raises(ValueError, match="mxf4nvf4"):
         mma_kind_for_pair(NVFP4, MXFP8_E4M3)
@@ -421,7 +715,7 @@ def test_format_without_dsl_element_type():
     formats that do have DSL types. See AI/blockscaled_api.md section 9."""
     from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
 
-    weird = BlockScaledFormat("e3m4_test", torch.uint8, None, 8, torch.float8_e8m0fnu, 32)
+    weird = BlockScaledFormat("e3m4_test", torch.uint8, None, 8, 1, torch.float8_e8m0fnu, 32)
     with pytest.raises(ValueError, match="no CuTe-DSL element type"):
         weird.to_cutlass_dtype()
     with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
@@ -450,7 +744,7 @@ def test_future_recipe_examples():
 
     # DeepSeek-style 1x128 fp32-scale fp8: hardware elements, software recipe.
     ds1d = BlockScaledFormat(
-        "fp8_e4m3_1x128", torch.float8_e4m3fn, "Float8E4M3FN", 8, torch.float32, 128
+        "fp8_e4m3_1x128", torch.float8_e4m3fn, "Float8E4M3FN", 8, 1, torch.float32, 128
     )
     with pytest.raises(ValueError, match="no hardware MMA kind"):
         mma_kind_for_pair(ds1d, ds1d)
@@ -459,19 +753,21 @@ def test_future_recipe_examples():
         mma_kind_for_pair(MXFP8_E4M3, ds1d)
 
     # kscale: bf16 elements + per-row fp32 K-block scales (one-sided customer).
-    kscale = BlockScaledFormat("bf16_1x128", torch.bfloat16, "BFloat16", 16, torch.float32, 128)
+    kscale = BlockScaledFormat(
+        "bf16_1x128", torch.bfloat16, "BFloat16", 16, 1, torch.float32, 128
+    )
     with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
         mma_kind_for_pair(kscale, MXFP8_E4M3)
 
     # W4A16 int4-g128 (AWQ/GPTQ): fixed-offset elements are element decode;
     # bf16 scale dtype is just data; no integer tcgen05 blockscaled kind.
-    int4 = BlockScaledFormat("int4_1x128", torch.uint8, "Int4", 4, torch.bfloat16, 128)
+    int4 = BlockScaledFormat("int4_1x128", torch.uint8, "Int4", 4, 2, torch.bfloat16, 128)
     with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
         mma_kind_for_pair(int4, int4)
 
     # e3m4: no DSL element type at all -> host-side only (see
     # test_format_without_dsl_element_type for the full behavior pin).
-    e3m4 = BlockScaledFormat("mxfp8_e3m4", torch.uint8, None, 8, torch.float8_e8m0fnu, 32)
+    e3m4 = BlockScaledFormat("mxfp8_e3m4", torch.uint8, None, 8, 1, torch.float8_e8m0fnu, 32)
     with pytest.raises(ValueError, match="no CuTe-DSL element type"):
         e3m4.to_cutlass_dtype()
 

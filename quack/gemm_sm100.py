@@ -375,6 +375,12 @@ class GemmSm100(GemmTmaBase):
 
         # Compute mma/cluster/tile shapes
         if self.mma_tiler[2] > 0:
+            if const_expr(self.blockscaled):
+                sf_chunk_k = self.sf_vec_size * 4
+                assert self.mma_tiler[2] % sf_chunk_k == 0, (
+                    f"Blockscaled MMA tiler K ({self.mma_tiler[2]}) must be divisible by "
+                    f"the scale-factor chunk K ({sf_chunk_k})"
+                )
             assert self.mma_tiler[2] % self.mma_inst_shape_mnk[2] == 0, (
                 f"MMA tiler K ({self.mma_tiler[2]}) must be divisible by "
                 f"MMA instruction K ({self.mma_inst_shape_mnk[2]})"
@@ -3032,6 +3038,10 @@ class GemmSm100(GemmTmaBase):
             return can_implement
         # Blockscaled: everything derives from the format descriptors.
         fmt_a, fmt_b = a_dtype, b_dtype
+        # Deprecated byte-container sub-byte formats are host-side migration
+        # inputs only; actual dispatch rejects them before kernel selection.
+        if fmt_a.is_byte_container or fmt_b.is_byte_container:
+            return False
         # tcgen05 blockscaled MMA accumulates in f32 only.
         if acc_dtype is not Float32:
             return False
@@ -3047,6 +3057,12 @@ class GemmSm100(GemmTmaBase):
         sf_dtype = torch2cute_dtype_map[fmt_a.scale_dtype]
         sf_vec_size = fmt_a.sf_vec_size
         can_implement = True
+        if (
+            len(mma_tiler_mnk) == 3
+            and mma_tiler_mnk[2] > 0
+            and mma_tiler_mnk[2] % (sf_vec_size * 4) != 0
+        ):
+            can_implement = False
         if not GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
             a_mma_dtype,
             b_mma_dtype,

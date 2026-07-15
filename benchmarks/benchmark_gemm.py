@@ -151,7 +151,8 @@ def parse_arguments() -> argparse.Namespace:
         help="A/B input dtype. Default: BFloat16 for dense, auto-detected for "
         "blockscaled (MXFP8 if sf=E8M0/vec=32, NVFP4 if sf=E4M3FN/vec=16). "
         "Dense: BFloat16/Float16/Float32. "
-        "Blockscaled: Float8E4M3FN/Float8E5M2/Float4E2M1FN.",
+        "Blockscaled: Float8E4M3FN/Float8E5M2/Float4E2M1FN/"
+        "Float6E2M3FN/Float6E3M2FN.",
     )
     parser.add_argument(
         "--sf_dtype",
@@ -173,10 +174,10 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         help="Blockscaled format for A (BlockScaledFormat registry name: mxfp8_e4m3/"
-        "mxfp8_e5m2/mxfp4/nvfp4/mxfp6_e2m3/mxfp6_e3m2). Setting this enables the "
-        "blockscaled path. Default: the format resolved from --ab_dtype/--sf_dtype/"
-        "--sf_vec_size. A and B may carry different formats (nvfp4 pairs only "
-        "with itself).",
+        "mxfp8_e5m2/mxfp4/nvfp4/mxfp6_e2m3_packed/mxfp6_e3m2_packed). "
+        "Setting this enables the blockscaled path. Default: the format resolved from "
+        "--ab_dtype/--sf_dtype/--sf_vec_size. A and B may carry different formats "
+        "(nvfp4 pairs only with itself).",
     )
     parser.add_argument(
         "--bs_format_b",
@@ -201,8 +202,8 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         choices=["k", "m"],
-        help="A operand major mode. Blockscaled: MXFP8 supports k/m, "
-        "MXFP4/NVFP4 must be k. Dense: varlen_k forces m, others default "
+        help="A operand major mode. Blockscaled: 8-bit formats support k/m; "
+        "packed fp4/fp6 formats require k. Dense: varlen_k forces m, others default "
         "to k if omitted.",
     )
     parser.add_argument(
@@ -210,8 +211,8 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         choices=["k", "n"],
-        help="B operand major mode. Blockscaled: MXFP8 supports k/n, "
-        "MXFP4/NVFP4 must be k. Dense: varlen_k forces n, others default "
+        help="B operand major mode. Blockscaled: 8-bit formats support k/n; "
+        "packed fp4/fp6 formats require k. Dense: varlen_k forces n, others default "
         "to k if omitted.",
     )
 
@@ -277,7 +278,7 @@ def _run_blockscaled(args):
     if args.varlen_k or args.gather_A or args.pingpong:
         raise NotImplementedError(
             "blockscaled + varlen_k/gather/pingpong is not wired up yet. "
-            "Only --varlen_m is currently supported for blockscaled (MXFP8 only)."
+            "Only same-format --varlen_m is currently supported for blockscaled."
         )
 
     m, n, k, l = args.mnkl
@@ -375,9 +376,10 @@ def _run_blockscaled(args):
     )
     if args.varlen_m:
         # varlen_m: l is num_experts, m is per-expert m, total_m = m * l.
-        # Supports MXFP8 / MXFP4 / NVFP4 (fp4 operands must be K-major).
+        # Supports every kernel-ready same-format operand pair. Packed fp4/fp6
+        # operands must be K-major.
         # A must stay k-major in varlen_m (the per-expert padded SF offset
-        # targets the M axis); B can be k- or n-major (MXFP8 only).
+        # targets the M axis); B can be k- or n-major for 8-bit formats.
         if fmt_a.name != fmt_b.name:
             raise NotImplementedError(
                 f"blockscaled varlen_m benchmarking supports a single format for A and B; "
@@ -400,7 +402,7 @@ def _run_blockscaled(args):
         mSFA, mSFB = a_sc_contig, b_sc_contig  # (1, padded_rm, rk, 32, 4, 4), (l, rn, rk, 32, 4, 4)
         mD = torch.empty(total_m, n, dtype=torch_dtype_for_cutlass(d_dtype), device="cuda")
         # Unified dispatch takes a (l, n, k) B view (zero-copy permute of the
-        # (n, k, l) kernel-layout tensor); A/D stay 2D (total_m, k[/2]) / (total_m, n).
+        # (n, k_storage, l) kernel-layout tensor); A/D stay 2D.
         B = mB.permute(2, 0, 1)
 
         def fn():

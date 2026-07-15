@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Tri Dao.
-"""Blockscaled (MXFP8 / MXFP4 / NVFP4) GEMM support.
+"""Blockscaled (MXFP8 / MXFP4 / MXFP6 / NVFP4) GEMM support.
 
 - :mod:`quack.blockscaled.quantize` — pure-PyTorch quantizers (ported from
   torchao) with torch.compile'd fast paths.
@@ -14,8 +14,13 @@ rejected with a TypeError). Design doc: ``AI/blockscaled_api.md``.
 from quack.blockscaled.operand import (  # noqa: F401
     BLOCKSCALED_FORMAT_REGISTRY,
     MXFP4,
+    MXFP4_BYTE,
     MXFP6_E2M3,
+    MXFP6_E2M3_BYTE,
+    MXFP6_E2M3_PACKED,
     MXFP6_E3M2,
+    MXFP6_E3M2_BYTE,
+    MXFP6_E3M2_PACKED,
     MXFP8_E4M3,
     MXFP8_E5M2,
     NVFP4,
@@ -31,7 +36,21 @@ from quack.blockscaled.quantize import (  # noqa: F401
     to_mx_dim0,
     to_mx_dim0_compiled,
     to_mxfp4,
+    to_mxfp4_byte,
+    to_mxfp4_byte_compiled,
     to_mxfp4_compiled,
+    to_mxfp6_e2m3,
+    to_mxfp6_e2m3_byte,
+    to_mxfp6_e2m3_byte_compiled,
+    to_mxfp6_e2m3_compiled,
+    to_mxfp6_e2m3_packed,
+    to_mxfp6_e2m3_packed_compiled,
+    to_mxfp6_e3m2,
+    to_mxfp6_e3m2_byte,
+    to_mxfp6_e3m2_byte_compiled,
+    to_mxfp6_e3m2_compiled,
+    to_mxfp6_e3m2_packed,
+    to_mxfp6_e3m2_packed_compiled,
     to_nvfp4,
     to_nvfp4_compiled,
 )

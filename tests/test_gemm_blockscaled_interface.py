@@ -492,6 +492,22 @@ def _mixed_operand(fmt, rows, k, seed=0):
     return BlockScaledOperand.quantize(x, fmt)
 
 
+def _relayout_packed_operand(op, offset_bytes, row_pad_bytes):
+    """Copy packed fp4/fp6 into a view with an explicit base offset and row pitch."""
+    rows, storage_k = op.qdata.shape
+    row_stride = storage_k + row_pad_bytes
+    raw = torch.empty(
+        offset_bytes + rows * row_stride,
+        dtype=op.qdata.dtype,
+        device=op.qdata.device,
+    )
+    qdata = raw[offset_bytes:].as_strided((rows, storage_k), (row_stride, 1))
+    qdata.view(torch.uint8).copy_(op.qdata.view(torch.uint8))
+    return BlockScaledOperand.from_parts(
+        qdata, op.scale, op.format, orig_dtype=op.orig_dtype
+    )
+
+
 @pytest.mark.parametrize(
     "fmt_pair",
     [
@@ -503,12 +519,12 @@ def _mixed_operand(fmt, rows, k, seed=0):
         ("mxfp8_e4m3", "mxfp4"),
         ("mxfp4", "mxfp8_e5m2"),
         # packed fp6 x fp8 (both orders)
-        ("mxfp6_e2m3", "mxfp8_e4m3"),
-        ("mxfp8_e4m3", "mxfp6_e2m3"),
+        ("mxfp6_e2m3_packed", "mxfp8_e4m3"),
+        ("mxfp8_e4m3", "mxfp6_e2m3_packed"),
         # both operands sub-byte: fp6 x fp6, fp6 x fp4, fp4 x fp6
-        ("mxfp6_e2m3", "mxfp6_e3m2"),
-        ("mxfp6_e2m3", "mxfp4"),
-        ("mxfp4", "mxfp6_e3m2"),
+        ("mxfp6_e2m3_packed", "mxfp6_e3m2_packed"),
+        ("mxfp6_e2m3_packed", "mxfp4"),
+        ("mxfp4", "mxfp6_e3m2_packed"),
     ],
 )
 def test_blockscaled_gemm_mixed(fmt_pair):
@@ -531,6 +547,67 @@ def test_blockscaled_gemm_mixed(fmt_pair):
     ref_dq = A.dequantize(torch.float32) @ W.dequantize(torch.float32).T
     rel_dq = (out.float() - ref_dq).abs().max().item() / ref_dq.abs().max().item()
     assert rel_dq < 5e-3, f"{fmt_a} x {fmt_b}: rel_err vs dequant={rel_dq}"
+
+
+@pytest.mark.parametrize("unpack_side", ["a", "b"])
+@pytest.mark.parametrize("unpack_fmt", ["mxfp4", "mxfp6_e2m3_packed"])
+@pytest.mark.parametrize(
+    "offset_bytes,row_pad_bytes",
+    [(16, 0), (32, 16)],
+    ids=["misaligned-base", "misaligned-row-stride"],
+)
+def test_mixed_unpack_alignment_rejected(
+    unpack_side, unpack_fmt, offset_bytes, row_pad_bytes
+):
+    """U4/U6 TMA unpack rejects bad bases/pitches before issuing a device instruction."""
+    _skip_if_not_sm100()
+    m = n = 128
+    k = 512
+    A = _mixed_operand(unpack_fmt if unpack_side == "a" else "mxfp8_e4m3", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3" if unpack_side == "a" else unpack_fmt, n, k, seed=1)
+
+    # Populate the pointer-agnostic plan cache before the offset-only case. The
+    # compiled argument signature must still reject the misaligned replacement.
+    if row_pad_bytes == 0:
+        gemm(A, W.mT, tuned=False)
+        torch.cuda.synchronize()
+    if unpack_side == "a":
+        A = _relayout_packed_operand(A, offset_bytes, row_pad_bytes)
+    else:
+        W = _relayout_packed_operand(W, offset_bytes, row_pad_bytes)
+
+    unpack_qdata = A.qdata if unpack_side == "a" else W.qdata
+    if unpack_fmt == "mxfp4" and row_pad_bytes == 16:
+        assert unpack_qdata.stride(0) == 272
+
+    with pytest.raises(ValueError) as exc_info:
+        gemm(A, W.mT, tuned=False)
+    assert "32" in str(exc_info.value)
+    assert "cudaError" not in str(exc_info.value)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("unpack_side", ["a", "b"])
+@pytest.mark.parametrize("unpack_fmt", ["mxfp4", "mxfp6_e2m3_packed"])
+def test_mixed_unpack_aligned_padded_numeric(unpack_side, unpack_fmt):
+    """A 32-byte-offset/padded packed view remains a valid unpack source."""
+    _skip_if_not_sm100()
+    m = n = 128
+    k = 512
+    A = _mixed_operand(unpack_fmt if unpack_side == "a" else "mxfp8_e4m3", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3" if unpack_side == "a" else unpack_fmt, n, k, seed=1)
+    if unpack_side == "a":
+        A = _relayout_packed_operand(A, offset_bytes=32, row_pad_bytes=32)
+    else:
+        W = _relayout_packed_operand(W, offset_bytes=32, row_pad_bytes=32)
+
+    unpack_qdata = A.qdata if unpack_side == "a" else W.qdata
+    assert unpack_qdata.data_ptr() % 32 == 0
+    assert all(stride == 1 or stride % 32 == 0 for stride in unpack_qdata.stride())
+    out = gemm(A, W.mT, tuned=False)
+    ref = gemm_blockscaled_ref(A, W.mT)
+    rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
+    assert rel < 5e-3, f"aligned padded {unpack_fmt} on {unpack_side}: rel_err={rel}"
 
 
 def test_mixed_fp4_unpack_k_granule_rejected():
@@ -565,11 +642,16 @@ def test_mixed_format_pairs():
     with pytest.raises(ValueError, match="cannot pair"):
         gemm(A4, B8, tuned=False)
     # mixed packed-fp4 pairs are legal: pair legality maps to kind::mxf8f6f4
-    from quack.blockscaled.operand import MXFP4, MXFP6_E2M3, MXFP8_E4M3, mma_kind_for_pair
+    from quack.blockscaled.operand import (
+        MXFP4,
+        MXFP6_E2M3_PACKED,
+        MXFP8_E4M3,
+        mma_kind_for_pair,
+    )
 
     assert mma_kind_for_pair(MXFP4, MXFP8_E4M3) == "mxf8f6f4"
     assert mma_kind_for_pair(MXFP8_E4M3, MXFP4) == "mxf8f6f4"
-    assert mma_kind_for_pair(MXFP4, MXFP6_E2M3) == "mxf8f6f4"
+    assert mma_kind_for_pair(MXFP4, MXFP6_E2M3_PACKED) == "mxf8f6f4"
 
 
 def test_sm100_dtype_gate():
@@ -619,8 +701,8 @@ def test_fp6_k_granule_rejected():
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
-    a6 = BlockScaledOperand.quantize(x, "mxfp6_e2m3")
-    b6 = BlockScaledOperand.quantize(w, "mxfp6_e3m2")
+    a6 = BlockScaledOperand.quantize(x, "mxfp6_e2m3_packed")
+    b6 = BlockScaledOperand.quantize(w, "mxfp6_e3m2_packed")
     assert a6.qdata.shape == (m, 3 * k // 4)  # packed 6-bit storage
     with pytest.raises(AssertionError, match="divisible by 128"):
         gemm(a6, b6.mT, tuned=False)
