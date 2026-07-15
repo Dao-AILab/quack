@@ -412,12 +412,16 @@ _SR_OPS = (Scalar("sr_seed", dtype=Int32),)
 
 
 @functools.lru_cache(maxsize=None)
-def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
-    """gemm_act/gemm_gated as a mod: D = acc (+ C + rowvec + colvec), aux =
-    act(D). Math order matches apply_linear_epilogue: C, rowvec, colvec."""
+def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False, has_alpha=False):
+    """gemm_act/gemm_gated as a mod: D = alpha * acc (+ C + rowvec + colvec),
+    aux = act(D). Math order matches apply_linear_epilogue: alpha scales the
+    accumulator only (before C / rowvec / colvec), so ``act(alpha * A @ B)``
+    is a pre-activation scale."""
     fn_map = gate_fn_map if gated else act_fn_map
     act = fn_map[activation]
     params, body = [], []
+    if has_alpha:
+        params.append("alpha")
     if has_c:
         params.append("c")
     if has_rowvec:
@@ -425,8 +429,11 @@ def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False
     if has_colvec:
         params.append("mColVecBroadcast")
     expr = "acc"
+    if has_alpha:
+        body.append("x = acc * alpha")
+        expr = "x"
     if has_c:
-        body.append("x = acc + c")
+        body.append(f"x = {expr} + c")
         expr = "x"
     if has_rowvec:
         body.append(f"x = {expr} + mRowVecBroadcast")
@@ -441,11 +448,17 @@ def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False
         body.append(f'return {{"D": {expr}, "mAuxOut": act({expr})}}')
     else:
         body.append(f'return {{"D": {expr}, "mAuxOut": {expr}}}')
-    tag = f"act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}v{int(has_colvec)}"
+    tag = (
+        f"act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}"
+        f"v{int(has_colvec)}a{int(has_alpha)}"
+    )
     fn = _gen_epi_fn("linear_act_epi", tag, params, body, {"act": act})
+    ops = _vec_pins(params)
+    if has_alpha:
+        ops["alpha"] = Scalar("alpha")
     return gemm_epilogue(
         outputs=("mAuxOut",),
-        ops=_vec_pins(params),
+        ops=ops,
         mode="acc_pair" if gated else None,
         extra_ops=_SR_OPS if sr else (),
     )(fn)
