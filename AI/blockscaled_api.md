@@ -152,28 +152,13 @@ class BlockScaledOperand:
 
 ### Extension seams (forward pointers)
 
-The descriptor bundles two orthogonal things: the *element encoding*
-(qdata dtype, bits, packing, DSL type) and the *scale recipe* (scale dtype,
-`sf_vec_size` = the K-extent of a `(1, sf_vec_size)` block grid). Two more
-axes are deliberately NOT in this PR but have reserved seams
-(AI/blockscaled_recipes.md is the worked design; consumers: the SM90
-blockwise-promotion GEMM and the SM100 linear-SF loader):
-
-- **2D scale grids** (DeepSeek-style 128x128 weight scales): an `sf_block_mn`
-  extent alongside `sf_vec_size`. `quant_dim` and the `.mT` scale-carry trick
-  generalize to 2D grids unchanged.
-- **Physical scale layouts**: the blocked `(rm, rk, 32, 4, 4)` atom is the
-  tcgen05 consumption layout, not a property of the format; the *linear*
-  `(MN, K/vec)` layout (FlashInfer/TRT-LLM `layout_linear`, torchao "plain")
-  becomes a per-OPERAND tag, never inferred from rank.
-- **DSL-typeless formats**: `cutlass_dtype_name=None` marks a format with no
-  CuTe-DSL element type (host-side complete; a consuming kernel declares its
-  own copy/MMA/convert triple). `mma_kind_for_pair` gates on the MMA element
-  class explicitly, so such formats fail at kind selection, not by falling
-  into a kind their elements cannot join.
-- **Sided-ness is per-kind**: hardware kinds require SF on both operands; the
-  software promotion kind admits one-sided (bf16 elements + per-K-block fp32
-  scales on A only), so the both-or-neither check lives with the kind rules.
+The descriptor bundles two orthogonal things: the *element encoding* (qdata
+dtype, bits, packing, DSL type) and the *scale recipe* (scale dtype,
+`sf_vec_size` = the K-extent of a `(1, sf_vec_size)` block grid). The other
+axes — 2D scale grids, physical scale layouts, DSL-typeless formats, per-kind
+sided-ness — are designed in section 9 and stress-tested in section 10; the
+hardenings they justify in this PR (`cutlass_dtype_name` Optional; explicit
+element-class + recipe gates in `mma_kind_for_pair`) are already in place.
 
 ## 4. GEMM interface integration (`quack/gemm_interface.py`)
 
@@ -330,3 +315,193 @@ shape or smoke checks alone.
   compile test with raw (q, sf) graph inputs.
 - Numerics references: `gemm_blockscaled_ref` dequant-matmul, plus bit-exact
   `torch._scaled_mm` comparison via `scale_blocked_for_cublas`.
+
+## 9. Generalization: scale recipes, layouts, and software kinds
+
+Design for extending the operand API beyond MX/NVFP4 microscaling. Consumers
+in flight: the SM90 blockwise-promotion GEMM (sm90kscale: fp32 scales,
+`kscale_block in {128, 256}`, one-sided bf16), the SM100 linear-SF cp.async
+loader (sfcpasync: per-operand `sfa_linear`/`sfb_linear`), the SM90
+weight-only family (sm90w4: W4A8 / W4A16 / W8A16), and DeepSeek-style fp8
+recipes (acts 1x128, weights 128x128). The generalization lands WITH its
+first consumer kernel; only the seams live in this PR.
+
+### 9.1 Model
+
+A block-scaled operand represents
+
+```
+X[i, j] ~= decode(qdata)[i, j] * S[i // bm, j // bk] * (pts if present)
+```
+
+- **Level-0 scale grid**: block shape `(bm, bk)` over the logical `(MN, K)`
+  index space -> grid `(ceil(MN/bm), ceil(K/bk))`, any scale dtype.
+- **Level-1**: the optional per-tensor scalar. Scaling is a hierarchy of
+  levels; we support exactly two, level 1 fixed at per-tensor fp32 (a
+  deliberate cap, stated like D1).
+- **Element encoding is orthogonal** and includes full-precision types: bf16
+  elements with per-K-block fp32 scales (kscale) are a valid operand. The
+  container is about *block scaling*; quantization is the special case of a
+  narrow element type.
+
+The recipe axis is the ecosystem's own taxonomy, factored into fields instead
+of an enum: cuBLASLt's `cublasLtMatmulMatrixScale_t` (`SCALAR_32F`,
+`VEC16_UE4M3`, `VEC32_UE8M0`, `OUTER_VEC_32F`, `VEC128_32F`,
+`BLK128x128_32F`, `PER_BATCH_SCALAR_32F` - set independently per operand via
+`A_SCALE_MODE`/`B_SCALE_MODE`, i.e. D11 is their design too) and torch's
+`_ScalingType` (`TensorWise, RowWise, BlockWise1x16/1x32/1x128/128x128`) are
+flat enumerations of the same `(bm, bk, scale dtype)` points.
+
+| recipe | bm | bk | scale dtype | elements |
+|---|---|---|---|---|
+| mxfp8 / mxfp4 / mxfp6 | 1 | 32 | e8m0 | fp8/4/6 |
+| nvfp4 | 1 | 16 | e4m3 (+pts) | fp4 |
+| DeepSeek 1D (acts) | 1 | 128 | fp32 | e4m3 |
+| DeepSeek 2D (weights) | 128 | 128 | fp32 | e4m3 |
+| kscale bf16 | 1 | 128/256 | fp32 | bf16 |
+| int4-g128 (AWQ/GPTQ, W4A16) | 1 | 128 | bf16 | uint4b8 |
+| rowwise (per-token / per-channel) | 1 | K (full) | fp32 | fp8/int8 |
+
+### 9.2 Three axes, three homes
+
+| concern | lives on | crosses op boundary as |
+|---|---|---|
+| element encoding + scale recipe | `BlockScaledFormat` | `bs_format_{a,b}` name |
+| physical scale layout | `BlockScaledOperand` | `bs_layout_{a,b}` name |
+| orientation | `BlockScaledOperand.quant_dim` | (existing) |
+
+The format is the **interchange contract** (numerics); the layout is a
+**storage detail** (like strides) - the same format legitimately exists in
+multiple layouts (mxfp8 blocked for tcgen05, mxfp8 linear from a fused quant
+producer), so layout is per-OPERAND (the kernels take `sfa_linear` /
+`sfb_linear` independently) and never part of the format identity. Layout is
+never inferred: blocked (5/6-D) vs linear (2/3-D) is rank-sniffable today,
+but that is the D5 trap again and breaks on the first same-rank layout.
+
+### 9.3 Descriptor changes (all defaulted - zero churn for existing formats)
+
+- `sf_block_mn: int = 1` - the MN-extent of the block grid (128 for 2D).
+- `sf_vec_size: Optional[int]` - `None` = the full contraction extent
+  (rowwise; cuBLASLt `OUTER_VEC`). AMENDED from the first draft: forced by
+  w4a8 per-token activation scales and w8a16 per-channel weight scales - a
+  format descriptor is shape-independent and cannot spell a literal K.
+- `canonical_scale_layout: str = "mx_blocked"` - what `quantize()` emits and
+  what an unspecified operand layout means. DECIDED: MX formats stay blocked;
+  "linear" is an accepted per-operand option; fp32-scale recipes are
+  canonically linear (no blocked form exists for them).
+- New registry rows land with their consumer kernels (never speculatively);
+  see the commented examples next to `BLOCKSCALED_FORMAT_REGISTRY` and
+  `test_future_recipe_examples`.
+- `quantize()` policy: fp8 recipes get a generic `(bm, bk)` amax quantizer
+  (e8m0 keeps the floor rule). bf16 and int-group formats RAISE - floating-
+  point relative precision is scale-invariant and group scales are upstream-
+  structural (GPTQ/AWQ groups, folded norms), so `from_parts` is the
+  construction path (the e5m2 precedent).
+
+### 9.4 Scale layouts (per-operand)
+
+`BlockScaledOperand.scale_layout: Optional[str]` (`None` -> the format's
+canonical layout; carried by `_view`, pytree ctx, pickle).
+
+| tag | shape | constraints |
+|---|---|---|
+| `"mx_blocked"` | `(L?, rm, rk, 32, 4, 4)`, atom strides `(16,4,1)` | requires `bm == 1` and e8m0/e4m3 scales (it IS the tcgen05 atom) |
+| `"linear"` | `(L?, ceil(MN/bm), ceil(K/bk))`, K-block dim contiguous | ecosystem name (FlashInfer/TRT-LLM `layout_linear`; torchao "plain"; scaled_mm NO_SWIZZLE) |
+
+Construction validation becomes a dispatch keyed on the tag; future tags are
+additive. `repack_scales(layout)` converts (linear->blocked is the existing
+`pack_scale_2d_to_blocked_contig`; the quantizers already produce the linear
+grid internally, so a linear-canonical `quantize` is cheaper, not costlier).
+`quant_dim` and the `.mT` scale-carry trick are untouched - the grid axes are
+interpreted through `quant_dim`, so D3 generalizes to 2D grids for free.
+
+### 9.5 Kinds and sided-ness: `gemm_kind_for_pair`
+
+Supersedes `mma_kind_for_pair` (which remains, delegated to, for the hardware
+subset - it already gates element class AND recipe so software recipes fail
+at kind selection with the reason). Takes `Optional` formats on both sides:
+**sided-ness is per-kind, not an interface invariant**.
+
+```
+(bs, bs)  hw recipe on both (bm==1, bk in {16,32}, e8m0/e4m3, DSL elem)
+    -> mxf4nvf4 | mxf4 | mxf8f6f4          # existing rules, unchanged
+(bs, bs)  fp8 elements, fp32 scales         -> blockwise_promote  # 1d1d / 1d2d
+(bs, None) bf16 elements, fp32 K-block scales -> blockwise_promote  # kscale
+(None, bs) plain acts x group-scaled weights -> upconvert (W4A16/W8A16 family)
+(None, None)                                 -> the ordinary GEMM path
+```
+
+Pairing rule (AMENDED): sides that block K must agree on `bk` (the promotion
+interval must align); **k-invariant scales compose freely** - rowwise and
+per-tensor scales factor out of the K loop entirely
+(`out[m,n] = sfa[m]*sfb[n]*sum_k ...`) and apply at epilogue or
+promotion-end, so w4a8 legally pairs rowwise fp8 acts with group-128 int4
+weights. One-sided pairs use a **plain Tensor** for the unscaled side
+(DECIDED - no identity-scale wrapper: the container's contract is "carries
+block scales"). Whether scales apply in the register decode (W4A16 nvfp4:
+2 significand bits x e4m3's 4 fit bf16 exactly), at k-tile promotion (w4a8,
+DeepGEMM), or in the epilogue (rowwise) is per-arch implementation, invisible
+to the API. Integer elements (e0m3/nvint4 = int4 + a recipe) get an
+int-accumulate promote variant via tcgen05 `kind::i8` - exact int32 inner
+products, scales at promotion.
+
+Per-arch gates own the support matrices, as in D11: SM100 tcgen05 kinds +
+linear-loader constraints (`K/vec % 4 == 0`; `sfa_linear` needs cluster
+N == 1); SM90 promote/upconvert matrices (`bk in {128, 256}`, `split_k == 1`,
+no `gather_A` - the kernels' existing asserts, fronted by descriptors).
+
+### 9.6 Host plumbing
+
+`gemm()` signature unchanged - everything rides on the operands. Op schemas
+gain `bs_layout_{a,b}` strings (same pattern as `bs_format_{a,b}`); autotune
+and compile keys gain the layout tags; kernel flags are derived from operands
+(`sfa_linear = (opA.scale_layout == "linear")`, `kscale_sfb_1d =
+(fmt_b.sf_block_mn == 1)`, ...). The D8 precedent extends: scales needed to
+*interpret an operand's bytes* travel WITH the operand - a forgotten `(N,)`
+per-channel multiply after a W8A16 GEMM is the pts-folding silent-accuracy
+trap again, and the container is what killed that class of bug.
+
+### 9.7 Prepared operands are NOT formats (a fence)
+
+The weight-only kernels repack weights offline into kernel-private blobs
+(WGMMA-fragment nibble shuffles, SF strips like `(N/64, K/64, 32, 4, 2)`).
+These must never enter the format/layout vocabulary: they are not interchange
+forms (no second consumer can read them) and they version with the kernel.
+They are a third tier - **prepare-and-cache above the container**, keyed on
+`(qdata storage identity, kernel key)`; weights are static so the one-time
+cost amortizes. The canonical container is what serializes; prepared blobs
+are rebuilt on load, which is what makes kernel-layout changes non-breaking.
+Precedent: torch.ao prepacked params, TRT-LLM
+`preprocess_weights_for_mixed_gemm`.
+
+### 9.8 Decisions and sequencing
+
+`sf_vec_size` keeps its name (`sf_block_mn` is the only new recipe field
+besides the full-extent sentinel). MX canonical layout stays blocked.
+One-sided = plain Tensor. bk=256 rows, ue8m0-scale DeepSeek variants, and all
+registry rows land on first demand, with their consumer kernels
+(sm90kscale / sfcpasync / sm90w4 integration - whichever merges first
+carries the descriptor generalization).
+
+## 10. Stress tests (worked examples)
+
+This table is the abstraction's regression suite: every new format proposal
+gets checked against it and either lands as a data row (good) or forces a
+minimal, named amendment (recorded). Seven adversarial cases produced two
+one-line amendments. Executable versions:
+`test_future_recipe_examples` / `test_format_without_dsl_element_type`.
+
+| case | axis exercised | change forced |
+|---|---|---|
+| e3m4 (no DSL type; bundled MLIR has `f8E3M4` but the DSL's reverse dispatch and dtype tables do not) | DSL-typeless elements | `cutlass_dtype_name` Optional + element-class gate (LANDED in this PR) |
+| e0m3 / nvint4 (= int4 element + nvfp4's recipe; MLIR `i4`, DSL `Int4`, torch.int4 all exist) | integer elements | none - int promote via `kind::i8` is a kind, not a descriptor change |
+| DeepSeek 1x128 / 128x128 fp32 scales | recipe: scale dtype + 2D grid | `sf_block_mn` (follow-up field) |
+| kscale bf16 + per-row fp32 K-block scales | full-precision elements; one-sided | vocabulary ("quantized" -> "block-scaled"); sided-ness moved into kind rules |
+| sfcpasync linear SF `(MN, K/vec)` | physical layout | `scale_layout` per-operand tag (follow-up field) |
+| W4A16 nvfp4 weights x bf16 acts | same format, new pairing | none - the SM100 tcgen05 operand and the SM90 upconvert weight are ONE format |
+| W4A8 / W8A16 (rowwise acts / per-channel weights) | full-extent bk; mixed-recipe pairs | `sf_vec_size` sentinel; pairing rule relaxed to "k-invariant composes freely" |
+
+Known unmodeled, deliberately (add only with a customer): per-group zero
+points (a third block-grid tensor; uint4b8's FIXED offset is element decode
+and costs nothing) and per-L batch scales (cuBLASLt `PER_BATCH_SCALAR_32F` -
+a third grid extent).

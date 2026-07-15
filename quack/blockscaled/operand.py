@@ -71,7 +71,7 @@ class BlockScaledFormat:
     # CuTe-DSL MMA element type (may differ from storage: fp6). None marks a format
     # with no DSL element type at all — host-side complete (quantize/dequantize/
     # serialize) but consumable by a kernel only once that kernel declares its own
-    # (copy dtype, MMA dtype, convert) triple. See AI/blockscaled_recipes.md.
+    # (copy dtype, MMA dtype, convert) triple. See AI/blockscaled_api.md section 9.
     cutlass_dtype_name: Optional[str]
     elem_bits: int
     elems_per_container: int  # logical elements per qdata element (2 for fp4x2)
@@ -161,6 +161,35 @@ BLOCKSCALED_FORMAT_REGISTRY = {
     for fmt in (MXFP8_E4M3, MXFP8_E5M2, MXFP4, MXFP4_BYTE, NVFP4, MXFP6_E2M3, MXFP6_E3M2)
 }
 
+# Worked examples of formats the descriptor already expresses but that are NOT
+# registered (registry rows land with their consumer kernels; see
+# AI/blockscaled_api.md sections 9-10, and the executable versions in
+# tests/test_blockscaled_operand.py::test_future_recipe_examples). The scale
+# recipe axis mirrors cuBLASLt's cublasLtMatmulMatrixScale_t / torch's
+# _ScalingType, factored into fields instead of an enum:
+#
+#   # DeepSeek-style 1x128 fp32-scale fp8 (SM90/SM100 blockwise promotion):
+#   BlockScaledFormat("fp8_e4m3_1x128", torch.float8_e4m3fn, "Float8E4M3FN",
+#                     8, 1, torch.float32, 128)
+#   # kscale: bf16 elements, per-row fp32 scale every 128 of K (one-sided;
+#   # quantize() would raise - scales are upstream-structural, from_parts only):
+#   BlockScaledFormat("bf16_1x128", torch.bfloat16, "BFloat16",
+#                     16, 1, torch.float32, 128)
+#   # W4A16 int4-g128 (AWQ/GPTQ-style; uint4b8's fixed offset is element
+#   # decode, not a descriptor field; bf16 scales are just data):
+#   BlockScaledFormat("int4_1x128", torch.uint8, "Int4",
+#                     4, 2, torch.bfloat16, 128)
+#   # A hypothetical e3m4: no CuTe-DSL element type -> host-side only until a
+#   # kernel declares its own (copy dtype, MMA dtype, convert) triple:
+#   BlockScaledFormat("mxfp8_e3m4", torch.uint8, None,
+#                     8, 1, torch.float8_e8m0fnu, 32)
+#
+# NVFP4 weight-only (W4A16) needs NO new row: the same NVFP4 format pairs with
+# a plain bf16 activation tensor and dispatches to an upconvert kernel per
+# arch. Still-missing axes (added with their first consumer): sf_block_mn (2D
+# 128x128 grids), a full-extent sf_vec_size sentinel (rowwise / cuBLASLt
+# OUTER_VEC), per-operand scale layouts ("linear"), and per-L batch scales.
+
 # Legacy short names used by blockscaled_quantize / BLOCKSCALED_FORMATS (the
 # inverse is derived - this dict is the single source of the aliasing).
 _LEGACY_FORMAT_NAMES = {"mxfp8": "mxfp8_e4m3"}
@@ -206,6 +235,28 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
             "mxfp4_byte x mxfp4_byte has no MMA kind: use mxfp4 (packed, kind::mxf4) "
             "for pure fp4 pairs; byte-container fp4 exists for mixed mxf8f6f4 pairs"
         )
+    # fp8/fp6 byte-width element types mix freely under mxf8f6f4 (all e8m0 / vec 32).
+    # Gate BOTH axes explicitly rather than falling through: a format whose
+    # elements no tcgen05 kind can consume (no DSL type, or a non-fp8/6/4 one),
+    # or whose scale RECIPE the SF hardware cannot represent (kind::mxf8f6f4 is
+    # e8m0 / vec-32 only — fp32 scales, vec 128, 2D grids are software recipes),
+    # must fail HERE with the reason, not at the per-arch gate later. Software
+    # kinds (blockwise promotion: fp32-scale fp8, one-sided bf16, int4) are a
+    # follow-up with their own kind names — see AI/blockscaled_api.md section 9.
+    for fmt in (fmt_a, fmt_b):
+        if _mma_element_class(fmt) is None:
+            raise ValueError(
+                f"{fmt.name} has no tcgen05 MMA element type "
+                f"(cutlass_dtype_name={fmt.cutlass_dtype_name}): no hardware "
+                f"blockscaled MMA kind exists for this format"
+            )
+        if fmt.scale_dtype != torch.float8_e8m0fnu or fmt.sf_vec_size != 32:
+            raise ValueError(
+                f"{fmt.name} (scales {fmt.scale_dtype}, vec {fmt.sf_vec_size}) has no "
+                f"hardware MMA kind: kind::mxf8f6f4 requires e8m0 scales with vec size "
+                f"32; software-scaled recipes are a follow-up (AI/blockscaled_api.md "
+                f"section 9)"
+            )
     if fmt_a.elems_per_container > 1 or fmt_b.elems_per_container > 1:
         packed = fmt_a.name if fmt_a.elems_per_container > 1 else fmt_b.name
         other = fmt_b.name if fmt_a.elems_per_container > 1 else fmt_a.name
@@ -216,19 +267,6 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
             f"mxfp4_byte (byte-container fp4) for mixed pairs "
             f"(AI/blockscaled_api.md section 6)"
         )
-    # fp8/fp6 byte-width element types mix freely under mxf8f6f4 (all e8m0 / vec 32).
-    # Gate on the MMA element class explicitly: a format without a tcgen05-
-    # representable element type (no DSL type, or a non-fp8/6/4 one) must fail
-    # HERE, not by falling through to a kind its elements cannot join. Software
-    # kinds (blockwise promotion: fp32-scale fp8, one-sided bf16, int4) are a
-    # follow-up with their own kind names — see AI/blockscaled_recipes.md.
-    for fmt in (fmt_a, fmt_b):
-        if _mma_element_class(fmt) is None:
-            raise ValueError(
-                f"{fmt.name} has no tcgen05 MMA element type "
-                f"(cutlass_dtype_name={fmt.cutlass_dtype_name}): no hardware "
-                f"blockscaled MMA kind exists for this format"
-            )
     return "mxf8f6f4"
 
 

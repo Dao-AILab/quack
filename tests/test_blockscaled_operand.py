@@ -357,7 +357,7 @@ def test_format_without_dsl_element_type():
     e3m4): it must fail loudly at the kernel seam (to_cutlass_dtype) and at
     kind selection (no silent mxf8f6f4 fall-through), and a registered
     DSL-typeless format must not break registry-wide dtype lookup for the
-    formats that do have DSL types. See AI/blockscaled_recipes.md."""
+    formats that do have DSL types. See AI/blockscaled_api.md section 9."""
     from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
 
     weird = BlockScaledFormat("e3m4_test", torch.uint8, None, 8, 1, torch.float8_e8m0fnu, 32)
@@ -377,3 +377,47 @@ def test_format_without_dsl_element_type():
         )
     finally:
         del BLOCKSCALED_FORMAT_REGISTRY[weird.name]
+
+
+def test_future_recipe_examples():
+    """Executable form of the worked examples next to BLOCKSCALED_FORMAT_REGISTRY
+    (AI/blockscaled_api.md section 10): recipes the descriptor already expresses
+    as pure data, pinned to fail at the KIND layer with the right reason until
+    their consumer kernels land. The scale-recipe axis mirrors cuBLASLt's
+    cublasLtMatmulMatrixScale_t and torch._C._ScalingType."""
+    from quack.blockscaled.operand import mma_kind_for_pair
+
+    # DeepSeek-style 1x128 fp32-scale fp8: hardware elements, software recipe.
+    ds1d = BlockScaledFormat(
+        "fp8_e4m3_1x128", torch.float8_e4m3fn, "Float8E4M3FN", 8, 1, torch.float32, 128
+    )
+    with pytest.raises(ValueError, match="no hardware MMA kind"):
+        mma_kind_for_pair(ds1d, ds1d)
+    # ... and a software recipe cannot smuggle in next to a hardware one.
+    with pytest.raises(ValueError, match="no hardware MMA kind"):
+        mma_kind_for_pair(MXFP8_E4M3, ds1d)
+
+    # kscale: bf16 elements + per-row fp32 K-block scales (one-sided customer).
+    kscale = BlockScaledFormat("bf16_1x128", torch.bfloat16, "BFloat16", 16, 1, torch.float32, 128)
+    with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
+        mma_kind_for_pair(kscale, MXFP8_E4M3)
+
+    # W4A16 int4-g128 (AWQ/GPTQ): fixed-offset elements are element decode;
+    # bf16 scale dtype is just data; no integer tcgen05 blockscaled kind.
+    int4 = BlockScaledFormat("int4_1x128", torch.uint8, "Int4", 4, 2, torch.bfloat16, 128)
+    with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
+        mma_kind_for_pair(int4, int4)
+
+    # e3m4: no DSL element type at all -> host-side only (see
+    # test_format_without_dsl_element_type for the full behavior pin).
+    e3m4 = BlockScaledFormat("mxfp8_e3m4", torch.uint8, None, 8, 1, torch.float8_e8m0fnu, 32)
+    with pytest.raises(ValueError, match="no CuTe-DSL element type"):
+        e3m4.to_cutlass_dtype()
+
+    # All are hashable descriptor singletons like the registered formats.
+    assert len({ds1d, kscale, int4, e3m4}) == 4
+
+    # W4A16-nvfp4 needs no new format: the container spelling is the existing
+    # NVFP4 operand paired with a plain bf16 tensor; sided-ness is per-kind
+    # (a follow-up), so today the interface still requires both-sided SF.
+    assert NVFP4.has_per_tensor_scale
