@@ -377,6 +377,11 @@ class BlockScaledOperand:
             object.__setattr__(self, "per_tensor_scale", self.per_tensor_scale.reshape(1))
         if self.qdata.device != self.scale.device:
             raise ValueError(f"qdata on {self.qdata.device} but scale on {self.scale.device}")
+        if self.per_tensor_scale is not None and self.qdata.device != self.per_tensor_scale.device:
+            raise ValueError(
+                f"qdata on {self.qdata.device} but per_tensor_scale on "
+                f"{self.per_tensor_scale.device}"
+            )
         requested = (
             None if self.quant_dim is None else _normalize_quant_dim(self.quant_dim, self.ndim)
         )
@@ -542,7 +547,13 @@ class BlockScaledOperand:
         return _construct(q, sf, fmt, pts, x.dtype, -1)
 
     def dequantize(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """Explicit dequantization to a plain high-precision tensor."""
+        """Explicit dequantization to a plain high-precision tensor.
+
+        The scale buffer must have the canonical dense shape for ``qdata``.
+        Varlen GEMMs use padded scale offsets derived from ``cu_seqlens``;
+        those buffers cannot be interpreted without metadata the operand does
+        not carry and therefore raise instead of returning incorrect values.
+        """
         fmt = self.format
         from quack.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
 
@@ -553,10 +564,18 @@ class BlockScaledOperand:
         vals = dequant_operand(q3, fmt)  # (l, mn, k) fp32
         l, mn, k = vals.shape
         scale = self.scale if self.scale.ndim == 6 else self.scale.unsqueeze(0)
-        sf2d = unpack_scale_blocked_to_2d(scale, mn, k // fmt.sf_vec_size).float()
-        out = vals * sf2d.view(l, mn, k // fmt.sf_vec_size).repeat_interleave(
-            fmt.sf_vec_size, dim=-1
-        )
+        sf_k = (k + fmt.sf_vec_size - 1) // fmt.sf_vec_size
+        expected_scale_shape = (l, (mn + 127) // 128, (sf_k + 3) // 4, 32, 4, 4)
+        if tuple(scale.shape) != expected_scale_shape:
+            raise ValueError(
+                "dequantize requires dense scale factors matching qdata; "
+                f"got {tuple(scale.shape)}, expected {expected_scale_shape}. "
+                "Padded varlen scale buffers require sequence offsets, which "
+                "BlockScaledOperand does not carry"
+            )
+        sf2d = unpack_scale_blocked_to_2d(scale, mn, sf_k).float()
+        scale_values = sf2d.view(l, mn, sf_k).repeat_interleave(fmt.sf_vec_size, dim=-1)
+        out = vals * scale_values[..., :k]
         if self.per_tensor_scale is not None:
             out = out * self.per_tensor_scale
         if not batched:
@@ -609,7 +628,6 @@ class BlockScaledOperand:
         )
 
 
-@torch._dynamo.allow_in_graph
 def _construct(qdata, scale, fmt, per_tensor_scale, orig_dtype, quant_dim):
     return BlockScaledOperand(qdata, scale, fmt, per_tensor_scale, orig_dtype, quant_dim)
 

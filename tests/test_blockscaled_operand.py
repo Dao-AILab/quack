@@ -109,6 +109,10 @@ def test_construction_rejects():
         BlockScaledOperand.from_parts(
             n.qdata, n.scale, NVFP4, per_tensor_scale=torch.ones(2, device="cuda")
         )
+    with pytest.raises(ValueError, match="per_tensor_scale on cpu"):
+        BlockScaledOperand.from_parts(
+            n.qdata, n.scale, NVFP4, per_tensor_scale=torch.tensor(1.0)
+        )
 
 
 def test_uint8_scale_canonicalization():
@@ -129,6 +133,15 @@ def test_varlen_padded_scale_constructible():
     padded = torch.zeros(1, rm + 3, rk, 32, 4, 4, dtype=t.scale.dtype, device="cuda")
     bst = BlockScaledOperand.from_parts(t.qdata, padded, MXFP8_E4M3)  # must not raise
     assert bst.scale.shape[1] == rm + 3
+    with pytest.raises(ValueError, match="Padded varlen scale buffers"):
+        bst.dequantize()
+
+    # Exact-shape atom-aligned slices remain valid dense scale storage even
+    # when their outer strides include padding.
+    strided_storage = torch.zeros(rm, rk + 3, 32, 4, 4, dtype=t.scale.dtype, device="cuda")
+    strided_storage[:, :rk] = t.scale
+    dense_view = BlockScaledOperand.from_parts(t.qdata, strided_storage[:, :rk], MXFP8_E4M3)
+    assert torch.equal(dense_view.dequantize(torch.float32), t.dequantize(torch.float32))
 
 
 @pytest.mark.parametrize(

@@ -243,13 +243,13 @@ def test_blockscaled_gemm_bad_sf_layout_rejected():
 
 
 def test_blockscaled_gemm_torch_compile():
-    """Raw (q, sf) parts as graph inputs, containers built in-graph via from_parts."""
+    """Raw parts as graph inputs, with from_parts staying in one full graph."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
     ref = gemm(A, B, tuned=False)
 
-    @torch.compile(dynamic=False)
+    @torch.compile(dynamic=False, fullgraph=True)
     def f(qa, sfa, b, sfw):
         a_op = BlockScaledOperand.from_parts(qa, sfa, "mxfp8_e4m3")
         b_op = BlockScaledOperand.from_parts(b, sfw, "mxfp8_e4m3", quant_dim=-2)
@@ -631,8 +631,7 @@ def test_blockscaled_gemm_torch_compile_container():
 
 
 def test_blockscaled_quantize_in_graph():
-    """Quantize + gemm in one compiled region (exercises the allow_in_graph
-    constructor path)."""
+    """Quantize + gemm in one full graph, including container construction."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)
@@ -645,5 +644,5 @@ def test_blockscaled_quantize_in_graph():
         return gemm(xq, wq.mT, tuned=False)
 
     ref = f(x, w)
-    out = torch.compile(f, dynamic=False)(x, w)
+    out = torch.compile(f, dynamic=False, fullgraph=True)(x, w)
     assert torch.equal(out, ref)
