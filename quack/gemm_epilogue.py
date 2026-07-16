@@ -1226,6 +1226,7 @@ class EpiMod:
         bs_format_a=None,
         bs_format_b=None,
         swap_ab=False,  # swap-at-trace: requires b_kn (B given (k, n)); dense element mode
+        ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
         varlen_m = cu_seqlens_m is not None
@@ -1242,6 +1243,10 @@ class EpiMod:
                 raise ValueError("swap_ab: dense non-blockscaled only")
             if self.mode != "element" or self.sinks:
                 raise ValueError("swap_ab supports element-mode sink-less epilogues only")
+            if ag_args is not None:
+                # With swapped slots kernel-A is the caller's B: the AG gate
+                # would gate the wrong operand (and the wrong M geometry).
+                raise ValueError("swap_ab does not support ag_args (AG shards kernel-A along M)")
         # Warm fast path: probe the plan cache on raw-input metadata before any
         # validation or kind inference — a hit is exactly a replay of a
         # previously validated call (the key subsumes everything validation
@@ -1275,6 +1280,7 @@ class EpiMod:
             bs_format_a,
             bs_format_b,
             swap_ab,
+            ag_args is not None,
         )
         plan = self._plan_cache.get(key)
         if plan is not None:
@@ -1286,6 +1292,7 @@ class EpiMod:
                     D,
                     C,
                     epi_args,
+                    ag_args=ag_args,
                     tile_count_semaphore=tile_count_semaphore,
                     cu_seqlens_m=cu_seqlens_m,
                     A_idx=A_idx,
@@ -1550,6 +1557,7 @@ class EpiMod:
             post_init_attrs=post_init_attrs,
             gemm_cls_ref=self._class_ref(mint_key),
             packed_cd=packed_form,
+            has_ag=ag_args is not None,
         )
         self._plan_cache[key] = plan
         if _launch:
@@ -1560,6 +1568,7 @@ class EpiMod:
                 D,
                 C,
                 epi_values,
+                ag_args=ag_args,
                 tile_count_semaphore=tile_count_semaphore,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,

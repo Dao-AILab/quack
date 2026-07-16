@@ -120,6 +120,107 @@ class WorkTileInfo:
         )
 
 
+@cute.jit
+def ag_wait_m_tile(
+    params, pid_m: Int32, cluster_shape_m: cutlass.Constexpr[int], last_gate: Int32
+) -> Int32:
+    """AllGather+GEMM arrival gate — the pipeline's consumer_wait on the
+    fine-grained FULL flags (see quack/distributed/all_gather_gemm.py module
+    docstring for the full/empty mapping): spin until the M-chunk owning CTA
+    tile pid_m has been delivered into local HBM
+    (flags[shard * num_chunks + chunk] >= *epoch, modular).
+    num_chunks == 1 degenerates to shard-granular gating.
+
+    1-entry satisfied-gate cache: flags are monotonic within a launch, so a
+    gate that passed once stays passed; consecutive tiles overwhelmingly map
+    to the same (shard, chunk) (the schedule sweeps N fastest within a cid_m
+    group), so remembering the LAST passed gate index skips the sys-scope
+    flag load for most tiles. The gate index is recomputed per tile from its
+    coordinates; the cache update is the RETURN VALUE, which callers thread
+    back in as last_gate (init -1). Only worth anything at comm-bound
+    corners — the check already rides in producer_acquire slack when
+    compute-bound.
+
+    Called from the AB-load warp before the tile's first TMA issue. flags
+    are plain local gmem, remote-written by the owning rank's transport (a
+    4-byte CE copy of the device epoch after each chunk's data send); the
+    values are monotonically increasing per-call epochs, so there is no
+    reset (and no reset barrier).
+
+    RELAXED loads, deliberately: acquire-sys lowers to LDG.STRONG.SYS +
+    CCTL.IVALL — a full L1 invalidate on the issuing SM per tile, even when
+    the flag is long set. The ordering it would buy is unnecessary for this
+    consumer: the gated data is read by TMA, which fetches at the L2
+    coherence point where the CE writes already landed (they are
+    stream-ordered before the flag memset, and the memset itself is
+    L2-visible when this load observes it). L1 staleness cannot reach a TMA
+    read. NCCL's CE-collective flag waits use the same relaxed/volatile
+    pattern. If a SIMT (L1-cached) consumer of the gated bytes is ever added,
+    this needs an acquire (or proxy fence) on the spun path.
+    """
+    cid_m = pid_m // cluster_shape_m
+    shard = cid_m // params.ag.nclusters_m_per_shard
+    chunk = (cid_m - shard * params.ag.nclusters_m_per_shard) // params.ag.nclusters_m_per_chunk
+    gate = shard * params.ag.num_chunks + chunk
+    if gate != last_gate:
+        # The epoch is DEVICE-resident (a 1-element tensor the host bumps
+        # with a captured kernel) so the whole call is CUDA-graph-capturable
+        # — nothing host-baked. One L2-hot load per gate miss.
+        epoch = cute.arch.load(params.ag.epoch.iterator.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+        ptr = params.ag.flags.iterator + gate
+        val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
+        # Modular GEQ (TE's CHECK_IDS trick): satisfied iff (val - epoch) has
+        # the sign bit clear under wrapping int32 arithmetic — flags may run
+        # up to 2^31 ahead across wraps, so there is NO wraparound resync.
+        while (val - epoch) < 0:
+            val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
+    return gate
+
+
+@mlir_namedtuple
+class AgSchedulerArguments(NamedTuple):
+    """AllGather+GEMM scheduler arguments — the kernel-side twin of
+    quack.gemm.AllGatherArguments, same field names (see
+    quack/distributed/all_gather_gemm.py). A's M dim is sharded across
+    num_shards ranks and delivered into local HBM by a transport that
+    publishes per-shard arrival flags. The scheduler decodes work ids
+    shard-major (ring-rotated by first_shard so the local shard's tiles are
+    issued first) with the usual L2 swizzle *inside* each shard, and the
+    load warp spins until flags[shard] >= *epoch before touching A."""
+
+    # (num_shards * num_chunks,) Int32, monotonic epoch values; chunk-major
+    # within a shard (flag idx = shard * num_chunks + chunk).
+    flags: cute.Tensor
+    epoch: cute.Tensor  # (1,) Int32, device-resident, read through the pointer
+    num_shards: Int32
+    first_shard: Int32
+    # Sub-shard arrival granularity: shards are delivered (and flagged) in
+    # num_chunks equal M-slices, so a tile's gate releases when its CHUNK has
+    # landed rather than the whole shard. 1 = shard-granular (mirrors the
+    # host twin's default).
+    num_chunks: Int32 = Int32(1)
+
+
+@mlir_namedtuple
+class AgParams(NamedTuple):
+    """Decode-ready AllGather scheduler params: AgSchedulerArguments' gate
+    fields plus the derived per-shard/per-chunk cluster geometry. Work ids
+    decode shard-major with the L2 swizzle confined to one shard's
+    (nclusters_m_per_shard, ncluster_n) sub-problem — the group/serpentine
+    divmods in TileScheduler.Params are built on the SUB-shape when this is
+    set; problem_shape_ncluster_mnl stays the full problem (grid sizing and
+    validity)."""
+
+    flags: cute.Tensor
+    epoch: cute.Tensor
+    num_shards: Int32
+    first_shard: Int32
+    num_chunks: Int32
+    clusters_per_shard_fdd: FastDivmod
+    nclusters_m_per_shard: Int32
+    nclusters_m_per_chunk: Int32
+
+
 # Grouping arguments together that should be passed to __call__
 @mlir_namedtuple
 class TileSchedulerOptions(NamedTuple):
@@ -128,6 +229,7 @@ class TileSchedulerOptions(NamedTuple):
     max_swizzle_size: Int32 = Int32(8)
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
+    ag: Optional[AgSchedulerArguments] = None
 
 
 @dataclass
@@ -142,6 +244,7 @@ class TileSchedulerArguments:
     # Split-K: the L (z) dimension of the work-id space is multiplied by num_split_k, with the
     # split index as the fastest-varying component. problem_shape_ntile_mnl[2] stays the true L.
     num_split_k: cutlass.Constexpr[int] = 1
+    ag: Optional[AgSchedulerArguments] = None
 
 
 class TileScheduler:
@@ -164,6 +267,7 @@ class TileScheduler:
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
         num_split_k: cutlass.Constexpr[int] = 1
+        ag: Optional[AgParams] = None
 
         @staticmethod
         @cute.jit
@@ -177,18 +281,47 @@ class TileScheduler:
                 args.problem_shape_ntile_mnl[2],
             )
             num_clusters_per_problem = cute.size(problem_shape_ncluster_mn)
+            # AllGather: raster/group/serpentine operate on one shard's sub-problem.
+            ag_params = None
+            problem_shape_ncluster_mn_swz = problem_shape_ncluster_mn
+            if const_expr(args.ag is not None):
+                ag_nclusters_m_per_shard = problem_shape_ncluster_mn[0] // args.ag.num_shards
+                ag_params = AgParams(
+                    flags=args.ag.flags,
+                    epoch=args.ag.epoch,
+                    num_shards=args.ag.num_shards,
+                    first_shard=args.ag.first_shard,
+                    num_chunks=args.ag.num_chunks,
+                    clusters_per_shard_fdd=FastDivmod(
+                        ag_nclusters_m_per_shard * problem_shape_ncluster_mn[1]
+                    ),
+                    nclusters_m_per_shard=ag_nclusters_m_per_shard,
+                    nclusters_m_per_chunk=ag_nclusters_m_per_shard // args.ag.num_chunks,
+                )
+                problem_shape_ncluster_mn_swz = (
+                    ag_nclusters_m_per_shard,
+                    problem_shape_ncluster_mn[1],
+                )
+            # NOTE(ag raster, tried July 2026 — negative result): resolving the
+            # raster heuristic from the GLOBAL shape instead of the per-shard
+            # sub-problem (the orders differ: 8x16 shard -> AlongM vs 64x16
+            # global -> AlongN at ws=8 16384x4096) did NOT change the rotated
+            # schedule's DRAM read amplification (~84MB/shard pass; NCU
+            # 1452 -> 1444MB) — the re-reads come from per-shard A-residency
+            # thrash under the combined B/D streams, not the sweep order, and
+            # they mostly hide in DRAM slack anyway (wall cost ~1-2% at TP8).
             raster_order = get_raster_order_from_option(
-                args.raster_order, problem_shape_ncluster_mn, args.group_size
+                args.raster_order, problem_shape_ncluster_mn_swz, args.group_size
             )
             ncluster_fast = (
-                problem_shape_ncluster_mn[0]
+                problem_shape_ncluster_mn_swz[0]
                 if raster_order == RasterOrder.AlongM
-                else problem_shape_ncluster_mn[1]
+                else problem_shape_ncluster_mn_swz[1]
             )
             ncluster_slow = (
-                problem_shape_ncluster_mn[1]
+                problem_shape_ncluster_mn_swz[1]
                 if raster_order == RasterOrder.AlongM
-                else problem_shape_ncluster_mn[0]
+                else problem_shape_ncluster_mn_swz[0]
             )
             group_size = min(args.group_size, ncluster_fast)
             group_size_tail = ncluster_fast % group_size
@@ -212,6 +345,7 @@ class TileScheduler:
                 args.cluster_shape_mnk,
                 args.persistence_mode,
                 args.num_split_k,
+                ag_params,
             )
 
     def __init__(
@@ -372,7 +506,13 @@ class TileScheduler:
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
                 if params.raster_order == RasterOrder.AlongM
-                else params.problem_shape_ncluster_mnl[0]
+                else (
+                    params.problem_shape_ncluster_mnl[0]
+                    if const_expr(params.ag is None)
+                    # AllGather: the swizzle runs inside one shard, so the
+                    # serpentine reflects over the shard's M extent.
+                    else params.ag.nclusters_m_per_shard
+                )
             )
             cid_slow = ncluster_slow - 1 - cid_slow
         cid_fast = group_id * params.group_size_fdd.divisor + cid_fast_in_group
@@ -442,7 +582,36 @@ class TileScheduler:
                     )
                     # bidz_ carries the combined (l, split) index, like grid z in NONE/CLC modes.
                     bidz_ = l_idx * params.num_split_k + split_idx
+            # AllGather: shard-major decode. The linear id splits into
+            # (shard, id-in-shard); the shard is ring-rotated so shard 0 of the
+            # *schedule* is the local shard (already resident), shard j arrives
+            # from peer (rank + j) % num_shards while shards < j compute. The
+            # swizzle below then runs on the shard's sub-problem.
+            # NOTE(ag L2 traversal, tried July 2026): the shard-major decode
+            # costs ~13-20us at TP4 16384x4096 vs the plain raster (-3.6pp L2
+            # hit) because every shard re-sweeps all of N (B re-read once per
+            # shard, +192MB DRAM/iter — intrinsic to arrival-ordered
+            # consumption). Fixes tried and REJECTED by measurement:
+            # cross-shard serpentine parity continuation (no effect),
+            # max_swizzle_size retuning (8 already optimal), B evict_last TMA
+            # cache hints (-3.5%, see gemm_sm100 load-warp note), and TMA
+            # prefetch of B was ruled out by NCU PM-sampling: the
+            # long-scoreboard stall timeline is FLAT through the mainloop with
+            # no bursts at shard/panel transitions (829 samples @0.7us), i.e.
+            # the misses are uniformly spread and already pipeline-hidden —
+            # prefetch has nothing to smooth. This cost is fundamental to
+            # consuming shards in arrival order; spend effort elsewhere.
+            ag_shard = Int32(0)
+            if const_expr(params.ag is not None):
+                ag_shard, cluster_id_in_problem = divmod(
+                    cluster_id_in_problem, params.ag.clusters_per_shard_fdd
+                )
+                ag_shard = ag_shard + params.ag.first_shard
+                if ag_shard >= params.ag.num_shards:
+                    ag_shard = ag_shard - params.ag.num_shards
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
+            if const_expr(params.ag is not None):
+                cid_m = cid_m + ag_shard * params.ag.nclusters_m_per_shard
             pid_m, pid_n = self._cluster_id_to_cta_id(
                 cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
             )

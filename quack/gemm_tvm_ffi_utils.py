@@ -12,7 +12,7 @@ from cutlass.cute.runtime import make_ptr
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.tile_scheduler import TileSchedulerOptions
+from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
 
@@ -260,7 +260,11 @@ def get_dtypes(A, B, D, C):
 
 
 def make_scheduler_args(
-    max_active_clusters, max_swizzle_size, tile_count_semaphore, batch_idx_permute=None
+    max_active_clusters,
+    max_swizzle_size,
+    tile_count_semaphore,
+    batch_idx_permute=None,
+    ag_args=None,  # quack.gemm.AllGatherArguments or None
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -269,16 +273,41 @@ def make_scheduler_args(
         tile_count_semaphore=(
             tile_count_semaphore.data_ptr() if tile_count_semaphore is not None else None
         ),
+        ag=(
+            AgSchedulerArguments(
+                flags=ag_args.flags,
+                epoch=ag_args.epoch,
+                num_shards=Int32(ag_args.num_shards),
+                first_shard=Int32(ag_args.first_shard),
+                num_chunks=Int32(ag_args.num_chunks),
+            )
+            if ag_args is not None
+            else None
+        ),
         batch_idx_permute=batch_idx_permute,
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
+def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag=False):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
         max_swizzle_size=Int32(8),
         tile_count_semaphore=(
             make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_semaphore else None
+        ),
+        ag=(
+            AgSchedulerArguments(
+                flags=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4),
+                # divisibility=1 elem => assumed_align=4 B: the gate reads one
+                # scalar int32, and the runtime tensor is a 1-elem VIEW that
+                # may sit 4 bytes off its allocation base (parity-1 slot).
+                epoch=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+                num_shards=Int32(1),
+                first_shard=Int32(0),
+                num_chunks=Int32(1),
+            )
+            if has_ag
+            else None
         ),
         batch_idx_permute=(
             fake_tensor(Int32, (l_sym,), leading_dim=0, divisibility=4)
@@ -410,14 +439,40 @@ def scalar_arg(scalar, mode, dtype=Float32):
         return scalar.data_ptr()
 
 
-def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None):
+def validate_ag_geometry(A, ag_args, tile_M, cluster_M):
+    """The ONE geometry fact the AG transport and kernel share: shard and
+    arrival-chunk boundaries must land on whole scheduler clusters along M,
+    else a tile spans two shards/chunks and gating it on one flag is unsound.
+    Enforced at the launch choke point every frontend goes through
+    (plan_scheduler_args — the plan knows the exact tile config); gemm() also
+    calls it pre-compile to fail fast on the cold path."""
+    m_rows = A.shape[-2]
+    assert m_rows % ag_args.num_shards == 0, (
+        f"AG+GEMM: M ({m_rows}) must divide into num_shards ({ag_args.num_shards})"
+    )
+    shard_rows = m_rows // ag_args.num_shards
+    assert shard_rows % (tile_M * cluster_M * ag_args.num_chunks) == 0, (
+        f"AG+GEMM: shard rows ({shard_rows}) must be a multiple of tile_M * cluster_M * "
+        f"arrival_chunks ({tile_M} * {cluster_M} * {ag_args.num_chunks}) so shard/chunk "
+        f"boundaries land on whole scheduler clusters"
+    )
+
+
+def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_args=None, A=None):
     """Per-call TileSchedulerOptions for a cached plan.
 
     Must mirror make_fake_scheduler_args in the variant's _compile_* function:
     only the SM8x/SM90 dynamic scheduler consumes the semaphore (SM100 uses CLC
     instead), so when the compiled signature has None there the semaphore the
     caller passed is dropped rather than forwarded.
+
+    AG+GEMM callers must pass A (the gathered kernel-A tensor) so the shard
+    geometry is validated against the plan's tile config on every launch —
+    frontends can't forget it by construction.
     """
+    if ag_args is not None:
+        assert A is not None, "plan_scheduler_args: ag_args requires A for geometry validation"
+        validate_ag_geometry(A, ag_args, plan.tile_M, plan.cluster_M)
     if plan.scheduler_static is not None:
         return plan.scheduler_static
     return make_scheduler_args(
@@ -425,6 +480,7 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None):
         plan.max_swizzle_size,
         tile_count_semaphore if plan.scheduler_uses_semaphore else None,
         batch_idx_permute,
+        ag_args=ag_args,
     )
 
 

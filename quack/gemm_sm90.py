@@ -23,7 +23,7 @@ from cutlass.utils import LayoutEnum, SmemPartition
 from quack import layout_utils
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
-from quack.tile_scheduler import TileSchedulerOptions
+from quack.tile_scheduler import TileSchedulerOptions, ag_wait_m_tile
 from quack.varlen_utils import VarlenArguments, VarlenManager
 
 # return PipelineStateWAdvance instead of PipelineState
@@ -694,14 +694,31 @@ class GemmSm90(GemmTmaBase):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
                 tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
+                ag_last_gate = Int32(-1)  # 1-entry satisfied-gate cache (see ag_wait_m_tile)
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
                 while work_tile.is_valid_tile:
-                    iket.range_push("tma_load")
                     # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
+                    # AllGather+GEMM: block until this tile's M-shard of A has
+                    # been pushed into local HBM by the owner rank. Only the
+                    # load warp gates — the MMA/epilogue warps are downstream
+                    # of the AB pipeline. With the ring-rotated shard-major
+                    # schedule the flag is normally already set and this is a
+                    # single L2 load. getattr: the varlen scheduler Params
+                    # classes have no ag_* fields at all.
+                    if const_expr(getattr(tile_sched_params, "ag", None) is not None):
+                        iket.range_push("ag_wait")
+                        ag_last_gate = ag_wait_m_tile(
+                            tile_sched_params,
+                            tile_coord_mnkl[0],
+                            self.cluster_shape_mnk[0],
+                            ag_last_gate,
+                        )
+                        iket.range_pop()
+                    iket.range_push("tma_load")
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None
                     if const_expr(not self.gather_A):

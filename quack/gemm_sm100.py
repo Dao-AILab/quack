@@ -36,7 +36,10 @@ from quack.pipeline import (
     mbarrier_acquire_cluster,
 )
 from quack.dsl.smem_struct import Reserved, partitioned_struct
-from quack.tile_scheduler import TileSchedulerOptions
+from quack.tile_scheduler import (
+    TileSchedulerOptions,
+    ag_wait_m_tile,
+)
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
@@ -44,6 +47,30 @@ from quack import layout_utils
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
 from quack.layout_utils import tile_atom_to_shape_SF_strided
+
+# TOMBSTONE — AllGather+GEMM arrival-gate placement experiment (2026-07-15,
+# MEASURED NEGATIVE, code removed; do not retry). Tried: the SCHEDULER warp
+# spins on the shard flag after decoding each CLC work tile (before its next
+# query) INSTEAD of the AB-load warp gating before a tile's first TMA (the
+# shipped design). It is structurally NOT a gate: under CLC persistence the
+# multicast response lands in every CTA's smem directly from hardware (no
+# STAS publish step by the sched warp), so there is no pre-commit window and
+# the sched warp's spin cannot order any load warp's TMA behind flag
+# arrival — the load warps free-run on already-multicast (and initial
+# blockIdx-derived) tiles. Measured on B300 TP2 (tests) + TP4 ce_push
+# (bench: 100 warmup + 500 timed, one event pair, cross-rank max, randn/8
+# bf16, tile 128x256 cluster (2,1)):
+#   - correctness: EVERY AG case fails (err ~5-12 vs tol ~0.016, delayed AND
+#     non-delayed copies; gathered_err=0 — the transport delivered, the GEMM
+#     consumed early).
+#   - (8192,2048,8192) gating-bound corner: 258.6us vs 284.8/285.4us
+#     (roof ~200) — the racy free-run recovers ~26us of the gate cost, an
+#     UPPER BOUND for any scheme that moves gating off the load warp's
+#     critical path (a correct one must add sync this version doesn't pay).
+#   - (16384,4096,8192): 962.0 vs 961.1/964.7us; (32768,2048,8192): 993.7 vs
+#     997.0/995.3us — parity within A/B/A drift, so the load-warp gate costs
+#     ~nothing where NVLink delivery fits the GEMM window (matches the
+#     regret decomposition in AI/allgather_gemm_design.md).
 
 # return PipelineStateWAdvance instead of PipelineState
 
@@ -1219,6 +1246,7 @@ class GemmSm100(GemmTmaBase):
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
+            ag_last_gate = Int32(-1)  # 1-entry satisfied-gate cache (see ag_wait_m_tile)
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.ab_stage
             )
@@ -1239,6 +1267,23 @@ class GemmSm100(GemmTmaBase):
                 # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
+                # AllGather+GEMM: block until this tile's M-shard of A has been
+                # pulled into local HBM by the copy stream. Only the load warp
+                # gates — the MMA/epilogue warps are downstream of the AB
+                # pipeline. With the ring-rotated shard-major schedule the flag
+                # is normally already set and this is a single L2 load.
+                # getattr: the varlen/triangular scheduler Params classes have
+                # no ag_* fields at all (pre-existing trace error since the AG
+                # gate landed; surfaced on any cold-cache varlen compile).
+                if const_expr(getattr(tile_sched_params, "ag", None) is not None):
+                    iket.range_push("ag_wait")
+                    ag_last_gate = ag_wait_m_tile(
+                        tile_sched_params,
+                        tile_coord_mnkl[0],
+                        self.cluster_shape_mnk[0],
+                        ag_last_gate,
+                    )
+                    iket.range_pop()
                 # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
                     tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),

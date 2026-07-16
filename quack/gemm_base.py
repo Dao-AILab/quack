@@ -743,8 +743,12 @@ class GemmBase:
                 batch_idx_permute=scheduler_args.batch_idx_permute,
                 persistence_mode=persistence_mode,
                 num_split_k=self.split_k,
+                ag=getattr(scheduler_args, "ag", None),
             )
         else:
+            assert getattr(scheduler_args, "ag", None) is None, (
+                "AllGather+GEMM does not support varlen_m"
+            )
             assert self.split_k == 1, "split_k does not support varlen_m"
             has_epi_tile_store = any(
                 getattr(epilogue_args, op.name, None) is not None
@@ -1077,6 +1081,13 @@ class GemmTmaBase(GemmBase):
         src_tensor, dst_tensor = (
             (sD, tDgD_for_tma_partition) if is_s2g else (tDgD_for_tma_partition, sD)
         )
+        # NOTE(l2-hints, tried July 2026): a cache_policy kwarg (PTX
+        # createpolicy Int64) flows through tma_get_copy_fn -> block_copy ->
+        # cute.copy if ever needed — we wired D stores as evict_first here and
+        # B loads as evict_last in the mainloop and measured a net REGRESSION
+        # (-0.9% plain / -3.5% AG at TP4 16384x4096x8192 settled). Don't
+        # retry without profiling data showing D/B L2 residency is the
+        # binding constraint (see gemm_sm100 load-warp note for details).
         return copy_utils.tma_get_copy_fn(
             atom,
             cta_coord=0,

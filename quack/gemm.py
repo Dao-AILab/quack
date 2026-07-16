@@ -40,6 +40,7 @@ from quack.gemm_tvm_ffi_utils import (
     scalar_mode,
     scalar_arg,
     plan_scheduler_args,
+    validate_ag_geometry,
     launch_gemm,
 )
 
@@ -84,6 +85,7 @@ def _compile_gemm(
     sf_batched=True,
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
+    has_ag=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -162,7 +164,10 @@ def _compile_gemm(
         ),
     )
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] <= 9), has_batch_idx_permute, l
+        (is_dynamic_persistent and device_capacity[0] <= 9),
+        has_batch_idx_permute,
+        l,
+        has_ag=has_ag,
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
@@ -341,6 +346,24 @@ def _reduce_staged_split_k(
     )
 
 
+class AllGatherArguments(NamedTuple):
+    """AllGather+GEMM scheduler arguments (see quack/distributed/): the typed
+    host-side mirror of the ag_* fields in TileSchedulerArguments — the
+    kernel-facing structure cute.jit consumes. flags[shard * num_chunks + c]
+    >= *epoch gates a tile's first TMA; num_shards/first_shard drive the
+    shard-major rotated decode; num_chunks is the sub-shard arrival
+    granularity."""
+
+    flags: Tensor  # (num_shards * num_chunks,) int32, symmetric
+    epoch: Tensor  # (1,) int32, 4B-aligned, device-resident epoch slot
+    num_shards: int  # world_size: shards along M
+    # Index of the shard whose tiles are scheduled FIRST; consumption walks
+    # the ring from there. Each rank passes its own rank — the local shard
+    # is resident immediately, remote shards arrive in ring order.
+    first_shard: int
+    num_chunks: int = 1  # sub-shard arrival granularity (flags per shard)
+
+
 def gemm(
     # (l, m, k), or (m, k) unbatched dense (SM90+; B/D/C must be 2D too), or (total_m, k)
     # if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or
@@ -391,6 +414,11 @@ def gemm(
     # B is passed (k, n) / (l, k, n) and relabeled to kernel order (n, k) at trace
     # time — saves the caller a per-call .mT view. Dense SM90+ only.
     b_kn: bool = False,
+    # AllGather+GEMM (SM90+, see quack/distributed/all_gather_gemm.py): A is the full
+    # gathered (M, K) buffer being filled by a copy stream; (flags, seq,
+    # num_shards, first_shard) drive the shard-major rotated schedule and the
+    # load-warp arrival gate.
+    ag_args: Optional[AllGatherArguments] = None,
 ) -> _GemmPlan:
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
@@ -402,6 +430,11 @@ def gemm(
     # strides subsume the majors, the validation asserts, and the fp4/SF shape
     # checks), so a cache hit is exactly a replay of a previously validated
     # call with different data pointers.
+    if ag_args is not None:
+        # Shard/chunk geometry (see validate_ag_geometry): enforced at launch
+        # for every frontend via plan_scheduler_args; checked here too so a
+        # bad-geometry cold call fails before the (expensive) compile.
+        validate_ag_geometry(A, ag_args, tile_M, cluster_M)
     key = (
         tensor_key(A),
         tensor_key(B),
@@ -440,6 +473,7 @@ def gemm(
         b_kn,
         bs_format_a,
         bs_format_b,
+        ag_args is not None,
     )
     plan = _gemm_plan_cache.get(key)
     if plan is None:
@@ -480,6 +514,7 @@ def gemm(
             b_kn=b_kn,
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
+            has_ag=ag_args is not None,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -500,6 +535,7 @@ def gemm(
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
         SFB=SFB,
+        ag_args=ag_args,
     )
     return plan
 
@@ -523,6 +559,7 @@ def run_gemm_plan(
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
+    ag_args: Optional[AllGatherArguments] = None,
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -573,7 +610,9 @@ def run_gemm_plan(
                 split_k_workspace.permute(3, 1, 2, 0) if split_k_semaphore is not None else None
             ),
         )
-    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute)
+    scheduler_args = plan_scheduler_args(
+        plan, tile_count_semaphore, batch_idx_permute, ag_args, A=A
+    )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
     launch_gemm(plan, A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
@@ -630,6 +669,7 @@ def _build_gemm_plan(
     b_kn=False,
     bs_format_a=None,
     bs_format_b=None,
+    has_ag=False,
 ) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -640,6 +680,10 @@ def _build_gemm_plan(
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
+    if has_ag:
+        assert not varlen and not gather_A, "AllGather+GEMM requires a dense GEMM"
+        assert persistent, "AllGather+GEMM requires the persistent scheduler"
+        assert split_k == 1, "AllGather+GEMM does not support split_k yet"
     if add_to_output:
         assert not varlen_m, "Add to output not supported with varlen_m"
     assert split_k >= 1, "split_k must be >= 1"
@@ -669,6 +713,10 @@ def _build_gemm_plan(
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
+    if has_ag:
+        # SM8x is the one arch without the load-warp gate (no specialized
+        # load warp in the cp.async kernel); every TMA arch supports AG.
+        assert device_capacity[0] >= 9, "AllGather+GEMM requires SM90+"
     sf_dtype, sf_vec_size = None, None
     a_mma_dtype, b_mma_dtype = None, None
     if blockscaled:
@@ -801,6 +849,7 @@ def _build_gemm_plan(
         SFA.ndim == 6 if blockscaled else True,
         a_mma_dtype,
         b_mma_dtype,
+        has_ag,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K
@@ -831,7 +880,7 @@ def _build_gemm_plan(
             sr_seed=None,
         )
     scheduler_static = None
-    if not scheduler_uses_semaphore and batch_idx_permute is None:
+    if not scheduler_uses_semaphore and batch_idx_permute is None and not has_ag:
         scheduler_static = make_scheduler_args(max_active_clusters, max_swizzle_size, None, None)
 
     return _GemmPlan(

@@ -195,6 +195,7 @@ def _compile_gemm_epi(
     b_mma_dtype=None,
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
+    has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -230,7 +231,7 @@ def _compile_gemm_epi(
     epi_args = GemmCls.EpilogueArguments(**fields)
 
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l
+        (is_dynamic_persistent and device_capacity[0] == 9), False, l, has_ag=has_ag
     )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
@@ -292,6 +293,8 @@ class GemmEpiPlan(NamedTuple):
     scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
     scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
     epi_arg_keys: tuple  # ((op_name, key), ...) as compiled
+    tile_M: int  # scheduler-cluster geometry, for launch-time AG validation
+    cluster_M: int  # (see validate_ag_geometry in plan_scheduler_args)
     # Launch-overhead precomputation (host hot path): (name, converter, key)
     # triples — converter is the op's bound ``host_call_arg``, or None when the
     # op inherits the identity default (the value passes straight through) —
@@ -339,6 +342,7 @@ def build_gemm_epi_plan(
     post_init_attrs=(),
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
+    has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
@@ -407,15 +411,18 @@ def build_gemm_epi_plan(
         b_mma_dtype=b_mma_dtype,
         post_init_attrs=post_init_attrs,
         packed_cd=packed_cd,
+        has_ag=has_ag,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     # Must mirror make_fake_scheduler_args above: only the SM90 dynamic
     # scheduler consumes the semaphore, so it's the only non-static case.
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
+    # AG plans get PER-CALL scheduler args (the flags seq advances every
+    # iteration), never the prebuilt static tuple.
     scheduler_static = (
         make_scheduler_args(max_active_clusters, max_swizzle_size, None)
-        if not scheduler_uses_semaphore
+        if not scheduler_uses_semaphore and not has_ag
         else None
     )
     from quack.epi_ops import EpiOp
@@ -442,6 +449,8 @@ def build_gemm_epi_plan(
         scheduler_uses_semaphore=scheduler_uses_semaphore,
         scheduler_static=scheduler_static,
         epi_arg_keys=epi_keys,
+        tile_M=tile_M,
+        cluster_M=cluster_M,
     )
 
 
@@ -453,6 +462,7 @@ def run_gemm_epi_plan(
     C,
     epi_values,
     *,
+    ag_args=None,  # forwarded to the scheduler (AllGather+GEMM flags contract)
     tile_count_semaphore=None,
     cu_seqlens_m=None,
     cu_seqlens_k=None,
@@ -476,7 +486,7 @@ def run_gemm_epi_plan(
         if value is not None:
             fields[name] = value
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
-    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
+    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
     launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
 

@@ -46,6 +46,7 @@ def gemm_act(
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
     b_kn: bool = False,  # B passed (k, n) / (l, k, n), transposed at trace time (dense SM90+)
+    ag_args: Optional[tuple] = None,  # AllGather+GEMM flags contract (see quack/distributed/)
 ) -> GemmEpiPlan:
     """GEMM + activation (optionally gated), on the epilogue-mod path
     (quack.epilogues.linear_act_mod). ``alpha`` scales the accumulator BEFORE
@@ -87,6 +88,7 @@ def gemm_act(
         D,
         C,
         epi_args=epi_args,
+        ag_args=ag_args,
         tile_M=tile_M,
         tile_N=tile_N,
         cluster_M=cluster_M,
