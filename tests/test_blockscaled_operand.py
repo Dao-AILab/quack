@@ -94,13 +94,9 @@ def test_format_legacy_positional_order_and_validation():
     # A call written against the short-lived signature without
     # elems_per_container must fail, not silently shift all later fields.
     with pytest.raises(TypeError, match="elems_per_container"):
-        BlockScaledFormat(
-            "shifted", torch.uint8, None, 4, torch.float8_e8m0fnu, 32, False
-        )
+        BlockScaledFormat("shifted", torch.uint8, None, 4, torch.float8_e8m0fnu, 32, False)
     with pytest.raises(ValueError, match="do not fit"):
-        BlockScaledFormat(
-            "overfull", torch.uint8, None, 6, 2, torch.float8_e8m0fnu, 32
-        )
+        BlockScaledFormat("overfull", torch.uint8, None, 6, 2, torch.float8_e8m0fnu, 32)
 
 
 def test_format_from_cutlass_dtypes():
@@ -169,9 +165,7 @@ def test_construction_rejects():
             n.qdata, n.scale, NVFP4, per_tensor_scale=torch.ones(2, device="cuda")
         )
     with pytest.raises(ValueError, match="per_tensor_scale on cpu"):
-        BlockScaledOperand.from_parts(
-            n.qdata, n.scale, NVFP4, per_tensor_scale=torch.tensor(1.0)
-        )
+        BlockScaledOperand.from_parts(n.qdata, n.scale, NVFP4, per_tensor_scale=torch.tensor(1.0))
 
 
 def test_uint8_scale_canonicalization():
@@ -775,9 +769,7 @@ def test_future_recipe_examples():
         mma_kind_for_pair(MXFP8_E4M3, ds1d)
 
     # kscale: bf16 elements + per-row fp32 K-block scales (one-sided customer).
-    kscale = BlockScaledFormat(
-        "bf16_1x128", torch.bfloat16, "BFloat16", 16, 1, torch.float32, 128
-    )
+    kscale = BlockScaledFormat("bf16_1x128", torch.bfloat16, "BFloat16", 16, 1, torch.float32, 128)
     with pytest.raises(ValueError, match="no tcgen05 MMA element type"):
         mma_kind_for_pair(kscale, MXFP8_E4M3)
 

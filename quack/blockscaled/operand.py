@@ -117,9 +117,7 @@ class BlockScaledFormat:
             elif storage_bits % elem_bits == 0:
                 values["elems_per_container"] = storage_bits // elem_bits
             else:
-                raise ValueError(
-                    "cannot infer elems_per_container from serialized format state"
-                )
+                raise ValueError("cannot infer elems_per_container from serialized format state")
         values.setdefault("has_per_tensor_scale", False)
         values.setdefault("storage_layout", None)
         if values["storage_layout"] == "packed_lsb_v1":
@@ -162,8 +160,7 @@ class BlockScaledFormat:
             or self.elems_per_container <= 0
         ):
             raise TypeError(
-                "elems_per_container must be a positive int, got "
-                f"{self.elems_per_container!r}"
+                f"elems_per_container must be a positive int, got {self.elems_per_container!r}"
             )
         if not isinstance(self.scale_dtype, torch.dtype):
             raise TypeError(f"scale_dtype must be a torch.dtype, got {self.scale_dtype!r}")

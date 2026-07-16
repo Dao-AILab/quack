@@ -1076,9 +1076,7 @@ def test_blockscaled_varlen_m_public_api(seqlens_m, b_major, fmt):
     assert err < 5e-3, f"public API varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
 
 
-@pytest.mark.parametrize(
-    "fmt", ["mxfp8_e5m2", "mxfp6_e2m3_packed", "mxfp6_e3m2_packed"]
-)
+@pytest.mark.parametrize("fmt", ["mxfp8_e5m2", "mxfp6_e2m3_packed", "mxfp6_e3m2_packed"])
 def test_blockscaled_varlen_m_extended_formats_public_api(fmt):
     """The benchmark's varlen generator supports every advertised same-format input."""
     _skip_if_not_sm100()

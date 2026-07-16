@@ -491,9 +491,7 @@ def _relayout_packed_operand(op, offset_bytes, row_pad_bytes):
     )
     qdata = raw[offset_bytes:].as_strided((rows, storage_k), (row_stride, 1))
     qdata.view(torch.uint8).copy_(op.qdata.view(torch.uint8))
-    return BlockScaledOperand.from_parts(
-        qdata, op.scale, op.format, orig_dtype=op.orig_dtype
-    )
+    return BlockScaledOperand.from_parts(qdata, op.scale, op.format, orig_dtype=op.orig_dtype)
 
 
 @pytest.mark.parametrize(
@@ -544,9 +542,7 @@ def test_blockscaled_gemm_mixed(fmt_pair):
     [(16, 0), (32, 16)],
     ids=["misaligned-base", "misaligned-row-stride"],
 )
-def test_mixed_unpack_alignment_rejected(
-    unpack_side, unpack_fmt, offset_bytes, row_pad_bytes
-):
+def test_mixed_unpack_alignment_rejected(unpack_side, unpack_fmt, offset_bytes, row_pad_bytes):
     """U4/U6 TMA unpack rejects bad bases/pitches before issuing a device instruction."""
     _skip_if_not_sm100()
     m = n = 128
