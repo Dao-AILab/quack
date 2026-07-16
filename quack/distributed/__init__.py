@@ -3,7 +3,7 @@
 
 Package layout:
 - all_gather_gemm.py: AllGatherRunner (ce-push transport, gather() context);
-  design doc AI/allgather_gemm_design.md
+  the module docstring is the full design record
 """
 
 from quack.distributed.all_gather_gemm import AllGatherRunner

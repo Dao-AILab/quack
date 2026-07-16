@@ -11,6 +11,37 @@ Protocol (shared-node rules): methods interleaved per round, per-launch CUDA
 events, median over rounds, cross-rank max reported. Run:
 
   torchrun --nproc_per_node=8 benchmarks/benchmark_all_gather_gemm.py
+
+Traps that produced WRONG conclusions until fixed (do not relearn):
+
+- Settled clocks: 100+ warmup and long windows — boost-clock short runs
+  read 15-25% fast. Rounds of interleaved bursts approximate this; final
+  numbers deserve a quiet node.
+- Matched input distributions: CUTLASS examples fill random ints in
+  [-2, 2], sustaining +10-13% clocks vs randn (zeros: +40%). Match data
+  before comparing anything.
+- Matched consistency model: static-buffer baselines (ex82/PK/TE) stage
+  the LOCAL shard outside the timed loop (their cross-rank transport still
+  runs per iteration) — the honest quack comparator for them is
+  quack_ag_zc; quack_ag additionally pays the per-iteration producer
+  dependency.
+- Burst timing: a dist.barrier per iteration injects cross-rank skew and
+  forbids cross-iteration pipelining (+139% -> +69% at one shape when
+  fixed). One event pair over BURST back-to-back iterations is the honest
+  protocol; barrier once per (method, round).
+- Cross-rank pacing is load-bearing for PERF, not just correctness:
+  stripping signals/barriers measures SLOWER (unpaced comm drifts into
+  peers' compute windows).
+
+Standings for context (settled clocks, matched data, July 2026, ms/iter at
+8192x2048 / 16384x4096 / 32768x2048, K=8192 bf16): TP4 quack (pull era)
+0.266/0.869/0.930 — post-refactor ce_push measured parity-or-better
+(0.251/0.847/0.867, boost regime) — vs CUTLASS ex82 0.255/0.921/0.924,
+cuBLASMp SPLIT_P2P 0.281/0.834/0.957, ParallelKittens 0.278/0.909/1.044
+(collapses at TP2), TE UB ring_exchange 0.286/0.897/0.961. TP8 ce_push
+beats-or-ties TE at all common points (incl. 0.972 vs 0.997 at
+32768x2048). quack is the only implementation paying the per-iteration
+producer dependency in these numbers.
 """
 
 import argparse

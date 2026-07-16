@@ -1,7 +1,8 @@
 # Copyright (c) 2026, QuACK team.
 """Overlapped distributed GEMMs for NVLink-connected ranks (SM90/SM100/SM110).
 
-Full design rationale, measurements, and next steps: AI/allgather_gemm_design.md.
+This docstring is the design record, measurements included — there is no
+separate design doc.
 
 Abstraction: from the GEMM kernel's perspective, AG-capability is exactly
 (a) the shard-major rotated scheduler decode and (b) one flag gate in the
@@ -36,6 +37,31 @@ readiness handshake at all — and the reverse ring hands every receiver its
 next-needed shard first under the ring-ROTATED consumption order. Chunked
 arrival flags (opt-in, keep >= ~64 MB per CE op) refine gate granularity.
 
+Measured transport physics the design rests on (B300, July 2026;
+benchmarks/benchmark_p2p_* and session probes):
+
+- Peer reads are never cached in local L2, so remote A must be
+  materialized in local HBM exactly once — a resident gather buffer, not
+  remote TMA (remote-A reads also amplify per N-tile reuse; NO-GO).
+- CE peaks ~740 GB/s per copy but restarts its bandwidth ramp at EVERY
+  descriptor (335/560/695 GB/s effective at 4/16/64 MB ops, ~2-6 us fixed
+  overhead each, no warmth carry-over). Remote writes beat remote reads,
+  idle and under load.
+- The send loop below is measured-OPTIMAL at the API level: one egress
+  path serializes a rank's peer-writes regardless of stream count (extra
+  send streams change nothing); cudaMemcpyBatchAsync saves ~2 us/op but
+  cannot order flags against data within a batch (uniform-late gates
+  lose more); flags on an event-chained side stream starve behind the
+  queued sends (CE serves its queue FIFO). The one live lever on top is
+  outer CUDA-graph capture (-10..-17 us/iter of host enqueue at small
+  many-rank shapes).
+- SM copy kernels collapse to 35-97 GB/s under a full persistent grid
+  while CE runs at 100% with ~zero GEMM interference — comm must ride CE
+  or be fused into a kernel that already owns SMs.
+- CE bytes transit L2 as evict_normal; access-policy windows are IGNORED
+  by CE. No software control of its eviction class exists (the GEMM-side
+  L2-hint chapter is closed too — tombstones in gemm_sm100/gemm_base).
+
 Flags-contract warning for anyone hand-rolling a transport (all probed on
 this stack against a spinning gated GEMM): publishing a flag CONCURRENTLY
 with the GEMM must not be an SM kernel — tensor fill_ starves behind the
@@ -47,11 +73,36 @@ persistent GEMM spins can wedge the context (a cold normal_ poisoned even
 subsequent plain memcpys; pre-warming it fixed everything) — warm every
 kernel your transport path touches before entering the spinning regime.
 
-Two other measured transports are PARKED on branch park/resolved-0715
-behind the same flags contract, not built here: CE ring pull (edged out ce_push by
-1-2pp only at world_size == 2 with >= 64 MB shards) and SM100 TMA-multicast push
-(won only world_size >= 8 with <= 24 MB shards; needs reserve_clusters livelock
-plumbing). Revisit when those corners matter.
+Two other transports were built, measured, and PARKED on branch
+park/resolved-0715 behind the same flags contract (re-examined head-to-head
+post-commit, July 2026 — these numbers are why; do not rebuild without a
+new regime):
+
+- CE ring pull (receiver-driven; staged-signal handshake + serial-ring
+  pulls): edges ce_push by only ~8-13 us/iter (~1-1.5pp) at
+  world_size == 2 with >= 128 MB shards — identically under CUDA graphs —
+  and loses everywhere else. Not a wire effect (writes beat reads); the
+  residual is ce_push's ~5.7 us remote flag memset per chunk vs pull's
+  local flag. Disqualifier: the receiver-side WAIT on the peer's staged
+  signal — stream-level waits compare against HOST immediates only,
+  irreconcilable with the device-epoch capture story. ce_push has no
+  receiver-side wait anywhere; the one device-valued waiter in the
+  system is the GEMM's load-warp gate (an SM we already own).
+- SM100 TMA-multicast push (smem-bounce kernel + multimem.st): wins ONLY
+  world_size >= 8 AND shard <= 24 MB (TP8 17 MB: 42.6% vs 52.4% over
+  roof), loses everywhere else including all of ws == 6. Three permanent
+  taxes (reserve_clusters grid carve-out = +8-14% GEMM at wave-sensitive
+  shapes; ~490 GB/s multicast plateau vs 600-740 unicast; host-sequenced
+  staggering) against one benefit (1x sender egress via in-switch
+  replication) that only pays when (ws-1) ramp-bound CE ops overrun the
+  GEMM window; also the only transport reaching into the GEMM
+  (reserve_clusters) and scheduler (own-first order) surfaces, and
+  SM100-only. Its corner is better served by producer-push (below).
+
+Parked with pull: the symmetric-source producer mode (make_source /
+call_from_source). Considered, not built: log-depth tree forwarding —
+distributes fan-out egress, but forwards are receiver-driven = pull's
+host-value gating problem again.
 
 Producer coupling: pass ``next_local_slot()`` for zero-copy producer writes
 into the rotating buffer (inference-shaped lifetime). The gathered A is a
@@ -64,7 +115,12 @@ is shared across all layers of the same (shard, dtype) shape (persistent
 symmetric buffers are collective+ms to create and peers/graphs bake their
 addresses — the Megatron GlobalMemoryBuffer / PyTorch async-TP pattern).
 Consequences: gathered_a() is transient (next call clobbers it) and
-zero-copy next_local_slot() is inference-only by construction.
+zero-copy next_local_slot() is inference-only by construction. The
+backward chapter this opens (not built): wgrad (dW = dD^T @ A_full)
+consumes the gathered dim as the REDUCTION dim, so its gating moves
+per-K-TILE and the ring-rotation trick moves to the k-loop start
+(reduction commutes — each rank starts at its own shard and wraps);
+dgrad's dA is the ReduceScatter sibling's job.
 
 Pipeline vocabulary (this is a distributed double-buffered producer/
 consumer pipeline; sync objects map onto full/empty roles):
@@ -127,77 +183,69 @@ NOTE: cross-rank pacing (per-peer signals, the barrier) measures FASTER
 than removing it: unpaced comm drifts into peers' compute windows and
 loses more to HBM contention than the sync costs.
 
+Overhead model (regret vs the pure-GEMM roof; all measured): SCHEDULE =
+B re-read once per shard (arrival-ordered consumption sweeps all N per
+shard; grows with TP); CONTENTION = the irreducible floor, ~0.1 us per MB
+of comm traffic (diffuse L2/latency interference, NOT DRAM bandwidth);
+GATING is binary — ~0 wherever NVLink delivery fits the GEMM window
+(N_local >= ~4096, or 2048 at TP2), dominant in the comm-bound corner
+(small N_local x large TP), where TP2-or-no-TP is the saner deployment
+anyway. Typical totals at compute-bound shapes: ~3.5% TP2 / ~7% TP4 /
+~11-17% TP8. B prefetch was refuted by NCU (stall timeline flat — misses
+already pipeline-hidden); A needs none (the inbound CE writes ARE one).
+
 CUDA graphs: whole calls are OUTER-capture-safe — torch.cuda.graph around
-ANY number of gather() calls. Mechanics refresher: capture records
-enqueued work as a DAG instead of running it (edges = stream order + event
-record->wait pairs); Python runs ONCE, at capture; replay executes the DAG
-and never re-enters Python. Ordinary single-stream tensor code captures
-with no special handling — torch swaps the allocator to a private pool,
-makes RNG capturable, and every op is just a node. This file breaks that
-mold in three ways, and every is_current_stream_capturing() check below
-maps to one of them:
+ANY number of gather() calls. Capture records enqueued work as a DAG
+(edges = stream order + event record->wait pairs); Python runs ONCE, at
+capture; replay executes the DAG without re-entering Python. Ordinary
+single-stream tensor code captures with no special handling; this file
+breaks that mold in three ways, and every is_current_stream_capturing()
+check below maps to one of them:
 
-1. WAITS ON EVENTS RECORDED BEFORE THE CAPTURE. ev_reuse[p] was recorded
-   two calls ago; a captured wait on an uncaptured record is illegal
-   ("dependency on uncaptured work"). _wait_reuse skips such waits — see
-   its docstring for the two-part proof that the skip is redundant, not
-   unsafe (capture start syncs the device; across replays a launched graph
-   is ONE stream operation, so replay N+1 starts only after EVERY node of
-   replay N — all ranks' GEMMs and barriers included).
-2. FORKED SIDE STREAMS LEFT DANGLING. Eagerly the barrier/sends dangle off
-   the critical path BY DESIGN; capture_end requires every forked branch
-   rejoined (cudaErrorStreamCaptureUnjoined) — but a plain per-call join
-   puts barrier_i -> compute_{i+1} edges in the graph: the 1-buffer
-   lockstep schedule. By default gather() therefore joins AND immediately
-   restores the pre-join capture dependency set
-   (cudaStreamUpdateCaptureDependencies): the side-branch tails become
-   graph LEAVES — in the graph, off every captured call's critical path,
-   preserving the eager schedule's skew slack. capture_lockstep=True keeps
-   the join edges instead (see gather()): measured FASTER in uniform
-   steady-state replay loops, where there is no skew to absorb and barrier
-   pacing keeps sends out of peers' compute windows. Cross-replay safety
-   needs neither variant's join-as-dependency: graph completion includes
-   leaves, and the barrier leaves certify all ranks' GEMMs, so
-   stream-ordered replays cannot race reuse.
-3. HOST VALUES BAKE. Replay re-executes nodes, not Python, so any host-
-   computed value (memset immediates, kernel scalars, counters) is frozen
-   at capture time. This one is designed away rather than checked: the
-   epoch lives in DEVICE memory — g += 1 on a global row (captured
-   kernel), snapshot-copied to epoch[parity] — and flag writes are 4-byte
-   copies FROM the snapshot: values are read at node EXECUTION, fresh on
-   every replay, monotone for ANY replayed call count because monotonicity
-   lives in the global row, not in parity alternation. (A chained
-   per-parity bump would reuse an epoch value when a replayed ODD capture
-   put two same-parity calls back to back — same epoch + same buffer =
-   gates release on stale data, silently. Reuse safety for those
-   back-to-back same-parity calls is whole-graph completion, as in 1.)
-   Pointers DO bake, which is safe here: persistent symmetric buffers.
+1. WAITS ON EVENTS RECORDED BEFORE THE CAPTURE are illegal, and
+   ev_reuse[p] was recorded two calls ago. _wait_reuse skips such waits;
+   its docstring has the proof that the skip is redundant, not unsafe.
+2. FORKED SIDE STREAMS LEFT DANGLING: capture_end requires every forked
+   branch rejoined, but a plain per-call join bakes barrier_i ->
+   compute_{i+1} edges — the 1-buffer lockstep schedule. gather() joins
+   and then RESTORES the pre-join capture dependency set, making the
+   side-branch tails graph LEAVES (still inside the graph — replay N+1
+   waits for every node of replay N — but off the captured critical
+   path). capture_lockstep=True keeps the join edges instead; both
+   schedules and their measurements are documented at the join site in
+   gather().
+3. HOST VALUES BAKE at capture. Designed away rather than checked: the
+   epoch lives in DEVICE memory and flag writes are 4-byte copies FROM
+   it — values are read at node execution, fresh and monotone for ANY
+   replayed call count (why a global row instead of a per-parity chain:
+   see the epoch comment in __init__). Pointers do bake, which is safe:
+   persistent symmetric buffers.
 
-Capture contract (all of it): replays stream-ordered with each other; all
-ranks run identical eager/replay call sequences (collective congruence);
-and switch between EAGER calls and replays only through runner.quiesce() —
-a stream-ordered full-quiescence fence + last-buffer-parity resync (see
-its docstring; measured without it: eager->replay under induced rank skew
-produces wrong GEMMs, and gathered_a() after odd-count replays selects
-the wrong buffer). Capture itself needs no boundary: torch syncs the
-device at capture start.
+Capture contract: replays stream-ordered with each other; all ranks run
+identical eager/replay call sequences; switch between EAGER calls and
+replays only through runner.quiesce() — a full-quiescence fence +
+last-buffer-parity resync (see its docstring; measured without it:
+eager->replay under rank skew computes wrong GEMMs, and gathered_a()
+after odd-count replays picks the wrong buffer). Capture itself needs no
+boundary: torch syncs the device at capture start.
 
-Contrast: TE's comm-gemm overlap has NO capture checks and needs none —
-every call forks its side streams at the top and joins them at the bottom
-UNCONDITIONALLY (self-contained record->wait pairs; a capture sees a closed
-subgraph), which is free for them because their overlap is intra-call
-(chunked GEMM; the output is complete at return anyway) and their counters
-are device-reset by an on-stream kernel. Our checks are the price of
-CROSS-CALL pipelining: call i's barrier/sends finish during call i+1, and
-ev_reuse spans i -> i+2 — edges TE's structure never creates. (A TE-style
-per-call join IS available as capture_lockstep=True — see hazard 2. ex82
-takes a third route: no stream capture at all, explicit graph-node
-construction.)
+Why TE needs none of this: its overlap is INTRA-call (chunked GEMM,
+output complete at return), so every call unconditionally forks and
+joins its side streams — a capture sees a closed subgraph. Our checks
+are the price of CROSS-CALL pipelining (call i's barrier/sends finish
+during call i+1; ev_reuse spans i -> i+2). There is deliberately no
+internal per-burst graph layer: measured ~neutral at TP2/TP4 and outer
+capture subsumes its one projected win.
 
-There is deliberately NO internal per-burst graph layer: it measured
-~neutral at TP2/TP4 (eager enqueue hides behind the gemm-first launch;
--29..-50 us pacing regression at 134 MB shards) and outer capture subsumes
-its one projected win.
+Future levers, in rough order of expected value: (1) producer-push north
+star — fuse the AG into the producing kernel's epilogue (multimem.st
+from CTAs that already own their SMs), making the GEMM side flags-only
+and attacking the small-shard corner at its root; (2) table-driven
+frontier schedule — a work-id permutation with arrival-aware diagonal
+order cutting B sweeps from num_shards to ~2 (batch_idx_permute
+precedent); (3) producer chunk-flag early delivery (producers flag
+row-chunks so transport rides the producer's window); (4) process groups
+beyond WORLD, torch-library custom op for compile-compat.
 """
 
 from contextlib import contextmanager
@@ -681,7 +729,10 @@ class AllGatherRunner:
             #    all ranks' gemm two calls ago released this buffer —
             #    ev_reuse carries that (recorded after the post-gemm barrier
             #    below). Stream order after ev_shard_staged carries the
-            #    producer dependency for free.
+            #    producer dependency for free. This loop is measured-OPTIMAL
+            #    at the API level — multi-stream fan-out, cudaMemcpyBatchAsync,
+            #    and flag-offload all measured worse ("Measured transport
+            #    physics" in the module docstring); don't "optimize" it.
             self.push_stream.wait_event(self.ev_shard_staged)  # stage->transport edge
             # producer_acquire (PEERS' replicas of THIS buffer)
             self._wait_reuse(self.push_stream, parity)

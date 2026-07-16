@@ -70,7 +70,7 @@ from quack.layout_utils import tile_atom_to_shape_SF_strided
 #   - (16384,4096,8192): 962.0 vs 961.1/964.7us; (32768,2048,8192): 993.7 vs
 #     997.0/995.3us — parity within A/B/A drift, so the load-warp gate costs
 #     ~nothing where NVLink delivery fits the GEMM window (matches the
-#     regret decomposition in AI/allgather_gemm_design.md).
+#     overhead model in quack/distributed/all_gather_gemm.py's docstring).
 
 # return PipelineStateWAdvance instead of PipelineState
 
