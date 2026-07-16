@@ -23,19 +23,6 @@ CASES = [
     (1032, 2056, 928, 2, "float16", "float16"),  # partial M/N tiles + K residue, batched
     (520, 1028, 672, 3, "bfloat16", "float32"),  # fp32 vec=4 path
 ]
-CASE_IDS = [
-    "4096x4096x4096-bf16",
-    "488x1024x1024-l2-bf16",
-    "528x4104x736-l3-bf16",
-    "1032x2056x928-l2-fp16",
-    "520x1028x672-l3-bf16-fp32",
-]
-TOLERANCES = {
-    torch.bfloat16: (3e-2, 1e-3),
-    torch.float16: (3e-2, 1e-3),
-    torch.float32: (1e-4, 1e-4),
-}
-
 pytestmark = pytest.mark.dist
 
 def _run_gemm_epi_reduce(
@@ -88,7 +75,6 @@ def _run_gemm_epi_reduce(
     m_per_rank = m // world_size
     torch_ab = cutlass_torch.dtype(ab_dtype)
     torch_d = cutlass_torch.dtype(d_dtype)
-    atol, rtol = TOLERANCES[torch_d]
 
     torch.manual_seed(1111 + rank)
     a_torch_cpu = (
@@ -121,8 +107,8 @@ def _run_gemm_epi_reduce(
     n_tiles = (n + tile_n - 1) // tile_n
     num_tiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    tf_torch, tf_torch_mc, tile_flags, tile_flags_mc = make_barrier_flags(num_tiles)
-    sb_torch, sb_torch_mc, sync_barrier, sync_barrier_mc = make_barrier_flags(num_sms)
+    tf_torch, _, tile_flags, tile_flags_mc = make_barrier_flags(num_tiles)
+    _, _, sync_barrier, sync_barrier_mc = make_barrier_flags(num_sms)
     slab_tiles_m = (m_per_rank + cta_m - 1) // cta_m
     counters_torch = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
     counters = from_dlpack(counters_torch).mark_layout_dynamic()
@@ -209,13 +195,11 @@ def _run_gemm_epi_reduce(
         assert torch.equal(out, expected), f"mutation loop iter {it}: stale or raced value"
     dist.barrier()
 
-    # Flag wrap: tile flags/counters are never reset (monotonic, +num_ranks per launch),
-    # so int32 wrap is reachable in long-lived processes. Seed both just below the wrap
-    # and relaunch across it: launch 1 hits INT32_MAX exactly, launch 2 crosses, 3 runs
-    # in the negative regime. A is back to its original bits, so output must equal run 1.
-    seed = torch.iinfo(torch.int32).max - world_size
-    tf_torch.fill_(seed)
-    counters_torch.fill_(seed)
+    # Flag wrap: flags/counters are monotonic (never reset), so int32 wrap is reachable;
+    # seed just below the wrap and relaunch across it (A is restored, output = run 1).
+    wrap_seed = torch.iinfo(torch.int32).max - world_size
+    tf_torch.fill_(wrap_seed)
+    counters_torch.fill_(wrap_seed)
     dist.barrier()
     for it in range(3):
         launch()
@@ -223,20 +207,29 @@ def _run_gemm_epi_reduce(
         assert torch.equal(out, runs[1]), f"flag-wrap launch {it}: mismatch"
     dist.barrier()
 
-    a_ref = a_torch_cpu.permute(2, 0, 1).contiguous().cuda().to(torch_d)
-    b_ref = b_torch_cpu.permute(2, 0, 1).contiguous().cuda().to(torch_d)
-    d_full = torch.empty(l, m, n, dtype=torch_d, device="cuda")
-    torch.bmm(a_ref, b_ref.mT, out=d_full)
-    if use_epi_reduce == "reduce_scatter":
-        d_ref = torch.empty(l, m_per_rank, n, dtype=torch_d, device="cuda")
-        for i in range(l):
-            dist.reduce_scatter_tensor(d_ref[i], d_full[i])
-    else:
+    # quack convention: fp32 ref is ground truth; kernel error < 2x same-dtype ref error.
+    a_ref = a_torch_cpu.permute(2, 0, 1).contiguous().cuda()
+    b_ref = b_torch_cpu.permute(2, 0, 1).contiguous().cuda()
+
+    def epilogue_ref(dtype):
+        d_full = torch.bmm(a_ref.to(dtype), b_ref.to(dtype).mT)
+        if use_epi_reduce == "reduce_scatter":
+            d_red = torch.empty(l, m_per_rank, n, dtype=dtype, device="cuda")
+            for i in range(l):
+                dist.reduce_scatter_tensor(d_red[i], d_full[i])
+            return d_red.float()
         dist.all_reduce(d_full)
-        d_ref = d_full
+        return d_full.float()
+
+    d_ref = epilogue_ref(torch.float32)
+    d_pt = epilogue_ref(torch_d)
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(out, d_ref, atol=atol, rtol=rtol)
+    d_err = (out.float() - d_ref).abs().max()
+    d_base = (d_pt.to(torch_d).float() - d_ref).abs().max()
+    if rank == 0:
+        print(f"D err {d_err:.3e} base {d_base:.3e}")
+    assert d_err < 2 * d_base + 1e-5, f"D err {d_err}, baseline {d_base}"
     if rank == 0:
         print("Ref check PASSED")
 
@@ -246,7 +239,7 @@ def _run_gemm_epi_reduce(
 
 @pytest.mark.parametrize("world_size", WORLD_SIZES, ids=lambda w: f"world{w}")
 @pytest.mark.parametrize("mode", ["reduce_scatter", "all_reduce"], ids=["rs", "ar"])
-@pytest.mark.parametrize("m,n,k,l,ab_dtype,d_dtype", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("m,n,k,l,ab_dtype,d_dtype", CASES)
 def test_gemm_epi_reduce(m, n, k, l, ab_dtype, d_dtype, mode, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} GPUs")

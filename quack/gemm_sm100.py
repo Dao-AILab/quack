@@ -1855,6 +1855,14 @@ class GemmSm100(GemmTpTmaBase):
                 rank_id = self.rank_id
                 lane_id = cute.arch.lane_idx()
 
+                # Epi ops here see slab-local coords/buffers (C/colvec/aux are m/TP-shaped):
+                # hand them a slab-framed manager so op-side bounds math matches.
+                varlen_manager_slab = VarlenManager.create(
+                    varlen_manager.params,
+                    len_m_static=varlen_manager.len_m(Int32(0)) // self.num_ranks,
+                    len_k_static=varlen_manager.len_k(Int32(0)),
+                )
+
                 tile_sched = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
                 work_tile = tile_sched.initial_work_tile_info()
 
@@ -1998,7 +2006,7 @@ class GemmSm100(GemmTpTmaBase):
                             copy_C,
                             tiled_copy_fake,
                             cta_tile_coord_mnkl,
-                            varlen_manager,
+                            varlen_manager_slab,
                             self.epi_reduce_barrier,
                             tile_sched,
                             epi_reduce_tidx,
