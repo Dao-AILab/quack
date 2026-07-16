@@ -107,8 +107,9 @@ def _run_gemm_epi_reduce(
     n_tiles = (n + tile_n - 1) // tile_n
     num_tiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    tf_torch, _, tile_flags, tile_flags_mc = make_barrier_flags(num_tiles)
-    _, _, sync_barrier, sync_barrier_mc = make_barrier_flags(num_sms)
+    # torch handles are the sole refs keeping the symmetric allocations alive
+    tf_torch, tf_torch_mc, tile_flags, tile_flags_mc = make_barrier_flags(num_tiles)
+    sb_torch, sb_torch_mc, sync_barrier, sync_barrier_mc = make_barrier_flags(num_sms)
     slab_tiles_m = (m_per_rank + cta_m - 1) // cta_m
     counters_torch = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
     counters = from_dlpack(counters_torch).mark_layout_dynamic()
