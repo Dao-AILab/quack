@@ -27,7 +27,16 @@ class FastDivmod:
     exact for all dividends < 2^31, i.e. any non-negative Int32. Same contract and
     algorithm as C++ cutlass::FastDivmod. Negative dividends are OUT of contract
     (they reinterpret through Uint32 to values >= 2^31 and silently divide wrong);
-    use cute.FastDivmodDivisor if signed or full-u32 dividends are ever needed.
+    use cute.FastDivmodDivisorV2 if signed or full-u32 dividends are ever needed.
+
+    Why we keep this instead of cute.FastDivmodDivisorV2 (DSL >= 4.6.1): V2 must be
+    exact for the full u32 dividend range, so it lowers to the two-shift add-back
+    form q = (hi + ((n - hi) >> s1)) >> s2 -- measured on sm_90a with DSL 4.6.1 that
+    is 7 SASS ops per divmod with a 5-op dependency chain to the quotient
+    (IMAD.HI -> IADD3 -> SHF -> IADD3 -> SHF). Ours is 6 ops with a 3-op chain
+    (IMAD.HI -> SHF -> SEL; the ISETP feeding the SEL is off the critical path and
+    amortizes per divisor). Tile schedulers chain divmods back-to-back on the
+    next-work-tile latency path, so we keep the < 2^31 contract and the shorter form.
     """
 
     def __init__(self, divisor: Integer):
