@@ -951,7 +951,8 @@ class GemmSm90(GemmTmaBase):
                 # to the tile's workspace and skip the epilogue; the last split waits for
                 # the tile's completion flag and runs the full epilogue on the summed
                 # accumulator (CUTLASS-3.x stream-K fixup semantics).
-                epi_read_state, epi_producer_state = self.epilogue_split_k(
+                epi_fn = partial(
+                    self.epilogue,
                     epilogue_params,
                     epi_smem_tensors,
                     epi_pipeline,
@@ -959,21 +960,35 @@ class GemmSm90(GemmTmaBase):
                     epi_read_state,
                     epi_producer_state,
                     self.epi_tile,
+                    # load_acc_subtile is the one argument left unbound
+                    tRS_rD=tRS_rD,
+                    tRS_rC=tRS_rC,
+                    tiled_copy_t2r=None,  # Sm100 only
+                    tiled_copy_r2s=tiled_copy_r2s,
+                    tRS_sD=tRS_sD,
+                    tiled_copy_s2r=tiled_copy_s2r,
+                    tSR_rC=tSR_rC,
+                    tSR_sC=tSR_sC,
+                    copy_D=copy_D,
+                    copy_C=copy_C,
+                    tile_coord_mnkl=tile_coord_mnkl,
+                    varlen_manager=varlen_manager,
+                    epilogue_barrier=self.epilogue_barrier,
+                    tile_scheduler=tile_scheduler,
+                    tidx=tidx,
+                    is_tma_warp=is_tma_warp,
+                )
+                epi_read_state, epi_producer_state = self.epilogue_split_k(
+                    epilogue_params,
+                    epi_fn,
                     load_acc_subtile,
                     tRS_rD,
-                    tRS_rC,
-                    None,  # tiled_copy_t2r, for Sm100 only
-                    tiled_copy_r2s,
-                    tRS_sD,
-                    tiled_copy_s2r,
-                    tSR_rC,
-                    tSR_sC,
-                    copy_D,
-                    copy_C,
+                    self.epi_tile,
+                    epi_read_state,
+                    epi_producer_state,
+                    epi_store_pipeline,
                     tile_coord_mnkl,
-                    varlen_manager,
                     self.epilogue_barrier,
-                    tile_scheduler,
                     tidx,
                     is_tma_warp,
                 )

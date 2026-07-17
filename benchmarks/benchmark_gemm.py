@@ -130,11 +130,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--split_k_mode",
-        choices=["serial", "parallel", "staged"],
+        choices=["serial", "parallel", "separate"],
         default="serial",
         help="serial: turnstile-ordered f32 partial commits, last split finalizes "
         "(deterministic); parallel: partial commits in arrival order (nondeterministic); "
-        "staged: f32 workspace + reduction kernel applying the epilogue",
+        "separate: f32 workspace + reduction kernel applying the epilogue",
     )
     parser.add_argument("--varlen_m", action="store_true", help="Variable length M dimension")
     parser.add_argument("--varlen_k", action="store_true", help="Variable length K dimension")

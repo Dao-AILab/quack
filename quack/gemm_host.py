@@ -23,10 +23,14 @@ from __future__ import annotations
 import importlib
 from typing import NamedTuple, Optional
 
+import cutlass.cute as cute
+from cutlass import Float32, Int32
 
 from quack.cache import jit_cache
 from quack.cache.async_compile import PoolPayload
+from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
+from quack.gemm_config import SplitKMode
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
     launch_gemm,
@@ -196,6 +200,8 @@ def _compile_gemm_epi(
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
+    split_k=1,  # K-dim split factor, constexpr kernel specialization
+    split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -228,6 +234,18 @@ def _compile_gemm_epi(
         fake = ops[name].host_fake_arg(key, fctx)
         if fake is not None:
             fields[name] = fake
+    if split_k > 1 and split_k_mode != SplitKMode.SEPARATE:
+        # Mirrors quack.gemm: (ntile_m, ntile_n, L) Int32 per-tile flag and
+        # (cta_tile_m * cta_tile_n, ntile_m, ntile_n, L) f32 partials stripes.
+        fields["split_k_semaphore"] = make_fake_tensor(
+            Int32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1
+        )
+        fields["split_k_workspace"] = make_fake_tensor(
+            Float32,
+            (cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()),
+            leading_dim=0,
+            divisibility=4,
+        )
     epi_args = GemmCls.EpilogueArguments(**fields)
 
     scheduler_args = make_fake_scheduler_args(
@@ -272,6 +290,8 @@ def _compile_gemm_epi(
         a_transposed=swap_ab,
         cd_transposed=swap_ab,
         cd_packed=packed_cd,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
 
@@ -303,6 +323,12 @@ class GemmEpiPlan(NamedTuple):
     # dicts and parsing kwargs.
     call_ops: tuple = ()
     arg_template: dict = {}
+    # Split-K (SERIAL/PARALLEL): run allocates the per-call flag/workspace
+    # buffers, sized from D and the tile/cluster geometry below.
+    split_k: int = 1
+    split_k_mode: object = SplitKMode.SERIAL
+    tile_N: int = 0
+    cluster_N: int = 1
 
 
 def _get_major(t, m_label, n_label):
@@ -343,6 +369,8 @@ def build_gemm_epi_plan(
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
+    split_k=1,
+    split_k_mode=SplitKMode.SERIAL,
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
@@ -412,6 +440,8 @@ def build_gemm_epi_plan(
         post_init_attrs=post_init_attrs,
         packed_cd=packed_cd,
         has_ag=has_ag,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -451,6 +481,10 @@ def build_gemm_epi_plan(
         epi_arg_keys=epi_keys,
         tile_M=tile_M,
         cluster_M=cluster_M,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
+        tile_N=tile_N,
+        cluster_N=cluster_N,
     )
 
 
@@ -485,6 +519,22 @@ def run_gemm_epi_plan(
             value = convert(value, key)
         if value is not None:
             fields[name] = value
+    if plan.split_k > 1:
+        # Fresh per-call buffers (mirrors quack.gemm.run_gemm_plan); lazy import —
+        # quack.gemm sits above this module in the import graph.
+        from quack.gemm import _split_k_buffers
+
+        sem, ws = _split_k_buffers(
+            D if D.ndim == 3 else D[None],
+            plan.split_k_mode,
+            plan.tile_M,
+            plan.tile_N,
+            plan.cluster_M,
+            plan.cluster_N,
+            plan.is_sm100_family,
+        )
+        fields["split_k_semaphore"] = sem.permute(1, 2, 0)
+        fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
     scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)

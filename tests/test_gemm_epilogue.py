@@ -1501,6 +1501,151 @@ def test_epi_mod_qknorm_rope_prepass(pingpong, tma):
     _rel_check(D, ref.reshape(l, m, n), "D")
 
 
+@pytest.mark.parametrize("split_k_mode", ["serial", "parallel"])
+@pytest.mark.parametrize("split_k", [2, 5])
+def test_epi_mod_split_k_norm_gelu(split_k, split_k_mode):
+    """Plain (non-prepass) epi mod under fused split-K: row/col operands and an
+    aux output must ride the finalizing split's epilogue only."""
+    from quack.gemm_config import SplitKMode
+
+    device = "cuda"
+    torch.random.manual_seed(23)
+    l, m, k, n = 2, 256, 4096, 512
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    postact = torch.empty_like(D)
+    rstd = torch.rand((l, m), device=device, dtype=torch.float32) + 0.5
+    weight = torch.randn((l, n), device=device, dtype=torch.float32)
+
+    norm_gelu.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(rstd=rstd, weight=weight, postact=postact),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+        split_k=split_k,
+        split_k_mode=SplitKMode[split_k_mode.upper()],
+    )
+
+    x_ref = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    x_ref = x_ref * rstd.unsqueeze(-1) * weight.unsqueeze(-2)
+    _rel_check(D, x_ref, "D")
+    _rel_check(postact, torch.nn.functional.gelu(x_ref, approximate="tanh"), "postact")
+
+
+@pytest.mark.parametrize("split_k_mode", ["serial", "parallel"])
+@pytest.mark.parametrize("split_k", [2, 5])
+def test_epi_mod_qknorm_prepass_split_k(split_k, split_k_mode):
+    """Acc prepass under fused split-K: the finalizer's folding load_acc_subtile
+    completes the accumulator BEFORE the prepass statistics sweep, so the
+    per-head RMS stats must match the full-K reference (this is the lifted
+    'acc prepass reads the raw accumulator' restriction)."""
+    _skip_unless_acc_prepass()
+    from quack.gemm_config import SplitKMode
+
+    device = "cuda"
+    torch.random.manual_seed(29)
+    l, m, k, head_dim, heads = 2, 384, 4096, 128, 4
+    n = head_dim * heads
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    w = torch.randn(head_dim, device=device, dtype=torch.float32).abs() + 0.5
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+
+    def run():
+        qknorm_epi.gemm(
+            A,
+            B,
+            D,
+            epi_args=dict(qk=w),
+            tile_M=128,
+            tile_N=128,
+            cluster_M=1,
+            cluster_N=1,
+            split_k=split_k,
+            split_k_mode=SplitKMode[split_k_mode.upper()],
+        )
+        return D.clone()
+
+    out = run()
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    _rel_check(out, _qknorm_ref(x, w, 1e-6), "D")
+    if split_k_mode == "serial":
+        # Turnstile-ordered commits: bitwise run-to-run determinism.
+        for _ in range(2):
+            assert torch.equal(run(), out), "serial split-k must be deterministic"
+
+
+def test_epi_mod_qknorm_rope_prepass_split_k():
+    """Prepass + TMA-staged rope table + fused serial split-K in one kernel."""
+    _skip_unless_acc_prepass()
+    from quack.gemm_config import SplitKMode
+
+    device = "cuda"
+    torch.random.manual_seed(31)
+    l, m, k, head_dim, heads = 2, 384, 4096, 128, 4
+    n = head_dim * heads
+    A = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
+    w = torch.randn(head_dim, device=device, dtype=torch.float32).abs() + 0.5
+    D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+    pos = torch.arange(m, device=device, dtype=torch.float32)
+    inv_freq = 10000.0 ** (
+        -torch.arange(head_dim // 2, device=device, dtype=torch.float32) / (head_dim // 2)
+    )
+    ang = pos[:, None] * inv_freq[None, :]
+    table = torch.stack([ang.cos(), ang.sin()], dim=-1).reshape(m, head_dim).contiguous()
+
+    qk_rope_epi.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(cs=table, qk=w),
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        split_k=4,
+        split_k_mode=SplitKMode.SERIAL,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    y = _qknorm_ref(x, w, 1e-6)
+    yp = y.unflatten(-1, (heads, head_dim // 2, 2))
+    c = ang.cos()[None, :, None, :]
+    s = ang.sin()[None, :, None, :]
+    ref = torch.empty_like(yp)
+    ref[..., 0] = yp[..., 0] * c - yp[..., 1] * s
+    ref[..., 1] = yp[..., 0] * s + yp[..., 1] * c
+    _rel_check(D, ref.reshape(l, m, n), "D")
+
+
+def test_epi_mod_split_k_separate_rejected():
+    from quack.gemm_config import SplitKMode
+
+    device = "cuda"
+    A = torch.empty((1, 128, 512), device=device, dtype=torch.bfloat16)
+    B = torch.empty((1, 128, 512), device=device, dtype=torch.bfloat16)
+    D = torch.empty((1, 128, 128), device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="SEPARATE"):
+        relu_mod.gemm(
+            A,
+            B,
+            D,
+            epi_args=dict(postact=torch.empty_like(D)),
+            tile_M=128,
+            tile_N=128,
+            cluster_M=1,
+            cluster_N=1,
+            split_k=2,
+            split_k_mode=SplitKMode.SEPARATE,
+        )
+
+
 def test_epi_mod_rms_block_pipeline():
     """(1)+(2): GEMM+residual+partial-rms -> host rstd -> GEMM+rstd+swiglu,
     validated end-to-end against a torch reference of the whole block."""

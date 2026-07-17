@@ -256,6 +256,27 @@ def tiled_copy_1d(
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 
+def vectorized_thread_partition(
+    tensor: cute.Tensor,
+    tidx: Int32,
+    num_threads: int,
+    num_copy_elems: int = 1,
+    *,
+    is_source: bool,
+) -> Tuple[cute.ThrCopy, cute.Tensor]:
+    """Partition a flat tensor into adjacent per-thread vectors.
+
+    At a fixed vector iteration, thread ``t`` owns
+    ``[t * num_copy_elems, (t + 1) * num_copy_elems)``. Returns the thread
+    copy together with its source or destination partition of ``tensor``.
+    """
+    thr_copy = tiled_copy_1d(tensor.element_type, num_threads, num_copy_elems).get_slice(tidx)
+    partition = (
+        thr_copy.partition_S(tensor) if const_expr(is_source) else thr_copy.partition_D(tensor)
+    )
+    return thr_copy, partition
+
+
 def tiled_copy_2d(
     dtype: Type[cutlass.Numeric],
     threads_per_row: int,
