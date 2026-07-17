@@ -13,7 +13,9 @@ import pytest
 import torch
 
 
-WORLD_SIZES = [4]  # 4 is good default, 2 ranks can miss numerical/ordering bugs, 8 occupies full node
+WORLD_SIZES = [
+    4
+]  # 4 is good default, 2 ranks can miss numerical/ordering bugs, 8 occupies full node
 # (m, n, k, l, ab_dtype, d_dtype); dtypes per quack gemm test convention (bf16
 # baseline, fp16 inputs, fp32 out), each non-bf16 pair on its own hard shape
 CASES = [
@@ -24,6 +26,7 @@ CASES = [
     (520, 1028, 672, 3, "bfloat16", "float32"),  # fp32 vec=4 path
 ]
 pytestmark = pytest.mark.dist
+
 
 def _run_gemm_epi_reduce(
     m, n, k, l=1, ab_dtype="bfloat16", d_dtype="bfloat16", use_epi_reduce="reduce_scatter"
@@ -78,18 +81,10 @@ def _run_gemm_epi_reduce(
 
     torch.manual_seed(1111 + rank)
     a_torch_cpu = (
-        cutlass_torch.matrix(l, m, k_local, False, ab_dtype)
-        .to(torch.float32)
-        .normal_()
-        .mul_(1.0 / (k**0.5))
-        .to(torch_ab)
+        torch.empty(l, m, k_local, dtype=torch.float32).normal_().mul_(1.0 / (k**0.5)).to(torch_ab)
     )
     b_torch_cpu = (
-        cutlass_torch.matrix(l, n, k_local, False, ab_dtype)
-        .to(torch.float32)
-        .normal_()
-        .mul_(1.0 / (k**0.5))
-        .to(torch_ab)
+        torch.empty(l, n, k_local, dtype=torch.float32).normal_().mul_(1.0 / (k**0.5)).to(torch_ab)
     )
     a_tensor, a_gpu = cutlass_torch.cute_tensor_like(
         a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
@@ -98,8 +93,12 @@ def _run_gemm_epi_reduce(
         b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
     d_cpu = torch.empty(l, m, n, dtype=torch_d).permute(1, 2, 0)
-    d_tensor, d_tensor_mc, d_torch_gpu, _, _, d_peer_tensors = create_multicast_tensor(
+    _, d_tensor_mc, d_torch_gpu, _, _, d_peer_tensors = create_multicast_tensor(
         d_cpu, d_dtype, leading_dim=1
+    )
+    # D arg is caller-order (l, m, n); the EpiReduceArguments views stay kernel-order (m, n, l).
+    d_tensor = from_dlpack(d_torch_gpu.permute(2, 0, 1), assumed_align=16).mark_layout_dynamic(
+        leading_dim=2
     )
 
     use_2cta = cluster_m % 2 == 0 and tile_m in (128, 256)
@@ -209,8 +208,8 @@ def _run_gemm_epi_reduce(
     dist.barrier()
 
     # quack convention: fp32 ref is ground truth; kernel error < 2x same-dtype ref error.
-    a_ref = a_torch_cpu.permute(2, 0, 1).contiguous().cuda()
-    b_ref = b_torch_cpu.permute(2, 0, 1).contiguous().cuda()
+    a_ref = a_torch_cpu.contiguous().cuda()
+    b_ref = b_torch_cpu.contiguous().cuda()
 
     def epilogue_ref(dtype):
         d_full = torch.bmm(a_ref.to(dtype), b_ref.to(dtype).mT)
@@ -281,12 +280,12 @@ def _parse_args():
     dtypes = ["bfloat16", "float16", "float32"]
     parser.add_argument("--ab_dtype", choices=dtypes, default="bfloat16")
     parser.add_argument("--d_dtype", choices=dtypes, default="bfloat16")
-    parser.add_argument("--mode", choices=["reduce_scatter", "all_reduce"], default="reduce_scatter")
+    parser.add_argument(
+        "--mode", choices=["reduce_scatter", "all_reduce"], default="reduce_scatter"
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    _run_gemm_epi_reduce(
-        args.m, args.n, args.k, args.l, args.ab_dtype, args.d_dtype, args.mode
-    )
+    _run_gemm_epi_reduce(args.m, args.n, args.k, args.l, args.ab_dtype, args.d_dtype, args.mode)

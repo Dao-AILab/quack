@@ -288,6 +288,29 @@ def make_scheduler_args(
     )
 
 
+def make_fake_epi_reduce_args(d_dtype, num_ranks):
+    """Fake EpiReduceArguments for use_epi_reduce compiles (see GemmTpTmaBase).
+
+    Comm views are kernel-order (m, n, l): __call__ does not rotate them.
+    """
+    from quack.gemm_tp_base import GemmTpTmaBase
+
+    dvec = 128 // d_dtype.width  # 16 B
+    d_fake = lambda: fake_tensor(
+        d_dtype, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=dvec
+    )
+    flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+    return GemmTpTmaBase.EpiReduceArguments(
+        mD_mc=d_fake(),
+        mD_peers=tuple(d_fake() for _ in range(num_ranks)),
+        tile_flags=flags(),
+        tile_flags_mc=flags(),
+        sync_barrier=flags(),
+        sync_barrier_mc=flags(),
+        consumer_counters=flags(),
+    )
+
+
 def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag=False):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
@@ -484,12 +507,29 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
     )
 
 
-def launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None):
+def launch_gemm(
+    plan,
+    A,
+    B,
+    D,
+    C,
+    epi_args,
+    scheduler_args,
+    varlen_args,
+    SFA=None,
+    SFB=None,
+    epi_reduce_args=None,
+):
     """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB)."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
+    er = ()
+    # getattr: gemm.py / gemm_symmetric.py pass their own plan NamedTuples.
+    if getattr(plan, "use_epi_reduce", None) is not None:
+        assert epi_reduce_args is not None, "use_epi_reduce plan launched without epi_reduce_args"
+        er = (epi_reduce_args,)
     if plan.is_sm100_family:
-        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, *er)
     else:
         plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)
 
@@ -683,8 +723,11 @@ def compile_gemm_kernel(
     cd_packed=None,
     a_mma_dtype=None,
     b_mma_dtype=None,
+    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see GemmTpTmaBase)
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
+    if epi_reduce is not None:
+        assert device_capacity[0] in [10, 11], "use_epi_reduce requires SM100/SM110"
     split_k_kwargs = {}
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
@@ -696,6 +739,11 @@ def compile_gemm_kernel(
     elif device_capacity[0] in [9, 12]:
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
+        er_kwargs = (
+            dict(use_epi_reduce=epi_reduce[0], num_ranks=epi_reduce[1], rank_id=epi_reduce[2])
+            if epi_reduce is not None
+            else {}
+        )
         GemmCls = partial(
             GemmCls,
             use_clc_persistence=is_dynamic_persistent,
@@ -703,6 +751,7 @@ def compile_gemm_kernel(
             sf_vec_size=sf_vec_size,
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
+            **er_kwargs,
             **split_k_kwargs,
         )
     gemm_obj = GemmCls(
@@ -724,6 +773,9 @@ def compile_gemm_kernel(
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     sf_args = () if device_capacity[0] in (8, 9, 12) else (mSFA, mSFB)
+    er_args = ()
+    if epi_reduce is not None:
+        er_args = (make_fake_epi_reduce_args(mD.element_type, epi_reduce[1]),)
     return cute.compile(
         gemm_obj,
         mA,
@@ -735,5 +787,6 @@ def compile_gemm_kernel(
         varlen_args,
         stream,
         *sf_args,
+        *er_args,
         options="--enable-tvm-ffi",
     )

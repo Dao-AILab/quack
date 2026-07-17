@@ -220,6 +220,8 @@ class GemmSm100(GemmTpTmaBase):
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
         use_epi_reduce: Optional[str] = None,
+        num_ranks: Optional[int] = None,
+        rank_id: Optional[int] = None,
         split_k: int = 1,
         split_k_mode: int = SplitKMode.SERIAL,
         # MMA element types when they differ from the tensor (storage/copy) dtypes:
@@ -329,8 +331,10 @@ class GemmSm100(GemmTpTmaBase):
                 barrier_id=EPI_REDUCE_BARRIER_ID,
                 num_threads=self.num_epi_reduce_warps * cute.arch.WARP_SIZE,
             )
-            self.num_ranks = torch.distributed.get_world_size()
-            self.rank_id = torch.distributed.get_rank()
+            self.num_ranks = (
+                num_ranks if num_ranks is not None else torch.distributed.get_world_size()
+            )
+            self.rank_id = rank_id if rank_id is not None else torch.distributed.get_rank()
         # CLC throttle: paces query issue to tile consumption so the multi-stage
         # lookahead can't over-cancel the pending pool. Producer = CTA0 load warp
         # (arrive per tile started), consumer = CTA0 scheduler warp (sync per

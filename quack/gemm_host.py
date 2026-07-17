@@ -29,6 +29,8 @@ from quack.cache.async_compile import PoolPayload
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
+    div_for_dtype,
+    fake_batched,
     launch_gemm,
     make_fake_gemm_tensors,
     make_fake_scheduler_args,
@@ -196,6 +198,7 @@ def _compile_gemm_epi(
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
+    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see GemmTpTmaBase)
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -221,6 +224,17 @@ def _compile_gemm_epi(
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
     )
+    if epi_reduce is not None:
+        # Epilogue tensors are slab-local (m / world): a fresh m sym, untied
+        # from the operand m; C is epilogue-consumed so it rides the same sym.
+        import cutlass.cute as cute
+
+        m = cute.sym_int()
+        if mC is not None:
+            c_leading = 1 if c_major == "n" else 0
+            mC = fake_batched(
+                c_dtype, m, n, l if batched else None, c_leading, div_for_dtype(c_dtype)
+            )
     fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab)
     ops = _ops_by_name(GemmCls)
     fields = {}
@@ -272,6 +286,7 @@ def _compile_gemm_epi(
         a_transposed=swap_ab,
         cd_transposed=swap_ab,
         cd_packed=packed_cd,
+        epi_reduce=epi_reduce,
     )
 
 
@@ -303,6 +318,7 @@ class GemmEpiPlan(NamedTuple):
     # dicts and parsing kwargs.
     call_ops: tuple = ()
     arg_template: dict = {}
+    use_epi_reduce: Optional[str] = None
 
 
 def _get_major(t, m_label, n_label):
@@ -343,9 +359,15 @@ def build_gemm_epi_plan(
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
+    use_epi_reduce=None,  # "reduce_scatter" | "all_reduce" (see GemmTpTmaBase)
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
+    epi_reduce = None
+    if use_epi_reduce is not None:
+        import torch.distributed as dist
+
+        epi_reduce = (use_epi_reduce, dist.get_world_size(), dist.get_rank())
     batched = A.ndim == 3 or varlen_m
     a_major = _get_major(A, "m", "k")
     b_major = _get_major(B, "n", "k")
@@ -412,6 +434,7 @@ def build_gemm_epi_plan(
         post_init_attrs=post_init_attrs,
         packed_cd=packed_cd,
         has_ag=has_ag,
+        epi_reduce=epi_reduce,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -451,6 +474,7 @@ def build_gemm_epi_plan(
         epi_arg_keys=epi_keys,
         tile_M=tile_M,
         cluster_M=cluster_M,
+        use_epi_reduce=use_epi_reduce,
     )
 
 
@@ -463,6 +487,7 @@ def run_gemm_epi_plan(
     epi_values,
     *,
     ag_args=None,  # forwarded to the scheduler (AllGather+GEMM flags contract)
+    epi_reduce_args=None,  # EpiReduceArguments over torch tensors (see GemmTpTmaBase)
     tile_count_semaphore=None,
     cu_seqlens_m=None,
     cu_seqlens_k=None,
@@ -488,7 +513,7 @@ def run_gemm_epi_plan(
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
     scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
-    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, epi_reduce_args)
 
 
 def gemm_epi_plan_key(A, B, D, C, epi_values, epi_key_overrides=None, *config) -> tuple:
