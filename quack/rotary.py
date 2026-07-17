@@ -609,7 +609,11 @@ def _mark_dirty(ctx, tensor: Tensor) -> None:
     # mark_dirty is the correct contract. Eager PyTorch rejects mark_dirty on a
     # leaf requiring grad ("a leaf Variable ... used in an in-place operation"),
     # but the public in-place rotary API has historically accepted that case.
-    if torch.compiler.is_compiling() or not (tensor.requires_grad and tensor.is_leaf):
+    # Since torch 2.13, Dynamo replays mark_dirty through the real autograd
+    # apply (AutogradFunctionApply.setup_context), which enforces the same
+    # leaf check under compile, so the skip must apply there too; the input
+    # mutation is still visible to the compiler via the mutates_args custom op.
+    if not (tensor.requires_grad and tensor.is_leaf):
         ctx.mark_dirty(tensor)
 
 

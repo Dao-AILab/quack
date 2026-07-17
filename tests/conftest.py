@@ -98,54 +98,6 @@ _PRECONFIGURED_WORKER_GPU = _assign_xdist_worker_gpu()
 pytest_plugins = ["quack.testing.pytest_plugin"]
 
 
-# Per-session bookkeeping for the xdist worker-crash retry hook below.
-_crash_retried: set[str] = set()
-
-
-def pytest_handlecrashitem(crashitem, report, sched):
-    """Re-queue a worker-crashed test on a fresh worker.
-
-    Background. Sometimes a worker crahses (idk why, still investigating).
-    --max-worker-restart spawns a fresh
-    replacement worker, but xdist still marks the test that was in flight
-    when the death happened as 'failed' (see xdist.dsession.handle_crashitem,
-    which synthesises a TestReport with longrepr only and no excinfo).
-
-    pytest-rerunfailures' --only-rerun matches against excinfo and so cannot
-    see worker-crash failures. This hook is the xdist-specific entry point:
-    it re-queues the crashed test via the scheduler's mark_test_pending API
-    and downgrades the synthetic crash report from 'failed' to 'skipped' so
-    the run isn't marked red on the leak alone. The retry produces its own
-    pass/fail report; if a test deterministically crashes any worker, the
-    second crash isn't retried and the failure stands.
-    """
-    if crashitem in _crash_retried:
-        # Already gave this nodeid one retry. If we're here again the bug is
-        # in the test (or in code the test exercises), not in cumulative RSS.
-        # Let xdist log the failure normally.
-        return
-    _crash_retried.add(crashitem)
-
-    try:
-        sched.mark_test_pending(crashitem)
-    except (NotImplementedError, AttributeError, ValueError):
-        # loadscope / each / unexpected scheduler shape: don't try to be
-        # clever, just let the failure go through.
-        return
-
-    # Mutate the synthetic crash report so it isn't counted as a failure.
-    # outcome='skipped' is the standard pytest signal; longrepr for skipped
-    # tests is conventionally a (path, lineno, reason) tuple.
-    fspath = report.location[0] if getattr(report, "location", None) else ""
-    report.outcome = "skipped"
-    report.longrepr = (
-        fspath,
-        0,
-        f"worker crashed; re-queued for one retry on a fresh worker "
-        f"({crashitem}). See cutlass#3062 background in tests/conftest.py.",
-    )
-
-
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     config.addinivalue_line(

@@ -15,6 +15,7 @@ from cutlass._mlir.dialects import llvm
 import quack.copy_utils as copy_utils
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm  # noqa: F401 (re-exported)
+from quack.pipeline import PipelineTmaAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
 from quack.varlen_utils import VarlenManager
 
@@ -52,9 +53,7 @@ def clc_block_to_static_scheduler_coord(cluster_shape_mn):
     bidx, bidy, bidz = cute.arch.block_idx()
     gdx, gdy, _ = cute.arch.grid_dim()
     cl_m, cl_n = cluster_shape_mn
-    cluster_id = bidx // cl_m + (gdx // cl_m) * (
-        bidy // cl_n + (gdy // cl_n) * bidz
-    )
+    cluster_id = bidx // cl_m + (gdx // cl_m) * (bidy // cl_n + (gdy // cl_n) * bidz)
     return cluster_id, bidx % cl_m, bidy % cl_n
 
 
@@ -134,11 +133,15 @@ class GemmTpTmaBase(GemmTmaBase):
 
         mD_mc: Optional[cute.Tensor] = None  # multicast view of symmetric D
         mD_peers: Optional[tuple] = None  # per-rank views of symmetric D
-        tile_flags: Optional[cute.Tensor] = None  # producer->consumer, ceil(M/cta_M)*ceil(N/cta_N)*L
+        tile_flags: Optional[cute.Tensor] = (
+            None  # producer->consumer, ceil(M/cta_M)*ceil(N/cta_N)*L
+        )
         tile_flags_mc: Optional[cute.Tensor] = None
         sync_barrier: Optional[cute.Tensor] = None  # exit barrier, one slot per resident CTA
         sync_barrier_mc: Optional[cute.Tensor] = None
-        consumer_counters: Optional[cute.Tensor] = None  # consumer-private, slab_tiles_m*ceil(N/cta_N)*L
+        consumer_counters: Optional[cute.Tensor] = (
+            None  # consumer-private, slab_tiles_m*ceil(N/cta_N)*L
+        )
 
     @cute.jit
     def epilogue_skip_evt(
@@ -173,7 +176,7 @@ class GemmTpTmaBase(GemmTmaBase):
         use_stochastic_rounding = const_expr(
             self.rounding_mode == RoundingMode.RS
             and self.acc_dtype == cutlass.Float32
-            and self.d_dtype == cutlass.BFloat16
+            and self.d_dtype in (cutlass.BFloat16, cutlass.Float16)
         )
 
         epi_tile_shape = cute.zipped_divide(
@@ -327,9 +330,7 @@ class GemmTpTmaBase(GemmTmaBase):
                         )
                     self.epi_tile_load_s2r(params, epi_tensors, epi_read_state.index)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        epi_pipeline.consumer_release(epi_read_state)
+                    epi_pipeline.consumer_release(epi_read_state)
                     epi_read_state.advance()
                 else:
                     c_buffer = epi_idx % self.epi_c_stage
@@ -400,7 +401,7 @@ class GemmTpTmaBase(GemmTmaBase):
                     epi_reduce_store_pipeline.producer_acquire()
                 epilogue_barrier.arrive_and_wait()
                 for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                    tiled_copy_aux_out_r2s, tRS_sAuxOut, _ = aux_out_ctxs[i]
+                    tiled_copy_aux_out_r2s, tRS_sAuxOut, _, _ = aux_out_ctxs[i]
                     cute.copy(
                         tiled_copy_aux_out_r2s,
                         tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
@@ -410,8 +411,12 @@ class GemmTpTmaBase(GemmTmaBase):
                 epilogue_barrier.arrive_and_wait()
                 if is_tma_warp:
                     for i in cutlass.range_constexpr(len(aux_out_ctxs)):
-                        _, _, copy_aux_out = aux_out_ctxs[i]
-                        copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                        _, _, copy_aux_out, store_pred = aux_out_ctxs[i]
+                        if const_expr(store_pred is None):
+                            copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                        else:
+                            if store_pred:
+                                copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_reduce_store_pipeline.producer_commit()
             self.epi_end_loop(
                 params,
@@ -504,7 +509,6 @@ class GemmTpTmaBase(GemmTmaBase):
 
     def make_epi_pipeline(
         self,
-        epi_pipeline_mbar_ptr: cute.Pointer,
         tx_count: int,
     ):
         """
@@ -522,13 +526,14 @@ class GemmTpTmaBase(GemmTmaBase):
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        return pipeline.PipelineTmaAsync.create(
-            barrier_storage=epi_pipeline_mbar_ptr,
+        return PipelineTmaAsync.create(
             num_stages=self.epi_c_stage,
             producer_group=epi_pipeline_producer_group,
             consumer_group=epi_pipeline_consumer_group,
             tx_count=tx_count,
             defer_sync=True,
+            elect_one_release=True,
+            syncwarp_before_release=True,
         )
 
     def make_epi_reduce_store_pipeline(self):

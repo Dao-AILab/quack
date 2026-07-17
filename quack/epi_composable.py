@@ -35,6 +35,7 @@ manually.
 
 from dataclasses import make_dataclass, MISSING
 
+import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
@@ -164,6 +165,72 @@ class ComposableEpiMixin:
         for op in self._epi_ops:
             atoms.extend(op.tma_atoms(self, params))
         return atoms
+
+    # --- Aux-output store path (delegates to TileStore ops) ---
+
+    def _epi_store_ops(self):
+        return tuple(op for op in self._epi_ops if op.is_tile_store())
+
+    def epi_setup_aux_out(
+        self,
+        params,
+        epi_smem_tensors,
+        tiled_copy_r2s,
+        tiled_copy_t2r,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        """One store context quadruple per active TileStore op (see
+        TileStore.store_setup); the driver's epilogue loop consumes them in
+        op order, matching epi_visit_subtile's returned tuple."""
+        return tuple(
+            op.store_setup(
+                self,
+                params,
+                epi_smem_tensors[op.name],
+                tiled_copy_r2s,
+                tiled_copy_t2r,
+                tile_coord_mnkl,
+                varlen_manager,
+                tidx,
+            )
+            for op in self._epi_store_ops()
+        )
+
+    @cute.jit
+    def epi_convert_aux_out(
+        self,
+        output_idx: cutlass.Constexpr[int],
+        tRS_rAuxOut,
+        sr_seed,
+        tidx,
+        tile_coord_mnkl,
+        num_prev_subtiles,
+        epi_idx,
+    ):
+        return self._epi_store_ops()[output_idx].store_convert(
+            self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
+
+    def _compute_tile_shape_or_override(
+        self, cta_tile_shape_mnk, atom_layout_mnk, element_type=None, epi_tile_override=None
+    ):
+        # Store ops may impose a static epi-tile choice (SM120 gated halved
+        # tile). Consulted from _setup_attributes, before args filtering, so
+        # walk the class-level schema.
+        if epi_tile_override is None:
+            for op in type(self)._epi_ops:
+                if op.is_tile_store():
+                    override = op.epi_tile_shape_override(
+                        self.arch, cta_tile_shape_mnk, atom_layout_mnk
+                    )
+                    if override is not None:
+                        epi_tile_override = override
+                        break
+        return super()._compute_tile_shape_or_override(
+            cta_tile_shape_mnk, atom_layout_mnk, element_type, epi_tile_override
+        )
 
     # --- Device-side: kernel execution (delegates to ops) ---
 

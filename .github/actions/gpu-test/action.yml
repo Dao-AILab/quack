@@ -128,19 +128,32 @@ runs:
             export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA} &&
             export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}
           fi &&
-          mkdir -p \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
-          # --max-worker-restart N tolerates worker deaths (OOM-kill from
-          # the upstream cute.compile ir.Context retention leak, see
-          # tests/conftest.py:pytest_handlecrashitem for background). The
-          # conftest's pytest_handlecrashitem hook re-queues the in-flight
-          # test on the fresh worker and downgrades the failure to a skip;
-          # second crashes are NOT retried so real bugs still fail the run.
+          mkdir -p \$QUACK_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
+          # Keep the persistent QuACK .o cache bounded on self-hosted
+          # runners. Cache entries live under source-fingerprint directories;
+          # once a fingerprint is older than a week it is unlikely to be reused
+          # by active PRs, and stale .o.tmp.* files are interrupted exports.
+          (
+            if command -v flock >/dev/null 2>&1; then flock 9 || exit 0; fi
+            find \"\$QUACK_CACHE_DIR\" -mindepth 1 -maxdepth 1 -type d -mtime +7 -prune -exec rm -rf {} + || true
+            find \"\$QUACK_CACHE_DIR\" -type f -name '*.tmp.*' -mtime +1 -delete || true
+          ) 9>\"\$QUACK_CACHE_DIR/.prune.lock\" &&
+          # --max-worker-restart N spawns a replacement worker after a worker
+          # death so the rest of the suite still runs. The test that was in
+          # flight when the worker died is reported as a failure (no retry, so
+          # crashes are never masked).
           #
           # --async-compile=24: single-pass workflow. Cold kernel-compile
           # misses are shipped to a pool of CPU workers (24 total, split
           # across the xdist workers) while the tests defer and retry; warm
           # runs pay nothing. Replaces the old two-pass
           # \"--compile-only then real run\" strategy.
+          # >= 50000 MiB free: the largest test (test_rmsnorm_large_tensor,
+          # M=32K N=262144 bf16) peaks at a measured 35.0 GiB (x + out fully
+          # materialized + chunked reference). test_rmsnorm_forward_backward
+          # reaches ~45 GiB for M=8192, N=131072 fp32. The large-tensor test
+          # also gates on free memory itself, so a tenant allocating after
+          # this check degrades to a skip rather than an OOM.
           FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 50000 {print \$1}' | paste -sd,) &&
           if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 50GB free memory'; exit 1; fi &&
           echo \"Running tests on GPUs: \$FREE_GPUS\" &&

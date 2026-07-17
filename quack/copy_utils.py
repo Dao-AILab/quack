@@ -12,7 +12,7 @@ from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.utils import LayoutEnum
+from cutlass.utils import LayoutEnum, block_copy
 import cutlass.pipeline
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
@@ -146,14 +146,22 @@ def sr_cvt_copy(
     loc=None,
     ip=None,
 ) -> None:
-    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
+    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16/FP16 conversion."""
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
-    from quack.rounding import convert_f32_to_bf16_sr
+    from quack.rounding import convert_f32_to_bf16_sr, convert_f32_to_f16_sr
     from cutlass.cute.tensor import TensorSSA
 
+    assert const_expr(dst.element_type in (cutlass.BFloat16, cutlass.Float16)), (
+        "stochastic rounding supports BF16/FP16 output only"
+    )
+    convert_sr = (
+        convert_f32_to_bf16_sr
+        if const_expr(dst.element_type == cutlass.BFloat16)
+        else convert_f32_to_f16_sr
+    )
     src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
     src_vec = src.load()
-    raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx, loc=loc, ip=ip)
+    raw_vec = convert_sr(src_vec, seed, tidx, loc=loc, ip=ip)
     src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
     src = src_cvt
     cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
@@ -1088,6 +1096,72 @@ def tma_get_copy_fn(
     return (copy_tma if const_expr(not single_stage) else copy_tma_single_stage), s, g
 
 
+@dsl_user_op
+def tma_get_block_copy_fn(
+    atom: cute.CopyAtom,
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    tma_multicast: Optional[dict] = None,
+    single_stage: bool = False,
+    *,
+    loc=None,
+    ip=None,
+    **kwargs,
+) -> Callable:
+    src_is_smem = const_expr(
+        isinstance(src_tensor.iterator, cute.Pointer)
+        and src_tensor.memspace == cute.AddressSpace.smem
+    )
+    if const_expr(tma_multicast is not None and "use_2cta_mma_inst" not in tma_multicast):
+        op = atom.op if const_expr(hasattr(atom, "op")) else atom
+        tma_multicast = {
+            **tma_multicast,
+            "use_2cta_mma_inst": getattr(op, "cta_group", None) == tcgen05.CtaGroup.TWO,
+        }
+    smem_tensor, gmem_tensor = (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
+    group_rank_smem = const_expr(cute.rank(smem_tensor) - (1 if not single_stage else 0))
+    group_rank_gmem = const_expr(cute.rank(gmem_tensor) - (1 if not single_stage else 0))
+    s = cute.group_modes(smem_tensor, 0, group_rank_smem)
+    g = cute.group_modes(gmem_tensor, 0, group_rank_gmem)
+    src, dst = (s, g) if src_is_smem else (g, s)
+
+    @dsl_user_op
+    def copy_tma(src_idx, dst_idx, *, loc=None, ip=None, **new_kwargs):
+        src_cur = src[None, src_idx]
+        dst_cur = dst[None, dst_idx]
+        if const_expr(tma_multicast is None):
+            block_copy(atom, src_cur, dst_cur, **new_kwargs, **kwargs, loc=loc, ip=ip)
+        else:
+            block_copy(
+                atom,
+                src_cur,
+                dst_cur,
+                tma_multicast=tma_multicast,
+                **new_kwargs,
+                **kwargs,
+                loc=loc,
+                ip=ip,
+            )
+
+    @dsl_user_op
+    def copy_tma_single_stage(*, loc=None, ip=None, **new_kwargs):
+        if const_expr(tma_multicast is None):
+            block_copy(atom, src, dst, **new_kwargs, **kwargs, loc=loc, ip=ip)
+        else:
+            block_copy(
+                atom,
+                src,
+                dst,
+                tma_multicast=tma_multicast,
+                **new_kwargs,
+                **kwargs,
+                loc=loc,
+                ip=ip,
+            )
+
+    return copy_tma if const_expr(not single_stage) else copy_tma_single_stage
+
+
 def s2t_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
@@ -1428,9 +1502,7 @@ def gather_k_get_copy_fn(
         for k in cutlass.range(cols_per_thread):
             col_idx = tAcA[0, 0, k][1]
             k_idx[k] = sAIdx_cur[col_idx]
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
         return k_idx, tApA_k
 
     def copy_fn(
@@ -1542,9 +1614,7 @@ def gather_k_get_tma_copy_fn(
     ) -> cute.Tensor:
         a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
         tSR_rAIdx = load_s2r(tSR_sAIdx[None, None, dst_idx])
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
         return tSR_rAIdx
 
     def copy_fn(src_idx, dst_idx, tSR_rAIdx, tma_bar_ptr: cute.Pointer):

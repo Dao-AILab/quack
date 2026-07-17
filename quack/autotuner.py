@@ -122,6 +122,7 @@ class Autotuner:
         self.keys = key
         self.cache: Dict[Tuple, AutotuneConfig] = {}
         self.arg_names = list(signature.parameters.keys())
+        self._arg_name_set = frozenset(self.arg_names)
         self.cache_results = (
             cache_results or os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_AUTOTUNING", None) == "1"
         )
@@ -280,7 +281,9 @@ class Autotuner:
         cache.put(
             json.dumps(
                 {
-                    "key": tuning_key,
+                    # str(): the key tuple holds torch dtypes/shape tuples, and
+                    # this field is informational (only configs_timings is read back)
+                    "key": str(tuning_key),
                     "configs_timings": [
                         (str(config), timings) for config, timings in self.configs_timings.items()
                     ],
@@ -291,21 +294,32 @@ class Autotuner:
         )
 
     def __call__(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
-            all_args = {**self.nargs, **kwargs}
-            _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
-            # Need "str" to make it json-serializable
-            key = [str(_args[key]) for key in self.keys if key in _args]
-            for _, arg in _args.items():
+            # Cache-hit fast path: build the key straight from args/kwargs —
+            # this runs on EVERY tuned call, so no dict merges and no str()
+            # formatting (together measured ~26us/call for a medium GEMM's arg
+            # list). Plain-value tuples; stringified only when persisted to
+            # the disk cache (see check_disk_cache / cache.put). The merged
+            # named-args view is materialized only on a miss, for pruning.
+            key = [kwargs[k] for k in self.keys if k in kwargs]
+            arg_name_set = self._arg_name_set
+            for arg in args:
                 if isinstance(arg, Tensor):
-                    key.append(str(arg.shape))
-                    # If stride != 0, 1, we just cache it as 2
-                    key.append(str([s if s in {0, 1} else 2 for s in arg.stride()]))
-                    key.append(str(arg.dtype))
+                    # tuple(arg.shape), not arg.shape: torch.Size would change the
+                    # str() of the key and invalidate on-disk autotune caches.
+                    key.append(tuple(arg.shape))
+                    # If stride != 0, 1, we just cache it as 2 (strides are never negative)
+                    key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
+                    key.append(arg.dtype)
+            for name, arg in kwargs.items():
+                if isinstance(arg, Tensor) and name in arg_name_set:
+                    key.append(tuple(arg.shape))
+                    key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
+                    key.append(arg.dtype)
             key = tuple(key)
             if key not in self.cache:
+                self.nargs = dict(zip(self.arg_names, args))
                 used_cached_result = False
                 pruned_configs = self.prune_configs(kwargs)
 
@@ -436,19 +450,16 @@ class Autotuner:
         else:
             config = self.configs[0]
         self.best_config = config
-        if (
+        # Cheap flag first: the getenv (plus its f-string) is measurable on the
+        # per-call cache-hit path.
+        if not used_cached_result and (
             os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
-            and not used_cached_result
         ):
             print(
                 f"{PACKAGE_NAME} autotuning for function {self.fn.__name__} finished after "
                 f"{self.bench_time:.2f}s; best config selected: {self.best_config};"
             )
-        ret = self.fn.__call__(
-            *args,
-            **kwargs,
-            **config.all_kwargs(),
-        )
+        ret = self.fn(*args, **kwargs, **config.all_kwargs())
         self.nargs = None
         return ret
 

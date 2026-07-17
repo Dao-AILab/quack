@@ -134,15 +134,17 @@ def _install_getfuncargnames_cache() -> None:
             code.co_firstlineno,
         )
 
-    def _patched(function, *, name="", cls=None):
+    def _patched(function, *, name="", cls=None, **kw):
+        # **kw forwards keyword params added by newer pytest (8.1: is_method)
+        # and joins the cache key, since they can change the result
         try:
-            key = (_identity_key(function), name, cls)
+            key = (_identity_key(function), name, cls, tuple(sorted(kw.items())))
         except (AttributeError, TypeError):
-            return orig(function, name=name, cls=cls)
+            return orig(function, name=name, cls=cls, **kw)
         cached = cache.get(key)
         if cached is not None:
             return cached
-        result = orig(function, name=name, cls=cls)
+        result = orig(function, name=name, cls=cls, **kw)
         cache[key] = result
         return result
 
@@ -235,12 +237,23 @@ def pytest_unconfigure(config):
             "quack-defer-loop"
         ) or config.pluginmanager.get_plugin("quack-xdist-defer")
         defers = defer_plugin.defer_count if defer_plugin else 0
-        print(
-            f"\nasync-compile: {stats['submitted']} keys submitted, "
+        summary = (
+            f"async-compile: {stats['submitted']} keys submitted, "
             f"{stats['failed']} failed, {defers} test deferrals"
         )
-        for sha, err in stats["errors"][:5]:
-            print(f"  pool compile error [{sha[:12]}]: {err}")
+        detail = [f"  pool compile error [{sha[:12]}]: {err}" for sha, err in stats["errors"][:5]]
+        tr = config.pluginmanager.get_plugin("terminalreporter")
+        if stats["failed"] and tr is not None:
+            # Failures degrade to in-process compiles (tests still pass), so
+            # paint the summary red or it reads as routine bookkeeping.
+            print()
+            tr.write_line(summary, red=True, bold=True)
+            for line in detail:
+                tr.write_line(line, red=True)
+        else:
+            print(f"\n{summary}")
+            for line in detail:
+                print(line)
         deactivate()
 
     # Always undo the global monkey-patches we installed. This keeps the

@@ -18,6 +18,7 @@ any ``_compile_*`` ``ValueError`` as a ``TorchRuntimeError`` graph break.
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Callable, Iterable, Optional, Union
 
 import torch
@@ -60,6 +61,39 @@ def cute_op(
             # jit_cache + the async compile pool at real execution time.
             return
 
-        return op
+        return _EagerBypassOp(op, fn)
 
     return dec
+
+
+class _EagerBypassOp:
+    """Callable returned by :func:`cute_op`.
+
+    Eager fast path: the torch.library dispatch + functionalization boundary
+    costs ~60us/call (measured on rmsnorm_fwd, H100) — for these small
+    memory-bound kernels that is often larger than the kernel itself (e.g.
+    rmsnorm 1024x4096: ~10us kernel vs ~125us through the boundary). In eager we
+    call the raw body directly to skip it; under ``torch.compile`` we route to
+    the real op so Dynamo captures it as a graph node (with the no-op fake).
+    ``torch.compiler.is_compiling()`` is constant-folded to True by Dynamo at
+    trace time (torch/_dynamo/variables/torch.py), so the gate is correct under
+    both compile and export. Same trick as ``_launch()`` in gemm_interface.py.
+
+    Attribute access falls through to the underlying ``CustomOpDef`` so
+    post-registration hooks keep working (e.g. ``register_effect``,
+    ``register_autograd``, ``_opoverload``).
+    """
+
+    def __init__(self, op, fn):
+        self._custom_op = op
+        self._init_fn = fn
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self._custom_op(*args, **kwargs)
+        return self._init_fn(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # Only reached for attrs not set on the instance -> forward to the op.
+        return getattr(self.__dict__["_custom_op"], name)

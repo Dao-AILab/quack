@@ -535,10 +535,10 @@ class TensorSpec:
 
     def tma_pipeline_umma(
         self,
-        barrier_storage,
         producer_group,
         consumer_group,
         *,
+        barrier_storage=None,
         full_tile: bool = False,
         extra_bytes: int = 0,
         **kwargs,
@@ -547,6 +547,9 @@ class TensorSpec:
         from the spec (stage count / per-stage TMA bytes), so the pipeline
         cannot drift from the storage ring it guards and kernels don't repeat
         the stage/byte bookkeeping per operand.
+
+        Omit `barrier_storage` to let the pipeline allocate reserved smem for
+        its mbarriers.
 
         `extra_bytes` is added to tx_count, for one pipeline guarding several
         operands loaded per stage (the gemm A+B pattern):
@@ -563,10 +566,10 @@ class TensorSpec:
 
     def tma_pipeline_async(
         self,
-        barrier_storage,
         producer_group,
         consumer_group,
         *,
+        barrier_storage=None,
         extra_bytes: int = 0,
         **kwargs,
     ):
@@ -575,6 +578,9 @@ class TensorSpec:
         this spec's stage count and per-stage TMA bytes. Multicast cluster
         shape goes through `cta_layout_vmnk=`. No `full_tile` here — peer-CTA
         storage splitting (cta_group=2) is tcgen05-only.
+
+        Omit `barrier_storage` to let the pipeline allocate reserved smem for
+        its mbarriers.
 
         `extra_bytes` is added to tx_count, for one pipeline guarding several
         operands loaded per stage (the gemm A+B pattern):

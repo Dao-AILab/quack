@@ -6,6 +6,7 @@ problem shape, then selects swap_ab by comparing estimated runtimes for both
 orientations.
 """
 
+import functools
 import logging
 import torch
 
@@ -78,8 +79,11 @@ def _get_hw(device_capacity):
         return None
 
 
+# Precision letters per nvMatmulHeuristics.h: H=fp16, T=bf16, S=fp32, B=int8.
+# (bf16 was previously mapped to "BSB", which is the int8 profile: 2x-off
+# traffic estimates and int8 MMA throughput in the perf model.)
 _TORCH_DTYPE_TO_NVMMH_PRECISION = {
-    torch.bfloat16: "BSB",
+    torch.bfloat16: "TST",
     torch.float16: "HSH",
     torch.float32: "SSS",
 }
@@ -116,6 +120,18 @@ def nvmmh_default_config(A, B, device_capacity):
     Returns None if nvMatmulHeuristics is unavailable, letting the caller fall
     back to the hardcoded default.
     """
+    # Extract M, N, K from tensor shapes
+    # A: (M, K) or (L, M, K), B: (K, N) or (L, K, N)
+    m = A.shape[-2] if A.ndim >= 2 else A.shape[0]
+    k = A.shape[-1]
+    n = B.shape[-1]
+    return _nvmmh_query_config(m, n, k, A.dtype, device_capacity)
+
+
+# The two C-library queries cost ~50-100us per call, which would otherwise be
+# paid on every untuned GEMM launch; None results are cached too.
+@functools.lru_cache(maxsize=None)
+def _nvmmh_query_config(m, n, k, torch_dtype, device_capacity):
     from nvMatmulHeuristics import NvMatmulHeuristicsMatmulLayout
 
     iface = _get_iface()
@@ -125,15 +141,9 @@ def nvmmh_default_config(A, B, device_capacity):
     if hw is None:
         return None
 
-    precision = _TORCH_DTYPE_TO_NVMMH_PRECISION.get(A.dtype)
+    precision = _TORCH_DTYPE_TO_NVMMH_PRECISION.get(torch_dtype)
     if precision is None:
         return None
-
-    # Extract M, N, K from tensor shapes
-    # A: (M, K) or (L, M, K), B: (K, N) or (L, K, N)
-    m = A.shape[-2] if A.ndim >= 2 else A.shape[0]
-    k = A.shape[-1]
-    n = B.shape[-1]
 
     # Query normal orientation: D(M,N) row-major
     normal = _query_top1(iface, hw, m, n, k, NvMatmulHeuristicsMatmulLayout.TN_ROW_MAJOR, precision)

@@ -186,6 +186,61 @@ def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
     return val
 
 
+@cute.jit
+def semaphore_wait_eq(lock_ptr: cute.Pointer, expected: Int32):
+    """Warp-cooperative gmem semaphore wait: spin until *lock_ptr == expected.
+
+    Lane 0 spins with gpu-scope acquire loads; all lanes are synchronized after the
+    wait, and a fence.proxy.async.global orders subsequent async-proxy (TMA) accesses
+    after the acquire so they observe the releaser's completed stores. Wait-for-equal
+    gives turnstile semantics: releasers passing monotonically increasing values
+    serialize waiters in a fixed order (e.g. CUTLASS-style serial split-K).
+    """
+    if cute.arch.lane_idx() == 0:
+        state = cute.arch.load(lock_ptr, Int32, sem="acquire", scope="gpu")
+        while state != expected:
+            state = cute.arch.load(lock_ptr, Int32, sem="acquire", scope="gpu")
+    cute.arch.sync_warp()
+    cute.arch.fence_proxy("async.global")
+
+
+@cute.jit
+def semaphore_release(
+    lock_ptr: cute.Pointer, value: Int32, drain_tma_store: cutlass.Constexpr[bool] = True
+):
+    """Warp-cooperative gmem semaphore release: store value to *lock_ptr.
+
+    With drain_tma_store (default), first waits for ALL of the calling threads'
+    outstanding bulk async-groups to COMPLETE and cross-proxy fences, so TMA
+    stores/reduces issued before the release are visible to the next acquirer. This
+    must be the non-.read wait: tma_store_wait's .read variant only protects smem
+    reuse, not the visibility of the gmem writes themselves. All lanes then sync
+    (ordering the issuing lane's completed work before the flag) and lane 0 performs
+    a gpu-scope release store.
+    """
+    if const_expr(drain_tma_store):
+        cute.arch.cp_async_bulk_wait_group(0)
+        cute.arch.fence_proxy("async.global")
+    cute.arch.sync_warp()
+    if cute.arch.lane_idx() == 0:
+        cute.arch.store(lock_ptr, value, sem="release", scope="gpu")
+
+
+@cute.jit
+def semaphore_arrive_inc(lock_ptr: cute.Pointer, value: Int32 = 1):
+    """Warp-cooperative gmem arrival counter: gpu-scope release-increment *lock_ptr.
+
+    The unordered counterpart of semaphore_release: arrivers in any order each add
+    `value`; a waiter using semaphore_wait_eq(expected=total) observes all arrivers'
+    prior (generic-proxy) writes once the count is reached. The caller must order
+    its own threads' writes before this call (e.g. a CTA/group barrier); lane 0's
+    release-RMW then publishes the chain.
+    """
+    cute.arch.sync_warp()
+    if cute.arch.lane_idx() == 0:
+        cute.arch.atomic_add(lock_ptr, Int32(value), sem="release", scope="gpu")
+
+
 @dsl_user_op
 def domain_offset_aligned(
     coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None

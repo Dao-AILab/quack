@@ -80,10 +80,23 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
 
     assert out.shape == x.shape
     assert out.dtype == input_dtype
-    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
+    # assert_close upcasts both operands to fp32 and allocates diff/mask
+    # temporaries (~7x the operand size). For the largest shapes here (4 GiB
+    # operands on top of 28 GiB of live tensors) that transient pushed peak
+    # memory to ~56 GiB. Chunk the comparison for operands >= 1 GiB, and free
+    # each tensor as soon as it has been checked, keeping the peak at ~30 GiB.
+    n_chunks = 16 if x.numel() * x.element_size() >= 2**30 else 1
+
+    def assert_close(actual, expected, atol):
+        for actual_c, expected_c in zip(actual.chunk(n_chunks), expected.chunk(n_chunks)):
+            torch.testing.assert_close(actual_c, expected_c, atol=atol, rtol=1e-3)
+
+    assert_close(out, out_ref, atol)
     if skip_bwd:
         return
-    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+    del out, out_ref, grad_out
+    assert_close(x.grad, x_ref.grad, atol)
+    x.grad = x_ref.grad = None
     if weight_dtype is not None:
         if weight_dtype == torch.float32:
             # Kernel and reference reduce dout*x_hat in float32 but in different summation
@@ -94,6 +107,41 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps, use_comp
             # Tolerance = 1 ULP at the magnitude of the largest gradient.
             weight_atol = 2 * torch.finfo(weight_dtype).eps * weight_ref.grad.abs().max()
         torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("N", [1024, 4096, 32768])
+@pytest.mark.parametrize("M", [1, 199, 8 * 1024])
+def test_rmsnorm_weight_offset(M, N, input_dtype, weight_dtype, use_compile):
+    """Gemma-style RMSNorm: out = x_hat * (1 + w) with zero-init weight, fwd + bwd."""
+    device = "cuda"
+    atol = TOLERANCES[input_dtype]
+    torch.random.manual_seed(0)
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    # Zero-init plus noise: the regime weight_offset=1.0 exists for. A plain
+    # w-multiply bug would show up as out ≈ 0 instead of out ≈ x_hat.
+    weight = (0.1 * torch.randn(N, device=device, dtype=weight_dtype)).requires_grad_()
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+
+    out = function(x, weight, weight_offset=1.0)
+    out_ref = rmsnorm_ref(x_ref, weight_ref, weight_offset=1.0)
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
+
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+    # dw is unaffected by the offset (d out/d w is x_hat either way); same
+    # summation-order tolerances as test_rmsnorm_forward_backward.
+    if weight_dtype == torch.float32:
+        weight_atol = 5e-6 * (M**0.5)
+    else:
+        weight_atol = 2 * torch.finfo(weight_dtype).eps * weight_ref.grad.abs().max()
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
@@ -254,28 +302,36 @@ def test_rmsnorm_strided_tensor(use_compile):
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_large_tensor(M, N, input_dtype, eps, use_compile):
     """Test RMSNorm forward pass against reference implementation."""
-    vram_bytes = torch.cuda.get_device_properties(0).total_memory
-    peak_bytes = M * N * 2 * 3  # x + out + out_ref, bf16
-    if peak_bytes > vram_bytes * 0.85:
-        pytest.skip(f"Insufficient VRAM ({vram_bytes // 2**30} GB)")
+    n_chunks = 16
+    # x + out must be fully materialized for the kernel call (irreducible);
+    # the reference is computed and compared one M/n_chunks-row chunk at a
+    # time (rmsnorm is row-wise, so chunking over M is exact), so out_ref
+    # never fully materializes. Budget: 2 full tensors + ~3 chunk-sized
+    # temporaries (out_ref chunk, diff, abs). Gate on *free* memory so a
+    # partially-occupied GPU on a shared machine skips instead of OOMing.
+    peak_bytes = 2 * M * N * 2 + 3 * (M // n_chunks) * N * 2
+    # Release cache reserved by earlier tests in this worker before measuring,
+    # otherwise it counts as "used" and forces a spurious skip.
+    torch.cuda.empty_cache()
+    free_bytes = torch.cuda.mem_get_info()[0]
+    if peak_bytes > free_bytes * 0.9:
+        pytest.skip(
+            f"Insufficient free VRAM ({free_bytes // 2**30} GiB free,"
+            f" need ~{peak_bytes // 2**30} GiB)"
+        )
     device = "cuda"
     atol = TOLERANCES[input_dtype]
     torch.random.manual_seed(0)
-    torch.cuda.empty_cache()
     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=False)
     weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=False)
     function = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
     out = function(x, weight, eps=eps)
-    # Need to compile, otherwise it OOMs
+    # Need to compile the ref, otherwise it OOMs. All chunks share one shape,
+    # so only the first chunk pays the compile.
     rmsnorm_compiled = torch.compile(rmsnorm_ref)
-    # Run once with smaller input to avoid OOMs
-    rmsnorm_compiled(x[:32], weight, eps=eps)
-    out_ref = rmsnorm_compiled(x, weight, eps=eps)
-    # Need to chunk, otherwise it OOMs
-    assert all(
-        (out_c - out_ref_c).abs().max() < atol
-        for out_c, out_ref_c in zip(out.chunk(16), out_ref.chunk(16))
-    )
+    for x_c, out_c in zip(x.chunk(n_chunks), out.chunk(n_chunks)):
+        out_ref_c = rmsnorm_compiled(x_c, weight, eps=eps)
+        assert (out_c - out_ref_c).abs().max() < atol
 
 
 def test_rmsnorm_input_validation():
@@ -304,9 +360,9 @@ def test_rmsnorm_input_validation():
     x_cpu = torch.randn(32, 1024, dtype=torch.float16)
     weight_cpu = torch.randn(1024, dtype=torch.float32)
 
-    # with pytest.raises(AssertionError, match="Tensors must be on CUDA device"):
-    # With torch.library custom op, this now fails with NotImplementedError
-    with pytest.raises(NotImplementedError):
+    # Eager calls bypass the torch.library dispatcher, so TVM-FFI performs the
+    # device validation directly.
+    with pytest.raises(ValueError, match="expected device_type=cuda"):
         rmsnorm(x_cpu, weight_cpu)
 
     # Test unsupported dtype

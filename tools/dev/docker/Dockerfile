@@ -17,14 +17,14 @@
 #   docker build -f tools/dev/docker/Dockerfile -t kernel-dev:cu133 .
 #
 # Useful build args:
-#   --build-arg CUTLASS_DSL_VERSION=4.6.0.dev0
-#   --build-arg TILELANG_VERSION=0.1.11
+#   --build-arg CUTLASS_DSL_VERSION=4.6.1
+#   --build-arg TILELANG_VERSION=0.1.12
 #   --build-arg CUDA_APT_SUFFIX=13-3
-#   --build-arg CUDNN_VERSION=9.23.2.1
-#   --build-arg CUDNN_FRONTEND_VERSION=1.25.0
+#   --build-arg CUDNN_VERSION=9.24.0.43
+#   --build-arg CUDNN_FRONTEND_VERSION=1.26.0
 #   --build-arg CUDA_PYTHON_VERSION=13.3.1
 #   --build-arg MATMUL_HEURISTICS_VERSION=0.1.0.27
-#   --build-arg NSIGHT_PYTHON_VERSION=0.9.6
+#   --build-arg NSIGHT_PYTHON_VERSION=1.0.0
 #   --build-arg COMPILEIQ_VERSION=1.0.1
 #   --build-arg UV_VERSION=0.11.22
 #   --build-arg GH_VERSION=2.95.0
@@ -41,16 +41,16 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHON_VERSION=3.12
 ARG CUDA_APT_SUFFIX=13-3
 ARG TORCH_CUDA=cu132
-ARG TORCH_VERSION=2.12.1
+ARG TORCH_VERSION=2.13.0
 ARG CUDNN_VERSION=9.24.0.43
-ARG CUDNN_FRONTEND_VERSION=1.25.0
+ARG CUDNN_FRONTEND_VERSION=1.26.0
 ARG CUDA_PYTHON_VERSION=13.3.1
 ARG MATMUL_HEURISTICS_VERSION=0.1.0.27
-ARG NSIGHT_PYTHON_VERSION=0.9.6
+ARG NSIGHT_PYTHON_VERSION=1.0.0
 ARG COMPILEIQ_VERSION=1.0.2
 ARG UV_VERSION=0.11.22
-ARG CUTLASS_DSL_VERSION=4.6.0
-ARG TILELANG_VERSION=0.1.11
+ARG CUTLASS_DSL_VERSION=4.6.1
+ARG TILELANG_VERSION=0.1.12
 ARG GH_VERSION=2.95.0
 
 ENV LANG=C.UTF-8 \
@@ -59,6 +59,8 @@ ENV LANG=C.UTF-8 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_COMPILE=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    UV_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     CUDA_HOME=/usr/local/cuda \
     LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
@@ -122,6 +124,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
+        python3-pip \
+        python-is-python3 \
         ripgrep \
         rsync \
         sollya \
@@ -173,9 +177,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -f /tmp/gh.deb /tmp/cuda-keyring.deb /usr/local/bin/nsys-ui /usr/local/cuda/bin/ncu-ui && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python${PYTHON_VERSION} -m venv /opt/venv
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH}
+ENV PATH=/usr/local/cuda/bin:${PATH}
 
 # Install Python packages in one layer so replaced/stripped files do not remain
 # in lower Docker layers. Torch is installed normally from the official PyTorch
@@ -188,9 +190,9 @@ ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH}
 #
 # Install basic nsight-python, not nsight-python[cu13], so cuda-core[cu13] does
 # not pull an additional CUDA toolkit stack.
-RUN python -m pip install --upgrade pip "setuptools<82" wheel packaging "uv==${UV_VERSION}" && \
+RUN python${PYTHON_VERSION} -m pip install "setuptools<82" wheel packaging "uv==${UV_VERSION}" && \
     export UV_CACHE_DIR=/tmp/uv-cache && \
-    uv pip install \
+    uv pip install --system \
         einops \
         ipdb \
         ipython \
@@ -212,31 +214,32 @@ RUN python -m pip install --upgrade pip "setuptools<82" wheel packaging "uv==${U
         pytest-timeout \
         pytest-xdist \
         ruff \
-        ty && \
-    uv pip install \
+        ty \
+        tyro && \
+    uv pip install --system \
         --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}" \
         "torch==${TORCH_VERSION}" && \
-    uv pip install "nvidia-cudnn-cu13==${CUDNN_VERSION}" && \
-    CUDNN_VERSION="${CUDNN_VERSION}" python -c 'from importlib.metadata import distribution; from pathlib import Path; import os, re; version=os.environ["CUDNN_VERSION"]; meta=Path(distribution("torch")._path)/"METADATA"; text=meta.read_text(); pattern=re.compile("^(Requires-Dist: nvidia-cudnn-cu13==)([^;\\s]+)(; platform_system == "+chr(34)+"Linux"+chr(34)+")$", re.M); new,count=pattern.subn(lambda m: f"{m.group(1)}{version}{m.group(3)}", text); assert count == 1, f"patched {count} torch cuDNN dependency lines"; meta.write_text(new)' && \
-    uv pip install \
+    uv pip install --system "nvidia-cudnn-cu13==${CUDNN_VERSION}" && \
+    CUDNN_VERSION="${CUDNN_VERSION}" python${PYTHON_VERSION} -c 'from importlib.metadata import distribution; from pathlib import Path; import os, re; version=os.environ["CUDNN_VERSION"]; meta=Path(distribution("torch")._path)/"METADATA"; text=meta.read_text(); pattern=re.compile("^(Requires-Dist: nvidia-cudnn-cu13==)([^;\\s]+)(; platform_system == "+chr(34)+"Linux"+chr(34)+")$", re.M); new,count=pattern.subn(lambda m: f"{m.group(1)}{version}{m.group(3)}", text); assert count == 1, f"patched {count} torch cuDNN dependency lines"; meta.write_text(new)' && \
+    uv pip install --system \
         "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
         "tilelang==${TILELANG_VERSION}" && \
-    uv pip check && \
+    uv pip check --system && \
     rm -rf /tmp/uv-cache && \
     rm -f \
-        /opt/venv/lib/python${PYTHON_VERSION}/site-packages/triton/backends/nvidia/lib/cupti/libcupti_static.a \
-        /opt/venv/lib/python${PYTHON_VERSION}/site-packages/triton/backends/nvidia/lib/cupti/libnvperf_host_static.a && \
-    find /opt/venv -type d -name __pycache__ -prune -exec rm -rf {} + && \
-    find /opt/venv -type f \( -name '*.so' -o -name '*.so.*' \) -print0 | \
+        /usr/local/lib/python${PYTHON_VERSION}/dist-packages/triton/backends/nvidia/lib/cupti/libcupti_static.a \
+        /usr/local/lib/python${PYTHON_VERSION}/dist-packages/triton/backends/nvidia/lib/cupti/libnvperf_host_static.a && \
+    find /usr/local/lib/python${PYTHON_VERSION}/dist-packages -type d -name __pycache__ -prune -exec rm -rf {} + && \
+    find /usr/local/lib/python${PYTHON_VERSION}/dist-packages -type f \( -name '*.so' -o -name '*.so.*' \) -print0 | \
         while IFS= read -r -d '' lib; do \
             if file "$lib" | grep -q 'ELF.*not stripped'; then strip --strip-unneeded "$lib" || true; fi; \
         done && \
     for bin in \
-        /opt/venv/bin/py-spy \
-        /opt/venv/bin/z3 \
-        /opt/venv/lib/python${PYTHON_VERSION}/site-packages/torch/bin/protoc \
-        /opt/venv/lib/python${PYTHON_VERSION}/site-packages/torch/bin/protoc-3.13.0.0 \
-        /opt/venv/lib/python${PYTHON_VERSION}/site-packages/triton/FileCheck; do \
+        /usr/local/bin/py-spy \
+        /usr/local/bin/z3 \
+        /usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/bin/protoc \
+        /usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/bin/protoc-3.13.0.0 \
+        /usr/local/lib/python${PYTHON_VERSION}/dist-packages/triton/FileCheck; do \
             if [ -f "$bin" ]; then strip --strip-unneeded "$bin" || true; fi; \
         done
 

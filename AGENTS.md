@@ -94,3 +94,37 @@ After finding a fix, verify that the minimized repro passes, the original repro 
 - Favor concise, self-explanatory code
 - Line length: 100 (ruff)
 - Ruff allows: lambda assignment (E731), single-char vars I/O/l (E741), unused locals (F841)
+
+## Measured facts & gotchas (hard-won; verify before assuming they changed)
+
+Hardware (B300 / SM100):
+- Dense bf16 peak is 2250 TFLOPS — never use the sparse marketing number.
+- L1TEX: gmem and smem share the 128 B/clk/SM pipe; 16-bit kernels with smem
+  exchanges are smem/latency-bound, not DRAM-bound (clone ceiling ~6.3 TB/s).
+- Blockscaled SF tmem is 64-N granular at both UTCCP write and QMMA read:
+  tile_n that is a 32-multiple but not 64 (96, 224) is hardware-blocked.
+
+Benchmarking (see tools/matmul_heuristic/common.py for the reference protocol):
+- Per-launch CUDA event pairs on a starved stream time the host enqueue gap,
+  not the kernel — any sub-100us kernel needs a GPU-side backlog (burner).
+  Consecutive kernels chain L2 state, so rotate config order across rounds.
+- On shared nodes: interleave variants at single-launch granularity and
+  compare medians; sequential do_bench rounds drift 2-3x with clocks and
+  co-tenants. Guard long benches with a contention canary.
+- Short benches ride boost clocks (~15-25% fast vs settled); input data
+  distribution shifts the settled clock (randn vs small-int vs zeros differ
+  up to ~40%) — match warmup AND data distribution across baselines.
+- Pin the CPU (taskset) when launch overhead matters; the Python/FFI launch
+  path floor is ~3.5us and drifts 2-3x unpinned.
+
+CuTe-DSL:
+- Dtype views of swizzled smem drop the swizzle: re-attach the SAME
+  byte-addressed swizzle via `recast_ptr`, never plain `recast_tensor`.
+- TensorSSA `.store` on all-zero-stride filtered rmem views is silently
+  dropped — use scalar setitem.
+- Data-independent per-element selects hoist above the load and spill
+  registers; make both select arms consume the loaded value.
+- Never `partition_D` a tile smaller than the epilogue tiler (warp
+  corruption); derive extents from the copy atom.
+- `QUACK_CACHE_ENABLED=0` for const_expr ablations — the jit cache ignores
+  env flags, and identical timings across an ablation mean a stale cubin.

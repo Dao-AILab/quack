@@ -19,6 +19,7 @@ the user never invoked ``.backward()``.
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from quack.dsl.torch_library_op import cute_op
 
@@ -119,6 +120,97 @@ def test_fake_never_runs_body_under_fake_mode():
         op(x, out)
 
     assert call_log == [], f"fake body must never run; saw {call_log}"
+
+
+class _OpCounter(TorchDispatchMode):
+    """Count how many times a specific op overload reaches the dispatcher."""
+
+    def __init__(self, needle: str):
+        self.needle = needle
+        self.count = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if self.needle in str(func):
+            self.count += 1
+        return func(*args, **(kwargs or {}))
+
+
+def test_wrapper_exposes_underlying_op():
+    """cute_op returns a dispatch wrapper that still exposes the raw body and
+    the registered custom op, and the op stays reachable via torch.ops."""
+    _, _ = _make_op("wrapper_introspect")  # register under torch.ops
+
+    @cute_op(
+        f"{_NS}::wrapper_attrs", mutates_args={"out"}, schema="(Tensor x, Tensor(a1!) out) -> ()"
+    )
+    def _impl(x: torch.Tensor, out: torch.Tensor) -> None:
+        out.copy_(x)
+
+    assert callable(_impl)
+    assert hasattr(_impl, "_init_fn") and hasattr(_impl, "_custom_op")
+    assert hasattr(torch.ops, _NS) and hasattr(getattr(torch.ops, _NS), "wrapper_attrs")
+
+
+def test_eager_call_bypasses_custom_op_boundary():
+    """In eager, calling the wrapper must run the raw body directly and skip the
+    ~60us torch.library dispatch/functionalization boundary — the registered op
+    overload must NOT reach the dispatcher — while still mutating correctly.
+    Calling the underlying op does go through the dispatcher (control)."""
+    call_log: list[tuple] = []
+
+    @cute_op(
+        f"{_NS}::eager_bypass", mutates_args={"out"}, schema="(Tensor x, Tensor(a1!) out) -> ()"
+    )
+    def _impl(x: torch.Tensor, out: torch.Tensor) -> None:
+        call_log.append(tuple(x.shape))
+        out.copy_(x)
+
+    x = torch.randn(8, 16)
+
+    # Wrapper in eager: body runs, but the custom op does not hit the dispatcher.
+    out = torch.empty_like(x)
+    with _OpCounter("eager_bypass") as c:
+        _impl(x, out)
+    assert torch.equal(out, x), "eager bypass must still mutate out"
+    assert call_log == [(8, 16)], f"body must run exactly once, saw {call_log}"
+    assert c.count == 0, f"custom-op boundary must be bypassed in eager, dispatched {c.count}x"
+
+    # Underlying op: goes through the dispatcher (control for the counter).
+    out2 = torch.empty_like(x)
+    with _OpCounter("eager_bypass") as c2:
+        _impl._custom_op(x, out2)
+    assert torch.equal(out2, x)
+    assert c2.count >= 1, "underlying custom op must reach the dispatcher"
+
+
+def test_wrapper_uses_real_op_under_compile():
+    """Under torch.compile the wrapper must route to the real op (captured as a
+    graph node with the no-op fake), not inline the body — so the body never runs
+    on fake tensors and runs exactly once eagerly at runtime."""
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    call_log: list[tuple] = []
+
+    @cute_op(
+        f"{_NS}::compile_wrapper", mutates_args={"out"}, schema="(Tensor x, Tensor(a1!) out) -> ()"
+    )
+    def _impl(x: torch.Tensor, out: torch.Tensor) -> None:
+        call_log.append(("fake" if isinstance(x, FakeTensor) else "eager", tuple(x.shape)))
+        if not isinstance(x, FakeTensor):
+            out.copy_(x)
+
+    @torch.compile(fullgraph=True)
+    def f(x):
+        out = torch.empty_like(x)
+        _impl(x, out)
+        return out
+
+    x = torch.randn(4, 8)
+    out = f(x)
+    assert torch.equal(out, x)
+    assert [k for k, _ in call_log] == ["eager"], (
+        f"fake body must not run under compile; body must run once eagerly, saw {call_log}"
+    )
 
 
 def test_fake_is_noop_under_dynamic_shapes():

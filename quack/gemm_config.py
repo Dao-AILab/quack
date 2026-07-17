@@ -1,8 +1,36 @@
 # Copyright (C) 2025, Tri Dao.
 import itertools
+from enum import IntEnum
 from typing import Optional, List
-from functools import partial
+from functools import lru_cache, partial
 from dataclasses import dataclass
+
+
+class SplitKMode(IntEnum):
+    """How split-K partial results are combined into the output.
+
+    The canonical public import path is ``from quack.gemm_interface import SplitKMode``
+    (re-exported there next to the gemm entry points that take it). The definition has
+    to live in this leaf module: the kernel layer (gemm_base / gemm_sm*) consumes it at
+    import time, and gemm_interface sits above quack.gemm in the import graph, so
+    defining it there would be a circular import.
+
+    IntEnum (like RoundingMode) so values cross the torch.library custom-op schema
+    boundary as plain ints and pickle stably for the jit-cache key.
+    """
+
+    # All modes commit raw f32 partials; the full epilogue runs exactly once, on the
+    # entity that owns the completed sum (f32 accumulation in every mode).
+    # Per-output-tile turnstile orders the partial commits in split order; the last
+    # split finalizes: bitwise deterministic run to run.
+    SERIAL = 0
+    # Partials commit in arrival order (no waiting); the last split finalizes after an
+    # arrival counter fills: lowest latency, NOT deterministic run to run.
+    PARALLEL = 1
+    # Each split stores f32 partials to its own workspace slice; a separate reduction
+    # kernel (quack/split_k_reduce.py) sums them in a deterministic order and applies
+    # the epilogue.
+    SEPARATE = 2
 
 
 @dataclass(frozen=True)
@@ -17,12 +45,30 @@ class GemmConfig:
     cluster_m: int = 2
     cluster_n: int = 1
     cluster_k: int = 1
+    split_k: int = 1
     swap_ab: bool = False
     # raster_order: int = 1
     max_swizzle_size: int = 8
     device_capacity: int = 9
     # whether to use TMA gather (vs normal cp.async) for gather_A on SM100
     use_tma_gather: bool = False
+
+
+def config_supports(config: GemmConfig, *, gather_A: bool = False, varlen_m: bool = False) -> bool:
+    """Structural validity of a config for gather_A / varlen_m.
+
+    Single source of truth shared by the autotune pruner
+    (gemm_interface.prune_invalid_gemm_configs) and the analytic heuristic's
+    candidate spaces (gemm_heuristic; enforced by tests/test_gemm_heuristic.py).
+    """
+    if (gather_A or varlen_m) and config.swap_ab:
+        return False
+    if gather_A:
+        if config.cluster_n != 1:
+            return False
+        if config.device_capacity == 9 and (config.tile_n == 208 or config.is_dynamic_persistent):
+            return False
+    return True
 
 
 def _get_sm90_configs(
@@ -189,3 +235,85 @@ def get_all_configs(
         + _get_sm100_configs(epilogue)
         + _get_sm120_configs(epilogue, tune_coop)
     )
+
+
+def default_config(device) -> GemmConfig:
+    """Per-arch default config (canonical home; gemm_interface re-exports)."""
+    from quack.cute_dsl_utils import get_device_capacity
+
+    return _default_config_for_cap(get_device_capacity(device)[0])
+
+
+def blockscaled_default_config(m: int, n: int) -> GemmConfig:
+    """Default SM100 config for blockscaled GEMM.
+
+    Large shapes use a (256, 256) tile: it makes num_acc_stage == 1, which turns
+    on ``overlap_accum_sf`` (a second TMEM accumulator stage) so the per-tile
+    scale-apply + TMEM drain overlaps the next tile's MMA instead of
+    serializing after it.
+    """
+    if m >= 512 and n >= 256:
+        tile_m, tile_n, cluster = 256, 256, (2, 1)
+    elif m >= 512 and n >= 128:
+        tile_m, tile_n, cluster = 256, 128, (2, 1)
+    else:
+        tile_m, tile_n, cluster = 128, 128, (1, 1)
+    return _blockscaled_config(tile_m, tile_n, cluster)
+
+
+@lru_cache(maxsize=None)
+def _blockscaled_config(tile_m, tile_n, cluster):
+    return GemmConfig(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        cluster_m=cluster[0],
+        cluster_n=cluster[1],
+        pingpong=False,
+        is_dynamic_persistent=True,
+        device_capacity=10,
+    )
+
+
+@lru_cache(maxsize=None)
+def _default_config_for_cap(cap):
+    if cap == 8:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            tile_k=32,
+            num_warps=4,
+            cluster_m=1,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=False,
+            device_capacity=8,
+        )
+    elif cap in [10, 11]:
+        return GemmConfig(
+            tile_m=256,
+            tile_n=256,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=True,
+            device_capacity=10,
+        )
+    elif cap == 12:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            cluster_m=1,
+            cluster_n=1,
+            pingpong=True,
+            is_dynamic_persistent=True,
+            device_capacity=12,
+        )
+    else:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=192,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=True,
+            is_dynamic_persistent=False,
+        )

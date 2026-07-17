@@ -24,6 +24,7 @@ import pickle
 import sys
 import tempfile
 import time
+import warnings
 from collections import namedtuple
 from getpass import getuser
 from pathlib import Path
@@ -187,6 +188,20 @@ def jit_cache(fn):
             m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
             return m[EXPORT_FUNC_NAME]
 
+        def _quarantine_corrupt(exc: Exception) -> None:
+            """A cached .o that fails to load (truncated write from a killed
+            worker, missing __tvm_ffi_func, ...) is a cache miss, not an error:
+            delete it so this and future processes recompile instead of failing
+            forever (the CI cache persists across runs)."""
+            print(
+                f"quack cache: corrupt cached object for key {sha} "
+                f"({type(exc).__name__}: {exc}); deleting and recompiling"
+            )
+            try:
+                o_path.unlink()
+            except OSError:
+                pass
+
         # 3. Fast path: optimistic existence check, then shared-lock load.
         #    The unlocked ``.exists()`` is a no-cost short-circuit for warm
         #    caches; the shared lock guards against reading a partial file
@@ -195,10 +210,16 @@ def jit_cache(fn):
             try:
                 with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
                     if o_path.exists():
-                        loaded = _load_cached()
-                        cache[cache_key] = loaded
-                        hits += 1
-                        return loaded
+                        try:
+                            loaded = _load_cached()
+                        except Exception as e:
+                            # Corrupt entry: recover under the exclusive lock in
+                            # the slow path (shared lock can't safely delete).
+                            _quarantine_corrupt(e)
+                        else:
+                            cache[cache_key] = loaded
+                            hits += 1
+                            return loaded
             except RuntimeError:
                 pass  # lock timeout; fall through to slow path
 
@@ -229,16 +250,26 @@ def jit_cache(fn):
                 try:
                     with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
                         if o_path.exists():
-                            loaded = _load_cached()
-                            cache[cache_key] = loaded
-                            hits += 1
-                            return loaded
+                            try:
+                                loaded = _load_cached()
+                            except Exception as e:
+                                _quarantine_corrupt(e)
+                            else:
+                                cache[cache_key] = loaded
+                                hits += 1
+                                return loaded
                 except RuntimeError:
                     pass  # lock timeout; fall through to slow path
             else:  # "failed"
-                print(
+                # warnings.warn, not print: this fires inside a test whose stdout
+                # pytest captures and discards on pass (the in-process fallback
+                # usually succeeds), so a print never reaches the user — the
+                # warning lands in pytest's warnings summary instead.
+                warnings.warn(
                     f"quack cache: async compile failed for {fn.__qualname__} "
-                    f"[{sha[:12]}]: {err}; recompiling in-process for a real traceback"
+                    f"[{sha[:12]}]: {err}; recompiling in-process for a real traceback",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
 
         # 4. Slow path: take EXCLUSIVE lock and compile under it. The recheck
@@ -246,36 +277,68 @@ def jit_cache(fn):
         #    while we were waiting; in that case we just load and return
         #    without duplicating the compile.
         try:
-            with FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT):
-                if o_path.exists():
-                    loaded = _load_cached()
-                    cache[cache_key] = loaded
-                    hits += 1
-                    return loaded
-
-                misses += 1
-                compiled_fn = fn(*args, **kwargs)
-                try:
-                    compiled_fn.export_to_c(
-                        object_file_path=str(o_path),
-                        function_name=EXPORT_FUNC_NAME,
-                    )
-                except Exception as e:
-                    print(f"quack cache: export failed for key {sha}: {e}")
-                cache[cache_key] = compiled_fn
-                return compiled_fn
+            lock = FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT)
+            # Acquire outside the compile's try scope: only the acquisition
+            # raises the timeout RuntimeError. A blanket `try: with lock: fn()`
+            # also caught RuntimeErrors from the compile itself, mislabeling
+            # real compile failures as lock timeouts and re-running the failed
+            # compile a second time.
+            lock.__enter__()
         except RuntimeError as e:
             # Lock acquisition timed out (heavy contention or stuck holder).
             # Fall back to in-process compile, no disk write. Better to do
             # the work twice than to fail the test.
-            print(
+            warnings.warn(
                 f"quack cache: lock timeout for key {sha}: {e}; "
-                f"falling back to in-process compile without disk cache"
+                f"falling back to in-process compile without disk cache",
+                RuntimeWarning,
+                stacklevel=2,
             )
             misses += 1
             compiled_fn = fn(*args, **kwargs)
             cache[cache_key] = compiled_fn
             return compiled_fn
+        try:
+            if o_path.exists():
+                try:
+                    loaded = _load_cached()
+                except Exception as e:
+                    _quarantine_corrupt(e)  # holds the exclusive lock: safe
+                else:
+                    cache[cache_key] = loaded
+                    hits += 1
+                    return loaded
+
+            misses += 1
+            compiled_fn = fn(*args, **kwargs)
+            # Export to a private temp file, then atomically rename into
+            # place: a process killed mid-export (xdist worker OOM-kill,
+            # timeout) must never leave a truncated .o at the final path —
+            # the advisory flock dies with the process, and a persistent
+            # cache (CI keeps one in $HOME) would then fail every future
+            # run on this key with "Symbols not found: __tvm_ffi_func".
+            tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")
+            try:
+                compiled_fn.export_to_c(
+                    object_file_path=str(tmp_path),
+                    function_name=EXPORT_FUNC_NAME,
+                )
+                os.replace(tmp_path, o_path)
+            except Exception as e:
+                warnings.warn(
+                    f"quack cache: export failed for key {sha}: {e} "
+                    f"(this key will recompile every run)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            cache[cache_key] = compiled_fn
+            return compiled_fn
+        finally:
+            lock.__exit__(None, None, None)
 
     def cache_clear():
         nonlocal hits, misses

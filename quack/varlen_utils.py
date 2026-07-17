@@ -40,6 +40,7 @@ class VarlenManager:
         params: Params,
         len_m_static: Int32,
         len_k_static: Int32,
+        len_n_static: Int32,
         last_batch_idx: Int32 = Int32(-1),
         is_group_changed: Boolean = Boolean(True),
         *,
@@ -49,6 +50,7 @@ class VarlenManager:
         self.params = params
         self._len_m_static = len_m_static
         self._len_k_static = len_k_static
+        self._len_n_static = len_n_static
         self._last_batch_idx = last_batch_idx
         self._is_group_changed = is_group_changed
         self.varlen_m = const_expr(params.cu_seqlens_m is not None)
@@ -70,11 +72,17 @@ class VarlenManager:
         params: Params,
         len_m_static: Int32,
         len_k_static: Int32,
+        len_n_static: Int32,
         *,
         loc=None,
         ip=None,
     ) -> "VarlenManager":
-        return VarlenManager(params, len_m_static=len_m_static, len_k_static=len_k_static)
+        return VarlenManager(
+            params,
+            len_m_static=len_m_static,
+            len_k_static=len_k_static,
+            len_n_static=len_n_static,
+        )
 
     def len_m(self, batch_idx: Int32) -> Int32:
         if const_expr(self.varlen_m):
@@ -87,6 +95,11 @@ class VarlenManager:
             return self.params.cu_seqlens_k[batch_idx + 1] - self.params.cu_seqlens_k[batch_idx]
         else:
             return self._len_k_static
+
+    def len_n(self) -> Int32:
+        # N is never variable-length (no varlen_n), so this is always the
+        # static problem N (from mB) the kernel passed at construction.
+        return self._len_n_static
 
     def offset_batch_A(self, mA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
@@ -123,7 +136,7 @@ class VarlenManager:
         return mAIdx_mk
 
     def offset_batch_SFA(self, mSFA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
-        """Offset SFA by padded per-expert offset (dQaccum-style).
+        """Offset SFA to this batch's tile-aligned region of the padded SF buffer.
 
         The padded offset, in tile units (128 source-M or source-K per tile),
         is simply `cu_seqlens[b] // 128 + b`. (Algebraically identical to
@@ -136,22 +149,28 @@ class VarlenManager:
         tile = 128
         if const_expr(self.varlen_m):
             offset_tile = params.cu_seqlens_m[batch_idx] // tile + batch_idx
-            return cute.domain_offset(((0, offset_tile), None), mSFA_mkl)
+            return cute.domain_offset(((None, offset_tile), None), mSFA_mkl)
         elif const_expr(self.varlen_k):
             offset_tile = params.cu_seqlens_k[batch_idx] // tile + batch_idx
-            return cute.domain_offset((None, (0, offset_tile)), mSFA_mkl)
+            return cute.domain_offset((None, (None, offset_tile)), mSFA_mkl)
         else:
             return mSFA_mkl[None, None, batch_idx]
 
-    def offset_batch_SFB(self, mSFB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
-        """Offset SFB by padded per-expert K offset (varlen_k only)."""
+    def offset_batch_SFB(self, mSFB_chunks: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        """Slice the (chunk, RK, RN, L) SFB chunk view to this batch.
+
+        For varlen_k (L == 1) the batch offset is on the atom-k mode, with the
+        same tile-aligned padded-layout arithmetic as offset_batch_SFA.
+        (varlen_k blockscaled is mxfp8-only, where one SF atom covers
+        4 sf-k blocks x sf_vec_size 32 = 128 K elements.)
+        """
         params = self.params
         tile = 128
         if const_expr(self.varlen_k):
-            offset_tile = params.cu_seqlens_k[batch_idx] // tile + batch_idx
-            return cute.domain_offset((None, (0, offset_tile)), mSFB_nkl)
+            offset_atom_k = params.cu_seqlens_k[batch_idx] // tile + batch_idx
+            return cute.domain_offset((None, offset_atom_k, None), mSFB_chunks[None, None, None, 0])
         else:
-            return mSFB_nkl[None, None, batch_idx]
+            return mSFB_chunks[None, None, None, batch_idx]
 
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
@@ -201,6 +220,7 @@ class VarlenManager:
             self.params,
             self._len_m_static,
             self._len_k_static,
+            self._len_n_static,
             self._last_batch_idx,
             self._is_group_changed,
         ]:
@@ -216,6 +236,7 @@ class VarlenManager:
                 self.params,
                 self._len_m_static,
                 self._len_k_static,
+                self._len_n_static,
                 self._last_batch_idx,
                 self._is_group_changed,
             ],

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Dump PTX and SASS of cute-dsl kernels from a script or Python module.
 
-Disables the QuACK persistent kernel cache, sets CUTE_DSL_KEEP_CUBIN=1 and
-CUTE_DSL_KEEP_PTX=1, runs the target, then disassembles all generated .cubin
-files with nvdisasm.
+Disables the QuACK persistent kernel cache, sets CUTE_DSL_KEEP=ptx,cubin, runs
+the target, then disassembles all generated .cubin files with nvdisasm.
 
 Usage::
 
@@ -30,6 +29,17 @@ def find_nvdisasm():
         if candidate.is_file():
             return str(candidate)
     return None
+
+
+def add_cute_keep_tokens(env, required_tokens):
+    keep_tokens = {
+        token.strip().lower()
+        for token in env.get("CUTE_DSL_KEEP", "").split(",")
+        if token.strip()
+    }
+    if "all" not in keep_tokens:
+        keep_tokens.update(required_tokens)
+    env["CUTE_DSL_KEEP"] = ",".join(sorted(keep_tokens))
 
 
 def main():
@@ -79,8 +89,7 @@ def main():
     env = os.environ.copy()
     if not args.use_cache:
         env["QUACK_CACHE_ENABLED"] = "0"
-    env["CUTE_DSL_KEEP_PTX"] = "1"
-    env["CUTE_DSL_KEEP_CUBIN"] = "1"
+    add_cute_keep_tokens(env, {"ptx", "cubin"})
     env["CUTE_DSL_DUMP_DIR"] = str(out_dir.resolve())
 
     print(f"Running: {' '.join(cmd)}")

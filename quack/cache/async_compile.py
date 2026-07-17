@@ -46,7 +46,42 @@ import os
 import pickle
 from concurrent.futures import Future, ProcessPoolExecutor
 from multiprocessing import get_context
-from typing import Optional
+from typing import NamedTuple, Optional
+
+
+class PoolPayload(NamedTuple):
+    """Out-of-band worker setup attached to a stable jit-cache argument.
+
+    ``identity`` commits the payload's semantics without putting the generally
+    non-deterministic serialized bytes in the persistent cache key. The
+    installer must validate it before making the payload visible to the
+    compile function.
+    """
+
+    installer_module: str
+    installer_qualname: str
+    identity: str
+    data: bytes
+
+
+def _collect_pool_payloads(obj, out: list[PoolPayload]) -> None:
+    """Walk nested tuples collecting ``__quack_pool_payload__`` side-channel
+    payloads the worker must install before compiling (e.g. shipping a
+    process-local epilogue definition by value). A provider raising means the
+    key cannot be shipped — the caller falls back to in-process compile."""
+    provider = getattr(obj, "__quack_pool_payload__", None)
+    if provider is not None:
+        payload = provider()
+        if payload is not None:
+            if not isinstance(payload, PoolPayload):
+                raise TypeError(
+                    f"{type(obj).__name__}.__quack_pool_payload__() must return PoolPayload or None"
+                )
+            out.append(payload)
+        return
+    if isinstance(obj, tuple):
+        for item in obj:
+            _collect_pool_payloads(item, out)
 
 
 def _flock_held_exclusively(lock_path: str) -> bool:
@@ -137,9 +172,28 @@ def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
     import quack.cache  # noqa: F401
 
 
-def _pool_worker(mod_name: str, qualname: str, key_b64: str, o_path: str) -> Optional[str]:
+def _pool_worker(
+    mod_name: str, qualname: str, key_b64: str, o_path: str, payloads_b64: str = ""
+) -> Optional[str]:
     """Compile one key. Returns None on success, error string on failure."""
     try:
+        # Honor the submitter's cache root: the jit_cache wrapper recomputes
+        # its export path from the live CACHE_DIR, and this worker (forked
+        # from a sidecar that snapshotted the env at start) may disagree with
+        # a submitter whose CACHE_DIR changed at runtime — the .o would land
+        # in the wrong tree and every pool compile would look failed.
+        # o_path is <cache_dir>/<source_fingerprint>/<sha>.o.
+        import quack.cache as _state
+
+        _state.CACHE_DIR = os.path.dirname(os.path.dirname(o_path))
+        if payloads_b64:
+            # Side-channel payloads (``__quack_pool_payload__``): install
+            # process-local definitions before the compile fn resolves them.
+            for payload in pickle.loads(base64.b64decode(payloads_b64)):
+                installer = importlib.import_module(payload.installer_module)
+                for part in payload.installer_qualname.split("."):
+                    installer = getattr(installer, part)
+                installer(payload.identity, payload.data)
         obj = importlib.import_module(mod_name)
         for part in qualname.split("."):
             obj = getattr(obj, part)
@@ -265,28 +319,40 @@ class CompilePool:
         with _neutral_main():
             self._executor.submit(os.getpid)
 
-    def submit_raw(self, sha: str, mod: str, qualname: str, key_b64: str, o_path: str) -> None:
+    def submit_raw(
+        self, sha: str, mod: str, qualname: str, key_b64: str, o_path: str, payloads_b64: str = ""
+    ) -> None:
         if sha in self._futures:
             return
         with _neutral_main():
-            self._futures[sha] = self._executor.submit(_pool_worker, mod, qualname, key_b64, o_path)
+            self._futures[sha] = self._executor.submit(
+                _pool_worker, mod, qualname, key_b64, o_path, payloads_b64
+            )
         self.n_submitted += 1
 
     def submit(self, sha: str, fn, args: tuple, kwargs: dict, o_path) -> bool:
         """Submit a live jit_cache miss. Returns False if the key can't be
         shipped to a subprocess (unpicklable args, ``<locals>`` qualname,
-        fn defined in ``__main__``) — the caller should compile in-process
-        instead."""
+        fn defined in ``__main__``, unserializable process-local payloads) —
+        the caller should compile in-process instead."""
         if sha in self._futures:
             return True
         if "<locals>" in fn.__qualname__ or fn.__module__ == "__main__":
             # Not resolvable by module+qualname in a worker; compile in-process.
             return False
         try:
+            payloads: list = []
+            _collect_pool_payloads(args, payloads)
+            _collect_pool_payloads(tuple(kwargs.values()), payloads)
             key_b64 = base64.b64encode(pickle.dumps((args, kwargs))).decode("ascii")
+            payloads_b64 = (
+                base64.b64encode(pickle.dumps(list(dict.fromkeys(payloads)))).decode("ascii")
+                if payloads
+                else ""
+            )
         except Exception:
             return False
-        self.submit_raw(sha, fn.__module__, fn.__qualname__, key_b64, str(o_path))
+        self.submit_raw(sha, fn.__module__, fn.__qualname__, key_b64, str(o_path), payloads_b64)
         return True
 
     def poll(self, sha: str) -> tuple[str, Optional[str]]:

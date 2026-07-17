@@ -339,11 +339,11 @@ def tile_atom_to_shape_SF_strided(
         shape: A/B operand shape. Rank-3 `(m/n, k, l)` or rank-2
             `(total_mn, k)` (varlen_m).
         sf_vec_size: Scale factor vector size (16 or 32).
-        sf_strides: Strides of the scale tensor, which has logical shape
-            `(L, rmn, rk, 512)` (rank 4). Only `sf_strides[0..2]` are used:
-            `sf_strides[1]` as the rmn stride, `sf_strides[2]` as the rk
-            stride, and `sf_strides[0]` as the L stride (only for rank-3
-            `shape`).
+        sf_strides: Strides of the `(L, rmn, rk, 32, 4, 4)` scale tensor.
+            Only `sf_strides[0..2]` are used: `sf_strides[1]` as the rmn
+            stride, `sf_strides[2]` as the rk stride, and `sf_strides[0]` as
+            the L stride (only for rank-3 `shape`); the inner atom layout is
+            hardware-fixed.
     """
     from cutlass.utils.blockscaled_layout import BlockScaledBasicChunk
 
