@@ -579,7 +579,56 @@ class GemmBase:
         last split waits for the tile's completion flag, folds the workspace into its
         accumulator, and runs the full epi mixin exactly once.
         """
-        if const_expr(self.split_k == 1 or self.split_k_mode == SplitKMode.SEPARATE):
+        if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
+            # The flag and workspace are CuTe tensors over the (cluster-rounded) tile
+            # domain — their layouts own the address computation.
+            assert self.acc_dtype == cutlass.Float32, "split_k workspace is f32"
+            batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
+            lock_ptr = utils.elem_pointer(
+                params.split_k_semaphore,
+                (tile_coord_mnkl[0], tile_coord_mnkl[1], batch_idx),
+            )
+            ws_ptr = utils.elem_pointer(
+                params.split_k_workspace,
+                (0, tile_coord_mnkl[0], tile_coord_mnkl[1], batch_idx),
+            )
+            # The stripe must tile the host-allocated region exactly.
+            epi_tile_num = cute.size(
+                cute.zipped_divide(cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile).shape[1]
+            )
+            assert (
+                cute.size(tRS_rD) * self.num_epi_warps * cute.arch.WARP_SIZE * epi_tile_num
+                == self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1]
+            ), "split-K workspace stripe does not tile cta_tile_m * cta_tile_n"
+        else:
+            lock_ptr, ws_ptr = None, None
+        # Mixed static/dynamic test (quack.dsl.mixed_constexpr_if): the const_expr
+        # prefix folds at trace time, so split_k == 1 / SEPARATE codegen is a bare
+        # epilogue call with no dynamic if, while SERIAL/PARALLEL non-finalizing
+        # splits commit raw partials and only the last split runs the epilogue.
+        if (
+            const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE)
+            and split_idx < self.split_k - 1
+        ):
+            self.split_k_partial_commit(
+                load_acc_subtile,
+                tRS_rD,
+                epi_tile,
+                ws_ptr,
+                lock_ptr,
+                split_idx,
+                epilogue_barrier,
+                tidx,
+                is_tma_warp,
+            )
+        else:
+            if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
+                # Finalizer (fixed: the last split, so e.g. the SM100 epi-load warp can
+                # gate C loads statically). Wait for all S-1 sibling commits; the flag
+                # counts committed splits in both modes.
+                if is_tma_warp:
+                    utils.semaphore_wait_eq(lock_ptr, self.split_k - 1)
+                epilogue_barrier.arrive_and_wait()
             epi_read_state, epi_producer_state = self.epilogue(
                 params,
                 epi_smem_tensors,
@@ -605,74 +654,9 @@ class GemmBase:
                 tile_scheduler,
                 tidx,
                 is_tma_warp,
+                split_k_ws=ws_ptr,
             )
-        else:
-            # The flag and workspace are CuTe tensors over the (cluster-rounded) tile
-            # domain — their layouts own the address computation.
-            assert self.acc_dtype == cutlass.Float32, "split_k workspace is f32"
-            batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
-            lock_ptr = utils.elem_pointer(
-                params.split_k_semaphore,
-                (tile_coord_mnkl[0], tile_coord_mnkl[1], batch_idx),
-            )
-            ws_ptr = utils.elem_pointer(
-                params.split_k_workspace,
-                (0, tile_coord_mnkl[0], tile_coord_mnkl[1], batch_idx),
-            )
-            # The stripe must tile the host-allocated region exactly.
-            epi_tile_num = cute.size(
-                cute.zipped_divide(cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile).shape[1]
-            )
-            assert (
-                cute.size(tRS_rD) * self.num_epi_warps * cute.arch.WARP_SIZE * epi_tile_num
-                == self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1]
-            ), "split-K workspace stripe does not tile cta_tile_m * cta_tile_n"
-            if split_idx < self.split_k - 1:
-                self.split_k_partial_commit(
-                    load_acc_subtile,
-                    tRS_rD,
-                    epi_tile,
-                    ws_ptr,
-                    lock_ptr,
-                    split_idx,
-                    epilogue_barrier,
-                    tidx,
-                    is_tma_warp,
-                )
-            else:
-                # Finalizer (fixed: the last split, so e.g. the SM100 epi-load warp can
-                # gate C loads statically). Wait for all S-1 sibling commits; the flag
-                # counts committed splits in both modes.
-                if is_tma_warp:
-                    utils.semaphore_wait_eq(lock_ptr, self.split_k - 1)
-                epilogue_barrier.arrive_and_wait()
-                epi_read_state, epi_producer_state = self.epilogue(
-                    params,
-                    epi_smem_tensors,
-                    epi_pipeline,
-                    epi_store_pipeline,
-                    epi_read_state,
-                    epi_producer_state,
-                    epi_tile,
-                    load_acc_subtile,
-                    tRS_rD,
-                    tRS_rC,
-                    tiled_copy_t2r,
-                    tiled_copy_r2s,
-                    tRS_sD,
-                    tiled_copy_s2r,
-                    tSR_rC,
-                    tSR_sC,
-                    copy_D,
-                    copy_C,
-                    tile_coord_mnkl,
-                    varlen_manager,
-                    epilogue_barrier,
-                    tile_scheduler,
-                    tidx,
-                    is_tma_warp,
-                    split_k_ws=ws_ptr,
-                )
+            if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
                 # Self-clean the flag (fresh-zeros allocation also works, but this keeps
                 # the tensor reusable if the host ever caches it).
                 if is_tma_warp:

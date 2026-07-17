@@ -4,6 +4,7 @@
 
 import quack.dsl.cute_tensor_indexing  # noqa: F401
 import quack.dsl.cute_tensor  # noqa: F401
+import quack.dsl.mixed_constexpr_if  # noqa: F401
 from quack.dsl.torch_library_op import cute_op
 
 __all__ = ["cute_op"]
