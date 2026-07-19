@@ -18,14 +18,23 @@ import torch
 
 
 WORLD_SIZES = [4]
-# (m, n, k, l, act); bf16 only — dtype coverage lives in test_gemm_epi_reduce.py
+# (m, n, k, l, act) -> test_gemm_act_reduce x extras x rs/ar; bf16 only — dtype
+# coverage lives in test_gemm_epi_reduce.py
 CASES = [
     (4096, 4096, 4096, 1, "relu"),  # baseline
     (528, 4104, 736, 3, "gelu_tanh_approx"),  # partial M/N tiles + K residue, batched
 ]
+# (m, n, k, l) -> test_gemm_sq_reduce x {plain, c} x rs/ar
 SQ_CASES = [
     (4096, 4096, 4096, 1),  # baseline
     (528, 4104, 736, 3),  # partial M/N tiles + K residue, batched; n_tiles=17 colvec stride
+]
+# (m, n, k, l, act, split_k, split_k_mode) -> test_gemm_act_reduce_split_k x rs/ar,
+# always with all extras (bias + C + colvec) so the C-load path stays in play.
+SPLIT_K_CASES = [
+    (2048, 3072, 2048, 1, "relu", 2, "serial"),  # full tiles, even k-tile split
+    (848, 2120, 1056, 2, "gelu_tanh_approx", 2, "serial"),  # partial M/N tiles + K residue
+    (1552, 1544, 1120, 2, "relu", 2, "parallel"),  # partial M/N tiles + K residue
 ]
 TORCH_ACT = {
     "relu": torch.nn.functional.relu,
@@ -44,34 +53,26 @@ def _dist_setup(m, k, world_size):
     assert k % world_size == 0, f"k ({k}) must be divisible by world_size ({world_size})"
 
 
-def _make_comm(m, n, l, m_per_rank, tile_m, tile_n, cta_m):
+def _make_comm(m, n, l, tile_n, cta_m, num_ranks):
     """Symmetric D work buffer + flags/barriers/counters; torch handles only."""
     import cutlass
 
-    from quack.dist_utils import create_multicast_tensor, make_barrier_flags
-    from quack.epi_reduce import EpiReduceArguments
+    from quack.dist_utils import create_multicast_tensor
+    from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 
     d_cpu = torch.empty(l, m, n, dtype=torch.bfloat16).permute(1, 2, 0)
     _, _, d_torch_gpu, d_torch_gpu_mc, d_peer_torch, _ = create_multicast_tensor(
         d_cpu, cutlass.BFloat16, leading_dim=1
     )
-    n_tiles = (n + tile_n - 1) // tile_n
-    num_tiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
-    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    tf_torch, tf_torch_mc, _, _ = make_barrier_flags(num_tiles)
-    sb_torch, sb_torch_mc, _, _ = make_barrier_flags(num_sms)
-    slab_tiles_m = (m_per_rank + cta_m - 1) // cta_m
-    counters_torch = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
-    epi_reduce_args = EpiReduceArguments(
-        mD_mc=d_torch_gpu_mc,
-        mD_peers=tuple(d_peer_torch),
-        tile_flags=tf_torch,
-        tile_flags_mc=tf_torch_mc,
-        sync_barrier=sb_torch,
-        sync_barrier_mc=sb_torch_mc,
-        consumer_counters=counters_torch,
+    epi_reduce_args = make_epi_reduce_args(
+        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_n, num_ranks
     )
-    return d_torch_gpu, epi_reduce_args, tf_torch, counters_torch
+    return (
+        d_torch_gpu,
+        epi_reduce_args,
+        epi_reduce_args.tile_flags,
+        epi_reduce_args.consumer_counters,
+    )
 
 
 def _make_ab(m, n, k_local, l, k, rank):
@@ -103,11 +104,14 @@ def _run_gemm_act_reduce(
     has_bias=False,
     has_c=False,
     has_colvec=False,
+    split_k=1,
+    split_k_mode="serial",
 ):
     import torch.distributed as dist
 
     from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
     from quack.epilogues import linear_act_mod
+    from quack.gemm_config import SplitKMode
 
     torchrun_init_nvshmem()
     rank, world_size = dist.get_rank(), dist.get_world_size()
@@ -123,7 +127,7 @@ def _run_gemm_act_reduce(
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
     d_torch_gpu, epi_reduce_args, tf_torch, counters_torch = _make_comm(
-        m, n, l, m_per_rank, tile_m, tile_n, cta_m
+        m, n, l, tile_n, cta_m, world_size
     )
     d_arg = d_torch_gpu.permute(2, 0, 1)  # caller-order (l, m, n) view
     # Aux is slab-local under epi_reduce (epilogue coords are m/TP-shaped).
@@ -149,6 +153,7 @@ def _run_gemm_act_reduce(
         epi_args["mRowVecBroadcast"] = bias_gpu
     if has_colvec:
         epi_args["mColVecBroadcast"] = colvec_gpu
+    sk_mode = SplitKMode.SERIAL if split_k_mode == "serial" else SplitKMode.PARALLEL
     launch = lambda: mod.gemm(
         a_gpu,
         b_gpu,
@@ -160,6 +165,8 @@ def _run_gemm_act_reduce(
         cluster_M=cluster_m,
         cluster_N=cluster_n,
         is_dynamic_persistent=True,
+        split_k=split_k,
+        split_k_mode=sk_mode,
         epi_reduce_mode=epi_reduce_mode,
         epi_reduce_args=epi_reduce_args,
     )
@@ -172,6 +179,11 @@ def _run_gemm_act_reduce(
         out = d_torch_gpu.permute(2, 0, 1)
     aux_out = aux_gpu
 
+    # PARALLEL split-K commits partials in arrival order (f32 adds are order-
+    # sensitive), so relaunches are not bit-identical: launches still run, but the
+    # bit-exact asserts below only hold for split_k == 1 and SERIAL.
+    bitwise_repeatable = split_k == 1 or sk_mode == SplitKMode.SERIAL
+
     # r2r: relaunch reuses flags/counters in place; D and aux must be bit-identical.
     runs, aux_runs = [], []
     for _ in range(2):
@@ -180,8 +192,9 @@ def _run_gemm_act_reduce(
         dist.barrier()
         runs.append(out.clone())
         aux_runs.append(aux_out.clone())
-    assert torch.equal(runs[0], runs[1]), "r2r: relaunch D not bit-identical"
-    assert torch.equal(aux_runs[0], aux_runs[1]), "r2r: relaunch aux not bit-identical"
+    if bitwise_repeatable:
+        assert torch.equal(runs[0], runs[1]), "r2r: relaunch D not bit-identical"
+        assert torch.equal(aux_runs[0], aux_runs[1]), "r2r: relaunch aux not bit-identical"
 
     # The mutation loop checks D only: D has a bit-exact sign-flip invariant when
     # all additive inputs are negated. Aux is act(D), so it has no simple bit-exact
@@ -202,7 +215,8 @@ def _run_gemm_act_reduce(
             torch.cuda._sleep(50_000_000)  # ~25 ms straggler: dwarfs one launch
         launch()
         torch.cuda.synchronize()
-        assert torch.equal(out, expected), f"mutation loop iter {it}: stale or raced value"
+        if bitwise_repeatable:
+            assert torch.equal(out, expected), f"mutation loop iter {it}: stale or raced value"
     dist.barrier()
 
     # Flag wrap (see test_gemm_epi_reduce.py): relaunch across the int32 boundary.
@@ -213,8 +227,9 @@ def _run_gemm_act_reduce(
     for it in range(3):
         launch()
         torch.cuda.synchronize()
-        assert torch.equal(out, runs[1]), f"flag-wrap launch {it}: D mismatch"
-        assert torch.equal(aux_out, aux_runs[1]), f"flag-wrap launch {it}: aux mismatch"
+        if bitwise_repeatable:
+            assert torch.equal(out, runs[1]), f"flag-wrap launch {it}: D mismatch"
+            assert torch.equal(aux_out, aux_runs[1]), f"flag-wrap launch {it}: aux mismatch"
     dist.barrier()
 
     # quack convention: fp32 ref is ground truth; kernel error < 2x same-dtype ref error.
@@ -284,7 +299,7 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
     d_torch_gpu, epi_reduce_args, tf_torch, counters_torch = _make_comm(
-        m, n, l, m_per_rank, tile_m, tile_n, cta_m
+        m, n, l, tile_n, cta_m, world_size
     )
     d_arg = d_torch_gpu.permute(2, 0, 1)
     # Per-N-tile sq partials, slab-local under epi_reduce; norm_weight is common
@@ -455,6 +470,42 @@ def test_gemm_act_reduce(m, n, k, l, act, mode, extras, world_size):
 
 
 @pytest.mark.parametrize("world_size", WORLD_SIZES, ids=lambda w: f"world{w}")
+@pytest.mark.parametrize("mode", ["reduce_scatter", "all_reduce"], ids=["rs", "ar"])
+@pytest.mark.parametrize("m,n,k,l,act,split_k,split_k_mode", SPLIT_K_CASES)
+def test_gemm_act_reduce_split_k(m, n, k, l, act, split_k, split_k_mode, mode, world_size):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} GPUs")
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+    }
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node",
+        str(world_size),
+        __file__,
+        *["--m", str(m), "--n", str(n), "--k", str(k), "--l", str(l)],
+        *["--act", act, "--mode", mode],
+        *["--split_k", str(split_k), "--split_k_mode", split_k_mode],
+        *["--bias", "--c_res", "--colvec"],
+    ]
+    result = subprocess.run(
+        cmd,
+        env=env,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "Ref check PASSED" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES, ids=lambda w: f"world{w}")
 @pytest.mark.parametrize("extras", ["plain", "c"])
 @pytest.mark.parametrize("mode", ["reduce_scatter", "all_reduce"], ids=["rs", "ar"])
 @pytest.mark.parametrize("m,n,k,l", SQ_CASES)
@@ -504,6 +555,8 @@ def _parse_args():
     parser.add_argument("--bias", action="store_true")
     parser.add_argument("--c_res", action="store_true")
     parser.add_argument("--colvec", action="store_true")
+    parser.add_argument("--split_k", type=int, default=1)
+    parser.add_argument("--split_k_mode", choices=["serial", "parallel"], default="serial")
     return parser.parse_args()
 
 
@@ -520,6 +573,8 @@ if __name__ == "__main__":
             args.bias,
             args.c_res,
             args.colvec,
+            args.split_k,
+            args.split_k_mode,
         )
     else:
         _run_gemm_sq_reduce(args.m, args.n, args.k, args.l, args.mode, args.c_res)

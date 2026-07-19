@@ -775,19 +775,13 @@ def _convert_f32_sr_impl(src_vec, seed, tid, cvt_fn, dst_numeric, loc, ip):
     num_elems = src_vec_type.shape[0]
     assert num_elems % 2 == 0, f"requires even number of elements, got {num_elems}"
     num_pairs = num_elems // 2
-    # The %4 is entropy economy, not correctness: one Philox call yields 4
-    # words and each bf16/f16 pair consumes one, so a partial batch would pay
-    # ~a full 7-round Philox for its unused words (the rounds are one dep
-    # chain — DCE can only trim the last round's dead extractions). The loop
-    # below handles any even num_elems; relax this if a caller with small
-    # fragments ever appears. NB if fp8 is ever wired in here, its unit is
-    # the QUAD, as a hard requirement: the hw instruction is f8x4-only and
-    # one rand word covers exactly 4 values (8 rbits each), with sw pairs
-    # carving bytes 0-1 / 2-3 of the SAME word for parity — so fp8 would
-    # assert num_elems % 4 == 0 (hard) and % 16 for full-batch economy.
-    assert num_pairs % 4 == 0, (
-        f"num_pairs must be divisible by 4 for stochastic rounding, got {num_pairs}"
-    )
+    # No num_pairs % 4 requirement for 16-bit outputs.
+    # For 8-bit outputs the QUAD is a hard requirement (the hw
+    # instruction is f8x4-only)
+    if dst_numeric.width == 8:
+        assert num_elems % 4 == 0, (
+            f"8-bit stochastic rounding requires num_elems % 4 == 0, got {num_elems}"
+        )
 
     dst_mlir_type = dst_numeric.mlir_type
     dst_vec_type = ir.VectorType.get([num_elems], dst_mlir_type, loc=loc)

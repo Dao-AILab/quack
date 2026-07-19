@@ -3,7 +3,7 @@ its own — gemm_sm100's kernel binds each piece into the shared GemmBase machin
 Sections below: host contract / reducer tile scheduler / cross-launch exit barrier /
 producer -> reducer tile signal / multimem reduce + store.
 
-Dataflow: the producer runs epilogue(skip_evt=True) via epilogue_split_k — D partials
+Dataflow: the producer runs epilogue(skip_epi_ops=True) via epilogue_split_k — D partials
 through the normal TMA path into symmetric D, then the tile signal. The reducer runs
 epilogue() between two bound functions: multimem ld_reduce in, EVT/C_load/aux
 TileStores unchanged in the middle, register-direct store out (this rank's slab for

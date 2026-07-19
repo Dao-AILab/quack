@@ -155,7 +155,7 @@ def _get_sm80_configs() -> List[GemmConfig]:
 def _get_sm100_configs(
     epilogue: Optional[str] = None,
 ) -> List[GemmConfig]:
-    tile_n_vals = [64, 128, 160, 192, 224, 256]
+    tile_n_vals = [16, 32, 64, 128, 160, 192, 224, 256]
     tile_mn_cluster_vals = (
         [(128, tile_n, (1, 1)) for tile_n in tile_n_vals]
         + [(128, tile_n, (1, 2)) for tile_n in tile_n_vals]

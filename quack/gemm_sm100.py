@@ -1766,22 +1766,20 @@ class GemmSm100(GemmTmaBase):
                         # Split-K (serial/parallel): only the finalizing split runs the
                         # epilogue, so only its tiles consume C — skip the loads (and the
                         # pipeline slots) for non-finalizing splits, symmetric with the
-                        # epilogue warps' skip in epilogue_split_k. The outer branch is
-                        # constexpr so split_k == 1 codegen is untouched.
-                        if const_expr(
-                            self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE
+                        # epilogue warps' skip in epilogue_split_k. The const_expr prefix
+                        # folds at trace time (quack.dsl.mixed_constexpr_if), so
+                        # split_k == 1 codegen has no dynamic if at all.
+
+                        # Under epi_reduce, this warp walks the reducer's separate slab schedule, which
+                        # never has split-K (split_idx is a synthetic 0): every tile stages C.
+                        if (
+                            const_expr(
+                                self.epi_reduce_mode is not None
+                                or self.split_k == 1
+                                or self.split_k_mode == SplitKMode.SEPARATE
+                            )
+                            or split_idx == self.split_k - 1
                         ):
-                            if split_idx == self.split_k - 1:
-                                for epi_idx in cutlass.range(epi_tile_num, unroll=1):
-                                    epi_pipeline.producer_acquire(epi_producer_state)
-                                    copy_epi_load(
-                                        src_idx=epi_load_layout.get_hier_coord(epi_idx),
-                                        producer_state=epi_producer_state,
-                                    )
-                                    # Epi pipeline's producer commit is a NOP
-                                    epi_pipeline.producer_commit(epi_producer_state)
-                                    epi_producer_state.advance()
-                        else:
                             for epi_idx in cutlass.range(epi_tile_num, unroll=1):
                                 epi_pipeline.producer_acquire(epi_producer_state)
                                 copy_epi_load(
@@ -2092,7 +2090,8 @@ class GemmSm100(GemmTmaBase):
                 # the tile's completion flag and runs the full epilogue on the summed
                 # accumulator (CUTLASS-3.x stream-K fixup semantics).
                 iket.range_push("epilogue")
-                epi_read_state, _ = self.epilogue_split_k(
+                epi_fn = partial(
+                    self.epilogue,
                     epilogue_params,
                     epi_smem_tensors,
                     epi_pipeline,
@@ -2100,21 +2099,36 @@ class GemmSm100(GemmTmaBase):
                     epi_read_state,
                     None,  # epi_producer_state
                     epi_tile,
+                    # load_acc_subtile is the one argument left unbound
+                    tRS_rD=tRS_rD,
+                    tRS_rC=tRS_rC,
+                    tiled_copy_t2r=tiled_copy_t2r,
+                    tiled_copy_r2s=tiled_copy_r2s,
+                    tRS_sD=tRS_sD,
+                    tiled_copy_s2r=tiled_copy_s2r,
+                    tSR_rC=tSR_rC,
+                    tSR_sC=tSR_sC,
+                    copy_D=copy_D,
+                    copy_C=copy_C,
+                    tile_coord_mnkl=tile_coord_mnkl,
+                    varlen_manager=varlen_manager,
+                    epilogue_barrier=self.epilogue_barrier,
+                    tile_scheduler=tile_scheduler,
+                    tidx=epi_tidx,
+                    is_tma_warp=is_tma_warp,
+                    skip_epi_ops=const_expr(self.epi_reduce_mode is not None),
+                )
+                epi_read_state, _ = self.epilogue_split_k(
+                    epilogue_params,
+                    epi_fn,
                     load_acc_subtile,
                     tRS_rD,
-                    tRS_rC,
-                    tiled_copy_t2r,
-                    tiled_copy_r2s,
-                    tRS_sD,
-                    tiled_copy_s2r,
-                    tSR_rC,
-                    tSR_sC,
-                    copy_D,
-                    copy_C,
+                    epi_tile,
+                    epi_read_state,
+                    None,  # epi_producer_state
+                    epi_store_pipeline,
                     tile_coord_mnkl,
-                    varlen_manager,
                     self.epilogue_barrier,
-                    tile_scheduler,
                     epi_tidx,
                     is_tma_warp,
                     signal_finalized_tile=signal_finalized_tile,

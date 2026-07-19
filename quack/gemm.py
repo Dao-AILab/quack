@@ -468,7 +468,7 @@ def gemm(
         if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
             raise ValueError("epi_reduce_mode composes with SERIAL/PARALLEL split_k only")
         if rounding_mode != RoundingMode.RN:
-            # RS under epi_reduce is unspecified: the skip-EVT partial store has no
+            # RS under epi_reduce is unspecified: the skip-epi-ops partial store has no
             # seed wired and the reducer's final convert is round-to-nearest.
             raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
         if epi_reduce_args is None:

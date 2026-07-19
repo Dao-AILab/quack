@@ -26,7 +26,7 @@ CASES = [
     (520, 1028, 672, 3, "bfloat16", "float32"),  # fp32 vec=4 path
 ]
 # Split-K x epi_reduce composition: the finalizing split folds the f32 workspace,
-# commits the skip-EVT partial to symmetric D, and signals. SERIAL is bitwise
+# commits the skip-epi-ops partial to symmetric D, and signals. SERIAL is bitwise
 # deterministic; PARALLEL commits in arrival order (ref check only).
 SPLIT_K_CASES = [
     # (m, n, k, l, ab_dtype, d_dtype, split_k, split_k_mode)
@@ -58,9 +58,8 @@ def _run_gemm_epi_reduce(
         torchrun_init_nvshmem,
         torchrun_finalize_nvshmem,
         create_multicast_tensor,
-        make_barrier_flags,
     )
-    from quack.epi_reduce import EpiReduceArguments
+    from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
     from quack.gemm import gemm
     from quack.gemm_config import SplitKMode
 
@@ -110,23 +109,12 @@ def _run_gemm_epi_reduce(
 
     use_2cta = cluster_m % 2 == 0 and tile_m in (128, 256)
     cta_m = tile_m // (2 if use_2cta else 1)
-    n_tiles = (n + tile_n - 1) // tile_n
-    num_tiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
-    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    # torch handles are the sole refs keeping the symmetric allocations alive
-    tf_torch, tf_torch_mc, _, _ = make_barrier_flags(num_tiles)
-    sb_torch, sb_torch_mc, _, _ = make_barrier_flags(num_sms)
-    slab_tiles_m = (m_per_rank + cta_m - 1) // cta_m
-    counters_torch = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
-    epi_reduce_args = EpiReduceArguments(
-        mD_mc=d_torch_gpu_mc,
-        mD_peers=tuple(d_peer_torch),
-        tile_flags=tf_torch,
-        tile_flags_mc=tf_torch_mc,
-        sync_barrier=sb_torch,
-        sync_barrier_mc=sb_torch_mc,
-        consumer_counters=counters_torch,
+    # torch handles inside the args are the sole refs keeping the symmetric allocs alive
+    epi_reduce_args = make_epi_reduce_args(
+        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_n, world_size
     )
+    tf_torch = epi_reduce_args.tile_flags
+    counters_torch = epi_reduce_args.consumer_counters
 
     sk_mode = SplitKMode.SERIAL if split_k_mode == "serial" else SplitKMode.PARALLEL
     launch = lambda: gemm(

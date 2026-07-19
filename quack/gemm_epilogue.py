@@ -180,7 +180,7 @@ from quack.gemm_host import (
     register_local_epi_mod,
     run_gemm_epi_plan,
 )
-from quack.gemm_config import blockscaled_default_config, default_config
+from quack.gemm_config import SplitKMode, blockscaled_default_config, default_config
 from quack.gemm_tvm_ffi_utils import tensor_key
 from quack.gemm_sm80 import GemmSm80
 import quack.layout_utils as layout_utils
@@ -527,6 +527,8 @@ class _EpiModMixinBase(ComposableEpiMixin):
         for key in getattr(self, "concat_layout", None) or ():
             if key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
+        d["split_k_semaphore"] = getattr(args, "split_k_semaphore", None)
+        d["split_k_workspace"] = getattr(args, "split_k_workspace", None)
         return self.EpilogueParams(**d)
 
     def _make_sink_tmps(self, ops_by_name, shape):
@@ -1138,6 +1140,12 @@ class EpiMod:
             )
             for op in epi_ops
         ]
+        # Split-K (SERIAL/PARALLEL) per-tile flag + partials workspace; None (and
+        # constexpr'd away) for split_k == 1 compiles. Mirrors GemmDefaultEpilogue.
+        arg_specs += [
+            ("split_k_semaphore", Optional[cute.Tensor]),
+            ("split_k_workspace", Optional[cute.Tensor]),
+        ]
         Args = NamedTuple("EpilogueArguments", arg_specs)
         Args.__new__.__defaults__ = (None,) * len(arg_specs)
         Args = mlir_namedtuple(Args)
@@ -1173,7 +1181,10 @@ class EpiMod:
                 "_epi_mod_prepass_outs": self.prepass_outs,
                 "_epi_mod_rounding": rounding,
                 "_epi_mod_vectorize": self.vectorize,
-                "_extra_param_fields": (),
+                "_extra_param_fields": (
+                    ("split_k_semaphore", Optional[cute.Tensor], None),
+                    ("split_k_workspace", Optional[cute.Tensor], None),
+                ),
                 "_epi_mod_class_semantic_key": class_semantic_key,
                 "EpilogueArguments": Args,
                 "__module__": __name__,
@@ -1226,6 +1237,8 @@ class EpiMod:
         bs_format_a=None,
         bs_format_b=None,
         swap_ab=False,  # swap-at-trace: requires b_kn (B given (k, n)); dense element mode
+        split_k: int = 1,  # K-dim split factor (SERIAL/PARALLEL only; see quack.gemm)
+        split_k_mode: int = SplitKMode.SERIAL,
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
         epi_reduce_mode=None,  # "reduce_scatter" | "all_reduce" (see quack.epi_reduce)
         epi_reduce_args=None,  # EpiReduceArguments over torch tensors
@@ -1237,6 +1250,19 @@ class EpiMod:
         concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
         if tile_count_semaphore is not None and not is_dynamic_persistent:
             raise ValueError("tile_count_semaphore requires is_dynamic_persistent=True")
+        if split_k > 1:
+            split_k_mode = SplitKMode(split_k_mode)
+            if split_k_mode == SplitKMode.SEPARATE:
+                raise ValueError(
+                    "epilogue-mod GEMM does not support SplitKMode.SEPARATE (the separate "
+                    "reduction kernel cannot run epi mods); use SERIAL or PARALLEL"
+                )
+            if varlen_m or gather_A or swap_ab or ag_args is not None:
+                raise ValueError("split_k requires a dense GEMM (no varlen/gather/swap_ab/ag)")
+            if rounding_mode != RoundingMode.RN:
+                raise ValueError("split_k does not support stochastic rounding")
+            if D is None:
+                raise ValueError("split_k requires the D output tensor")
         if swap_ab:
             # Swap-at-trace contract: dense, element-mode, sink-less, B (k, n).
             if not b_kn:
@@ -1260,7 +1286,7 @@ class EpiMod:
             if not persistent:
                 raise ValueError("epi_reduce_mode requires the persistent scheduler")
             if rounding_mode != RoundingMode.RN:
-                # RS under epi_reduce is unspecified: the skip-EVT partial store has no
+                # RS under epi_reduce is unspecified: the skip-epi-ops partial store has no
                 # seed wired and the reducer's final convert is round-to-nearest.
                 raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
             if epi_reduce_args is None:
@@ -1300,6 +1326,8 @@ class EpiMod:
             bs_format_a,
             bs_format_b,
             swap_ab,
+            split_k,
+            int(split_k_mode),
             ag_args is not None,
             epi_reduce,
         )
@@ -1624,6 +1652,8 @@ class EpiMod:
             packed_cd=packed_form,
             has_ag=ag_args is not None,
             epi_reduce=epi_reduce,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
         )
         self._plan_cache[key] = plan
         if _launch:

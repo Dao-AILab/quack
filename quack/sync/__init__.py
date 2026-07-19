@@ -2,6 +2,12 @@
 
 """Synchronization helpers for CuTe DSL kernels."""
 
-from quack.sync.barrier import GlobalSemaphore, Semaphore, arrive_inc, wait_eq
+from quack.sync.barrier import (
+    GlobalSemaphore,
+    Semaphore,
+    release_add,
+    release_store,
+    wait_eq,
+)
 
-__all__ = ["Semaphore", "GlobalSemaphore", "wait_eq", "arrive_inc"]
+__all__ = ["Semaphore", "GlobalSemaphore", "wait_eq", "release_store", "release_add"]
