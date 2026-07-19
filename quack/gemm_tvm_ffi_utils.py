@@ -289,18 +289,18 @@ def make_scheduler_args(
 
 
 def make_fake_epi_reduce_args(d_dtype, num_ranks):
-    """Fake EpiReduceArguments for use_epi_reduce compiles (see GemmTpTmaBase).
+    """Fake EpiReduceArguments for epi_reduce_mode compiles (see quack.epi_reduce).
 
     Comm views are kernel-order (m, n, l): __call__ does not rotate them.
     """
-    from quack.gemm_tp_base import GemmTpTmaBase
+    from quack.epi_reduce import EpiReduceArguments
 
     dvec = 128 // d_dtype.width  # 16 B
     d_fake = lambda: fake_tensor(
         d_dtype, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=dvec
     )
     flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
-    return GemmTpTmaBase.EpiReduceArguments(
+    return EpiReduceArguments(
         mD_mc=d_fake(),
         mD_peers=tuple(d_fake() for _ in range(num_ranks)),
         tile_flags=flags(),
@@ -525,8 +525,8 @@ def launch_gemm(
         _validate_tma_unpack_operands(A, B)
     er = ()
     # getattr: gemm.py / gemm_symmetric.py pass their own plan NamedTuples.
-    if getattr(plan, "use_epi_reduce", None) is not None:
-        assert epi_reduce_args is not None, "use_epi_reduce plan launched without epi_reduce_args"
+    if getattr(plan, "epi_reduce_mode", None) is not None:
+        assert epi_reduce_args is not None, "epi_reduce_mode plan launched without epi_reduce_args"
         er = (epi_reduce_args,)
     if plan.is_sm100_family:
         plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, *er)
@@ -723,11 +723,11 @@ def compile_gemm_kernel(
     cd_packed=None,
     a_mma_dtype=None,
     b_mma_dtype=None,
-    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see GemmTpTmaBase)
+    epi_reduce=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if epi_reduce is not None:
-        assert device_capacity[0] in [10, 11], "use_epi_reduce requires SM100/SM110"
+        assert device_capacity[0] in [10, 11], "epi_reduce_mode requires SM100/SM110"
     split_k_kwargs = {}
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
@@ -740,7 +740,7 @@ def compile_gemm_kernel(
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         er_kwargs = (
-            dict(use_epi_reduce=epi_reduce[0], num_ranks=epi_reduce[1], rank_id=epi_reduce[2])
+            dict(epi_reduce_mode=epi_reduce[0], num_ranks=epi_reduce[1], rank_id=epi_reduce[2])
             if epi_reduce is not None
             else {}
         )

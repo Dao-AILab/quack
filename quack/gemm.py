@@ -11,6 +11,7 @@ from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
 from quack.cache import jit_cache
+from quack.epi_reduce import EpiReduceArguments
 from quack.split_k_reduce import split_k_reduce
 from quack.gemm_config import SplitKMode
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -86,6 +87,7 @@ def _compile_gemm(
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
     has_ag=False,
+    epi_reduce=None,  # (mode, num_ranks, rank)
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -118,6 +120,20 @@ def _compile_gemm(
         mD = fake_batched(
             d_dtype, m, n, cute.sym_int(), 1 if d_major == "n" else 0, 128 // d_dtype.width
         )
+    if epi_reduce is not None:
+        # Epilogue tensors are slab-local (m / world): a fresh m sym, untied from
+        # the operand m; C is epilogue-consumed so it rides the same sym (mirrors
+        # gemm_host._compile_gemm_epi). D stays the full-M symmetric partials view.
+        m = cute.sym_int()
+        if mC is not None:
+            mC = fake_batched(
+                c_dtype,
+                m,
+                n,
+                l if batched else None,
+                1 if c_major == "n" else 0,
+                128 // c_dtype.width,
+            )
 
     def fake_scalar(mode, dtype=Float32):
         if mode == 0:
@@ -209,6 +225,7 @@ def _compile_gemm(
         b_transposed=b_kn,
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
+        epi_reduce=epi_reduce,
     )
 
 
@@ -242,6 +259,7 @@ class _GemmPlan(NamedTuple):
     tile_N: int
     cluster_M: int
     cluster_N: int
+    epi_reduce_mode: Optional[str]  # launch_gemm requires epi_reduce_args when set
 
 
 # (metadata key) -> _GemmPlan. Grows with distinct (shape, stride, dtype, flag)
@@ -419,6 +437,10 @@ def gemm(
     # num_shards, first_shard) drive the shard-major rotated schedule and the
     # load-warp arrival gate.
     ag_args: Optional[AllGatherArguments] = None,
+    # GEMM+ReduceScatter/AllReduce (SM100+, see quack/epi_reduce.py):
+    # D is the full-M symmetric partials view; C/colvec_bias are slab-local (m / world).
+    epi_reduce_mode: Optional[str] = None,  # "reduce_scatter" | "all_reduce"
+    epi_reduce_args: Optional[EpiReduceArguments] = None,
 ) -> _GemmPlan:
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
@@ -435,6 +457,25 @@ def gemm(
         # for every frontend via plan_scheduler_args; checked here too so a
         # bad-geometry cold call fails before the (expensive) compile.
         validate_ag_geometry(A, ag_args, tile_M, cluster_M)
+    epi_reduce = None
+    if epi_reduce_mode is not None:
+        import torch.distributed as dist
+
+        if cu_seqlens_m is not None or cu_seqlens_k is not None or A_idx is not None:
+            raise ValueError("epi_reduce_mode requires a dense GEMM")
+        if SFA is not None or ag_args is not None:
+            raise ValueError("epi_reduce_mode: non-blockscaled and no ag_args")
+        if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
+            raise ValueError("epi_reduce_mode composes with SERIAL/PARALLEL split_k only")
+        if rounding_mode != RoundingMode.RN:
+            # RS under epi_reduce is unspecified: the skip-EVT partial store has no
+            # seed wired and the reducer's final convert is round-to-nearest.
+            raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
+        if epi_reduce_args is None:
+            raise ValueError("epi_reduce_mode requires epi_reduce_args")
+        epi_reduce = (epi_reduce_mode, dist.get_world_size(), dist.get_rank())
+    elif epi_reduce_args is not None:
+        raise ValueError("epi_reduce_args requires epi_reduce_mode")
     key = (
         tensor_key(A),
         tensor_key(B),
@@ -474,6 +515,7 @@ def gemm(
         bs_format_a,
         bs_format_b,
         ag_args is not None,
+        epi_reduce,
     )
     plan = _gemm_plan_cache.get(key)
     if plan is None:
@@ -515,6 +557,7 @@ def gemm(
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
             has_ag=ag_args is not None,
+            epi_reduce=epi_reduce,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -536,6 +579,7 @@ def gemm(
         SFA=SFA,
         SFB=SFB,
         ag_args=ag_args,
+        epi_reduce_args=epi_reduce_args,
     )
     return plan
 
@@ -560,6 +604,7 @@ def run_gemm_plan(
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
     ag_args: Optional[AllGatherArguments] = None,
+    epi_reduce_args: Optional[EpiReduceArguments] = None,
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -615,7 +660,19 @@ def run_gemm_plan(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
-    launch_gemm(plan, A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    launch_gemm(
+        plan,
+        A,
+        B,
+        D_gemm,
+        C_gemm,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        SFA,
+        SFB,
+        epi_reduce_args=epi_reduce_args,
+    )
 
     if staged_split_k:
         _reduce_staged_split_k(
@@ -670,6 +727,7 @@ def _build_gemm_plan(
     bs_format_a=None,
     bs_format_b=None,
     has_ag=False,
+    epi_reduce=None,  # (mode, num_ranks, rank), see quack/epi_reduce.py
 ) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -684,6 +742,16 @@ def _build_gemm_plan(
         assert not varlen and not gather_A, "AllGather+GEMM requires a dense GEMM"
         assert persistent, "AllGather+GEMM requires the persistent scheduler"
         assert split_k == 1, "AllGather+GEMM does not support split_k yet"
+    if epi_reduce is not None:
+        assert not varlen and not gather_A and not blockscaled, (
+            "epi_reduce_mode requires a dense non-blockscaled GEMM"
+        )
+        assert persistent, "epi_reduce_mode requires the persistent scheduler"
+        # SEPARATE finalizes in a second launch; the in-kernel reducer warps can't wait on it.
+        assert not (split_k > 1 and split_k_mode == SplitKMode.SEPARATE), (
+            "epi_reduce_mode composes with SERIAL/PARALLEL split_k only"
+        )
+        assert not has_ag, "epi_reduce_mode does not compose with AllGather+GEMM"
     if add_to_output:
         assert not varlen_m, "Add to output not supported with varlen_m"
     assert split_k >= 1, "split_k must be >= 1"
@@ -717,6 +785,8 @@ def _build_gemm_plan(
         # SM8x is the one arch without the load-warp gate (no specialized
         # load warp in the cp.async kernel); every TMA arch supports AG.
         assert device_capacity[0] >= 9, "AllGather+GEMM requires SM90+"
+    if epi_reduce is not None:
+        assert device_capacity[0] in [10, 11], "epi_reduce_mode requires SM100/SM110"
     sf_dtype, sf_vec_size = None, None
     a_mma_dtype, b_mma_dtype = None, None
     if blockscaled:
@@ -850,6 +920,7 @@ def _build_gemm_plan(
         a_mma_dtype,
         b_mma_dtype,
         has_ag,
+        epi_reduce,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K
@@ -902,4 +973,5 @@ def _build_gemm_plan(
         tile_N=tile_N,
         cluster_M=cluster_M,
         cluster_N=cluster_N,
+        epi_reduce_mode=epi_reduce[0] if epi_reduce is not None else None,
     )

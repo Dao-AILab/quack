@@ -147,6 +147,7 @@ def pytest_collection_finish(session):
         f"Collected {total} tests: {json.dumps(summary, indent=2)}"
     )
 
+
 def pytest_addoption(parser):
     parser.addoption(
         "--dist-only",
@@ -167,6 +168,7 @@ def pytest_collection_modifyitems(config, items):
     if deselected:
         config.hook.pytest_deselected(items=deselected)
         items[:] = selected
+
 
 # Compile-only error-swallow hooks live in quack.testing.pytest_plugin. The
 # only normal-mode hook we keep here is the OOM-retry, which is QuACK-specific.

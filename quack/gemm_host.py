@@ -198,7 +198,7 @@ def _compile_gemm_epi(
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
-    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see GemmTpTmaBase)
+    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see quack.epi_reduce)
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -318,7 +318,7 @@ class GemmEpiPlan(NamedTuple):
     # dicts and parsing kwargs.
     call_ops: tuple = ()
     arg_template: dict = {}
-    use_epi_reduce: Optional[str] = None
+    epi_reduce_mode: Optional[str] = None
 
 
 def _get_major(t, m_label, n_label):
@@ -359,15 +359,10 @@ def build_gemm_epi_plan(
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
-    use_epi_reduce=None,  # "reduce_scatter" | "all_reduce" (see GemmTpTmaBase)
+    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see quack.epi_reduce)
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
-    epi_reduce = None
-    if use_epi_reduce is not None:
-        import torch.distributed as dist
-
-        epi_reduce = (use_epi_reduce, dist.get_world_size(), dist.get_rank())
     batched = A.ndim == 3 or varlen_m
     a_major = _get_major(A, "m", "k")
     b_major = _get_major(B, "n", "k")
@@ -474,7 +469,7 @@ def build_gemm_epi_plan(
         epi_arg_keys=epi_keys,
         tile_M=tile_M,
         cluster_M=cluster_M,
-        use_epi_reduce=use_epi_reduce,
+        epi_reduce_mode=epi_reduce[0] if epi_reduce is not None else None,
     )
 
 
@@ -487,7 +482,7 @@ def run_gemm_epi_plan(
     epi_values,
     *,
     ag_args=None,  # forwarded to the scheduler (AllGather+GEMM flags contract)
-    epi_reduce_args=None,  # EpiReduceArguments over torch tensors (see GemmTpTmaBase)
+    epi_reduce_args=None,  # EpiReduceArguments over torch tensors (see quack.epi_reduce)
     tile_count_semaphore=None,
     cu_seqlens_m=None,
     cu_seqlens_k=None,

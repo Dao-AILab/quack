@@ -1,4 +1,4 @@
-"""GEMM + fused reduce-scatter benchmark (SM100, use_epi_reduce="reduce_scatter").
+"""GEMM + fused reduce-scatter benchmark (SM100, epi_reduce_mode="reduce_scatter").
 
 Each rank computes A_local @ B_local^T over its K-shard (k_local = k / world_size); the
 epi_reduce warps multimem-reduce the partial D across ranks and each rank keeps its
@@ -31,6 +31,7 @@ from quack.dist_utils import (
     make_barrier_flags,
 )
 from quack.cute_dsl_utils import get_device_capacity
+from quack.epi_reduce import EpiReduceArguments
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_tvm_ffi_utils import make_scheduler_args, make_varlen_args
 
@@ -113,11 +114,17 @@ def run(args):
     torch_ab = cutlass_torch.dtype(ab_dtype)
     a_torch_cpu = (
         cutlass_torch.matrix(l, m, k_local, False, ab_dtype)
-        .to(torch.float32).normal_().mul_(1.0 / (k**0.5)).to(torch_ab)
+        .to(torch.float32)
+        .normal_()
+        .mul_(1.0 / (k**0.5))
+        .to(torch_ab)
     )
     b_torch_cpu = (
         cutlass_torch.matrix(l, n, k_local, False, ab_dtype)
-        .to(torch.float32).normal_().mul_(1.0 / (k**0.5)).to(torch_ab)
+        .to(torch.float32)
+        .normal_()
+        .mul_(1.0 / (k**0.5))
+        .to(torch_ab)
     )
     a_tensor, _ = cutlass_torch.cute_tensor_like(
         a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
@@ -144,7 +151,7 @@ def run(args):
     slab_tiles_m = (m_per_rank + cta_m - 1) // cta_m
     counters_torch = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
     counters = from_dlpack(counters_torch).mark_layout_dynamic()
-    epi_reduce_args = GemmDefaultSm100.EpiReduceArguments(
+    epi_reduce_args = EpiReduceArguments(
         mD_mc=d_tensor_mc,
         mD_peers=tuple(d_peer_tensors),
         tile_flags=tile_flags,
@@ -159,7 +166,7 @@ def run(args):
         a_dtype=ab_dtype,
         mma_tiler_mnk=(tile_M, tile_N),
         cluster_shape_mnk=(cluster_M, cluster_N, 1),
-        use_epi_reduce="reduce_scatter",
+        epi_reduce_mode="reduce_scatter",
     )
     epi_args = GemmDefaultSm100.EpilogueArguments()
     max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
@@ -170,8 +177,18 @@ def run(args):
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_gemm = cute.compile(
-        gemm, a_tensor, b_tensor, d_tensor, None, epi_args, sched_args, varlen_args,
-        current_stream, None, None, epi_reduce_args,
+        gemm,
+        a_tensor,
+        b_tensor,
+        d_tensor,
+        None,
+        epi_args,
+        sched_args,
+        varlen_args,
+        current_stream,
+        None,
+        None,
+        epi_reduce_args,
     )
 
     # No host-side barriers in the loop: the kernel owns cross-invocation sync
@@ -179,8 +196,17 @@ def run(args):
     def fn():
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         compiled_gemm(
-            a_tensor, b_tensor, d_tensor, None, epi_args, sched_args, varlen_args,
-            stream, None, None, epi_reduce_args,
+            a_tensor,
+            b_tensor,
+            d_tensor,
+            None,
+            epi_args,
+            sched_args,
+            varlen_args,
+            stream,
+            None,
+            None,
+            epi_reduce_args,
         )
 
     torch_d = cutlass_torch.dtype(d_dtype)

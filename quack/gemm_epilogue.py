@@ -1227,7 +1227,7 @@ class EpiMod:
         bs_format_b=None,
         swap_ab=False,  # swap-at-trace: requires b_kn (B given (k, n)); dense element mode
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
-        use_epi_reduce=None,  # "reduce_scatter" | "all_reduce" (see GemmTpTmaBase)
+        epi_reduce_mode=None,  # "reduce_scatter" | "all_reduce" (see quack.epi_reduce)
         epi_reduce_args=None,  # EpiReduceArguments over torch tensors
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
@@ -1249,17 +1249,24 @@ class EpiMod:
                 # With swapped slots kernel-A is the caller's B: the AG gate
                 # would gate the wrong operand (and the wrong M geometry).
                 raise ValueError("swap_ab does not support ag_args (AG shards kernel-A along M)")
-        num_ranks = None
-        if use_epi_reduce is not None:
+        epi_reduce, num_ranks = None, None
+        if epi_reduce_mode is not None:
             import torch.distributed as dist
 
             if varlen_m or gather_A or blockscaled or swap_ab or ag_args is not None:
-                raise ValueError("use_epi_reduce: dense non-blockscaled unswapped only")
+                raise ValueError("epi_reduce_mode: dense non-blockscaled unswapped only")
             if self.mode != "element":
-                raise ValueError("use_epi_reduce supports element-mode epilogues only")
+                raise ValueError("epi_reduce_mode supports element-mode epilogues only")
+            if not persistent:
+                raise ValueError("epi_reduce_mode requires the persistent scheduler")
+            if rounding_mode != RoundingMode.RN:
+                # RS under epi_reduce is unspecified: the skip-EVT partial store has no
+                # seed wired and the reducer's final convert is round-to-nearest.
+                raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
             if epi_reduce_args is None:
-                raise ValueError("use_epi_reduce requires epi_reduce_args")
-            num_ranks = dist.get_world_size()
+                raise ValueError("epi_reduce_mode requires epi_reduce_args")
+            epi_reduce = (epi_reduce_mode, dist.get_world_size(), dist.get_rank())
+            num_ranks = epi_reduce[1]
         # Warm fast path: probe the plan cache on raw-input metadata before any
         # validation or kind inference — a hit is exactly a replay of a
         # previously validated call (the key subsumes everything validation
@@ -1294,8 +1301,7 @@ class EpiMod:
             bs_format_b,
             swap_ab,
             ag_args is not None,
-            use_epi_reduce,
-            num_ranks,
+            epi_reduce,
         )
         plan = self._plan_cache.get(key)
         if plan is not None:
@@ -1385,15 +1391,15 @@ class EpiMod:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
         # stays caller-oriented (swap-at-trace transposes those at trace).
-        if use_epi_reduce is not None and m % num_ranks:
-            raise ValueError(f"use_epi_reduce: m ({m}) must be divisible by world ({num_ranks})")
-        # use_epi_reduce: C and every epi output/sink are slab-local (m / world); D stays full-M.
-        m_epi = m if use_epi_reduce is None else m // num_ranks
+        if epi_reduce_mode is not None and m % num_ranks:
+            raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
+        # epi_reduce_mode: C and every epi output/sink are slab-local (m / world); D stays full-M.
+        m_epi = m if epi_reduce_mode is None else m // num_ranks
         m_i, n_i = (n_gemm, m) if swap_ab else (m_epi, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
         epi_base_shape = _tile_shape(batch, m_epi, n_gemm, varlen_m)
-        if use_epi_reduce is not None:
+        if epi_reduce_mode is not None:
             # Guard what the kernel can only corrupt on: multimem vector width,
             # kernel-order comm views, and flag/counter capacities (an under-sized
             # flag array is a silent OOB multimem write). Warm plan-cache hits
@@ -1402,12 +1408,12 @@ class EpiMod:
 
             era = epi_reduce_args
             if D is None:
-                raise ValueError("use_epi_reduce requires D (the symmetric work buffer)")
+                raise ValueError("epi_reduce_mode requires D (the symmetric work buffer)")
             vec = 16 // D.element_size()
             if n_gemm % vec:
-                raise ValueError(f"use_epi_reduce: n ({n_gemm}) must be divisible by {vec}")
+                raise ValueError(f"epi_reduce_mode: n ({n_gemm}) must be divisible by {vec}")
             if D.stride(-1) != 1:
-                raise ValueError("use_epi_reduce: D must be n-major (multimem vectors)")
+                raise ValueError("epi_reduce_mode: D must be n-major (multimem vectors)")
             if len(era.mD_peers) != num_ranks:
                 raise ValueError(
                     f"epi_reduce_args.mD_peers has {len(era.mD_peers)} views, world {num_ranks}"
@@ -1617,7 +1623,7 @@ class EpiMod:
             gemm_cls_ref=self._class_ref(mint_key),
             packed_cd=packed_form,
             has_ag=ag_args is not None,
-            use_epi_reduce=use_epi_reduce,
+            epi_reduce=epi_reduce,
         )
         self._plan_cache[key] = plan
         if _launch:

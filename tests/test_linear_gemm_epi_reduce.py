@@ -1,6 +1,6 @@
 """Distributed tests for GEMM + reduce epilogues composed with epilogue-mod
 classes (quack.epilogues.linear_act_mod / sq_reduce_mod), driven through the
-host plan path (EpiMod.gemm with use_epi_reduce / epi_reduce_args).
+host plan path (EpiMod.gemm with epi_reduce_mode / epi_reduce_args).
 
 The epi-reduce warps keep D linear (act: mAuxOut = act_fn(D); sq: D = D_raw * w
 with sq partials from pre-w D_raw), all slab-local. Marked `dist`: deselected by
@@ -49,7 +49,7 @@ def _make_comm(m, n, l, m_per_rank, tile_m, tile_n, cta_m):
     import cutlass
 
     from quack.dist_utils import create_multicast_tensor, make_barrier_flags
-    from quack.gemm_tp_base import GemmTpTmaBase
+    from quack.epi_reduce import EpiReduceArguments
 
     d_cpu = torch.empty(l, m, n, dtype=torch.bfloat16).permute(1, 2, 0)
     _, _, d_torch_gpu, d_torch_gpu_mc, d_peer_torch, _ = create_multicast_tensor(
@@ -62,7 +62,7 @@ def _make_comm(m, n, l, m_per_rank, tile_m, tile_n, cta_m):
     sb_torch, sb_torch_mc, _, _ = make_barrier_flags(num_sms)
     slab_tiles_m = (m_per_rank + cta_m - 1) // cta_m
     counters_torch = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
-    epi_reduce_args = GemmTpTmaBase.EpiReduceArguments(
+    epi_reduce_args = EpiReduceArguments(
         mD_mc=d_torch_gpu_mc,
         mD_peers=tuple(d_peer_torch),
         tile_flags=tf_torch,
@@ -99,7 +99,7 @@ def _run_gemm_act_reduce(
     k,
     l=1,
     act="relu",
-    use_epi_reduce="reduce_scatter",
+    epi_reduce_mode="reduce_scatter",
     has_bias=False,
     has_c=False,
     has_colvec=False,
@@ -160,13 +160,13 @@ def _run_gemm_act_reduce(
         cluster_M=cluster_m,
         cluster_N=cluster_n,
         is_dynamic_persistent=True,
-        use_epi_reduce=use_epi_reduce,
+        epi_reduce_mode=epi_reduce_mode,
         epi_reduce_args=epi_reduce_args,
     )
 
     # D view: RS owns its m-slab of the (m, n, l) D; AR holds the full reduced D.
     # Aux is slab-local in both modes.
-    if use_epi_reduce == "reduce_scatter":
+    if epi_reduce_mode == "reduce_scatter":
         out = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
     else:
         out = d_torch_gpu.permute(2, 0, 1)
@@ -220,7 +220,7 @@ def _run_gemm_act_reduce(
     # quack convention: fp32 ref is ground truth; kernel error < 2x same-dtype ref error.
     def epilogue_ref(dtype):
         d_full = torch.bmm(a_gpu.to(dtype), b_gpu.to(dtype).mT)
-        if use_epi_reduce == "reduce_scatter":
+        if epi_reduce_mode == "reduce_scatter":
             d_red = torch.empty(l, m_per_rank, n, dtype=dtype, device="cuda")
             for i in range(l):
                 dist.reduce_scatter_tensor(d_red[i], d_full[i])
@@ -235,11 +235,11 @@ def _run_gemm_act_reduce(
         if has_bias:
             post += bias_gpu.unsqueeze(1)
         if has_colvec:
-            cv = colvec_gpu if use_epi_reduce == "reduce_scatter" else colvec_full
+            cv = colvec_gpu if epi_reduce_mode == "reduce_scatter" else colvec_full
             post += cv.unsqueeze(-1)
         slab = (
             post
-            if use_epi_reduce == "reduce_scatter"
+            if epi_reduce_mode == "reduce_scatter"
             else (post[:, rank * m_per_rank : (rank + 1) * m_per_rank])
         )
         return post, slab
@@ -263,7 +263,7 @@ def _run_gemm_act_reduce(
     torchrun_finalize_nvshmem()
 
 
-def _run_gemm_sq_reduce(m, n, k, l=1, use_epi_reduce="reduce_scatter", has_c=False):
+def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=False):
     import torch.distributed as dist
 
     from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
@@ -312,11 +312,11 @@ def _run_gemm_sq_reduce(m, n, k, l=1, use_epi_reduce="reduce_scatter", has_c=Fal
         cluster_M=cluster_m,
         cluster_N=cluster_n,
         is_dynamic_persistent=True,
-        use_epi_reduce=use_epi_reduce,
+        epi_reduce_mode=epi_reduce_mode,
         epi_reduce_args=epi_reduce_args,
     )
 
-    if use_epi_reduce == "reduce_scatter":
+    if epi_reduce_mode == "reduce_scatter":
         out = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
     else:
         out = d_torch_gpu.permute(2, 0, 1)
@@ -364,7 +364,7 @@ def _run_gemm_sq_reduce(m, n, k, l=1, use_epi_reduce="reduce_scatter", has_c=Fal
     # quack convention: fp32 reference = ground truth; kernel error < 2x bf16-impl error.
     def epilogue_ref(dtype):
         d_full = torch.bmm(a_gpu.to(dtype), b_gpu.to(dtype).mT)
-        if use_epi_reduce == "reduce_scatter":
+        if epi_reduce_mode == "reduce_scatter":
             d_red = torch.empty(l, m_per_rank, n, dtype=dtype, device="cuda")
             for i in range(l):
                 dist.reduce_scatter_tensor(d_red[i], d_full[i])
@@ -373,13 +373,13 @@ def _run_gemm_sq_reduce(m, n, k, l=1, use_epi_reduce="reduce_scatter", has_c=Fal
             dist.all_reduce(d_full)
             post = d_full.float()
         if has_c:
-            if use_epi_reduce == "reduce_scatter":
+            if epi_reduce_mode == "reduce_scatter":
                 post += c_gpu.float()
             else:
                 post += c_full_cpu.cuda().float()
         slab = (
             post
-            if use_epi_reduce == "reduce_scatter"
+            if epi_reduce_mode == "reduce_scatter"
             else (post[:, rank * m_per_rank : (rank + 1) * m_per_rank])
         )
         # Per-tile sq partials (sq is pre-norm_weight), matching the kernel's slots.

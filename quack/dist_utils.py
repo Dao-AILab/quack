@@ -1,7 +1,11 @@
-"""Host-side distributed runtime helpers for the fused reduce-scatter / all-reduce
-GEMM path (use_epi_reduce): nvshmem + torch.distributed setup, symmetric / multicast
-tensor allocation, and the barrier flags the kernel's comm layer reads. These are the
-runtime contract for calling GemmSm100(use_epi_reduce=...), not benchmarking helpers.
+"""Distributed helpers for the fused reduce-scatter / all-reduce GEMM path
+(epi_reduce_mode): nvshmem + torch.distributed setup, symmetric / multicast tensor
+allocation, the barrier flags the kernel's comm layer reads, and the multimem
+intrinsic dispatch its reduce uses. These are the runtime contract for calling
+GemmSm100(epi_reduce_mode=...), not benchmarking helpers.
+
+nvshmem / cuda.core imports are lazy: this module is imported from the kernel
+layer (epi_reduce), which must not require nvshmem at import time.
 """
 
 import os
@@ -10,14 +14,31 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-import nvshmem.core
-from cuda.core.experimental import Device
-
+import cutlass
 import cutlass.torch as cutlass_torch
+import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack
 
 
+def multimem_ld_reduce_128b(dtype):
+    """128-bit multimem.ld_reduce(add) variant for dtype; all return 4x b32 (x, y, z, w)."""
+    if dtype == cutlass.Float16:
+        return utils.distributed.multimem_ld_reduce_8xf16
+    if dtype == cutlass.Float32:
+        return utils.distributed.multimem_ld_reduce_4xf32
+    if dtype == cutlass.BFloat16:
+        return utils.distributed.multimem_ld_reduce_8xbf16
+    if dtype == cutlass.Float8E4M3FN:
+        return utils.distributed.multimem_ld_reduce_16xe4m3
+    if dtype == cutlass.Float8E5M2:
+        return utils.distributed.multimem_ld_reduce_16xe5m2
+    raise NotImplementedError(f"multimem_ld_reduce_128b: unsupported dtype {dtype}")
+
+
 def torchrun_init_nvshmem(dist_initialized=False):
+    import nvshmem.core
+    from cuda.core.experimental import Device
+
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     dev = Device(local_rank)
@@ -46,6 +67,8 @@ def on_finalize(fn):
 
 
 def torchrun_finalize_nvshmem():
+    import nvshmem.core
+
     for fn in reversed(_finalizers):
         try:
             fn()
@@ -63,6 +86,8 @@ def create_multicast_tensor(torch_tensor_cpu, dtype, leading_dim, is_dynamic_lay
     the symmetric tensor matches the source's strides for any rank / major-ness. Returns
     (cute, cute_mc, torch_gpu, torch_gpu_mc, peer_torch, cute_peers); the symmetric
     allocation self-registers its free via on_finalize."""
+    import nvshmem.core
+
     ndim = torch_tensor_cpu.dim()
     base_order = sorted(range(ndim), key=lambda d: -torch_tensor_cpu.stride(d))
     inv = [base_order.index(d) for d in range(ndim)]
@@ -91,6 +116,8 @@ def create_multicast_tensor(torch_tensor_cpu, dtype, leading_dim, is_dynamic_lay
 
 
 def make_barrier_flags(num_flags):
+    import nvshmem.core
+
     bf_torch = nvshmem.core.tensor((num_flags,), dtype=torch.int32)
     bf_torch.fill_(0)
     bf_torch_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, bf_torch)
