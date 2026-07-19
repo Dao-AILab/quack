@@ -520,16 +520,17 @@ def launch_gemm(
     SFB=None,
     epi_reduce_args=None,
 ):
-    """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB)."""
+    """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB,
+    epi_reduce_args)."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
-    er = ()
     # getattr: gemm.py / gemm_symmetric.py pass their own plan NamedTuples.
     if getattr(plan, "epi_reduce_mode", None) is not None:
         assert epi_reduce_args is not None, "epi_reduce_mode plan launched without epi_reduce_args"
-        er = (epi_reduce_args,)
     if plan.is_sm100_family:
-        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, *er)
+        plan.compiled_fn(
+            A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, epi_reduce_args
+        )
     else:
         plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)
 

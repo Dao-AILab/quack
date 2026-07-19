@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib
 from typing import NamedTuple, Optional
 
+import cutlass.cute as cute
 from cutlass import Float32, Int32
 
 from quack.cache import jit_cache
@@ -232,8 +233,6 @@ def _compile_gemm_epi(
     if epi_reduce is not None:
         # Epilogue tensors are slab-local (m / world): a fresh m sym, untied
         # from the operand m; C is epilogue-consumed so it rides the same sym.
-        import cutlass.cute as cute
-
         m = cute.sym_int()
         if mC is not None:
             c_leading = 1 if c_major == "n" else 0
