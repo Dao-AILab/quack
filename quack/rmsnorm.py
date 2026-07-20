@@ -133,7 +133,18 @@ class RMSNorm(ReductionBase):
         ]
         num_heads = mX.shape[1] if const_expr(cute.rank(mX) == 3) else 1
         self.kernel(
-            mX, mW, mB, mRes, mO, mResO, mRstd, mMean, eps, tiler_mn, tiled_copy, threads_per_row
+            mX,
+            mW,
+            mB,
+            mRes,
+            mO,
+            mResO,
+            mRstd,
+            mMean,
+            eps,
+            tiler_mn,
+            tiled_copy,
+            threads_per_row,
         ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, num_heads],
             block=[num_threads, 1, 1],

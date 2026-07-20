@@ -204,6 +204,7 @@ def _compile_quant_fwd(
 
 def _quant_configs(block_size: int, vecsize: int) -> list[AutotuneConfig]:
     """Valid (threads_per_row, num_threads) pairs for a given block_size and vecsize."""
+    return [AutotuneConfig(config=(4, 64))]
     configs = []
     for num_threads in [64, 128, 256]:
         for threads_per_row in [4, 8, 16, 32]:
@@ -293,7 +294,10 @@ def blockwise_quant(
     scatter in-kernel, or quantize unpadded then use ``grouped_scale_to_dqaccum`` /
     ``permute_scale_to_dqaccum``.
     """
-    M, N = src.shape
+    N = src.shape[-1]
+    orig_shape = src.shape
+    src = src.view(-1, N)
+    M = src.shape[0]
     assert N % block_size == 0
     if scale_row_idx is not None:
         assert scale_rows is not None, "scale_rows is required when scale_row_idx is given"
@@ -307,7 +311,7 @@ def blockwise_quant(
     else:
         scale = torch.empty(rows, N // block_size, device=src.device, dtype=torch.float32)
     _blockwise_quant(src, out, scale, scale_row_idx, block_size)
-    return out, scale
+    return out.view(*orig_shape), scale.view(*orig_shape[:-1], N // block_size)
 
 
 def dqaccum_total_padded_m(total_m: int, num_experts: int) -> int:

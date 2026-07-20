@@ -10,6 +10,15 @@ class GemmConfig:
     tile_m: int = 128
     tile_n: int = 192
     tile_k: int | None = None
+    # Epilogue sub-tile N extent (SM90 blockscaled). The epilogue drains the output in
+    # ceil_div(tile_n, epi_tile_n) N sub-tiles, each costing 2 CTA bar.sync (the dominant
+    # epilogue stall). Widening epi_tile_n toward tile_n collapses those sub-tiles (fewer
+    # barriers) at the cost of a larger epilogue smem buffer (fewer AB stages). None keeps
+    # the heuristic default; must divide tile_n. Swept by the autotuner.
+    # NOTE: the M axis is deliberately NOT a lever — widening epi_tile_m forces a full-tile
+    # (64KB) output buffer that starves the AB pipeline to 1 stage (~2x slower); the 49KB/
+    # stage AB tiles leave no room for it. See _get_sm90_blockscaled_configs.
+    epi_tile_n: int | None = None
     num_warps: int | None = None
     pingpong: bool = True
     # by default, we use dynamic persistent tile scheduler on SM100 but not on SM90
@@ -70,6 +79,59 @@ def _get_sm90_configs(
             cluster,
             swap_ab_vals,
         )
+    ]
+
+
+def _get_sm90_blockscaled_configs(epilogue: Optional[str] = None) -> List[GemmConfig]:
+    """Autotuning configs for the SM90 MXFP8 blockscaled GEMM (software-applied f32 scales).
+
+    Cooperative (non-pingpong) only for now. Correctness constraints:
+      - ``tile_n in {128, 256}``: the per-tile weight-scale (``scale_b``) indexing assumes a
+        tile spans exactly one or two of the 128-wide weight-scale N-blocks. ``tile_n`` of
+        160/192/208 silently produce wrong results (they compile and are fast, so they must
+        NOT be offered to the autotuner, which selects on speed alone).
+      - ``tile_m in {128, 256}`` (must be a multiple of 128).
+      - Pingpong is register-capped to a 128x128 accumulator per warpgroup, so it can neither
+        hold ``tile_n=256`` nor serve the gated (concat-B) epilogue's ``tile_n>128`` requirement
+        -> cooperative only.
+      - no ``swap_ab`` (SFA/SFB would have to swap too; untested).
+    ``(256, 256)`` is dropped: its 256-reg/thread accumulator spills (~300 vs ~1350 TFLOPS).
+    """
+    # tile_n=192 is enabled by the per-N-core predicate scale in mma_blockscaled (a tile
+    # straddles a 128-wide SFB block). (256, 192) is excluded: acc = 192 regs/thread spills.
+    tile_mn_vals = [(128, 128), (128, 256), (256, 128), (128, 192)]
+    if epilogue in ("gated", "dgated"):
+        # concat-B gated needs tile_n > 128 AND a multiple of 128: its gate/up parity scale
+        # path (unlike the non-gated predicate path) still assumes one 128-wide SFB block per
+        # tile half, so it can't straddle a boundary (tile_n=192 would).
+        tile_mn_vals = [(m, n) for m, n in tile_mn_vals if n > 128 and n % 128 == 0]
+    cluster = [(1, 2), (2, 1)]
+
+    # Epilogue N granularity lever: None = heuristic default (~32-wide sub-tiles, many
+    # CTA barriers); larger values collapse sub-tiles -> fewer barriers. Only offer
+    # divisors of tile_n and cap at 128 so the epilogue smem buffer never starves the
+    # AB pipeline stages (128*128*2B per stage stays within budget for every config).
+    # The M axis is intentionally left alone: widening epi_tile_m to a single M pass needs
+    # a 64KB full-tile buffer that drops AB stages to 1 (measured ~2x slower), so it is not
+    # swept — epi_tile_n at the 4-barrier point (epi_tile_n=tile_n) is the sweet spot.
+    def _epi_tile_n_choices(tile_n: int) -> List[Optional[int]]:
+        return [None] + [v for v in (64, 128) if tile_n % v == 0 and v <= tile_n]
+
+    return [
+        GemmConfig(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            epi_tile_n=epi_tile_n,
+            pingpong=False,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            swap_ab=False,
+            device_capacity=9,
+            is_dynamic_persistent=False,
+            use_tma_gather=False,
+        )
+        for (tile_m, tile_n), (cluster_m, cluster_n) in itertools.product(tile_mn_vals, cluster)
+        for epi_tile_n in _epi_tile_n_choices(tile_n)
     ]
 
 

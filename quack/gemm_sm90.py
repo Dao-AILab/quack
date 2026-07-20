@@ -131,6 +131,7 @@ class GemmSm90(GemmTmaBase):
         use_pdl: bool = True,
         sf_vec_size: Optional[int] = None,
         weight_n_block: Optional[int] = None,
+        epi_tile_n: Optional[int] = None,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -150,6 +151,7 @@ class GemmSm90(GemmTmaBase):
         self.pingpong = pingpong
         self.sf_vec_size = sf_vec_size
         self.weight_n_block = weight_n_block
+        self.epi_tile_n = epi_tile_n
         self.blockscaled = sf_vec_size is not None
         self.is_persistent = is_persistent
         self.use_clc_persistence = use_clc_persistence
@@ -204,9 +206,7 @@ class GemmSm90(GemmTmaBase):
                 else:
                     atom_layout_m, atom_layout_n = 1, 2
             else:
-                atom_layout_m = (
-                    self.cta_tile_shape_mnk[0] // 64 if self.cta_tile_shape_mnk[0] < 256 else 2
-                )
+                atom_layout_m = tile_M // 64 if tile_M < 256 else 2
                 atom_layout_n = 1
             assert atom_layout_m in [1, 2, 3] and atom_layout_n in [1, 2]
         else:
@@ -243,6 +243,11 @@ class GemmSm90(GemmTmaBase):
         if self.fp8_slow_accum:
             if self.blockscaled:
                 assert tile_M % 128 == 0
+                # mma_blockscaled always accumulates one (m, n) WGMMA fragment at a time
+                # into a single-fragment "partial acc" scratch, then scales it into the real
+                # acc. So the partial-acc scheme (a ((2,2,16),1,1) acc_slow) is mandatory for
+                # blockscaled at any tile size; a full-size acc_slow makes the per-fragment
+                # WGMMA layout (A MMA_M=1 vs D MMA_M=MMA_M) fail to form a gemm.
                 if tile_M >= 256 or tile_N >= 256:
                     regs_per_thread += regs_per_thread // 2
                     self.fp8_partial_acc = True
@@ -325,6 +330,15 @@ class GemmSm90(GemmTmaBase):
             self.cta_tile_shape_mnk[1],
             tile_k,
         )
+        if self.blockscaled:
+            # Number of 128-wide SFB blocks one output N-tile spans, used to size the
+            # per-tile SFB smem staging buffer. tile_n%128==0 -> tile_n/128 aligned blocks;
+            # otherwise +1 for the straddle (e.g. tile_n=192 -> 2 blocks). sfb_kmax is the
+            # per-block K-tile capacity so that sfb_nb * sfb_kmax == SFB_SMEM_MAX.
+            tile_n = self.cta_tile_shape_mnk[1]
+            extra = 0 if tile_n % self.weight_n_block == 0 else 1
+            self.sfb_nb = tile_n // self.weight_n_block + extra
+            self.sfb_kmax = self.SFB_SMEM_MAX // self.sfb_nb
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments):
         """Set up configurations that are dependent on GEMM inputs
@@ -349,13 +363,25 @@ class GemmSm90(GemmTmaBase):
             self.atom_layout_mnk,
             self.d_dtype,
         )
+        # Tunable epilogue N granularity (blockscaled). The generic epilogue drains the
+        # output in `ceil_div(tile_n, epi_tile_n)` N sub-tiles, each costing 2 CTA bar.sync
+        # (the dominant epilogue stall); widening epi_tile_n toward tile_n collapses those
+        # sub-tiles (fewer barriers) at the cost of a larger epilogue smem buffer (fewer AB
+        # stages). `None` keeps the heuristic default; the autotuner sweeps concrete values.
+        # The M axis is intentionally NOT widened: a full-tile_m epilogue buffer (64KB) starves
+        # the AB pipeline to 1 stage (~2x slower), so epi_tile_m stays at its heuristic value.
+        if self.blockscaled and not self.pingpong and self.epi_tile_n is not None:
+            assert self.cta_tile_shape_mnk[1] % self.epi_tile_n == 0, (
+                f"epi_tile_n ({self.epi_tile_n}) must divide tile_n ({self.cta_tile_shape_mnk[1]})"
+            )
+            self.epi_tile = (self.epi_tile[0], self.epi_tile_n)
         self.epi_tile_shape = cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile)
 
         # Compute stage before compute smem layout. SFA staging (mxfp8) needs
         # BLOCK_M * 4 extra bytes per stage so reduce ab_stage accordingly.
         sfa_bytes_per_stage = self.cta_tile_shape_mnk[0] * 4 if self.blockscaled else 0
         # Fixed (once-per-CTA) SFB buffer; not staged, so reserve it up front.
-        sfb_fixed_bytes = self.SFB_SMEM_MAX * 4 if (self.blockscaled and not self.pingpong) else 0
+        sfb_fixed_bytes = self.SFB_SMEM_MAX * 4 if self.blockscaled else 0
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
             self.cta_tile_shape_mnk,
             self.epi_tile,
@@ -518,7 +544,7 @@ class GemmSm90(GemmTmaBase):
         # Fixed buffer staged once per output block (DeepGEMM-style), eliminating
         # the per-k_tile gmem dependency on the wgmma issue path. Size reserved in
         # _compute_stages via sfb_fixed_bytes so ab_stage leaves room for it.
-        sfb_smem_size = self.SFB_SMEM_MAX if (self.blockscaled and not self.pingpong) else 0
+        sfb_smem_size = self.SFB_SMEM_MAX if (self.blockscaled) else 0
 
         @cute.struct
         class SharedStorage:
@@ -731,8 +757,10 @@ class GemmSm90(GemmTmaBase):
             sSFA = storage.sSFA.get_tensor(sfa_smem_layout)
         # Per-output-block scale_b staged into smem (non-pingpong only for now).
         sSFB = None
-        if const_expr(self.blockscaled and not self.pingpong):
-            sSFB = storage.sSFB.get_tensor(cute.make_layout((512,)))
+        if const_expr(self.blockscaled):
+            # 2D [local_block, k_tile]: one output tile can span multiple 128-wide SFB
+            # blocks (e.g. tile_n=256 -> 2), so stage each block's k-strip in its own row.
+            sSFB = storage.sSFB.get_tensor(cute.make_layout((self.sfb_nb, self.sfb_kmax)))
         sD = None
         if const_expr(has_D):
             sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
@@ -965,18 +993,28 @@ class GemmSm90(GemmTmaBase):
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
-                # Stage scale_b for this output block into smem (non-pingpong only).
-                # Math threads cooperatively load mSFB[batch, n_tile, 0..k_tile_cnt-1]
-                # into sSFB, then sync the math WGs via the epilogue_barrier (256 threads).
-                # if const_expr(self.blockscaled and not self.pingpong):
-                #     threads_per_math = self.mma_warp_groups * self.num_threads_per_warp_group
-                #     # Each pass covers `threads_per_math` scales; 2 passes covers k_tile_cnt up to 512.
-                #     NUM_SFB_PASSES = const_expr(512 // threads_per_math)
-                #     for pass_idx in cutlass.range_constexpr(NUM_SFB_PASSES):
-                #         kk = tidx + pass_idx * threads_per_math
-                #         if kk < k_tile_cnt:
-                #             sSFB[kk] = mSFB[batch_idx, tile_coord_mnkl[1], kk]
-                #     self.epilogue_barrier.arrive_and_wait()
+                # Stage this output tile's scale_b (SFB) blocks into smem once, so the MMA
+                # k-loop reads scales from smem instead of re-fetching gmem every k-iteration.
+                # Runs on the 256 math threads and overlaps with the previous tile's async TMA
+                # store of D. Non-pingpong only; pingpong reads scales from gmem in the loop.
+                if const_expr(self.blockscaled and not self.pingpong):
+                    tile_n_stage = const_expr(self.cta_tile_shape_mnk[1])
+                    threads_per_math = const_expr(
+                        self.mma_warp_groups * self.num_threads_per_warp_group
+                    )
+                    # Each pass covers `threads_per_math` k-tiles; sfb_kmax caps total k-tiles.
+                    NUM_SFB_PASSES = const_expr(cute.ceil_div(self.sfb_kmax, threads_per_math))
+                    n_blocks_sfb = cute.size(mSFB, mode=[1])
+                    base_blk = (tile_coord_mnkl[1] * tile_n_stage) // self.weight_n_block
+                    for local in cutlass.range_constexpr(self.sfb_nb):
+                        # Clamp: a partial last N-tile can reach past the final SFB block; those
+                        # columns are masked in the epilogue, so a clamped scale is harmless.
+                        gblk = cutlass.min(base_blk + local, n_blocks_sfb - 1)
+                        for pass_idx in cutlass.range_constexpr(NUM_SFB_PASSES):
+                            kk = tidx + pass_idx * threads_per_math
+                            if kk < k_tile_cnt:
+                                sSFB[local, kk] = mSFB[batch_idx, gblk, kk]
+                    self.epilogue_barrier.arrive_and_wait()
                 iket.range_push("mma")
                 if const_expr(self.blockscaled):
                     ab_read_state = self.mma_blockscaled(
@@ -1337,7 +1375,7 @@ class GemmSm90(GemmTmaBase):
         MMA_M, MMA_N = const_expr(acc.shape[1]), const_expr(acc.shape[0])
         # Sanity check that MMA_M of acc is the same as the MMA_M of tCrA
         wgmma_m = const_expr(cute.size(self.tiled_mma.shape_mnk, mode=[0]))
-        if const_expr(self.atom_layout_mnk[0] > 1 and not self.pingpong):
+        if const_expr(self.atom_layout_mnk[0] > 1):
             wg_m_offset = warp_group_idx * Int32(wgmma_m)
         else:
             wg_m_offset = Int32(0)
@@ -1349,18 +1387,40 @@ class GemmSm90(GemmTmaBase):
 
         ab_release_state = ab_read_state.clone()
         acc.fill(0.0)
-        # scales holds the per-(m0, m1) row-pair scale for one (m, n) fragment.
-        scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
-        # scale_b[n] is the SFB scale for the n-th 128-wide N block of this CTA tile.
-        scale_b = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
+        # Blockscaled scale application is non-concat only. Gated B-concat (the
+        # gate/up-interleaved weight layout) is not supported on the blockscaled SM90
+        # path — the per-column gate/up alternation needs distinct SFB scales within a
+        # single WGMMA fragment, which this scale-apply no longer handles.
+        assert "B" not in self.concat_layout, (
+            "SM90 blockscaled GEMM does not support concat_layout with B; use the non-concat path."
+        )
+        # SFB was staged into sSFB (2D [local_block, k]) at the loop top for the
+        # non-pingpong path — read scales from smem instead of gmem there.
+        # Compile-time fragment geometry. acc mode-0 is ((2, 2, G_N)): the leading axis is
+        # the 2 adjacent N columns a thread owns within an 8-wide WGMMA "core", the middle
+        # axis is the (m0, m1) row pair, and G_N is the number of 8-wide N cores in one
+        # WGMMA-N fragment. So one fragment spans `frag_n = 8 * G_N` N columns, and core
+        # group g covers fragment-local columns [8*g, 8*g + 8).
+        G_N = const_expr(acc.shape[0][2])
+        frag_n = const_expr(8 * G_N)
+        tile_n = const_expr(self.cta_tile_shape_mnk[1])
+        sf_block_n = const_expr(self.weight_n_block)  # 128-wide weight-scale N block
+        # A WGMMA-N fragment sits entirely within one 128-wide SFB block iff frag_n divides
+        # the block and tiles are block-aligned. Then a single scale_b per fragment suffices
+        # (fast path, e.g. tile_n=128/256). Otherwise a fragment straddles a boundary and we
+        # apply a DeepGEMM-style per-core predicate scale (e.g. tile_n=192 -> 1.5 blocks).
+        uniform_scale = const_expr(
+            self.weight_n_block % frag_n == 0 and tile_n % self.weight_n_block == 0
+        )
+        if const_expr(uniform_scale):
+            # scales[0]/scales[1]: (m0, m1) row-pair scale for the fragment's single block.
+            scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
+        else:
+            # sa: (m0, m1) row-pair A scale. sb_g: per-N-core weight scale (predicate).
+            sa = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
+            sb_g = cute.make_rmem_tensor(cute.make_layout((G_N,)), acc.dtype)
         for k_tile in cutlass.range(k_tile_cnt, unroll=8):
             peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
-            if const_expr(self.cta_tile_shape_mnk[1] <= 128):
-                scale_b[0] = mSFB_nk[n_tile_coord, k_tile]
-                scale_b[1] = scale_b[0]
-            else:
-                scale_b[0] = mSFB_nk[n_tile_coord * 2, k_tile]
-                scale_b[1] = mSFB_nk[n_tile_coord * 2 + 1, k_tile]
             ab_pipeline.consumer_wait(ab_read_state, peek_full)
             stage = ab_read_state.index
             for m_idx in cutlass.range_constexpr(MMA_M):
@@ -1368,16 +1428,62 @@ class GemmSm90(GemmTmaBase):
                 scale_a0 = sSFA[m0 + m_off, 0, stage]
                 scale_a1 = sSFA[m1 + m_off, 0, stage]
                 curr_tCrA = layout_utils.expand(tCrA[None, m_idx, None, None], dim=1, size=1)
+                if const_expr(not uniform_scale):
+                    sa[0] = scale_a0
+                    sa[1] = scale_a1
                 for n_idx in cutlass.range_constexpr(MMA_N):
                     curr_tCrB = layout_utils.expand(tCrB[None, n_idx, None, None], dim=1, size=1)
-                    # acc[m_idx, n_idx] reshaped to a single ((2,2,16),1,1) fragment.
+                    # acc[m_idx, n_idx] reshaped to a single ((2,2,G_N),1,1) fragment.
                     curr_acc = layout_utils.expand(
                         layout_utils.expand(acc[None, m_idx, n_idx], dim=1, size=1),
                         dim=2,
                         size=1,
                     )
-                    scales[0] = scale_a0 * scale_b[n_idx]
-                    scales[1] = scale_a1 * scale_b[n_idx]
+                    if const_expr(uniform_scale):
+                        # Fragment is wholly inside SFB block (n_tile*tile_n + n_idx*frag_n)/128.
+                        if const_expr(not self.pingpong):
+                            # tile-local slot = global blk - n_tile_coord*(tile_n/128); the
+                            # n_tile_coord term cancels, leaving a compile-time constant.
+                            local_blk = const_expr(n_idx * (frag_n // sf_block_n))
+                            scale_b_val = sSFB[local_blk, k_tile]
+                        else:
+                            blk = n_tile_coord * Int32(tile_n // sf_block_n) + Int32(
+                                n_idx * (frag_n // sf_block_n)
+                            )
+                            scale_b_val = mSFB_nk[blk, k_tile]
+                        scales[0] = scale_a0 * scale_b_val
+                        scales[1] = scale_a1 * scale_b_val
+                    else:
+                        # This fragment covers absolute N columns [frag_col0, frag_col0+frag_n).
+                        # b0/b1 are the 128-wide SFB blocks at its first/last column; the first
+                        # `num_former` columns lie in b0, the rest in b1. Pick per core group g
+                        # by predicate 8*g < num_former.
+                        frag_col0 = n_tile_coord * Int32(tile_n) + Int32(n_idx * frag_n)
+                        off = frag_col0 % Int32(sf_block_n)
+                        b0 = frag_col0 // Int32(sf_block_n)
+                        # Clamp b1: a partial last tile (N not a multiple of tile_n) would
+                        # otherwise index past the last SFB block. Columns beyond N are masked
+                        # out in the epilogue, so the clamped scale on them is harmless.
+                        n_blocks = cute.size(mSFB_nk, mode=[0])
+                        b1 = cutlass.min(
+                            (frag_col0 + Int32(frag_n - 1)) // Int32(sf_block_n),
+                            Int32(n_blocks - 1),
+                        )
+                        num_former = cutlass.min(Int32(frag_n), Int32(sf_block_n) - off)
+                        if const_expr(not self.pingpong):
+                            # Map global blocks to tile-local staging slots (same base_blk
+                            # the loop-top staging used: (n_tile_coord*tile_n)//sf_block_n).
+                            base_blk = n_tile_coord * Int32(tile_n) // Int32(sf_block_n)
+                            sb0 = sSFB[b0 - base_blk, k_tile]
+                            sb1 = sSFB[b1 - base_blk, k_tile]
+                        else:
+                            sb0 = mSFB_nk[b0, k_tile]
+                            sb1 = mSFB_nk[b1, k_tile]
+                        for g in cutlass.range_constexpr(G_N):
+                            # Branch-free select: sb0 if this core is before the block
+                            # boundary, else sb1 (== sb0 when the fragment doesn't cross).
+                            in_former = (Int32(g * 8) < num_former).to(cutlass.Float32)
+                            sb_g[g] = sb1 + (sb0 - sb1) * in_former
                     mma_fn(
                         tCrA=curr_tCrA,
                         tCrB=curr_tCrB,
@@ -1388,14 +1494,32 @@ class GemmSm90(GemmTmaBase):
                     warpgroup.wait_group(0)
                     if const_expr(m_idx == MMA_M - 1 and n_idx == MMA_N - 1):
                         ab_pipeline.consumer_release(ab_release_state)
+                        if const_expr(self.pingpong):
+                            # Cue for next WG's MMA to start
+                            self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
 
-                    # Broadcast scales over the ((2,2,16),1,1) fragment: only the second
-                    # mode-0 axis (the m0/m1 row pair) selects scales[0] vs scales[1].
-                    scales_bcast = cute.make_tensor(
-                        scales.iterator,
-                        cute.make_layout(acc_slow.shape, stride=((0, 1, 0), 0, 0)),
-                    )
-                    curr_acc.store(curr_acc.load() + acc_slow.load() * scales_bcast.load())
+                    if const_expr(not uniform_scale):
+                        # scale = A row scale (sa, selected by the mode-0 row axis) times the
+                        # per-core weight scale (sb_g, selected by the mode-0 core axis G_N).
+                        sa_bcast = cute.make_tensor(
+                            sa.iterator,
+                            cute.make_layout(acc_slow.shape, stride=((0, 1, 0), 0, 0)),
+                        )
+                        sb_bcast = cute.make_tensor(
+                            sb_g.iterator,
+                            cute.make_layout(acc_slow.shape, stride=((0, 0, 1), 0, 0)),
+                        )
+                        curr_acc.store(
+                            curr_acc.load() + acc_slow.load() * sa_bcast.load() * sb_bcast.load()
+                        )
+                    else:
+                        # Broadcast scales over the fragment: only the mode-0 row axis
+                        # selects scales[0] (m0) vs scales[1] (m1).
+                        scales_bcast = cute.make_tensor(
+                            scales.iterator,
+                            cute.make_layout(acc_slow.shape, stride=((0, 1, 0), 0, 0)),
+                        )
+                        curr_acc.store(curr_acc.load() + acc_slow.load() * scales_bcast.load())
             ab_read_state.advance()
             ab_release_state.advance()
         return ab_read_state
