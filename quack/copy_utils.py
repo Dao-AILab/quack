@@ -143,6 +143,7 @@ def sr_cvt_copy(
     seed: Int32,
     tidx: Int32,
     *,
+    retile: bool = False,
     loc=None,
     ip=None,
 ) -> None:
@@ -164,6 +165,8 @@ def sr_cvt_copy(
     raw_vec = convert_sr(src_vec, seed, tidx, loc=loc, ip=ip)
     src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
     src = src_cvt
+    if const_expr(retile):
+        src = tiled_copy.retile(src)
     cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
 
 
