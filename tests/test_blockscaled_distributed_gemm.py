@@ -1,6 +1,6 @@
 # Copyright (c) 2026, QuACK team.
 """Multi-rank correctness tests for BlockScaledAllGatherRunner
-(quack/distributed/block_scaled_allgather_gemm.py).
+(quack/distributed/all_gather_gemm.py).
 
 Runs under torchrun (one rank per GPU); the pytest entry point spawns
 torchrun as a subprocess on the available GPUs.
