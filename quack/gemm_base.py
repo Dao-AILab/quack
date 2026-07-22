@@ -44,6 +44,8 @@ class NamedBarrierGemm(enum.IntEnum):
     # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
     # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
     ClcThrottle = enum.auto()
+    # Reducer warp-group sync under epi_reduce_mode.
+    EpiReduce = enum.auto()
 
 
 class GemmBase:
@@ -73,6 +75,12 @@ class GemmBase:
     #   and applies the full epilogue math.
     split_k = 1
     split_k_mode = SplitKMode.SERIAL
+    # Fused epilogue reduction across TP ranks: None | "reduce_scatter" | "all_reduce".
+    # Staging tiles (read by quack.epi_utils.setup_epi_tensor):
+    #   D partials -> epi_tile (epilogue warps, unchanged)
+    #   C / EpiOp aux -> epi_reduce_tile (reducer warps)
+    epi_reduce_mode = None
+    epi_reduce_tile = None
     # mB arrives (l, k, n) and is transposed to (n, k, l) at trace time when set
     # (see rotate_batch_last); compile_gemm_kernel sets these per compiled
     # variant. All three are trace-time relabels replacing per-call host
@@ -224,7 +232,7 @@ class GemmBase:
         tRS_rC: Optional[cute.Tensor],
         tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
         tiled_copy_r2s: cute.TiledCopy,
-        tRS_sD: cute.Tensor,
+        tRS_sD: Optional[cute.Tensor],
         tiled_copy_s2r: Optional[cute.ThrCopy],
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
@@ -236,13 +244,20 @@ class GemmBase:
         tile_scheduler,
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
+        # epi_reduce_mode producer: defer EVT/C/aux to the reducer warps.
+        skip_epi_ops: cutlass.Constexpr[bool] = False,
+        # epi_reduce_mode reducer: store D straight from registers, replacing copy_D.
+        commit_D: Optional[Callable] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
-        has_epi_load = const_expr(self.epi_c_stage > 0)
+        has_epi_load = const_expr(self.epi_c_stage > 0 and not skip_epi_ops)
         has_D = const_expr(copy_D is not None)
+        assert not (copy_D is not None and commit_D is not None), (
+            "copy_D (smem+TMA) and commit_D (register-direct) are alternative D store paths"
+        )
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
-        inline_epi_load = const_expr(copy_C is not None)
+        inline_epi_load = const_expr(copy_C is not None and not skip_epi_ops)
         use_stochastic_rounding = const_expr(
             self.rounding_mode == RoundingMode.RS
             and self.acc_dtype == cutlass.Float32
@@ -254,14 +269,18 @@ class GemmBase:
         # TileStore op (empty for the default epilogue). ``store_pred`` is
         # None for an unconditional store, else a per-CTA-tile Boolean (e.g.
         # GemmSymmetric skips the mirrored write on diagonal tiles).
-        aux_out_ctxs = self.epi_setup_aux_out(
-            params,
-            epi_smem_tensors,
-            tiled_copy_r2s,
-            tiled_copy_t2r,
-            tile_coord_mnkl,
-            varlen_manager,
-            tidx,
+        aux_out_ctxs = (
+            self.epi_setup_aux_out(
+                params,
+                epi_smem_tensors,
+                tiled_copy_r2s,
+                tiled_copy_t2r,
+                tile_coord_mnkl,
+                varlen_manager,
+                tidx,
+            )
+            if const_expr(not skip_epi_ops)
+            else ()
         )
 
         epi_tile_shape = cute.zipped_divide(
@@ -273,20 +292,24 @@ class GemmBase:
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
-        epi_tensors = self.epi_begin(
-            params,
-            epi_smem_tensors,
-            epi_tile,
-            tiled_copy_t2r,
-            tiled_copy_r2s,
-            tile_coord_mnkl,
-            varlen_manager,
-            epilogue_barrier,
-            tidx,
-            tRS_rD.layout,
+        epi_tensors = (
+            self.epi_begin(
+                params,
+                epi_smem_tensors,
+                epi_tile,
+                tiled_copy_t2r,
+                tiled_copy_r2s,
+                tile_coord_mnkl,
+                varlen_manager,
+                epilogue_barrier,
+                tidx,
+                tRS_rD.layout,
+            )
+            if const_expr(not skip_epi_ops)
+            else ()
         )
 
-        if const_expr(self.epi_needs_acc_prepass):
+        if const_expr(self.epi_needs_acc_prepass and not skip_epi_ops):
             assert self.arch in (90, 100, 120), (
                 "acc prepass needs a re-readable accumulator (SM90/SM120 registers / SM100 tmem)"
             )
@@ -346,7 +369,11 @@ class GemmBase:
                     cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, c_buffer], tSR_rC)
                     # TODO: cp.async wait once we switch to cp.async
                     epilogue_barrier.arrive_and_wait()
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
+            epi_loop_tensors = (
+                self.epi_begin_loop(params, epi_tensors, epi_coord)
+                if const_expr(not skip_epi_ops)
+                else {}
+            )
             if const_expr(inline_epi_load and epi_idx + self.epi_c_stage < epi_tile_num):
                 epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
                 if const_expr(use_tma_c):
@@ -364,18 +391,23 @@ class GemmBase:
             # Returns a tuple of register tensors — one per aux output.
             # Length matches ``aux_out_ctxs``. ``()`` for the default
             # epilogue (no aux output).
-            tRS_rAuxOuts = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
-            self.epi_end_loop(
-                params,
-                epi_tensors,
-                epi_coord,
-                epi_tile,
-                tiled_copy_t2r,
-                tiled_copy_r2s,
-                tile_coord_mnkl,
-                varlen_manager,
-                tidx,
+            tRS_rAuxOuts = (
+                self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+                if const_expr(not skip_epi_ops)
+                else ()
             )
+            if const_expr(not skip_epi_ops):
+                self.epi_end_loop(
+                    params,
+                    epi_tensors,
+                    epi_coord,
+                    epi_tile,
+                    tiled_copy_t2r,
+                    tiled_copy_r2s,
+                    tile_coord_mnkl,
+                    varlen_manager,
+                    tidx,
+                )
             # Convert each output to its storage dtype.
             tRS_rAuxOuts_out = tuple(
                 self.epi_convert_aux_out(
@@ -445,17 +477,20 @@ class GemmBase:
                         if store_pred:
                             copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
+            if const_expr(commit_D is not None):
+                commit_D(tRS_rD, epi_coord)
 
-        self.epi_end(
-            params,
-            epi_tensors,
-            epi_tile,
-            tiled_copy_t2r,
-            tiled_copy_r2s,
-            tile_coord_mnkl,
-            varlen_manager,
-            tidx,
-        )
+        if const_expr(not skip_epi_ops):
+            self.epi_end(
+                params,
+                epi_tensors,
+                epi_tile,
+                tiled_copy_t2r,
+                tiled_copy_r2s,
+                tile_coord_mnkl,
+                varlen_manager,
+                tidx,
+            )
 
         return epi_read_state, epi_producer_state
 
@@ -584,6 +619,8 @@ class GemmBase:
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
+        # epi_reduce_mode: announces the finalized tile's D commit; fires once per tile.
+        signal_finalized_tile: Optional[Callable] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """The split-K finalization protocol around an epilogue closure.
 
@@ -607,7 +644,16 @@ class GemmBase:
         ``epi_read_state``/``epi_producer_state`` are the same values already bound
         into ``epi_fn``; they are passed here only so the partial-commit branch can
         return them unchanged.
+
+        Under self.epi_reduce_mode the epilogue runs with the epi ops skipped (EVT/C/aux
+        belong to the reducer warps; the caller binds skip_epi_ops into ``epi_fn``) and
+        signal_finalized_tile fires where the full epilogue runs: once per output tile,
+        on the finalizing entity, after its D stores drain. Non-finalizing splits never
+        call it — their only signaling is the internal split-K semaphore.
         """
+        assert not (self.epi_reduce_mode is not None and signal_finalized_tile is None), (
+            "epi_reduce_mode requires signal_finalized_tile (the reducer warps spin on tile flags)"
+        )
         finalizer_load_acc = load_acc_subtile
         if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
             # The flag and workspace are CuTe tensors over the (cluster-rounded) tile
@@ -684,6 +730,12 @@ class GemmBase:
                 if const_expr(epi_store_pipeline is not None):
                     if is_tma_warp:
                         epi_store_pipeline.producer_tail()
+            # Only the finalizing entity reaches here (non-finalizing splits committed
+            # raw partials above); fire after this warp's D partial TMA stores drain.
+            if const_expr(signal_finalized_tile is not None):
+                if is_tma_warp:
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+                    signal_finalized_tile()
         return epi_read_state, epi_producer_state
 
     def get_scheduler_class(self, varlen_m: bool = False):
@@ -1052,8 +1104,14 @@ class GemmTmaBase(GemmBase):
             )
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
+            # Under epi_reduce_mode, C is consumed by the reducer warps per epi_reduce_tile.
+            epi_c_tile = (
+                self.epi_reduce_tile
+                if const_expr(self.epi_reduce_mode is not None)
+                else self.epi_tile
+            )
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
-                mC, self.epi_c_smem_layout_staged, self.epi_tile, op_type="load"
+                mC, self.epi_c_smem_layout_staged, epi_c_tile, op_type="load"
             )
         return (
             tma_atom_d,
@@ -1123,8 +1181,13 @@ class GemmTmaBase(GemmBase):
         tx_count: int,
     ):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        # Each warp will contribute 1 to the arrive count
-        consumer_arrive_cnt = self.num_epi_warps
+        # Each warp contributes 1 to the arrive count; under epi_reduce_mode the
+        # C pipeline's consumers are the reducer warps, not the epilogue warps.
+        consumer_arrive_cnt = (
+            self.num_epi_warps
+            if const_expr(self.epi_reduce_mode is None)
+            else self.num_epi_reduce_warps
+        )
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1143,6 +1206,17 @@ class GemmTmaBase(GemmBase):
         epi_store_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_epi_threads)
         return pipeline.PipelineTmaStore.create(
             num_stages=self.epi_stage, producer_group=epi_store_producer_group
+        )
+
+    def make_epi_reduce_store_pipeline(self):
+        """AuxOut store (S2G) in the reducer epilogue; the epilogue warps' D_store
+        keeps its own epi_store_pipeline."""
+        num_epi_reduce_threads = self.num_epi_reduce_warps * cute.arch.WARP_SIZE
+        epi_reduce_store_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, num_epi_reduce_threads
+        )
+        return pipeline.PipelineTmaStore.create(
+            num_stages=self.epi_stage, producer_group=epi_reduce_store_producer_group
         )
 
     @staticmethod
