@@ -2,9 +2,16 @@
 
 """CuTe DSL helpers and integration hooks."""
 
-import quack.dsl.cute_tensor_indexing  # noqa: F401
-import quack.dsl.cute_tensor  # noqa: F401
-import quack.dsl.mixed_constexpr_if  # noqa: F401
+import torch
+
+# CuTe helpers are a CUDA-only process-wide initialization. Keeping them out
+# of ROCm imports lets the backend-neutral torch_library_op compatibility path
+# work without NVIDIA dependencies.
+if torch.version.hip is None:
+    import quack.dsl.cute_tensor_indexing  # noqa: F401
+    import quack.dsl.cute_tensor  # noqa: F401
+    import quack.dsl.mixed_constexpr_if  # noqa: F401
+
 from quack.dsl.torch_library_op import cute_op
 
 __all__ = ["cute_op"]

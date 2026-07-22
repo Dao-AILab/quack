@@ -1,29 +1,82 @@
-__version__ = "0.6.1"
+"""Quack's backend-aware public package surface.
+
+CUDA builds preserve the original eager CuTe initialization. ROCm builds keep
+both compiler backends unloaded until a public operator is requested.
+"""
+
+from __future__ import annotations
 
 import os
+from importlib import import_module
 
-import quack.dsl as _quack_dsl  # noqa: F401
+__version__ = "0.6.1"
 
-if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
-    from quack.dsl import cute_dsl_ptxas as _cute_dsl_ptxas
+__all__ = ["rmsnorm", "softmax", "cross_entropy", "RoundingMode"]
 
-    # Patch before importing any modules that instantiate CuTeDSL. The patch
-    # forces PTX dumping so the CUDA library loader can replace CUTLASS DSL's
-    # embedded ptxas-library cubin with one assembled by system ptxas.
-    _cute_dsl_ptxas.patch()
-
-# Pythonic CuTe tensor indexing (`:` / `...` sugar) is installed as a side effect
-# of importing `quack.dsl`, which imports `quack.dsl.cute_tensor_indexing` and
-# monkey-patches CuTe's tensor classes process-wide.
-from quack.rmsnorm import rmsnorm  # noqa: E402
-from quack.softmax import softmax  # noqa: E402
-from quack.cross_entropy import cross_entropy  # noqa: E402
-from quack.rounding import RoundingMode  # noqa: E402
+_LAZY_EXPORTS = {
+    "softmax": ("quack.softmax", "softmax"),
+    "cross_entropy": ("quack.cross_entropy", "cross_entropy"),
+    "RoundingMode": ("quack.rounding", "RoundingMode"),
+}
 
 
-__all__ = [
-    "rmsnorm",
-    "softmax",
-    "cross_entropy",
-    "RoundingMode",
-]
+def __getattr__(name: str):
+    if name == "rmsnorm":
+        import torch
+
+        if torch.compiler.is_compiling():
+            raise RuntimeError("resolve `from quack import rmsnorm` before entering torch.compile")
+        from quack.backends.registry import REGISTRY
+        from quack.backends.target import vendor_from_torch_build
+
+        vendor = vendor_from_torch_build()
+        if vendor not in {"amd", "nvidia"}:
+            raise RuntimeError("quack.rmsnorm requires a CUDA or ROCm PyTorch build")
+        value = REGISTRY.load_provider("rmsnorm", vendor).load_op()
+        globals()[name] = value
+        return value
+    try:
+        module_name, attr_name = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    value = getattr(import_module(module_name), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
+
+
+def _initialize_backend_exports() -> None:
+    """Restore pre-existing CUDA initialization and callable exports.
+
+    CUDA builds install CuTe tensor helpers and bind callable package exports
+    during ``import quack``. ROCm builds leave exports lazy so importing Quack
+    never requires CuTe or FlyDSL.
+    """
+
+    import torch
+
+    if torch.version.hip is not None:
+        return
+    if torch.version.cuda is None:
+        return
+
+    import_module("quack.dsl")
+    if os.environ.get("CUTE_DSL_PTXAS_PATH") is not None:
+        from quack.dsl import cute_dsl_ptxas as _cute_dsl_ptxas
+
+        _cute_dsl_ptxas.patch()
+
+    exports = {
+        "rmsnorm": ("quack.rmsnorm", "rmsnorm"),
+        "softmax": ("quack.softmax", "softmax"),
+        "cross_entropy": ("quack.cross_entropy", "cross_entropy"),
+        "RoundingMode": ("quack.rounding", "RoundingMode"),
+    }
+    for name, (module_name, attr_name) in exports.items():
+        globals()[name] = getattr(import_module(module_name), attr_name)
+
+
+_initialize_backend_exports()

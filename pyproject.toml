@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.1"]
+flydsl = ["flydsl>=0.2.3"]
+rocm = ["flydsl>=0.2.3"]
 heuristics = ["nvidia-matmul-heuristics"]
 jax = ["jax", "jax-tvm-ffi"]
 bench = ["pandas", "tyro"]

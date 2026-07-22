@@ -29,9 +29,9 @@ jobs:
       - name: Install ruff
         run: pip install ruff
       - name: Ruff check
-        run: ruff check quack/ tests/
+        run: ruff check quack/ tests/ benchmarks/benchmark_rmsnorm_flydsl.py
       - name: Ruff format
-        run: ruff format --check quack/ tests/
+        run: ruff format --check quack/ tests/ benchmarks/benchmark_rmsnorm_flydsl.py
 
   changes:
     runs-on: ubuntu-24.04
@@ -50,6 +50,7 @@ jobs:
             code:
               - 'quack/**'
               - 'tests/**'
+              - 'benchmarks/benchmark_rmsnorm_flydsl.py'
               - '.github/**'
               - 'pyproject.toml'
 

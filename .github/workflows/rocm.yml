@@ -1,0 +1,118 @@
+name: ROCm FlyDSL
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "quack/**"
+      - "tests/test_benchmark_rmsnorm_flydsl.py"
+      - "tests/test_rmsnorm_dispatch.py"
+      - "tests/test_rmsnorm_flydsl.py"
+      - "tests/test_rocm_workflow.py"
+      - "benchmarks/benchmark_rmsnorm_flydsl.py"
+      - "pyproject.toml"
+      - ".github/workflows/rocm.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "quack/**"
+      - "tests/test_benchmark_rmsnorm_flydsl.py"
+      - "tests/test_rmsnorm_dispatch.py"
+      - "tests/test_rmsnorm_flydsl.py"
+      - "tests/test_rocm_workflow.py"
+      - "benchmarks/benchmark_rmsnorm_flydsl.py"
+      - "pyproject.toml"
+      - ".github/workflows/rocm.yml"
+  pull_request_target:
+    branches: [main]
+    paths:
+      - "quack/**"
+      - "tests/test_benchmark_rmsnorm_flydsl.py"
+      - "tests/test_rmsnorm_dispatch.py"
+      - "tests/test_rmsnorm_flydsl.py"
+      - "tests/test_rocm_workflow.py"
+      - "benchmarks/benchmark_rmsnorm_flydsl.py"
+      - "pyproject.toml"
+      - ".github/workflows/rocm.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-flydsl-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROCM_PYTORCH_IMAGE: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
+  EXPECTED_TORCH_VERSION: "2.9.1"
+  EXPECTED_ROCM_VERSION: "7.2"
+  FLYDSL_VERSION: "0.2.3"
+  PYTEST_VERSION: "8.4.2"
+
+jobs:
+  rmsnorm:
+    if: >
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
+    name: rmsnorm (${{ matrix.arch }})
+    environment: gpu-ci
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: linux-flydsl-mi325-1, arch: gfx942 }
+          - { runner: linux-flydsl-mi355-1, arch: gfx950 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Run isolated ROCm tests
+        env:
+          EXPECTED_GFX: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          DEVICE_ARGS=(--device /dev/kfd)
+          if [ -f /etc/podinfo/gha-render-devices ]; then
+            read -r -a RENDER_ARGS <<< "$(cat /etc/podinfo/gha-render-devices)"
+            DEVICE_ARGS+=("${RENDER_ARGS[@]}")
+          else
+            DEVICE_ARGS+=(--device /dev/dri)
+          fi
+          docker run --rm --network=host "${DEVICE_ARGS[@]}" \
+            --group-add video --ipc=host --shm-size=8g \
+            --security-opt seccomp=unconfined \
+            -e HIP_VISIBLE_DEVICES=0 \
+            -e QUACK_EXPECTED_GFX="${EXPECTED_GFX}" \
+            -e FLYDSL_GPU_ARCH="${EXPECTED_GFX}" \
+            -e FLYDSL_VERSION -e EXPECTED_TORCH_VERSION \
+            -e EXPECTED_ROCM_VERSION -e PYTEST_VERSION \
+            -v "${GITHUB_WORKSPACE}:/workspace" -w /workspace \
+            "${ROCM_PYTORCH_IMAGE}" bash -lc '
+              set -euo pipefail
+              python3 -m pip install --no-cache-dir \
+                "flydsl==${FLYDSL_VERSION}" "pytest==${PYTEST_VERSION}"
+              python3 -m pip install --no-deps -e .
+              python3 -c "import os; from importlib.metadata import version; import torch; \
+                arch = torch.cuda.get_device_properties(0).gcnArchName.split(\":\", 1)[0]; \
+                assert version(\"flydsl\") == os.environ[\"FLYDSL_VERSION\"]; \
+                assert torch.__version__.startswith(os.environ[\"EXPECTED_TORCH_VERSION\"]); \
+                assert torch.version.hip.startswith(os.environ[\"EXPECTED_ROCM_VERSION\"]); \
+                assert arch == os.environ[\"QUACK_EXPECTED_GFX\"]"
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+                python3 -m pytest --noconftest -q \
+                  tests/test_benchmark_rmsnorm_flydsl.py \
+                  tests/test_rmsnorm_dispatch.py \
+                  tests/test_rmsnorm_flydsl.py \
+                  tests/test_rocm_workflow.py
+              python3 benchmarks/benchmark_rmsnorm_flydsl.py \
+                --M 64 --N 65 --dtype bfloat16 \
+                --warmup 1 --iterations 2 --skip-torch-compile \
+                --output-json /tmp/rmsnorm-flydsl-benchmark.json
+            '
