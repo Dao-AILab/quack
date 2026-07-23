@@ -309,6 +309,39 @@ def test_rotary_emb_vector_width_selection(headdim, rotary_dim, x_offset, dtype)
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("seqlen_offsets_type", [None, torch.Tensor])
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize(("headdim", "rotary_dim"), [(256, 128), (512, 256)])
+def test_rotary_emb_large_partial_tail_copy(
+    headdim, rotary_dim, interleaved, seqlen_offsets_type, dtype
+):
+    torch.manual_seed(42)
+    device = "cuda"
+    batch_size, seqlen, nheads = 2, 23, 3
+    x = torch.randn(
+        batch_size, seqlen, nheads, headdim, dtype=dtype, device=device, requires_grad=True
+    )
+    x_pt = x.detach().clone().requires_grad_()
+    cos, sin = generate_cos_sin(seqlen, rotary_dim, device, dtype)
+    seqlen_offsets = generate_seqlen_offsets(seqlen_offsets_type, batch_size, seqlen, device)
+
+    out = apply_rotary_emb(x, cos, sin, seqlen_offsets=seqlen_offsets, interleaved=interleaved)
+    cos_pt, sin_pt = index_cos_sin(cos, sin, seqlen_offsets, seqlen)
+    out_pt = apply_rotary_emb_torch(
+        x_pt.float(), cos_pt.float(), sin_pt.float(), interleaved=interleaved
+    ).to(dtype=dtype)
+
+    grad = torch.randn_like(out)
+    grad_pt = grad.clone()
+    out.backward(grad)
+    out_pt.backward(grad_pt)
+
+    assert torch.equal(x, x_pt)
+    torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
+
+
 @pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float32])
 # @pytest.mark.parametrize("x_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("cossin_dtype", [torch.bfloat16, torch.float32])
