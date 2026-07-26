@@ -53,19 +53,16 @@ def _dist_setup(m, k, world_size):
     assert k % world_size == 0, f"k ({k}) must be divisible by world_size ({world_size})"
 
 
-def _make_comm(m, n, l, tile_n, cta_m, num_ranks):
+def _make_comm(m, n, l, tile_m, tile_n, cluster_m, num_ranks):
     """Symmetric D work buffer + flags/barriers/counters; torch handles only."""
-    import cutlass
-
-    from quack.dist_utils import create_multicast_tensor
+    from quack.dist_utils import make_symmetric_tensor
     from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 
-    d_cpu = torch.empty(l, m, n, dtype=torch.bfloat16).permute(1, 2, 0)
-    _, _, d_torch_gpu, d_torch_gpu_mc, d_peer_torch, _ = create_multicast_tensor(
-        d_cpu, cutlass.BFloat16, leading_dim=1
+    d_torch_gpu, d_torch_gpu_mc, d_peer_torch = make_symmetric_tensor(
+        (l, m, n), torch.bfloat16, (1, 2, 0)
     )
     epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_n, num_ranks
+        d_torch_gpu_mc, d_peer_torch, m, n, l, tile_m, tile_n, cluster_m, num_ranks
     )
     return (
         d_torch_gpu,
@@ -120,14 +117,13 @@ def _run_gemm_act_reduce(
 
     tile_m, tile_n = 256, 256
     cluster_m, cluster_n = 2, 1
-    cta_m = tile_m // 2
     assert n % 8 == 0, f"n ({n}) must be divisible by 8 (16B multimem vectors)"
     k_local = k // world_size
     m_per_rank = m // world_size
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
     d_torch_gpu, epi_reduce_args, tf_torch, counters_torch = _make_comm(
-        m, n, l, tile_n, cta_m, world_size
+        m, n, l, tile_m, tile_n, cluster_m, world_size
     )
     d_arg = d_torch_gpu.permute(2, 0, 1)  # caller-order (l, m, n) view
     # Aux is slab-local under epi_reduce (epilogue coords are m/TP-shaped).
@@ -291,7 +287,6 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
 
     tile_m, tile_n = 256, 256
     cluster_m, cluster_n = 2, 1
-    cta_m = tile_m // 2
     assert n % 8 == 0, f"n ({n}) must be divisible by 8 (16B multimem vectors)"
     k_local = k // world_size
     m_per_rank = m // world_size
@@ -299,7 +294,7 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
     d_torch_gpu, epi_reduce_args, tf_torch, counters_torch = _make_comm(
-        m, n, l, tile_n, cta_m, world_size
+        m, n, l, tile_m, tile_n, cluster_m, world_size
     )
     d_arg = d_torch_gpu.permute(2, 0, 1)
     # Per-N-tile sq partials, slab-local under epi_reduce; norm_weight is common

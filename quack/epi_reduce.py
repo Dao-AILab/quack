@@ -11,8 +11,8 @@ is split_rank_partial_commit — register-direct d_dtype D partials into symmetr
 then the tile signal. The reducer's is epilogue() between two bound functions:
 multimem ld_reduce in, EVT/C_load/aux TileStores unchanged in the middle,
 register-direct store out (this rank's slab for reduce_scatter, multimem_st
-broadcast for all_reduce). Pipelines: epi_pipeline stages C for the reducer;
-epi_reduce_store_pipeline backs the reducer's aux stores."""
+broadcast for all_reduce). Pipelines: epi_pipeline stages C for the reducer; the
+reducer's aux stores ride its own epi_store_pipeline instance."""
 
 from typing import NamedTuple, Optional
 
@@ -46,6 +46,50 @@ class EpiReduceArguments(NamedTuple):
     sync_barrier_mc: Optional[cute.Tensor] = None
     # consumer-private epoch bases, slab_tiles_m * ceil(N/cta_N) * L entries
     consumer_counters: Optional[cute.Tensor] = None
+
+
+def validate_epi_reduce_args(epi_reduce_args, D, m, n, l, tile_M, tile_N, cluster_M, num_ranks):
+    """Guard the comm bundle against this call's geometry — the epi_reduce sibling of
+    validate_ag_geometry, called per launch from every frontend (warm plan-cache hits
+    skip trace-time asserts, so the host is the only per-call check). Everything here
+    is a mismatch the kernel can only corrupt or hang on: multimem vector width,
+    kernel-order comm views, and flag/counter capacities (an under-sized flag array
+    is a silent OOB multimem write)."""
+    import torch
+
+    era = epi_reduce_args
+    if m % num_ranks:
+        raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
+    if D is None:
+        raise ValueError("epi_reduce_mode requires D (the symmetric work buffer)")
+    vec = 16 // D.element_size()
+    if n % vec:
+        raise ValueError(f"epi_reduce_mode: n ({n}) must be divisible by {vec}")
+    if D.stride(-1) != 1:
+        raise ValueError("epi_reduce_mode: D must be n-major (multimem vectors)")
+    if len(era.mD_peers) != num_ranks:
+        raise ValueError(
+            f"epi_reduce_args.mD_peers has {len(era.mD_peers)} views, world {num_ranks}"
+        )
+    mnl = (m, n, l)
+    for name, t in (("mD_mc", era.mD_mc), ("mD_peers[0]", era.mD_peers[0])):
+        if tuple(t.shape) != mnl:
+            raise ValueError(
+                f"epi_reduce_args.{name}: kernel-order (m, n, l) {mnl} expected, "
+                f"got {tuple(t.shape)}"
+            )
+    use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
+    cta_m = tile_M // (2 if use_2cta else 1)
+    n_tiles = (n + tile_N - 1) // tile_N
+    ntiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
+    if era.tile_flags.numel() < ntiles or era.tile_flags_mc.numel() < ntiles:
+        raise ValueError(f"epi_reduce_args.tile_flags needs >= {ntiles} entries")
+    num_sms = torch.cuda.get_device_properties(D.device).multi_processor_count
+    if era.sync_barrier.numel() < num_sms or era.sync_barrier_mc.numel() < num_sms:
+        raise ValueError(f"epi_reduce_args.sync_barrier needs >= {num_sms} entries")
+    slab_tiles = ((m // num_ranks + cta_m - 1) // cta_m) * n_tiles * l
+    if era.consumer_counters.numel() < slab_tiles:
+        raise ValueError(f"epi_reduce_args.consumer_counters needs >= {slab_tiles} entries")
 
 
 # ---- reducer tile scheduler ----

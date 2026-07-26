@@ -2168,7 +2168,8 @@ class GemmSm100(GemmTmaBase):
 
                 slab_tiles_m = cute.ceil_div(slab_m, cta_m)
 
-                epi_reduce_store_pipeline = self.make_epi_reduce_store_pipeline()
+                # Reducer warps' own instance, for their aux S2G stores.
+                epi_store_pipeline = self.make_epi_store_pipeline()
 
                 epi_reduce_tidx = tidx - self.epi_reduce_warp_ids[0] * 32
                 thr_copy_fake = tiled_copy_fake.get_slice(epi_reduce_tidx)
@@ -2249,7 +2250,7 @@ class GemmSm100(GemmTmaBase):
                             epilogue_params,
                             epi_smem_tensors,
                             epi_pipeline,
-                            epi_reduce_store_pipeline,
+                            epi_store_pipeline,
                             epi_read_state,
                             None,  # epi_producer_state (only for inline_epi_load)
                             self.epi_reduce_tile,
@@ -2280,7 +2281,7 @@ class GemmSm100(GemmTmaBase):
                             self.epi_reduce_tile,
                             epi_read_state,
                             None,  # epi_producer_state
-                            None,  # epi_store_pipeline
+                            None,  # epi_store_pipeline: reducer never TMA-stores D; aux drains at exit
                             cta_tile_coord_mnkl,
                             self.epi_reduce_barrier,
                             epi_reduce_tidx,
@@ -2296,7 +2297,7 @@ class GemmSm100(GemmTmaBase):
 
                 # Drain outstanding aux TMA stores before exit (no-op when none issued).
                 if warp_idx == self.epi_reduce_warp_ids[0]:
-                    epi_reduce_store_pipeline.producer_tail()
+                    epi_store_pipeline.producer_tail()
 
                 cute.arch.barrier(
                     barrier_id=self.epi_reduce_sync_bar_id,

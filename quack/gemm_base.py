@@ -589,6 +589,8 @@ class GemmBase:
             load_acc_subtile(tRS_rD, epi_coord)
             tRS_rD_out = cute.make_rmem_tensor(tRS_rD.layout.shape, self.d_dtype)
             tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
+            # Direct D store measures ~1-3% slower than a TMA-pipelined commit
+            # (lost async-store overlap) but frees the sD smem and needs no drain.
             tRS_gD_cur = tRS_gD[None, None, None, epi_coord[0], epi_coord[1]]
             if full_tile:
                 cute.autovec_copy(tRS_rD_out, tRS_gD_cur)
@@ -788,6 +790,8 @@ class GemmBase:
         epi_tile: cute.Tile,
         epi_read_state: Optional[cutlass.pipeline.PipelineState],
         epi_producer_state: Optional[cutlass.pipeline.PipelineState],
+        # Also bound inside epi_fn: the closure is opaque to the protocol layer,
+        # so the shared tail's split-K drain needs the pipeline passed directly.
         epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
         tile_coord_mnkl: cute.Coord,
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
@@ -830,8 +834,23 @@ class GemmBase:
         addressing (fragment-order gmem partition of this tile of symmetric D),
         and the reducer's spin + epoch counters. Without epi_reduce_mode this is
         a pure passthrough (world of 1 is a trivial rank split)."""
+        if const_expr(self.epi_reduce_mode is None):
+            return self.epilogue_split_k(
+                params,
+                epi_fn,
+                load_acc_subtile,
+                tRS_rD,
+                epi_tile,
+                epi_read_state,
+                epi_producer_state,
+                epi_store_pipeline,
+                tile_coord_mnkl,
+                epilogue_barrier,
+                tidx,
+                is_tma_warp,
+            )
         cta_m, cta_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
-        if const_expr(self.epi_reduce_mode is not None and is_producer):
+        if const_expr(is_producer):
             assert tiled_copy_r2s is not None and epi_reduce_args is not None, (
                 "producer needs tiled_copy_r2s and epi_reduce_args"
             )
@@ -883,7 +902,23 @@ class GemmBase:
                 in_bounds=in_bounds,
                 is_tma_warp=is_tma_warp,
             )
-        if const_expr(self.epi_reduce_mode is not None and not is_producer):
+            # Nesting through epilogue_split_k composes local split-K: the
+            # committed partial is the rank's completed local sum.
+            return self.epilogue_split_k(
+                params,
+                epi_fn,
+                load_acc_subtile,
+                tRS_rD,
+                epi_tile,
+                epi_read_state,
+                epi_producer_state,
+                epi_store_pipeline,
+                tile_coord_mnkl,
+                epilogue_barrier,
+                tidx,
+                is_tma_warp,
+            )
+        else:
             assert epi_reduce_args is not None, "reducer needs epi_reduce_args"
             # Finalizer wait — the sibling of split-K's sem.wait_eq(S-1). Producer
             # tiles (and their flags) are anchored at global row 0; consumer tiles
@@ -934,20 +969,6 @@ class GemmBase:
                 )
             epilogue_barrier.arrive_and_wait()
             return epi_fn(load_acc_subtile)
-        return self.epilogue_split_k(
-            params,
-            epi_fn,
-            load_acc_subtile,
-            tRS_rD,
-            epi_tile,
-            epi_read_state,
-            epi_producer_state,
-            epi_store_pipeline,
-            tile_coord_mnkl,
-            epilogue_barrier,
-            tidx,
-            is_tma_warp,
-        )
 
     def get_scheduler_class(self, varlen_m: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
@@ -1417,17 +1438,6 @@ class GemmTmaBase(GemmBase):
         epi_store_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_epi_threads)
         return pipeline.PipelineTmaStore.create(
             num_stages=self.epi_stage, producer_group=epi_store_producer_group
-        )
-
-    def make_epi_reduce_store_pipeline(self):
-        """AuxOut store (S2G) in the reducer epilogue; the epilogue warps' D_store
-        keeps its own epi_store_pipeline."""
-        num_epi_reduce_threads = self.num_epi_reduce_warps * cute.arch.WARP_SIZE
-        epi_reduce_store_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_epi_reduce_threads
-        )
-        return pipeline.PipelineTmaStore.create(
-            num_stages=self.epi_stage, producer_group=epi_reduce_store_producer_group
         )
 
     @staticmethod

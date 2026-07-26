@@ -57,7 +57,7 @@ def _run_gemm_epi_reduce(
     from quack.dist_utils import (
         torchrun_init_nvshmem,
         torchrun_finalize_nvshmem,
-        create_multicast_tensor,
+        make_symmetric_tensor,
     )
     from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
     from quack.gemm import gemm
@@ -100,18 +100,13 @@ def _run_gemm_epi_reduce(
     )
     a_gpu = a_torch_cpu.cuda()
     b_gpu = b_torch_cpu.cuda()
-    d_cpu = torch.empty(l, m, n, dtype=torch_d).permute(1, 2, 0)
-    _, _, d_torch_gpu, d_torch_gpu_mc, d_peer_torch, _ = create_multicast_tensor(
-        d_cpu, d_dtype, leading_dim=1
-    )
+    d_torch_gpu, d_torch_gpu_mc, d_peer_torch = make_symmetric_tensor((l, m, n), torch_d, (1, 2, 0))
     # D arg is caller-order (l, m, n); the EpiReduceArguments views stay kernel-order (m, n, l).
     d_arg = d_torch_gpu.permute(2, 0, 1)
 
-    use_2cta = cluster_m % 2 == 0 and tile_m in (128, 256)
-    cta_m = tile_m // (2 if use_2cta else 1)
     # torch handles inside the args are the sole refs keeping the symmetric allocs alive
     epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_n, world_size
+        d_torch_gpu_mc, d_peer_torch, m, n, l, tile_m, tile_n, cluster_m, world_size
     )
     tf_torch = epi_reduce_args.tile_flags
     counters_torch = epi_reduce_args.consumer_counters

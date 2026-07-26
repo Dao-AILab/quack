@@ -25,7 +25,7 @@ from quack.bench.bench_utils_dist import do_bench_all
 from quack.dist_utils import (
     torchrun_init_nvshmem,
     torchrun_finalize_nvshmem,
-    create_multicast_tensor,
+    make_symmetric_tensor,
 )
 from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 from quack.cute_dsl_utils import get_device_capacity
@@ -133,16 +133,11 @@ def run(args):
     )
     # D is (m, n, l) n-major in symmetric memory (the multimem reduce reads partials
     # there); gemm() takes the caller-order (l, m, n) view.
-    d_cpu = torch.empty(l, m, n, dtype=torch_d).permute(1, 2, 0)
-    _, _, d_torch_gpu, d_torch_gpu_mc, d_peer_torch, _ = create_multicast_tensor(
-        d_cpu, d_dtype, leading_dim=1
-    )
+    d_torch_gpu, d_torch_gpu_mc, d_peer_torch = make_symmetric_tensor((l, m, n), torch_d, (1, 2, 0))
     d_arg = d_torch_gpu.permute(2, 0, 1)
 
-    use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
-    cta_m = tile_M // (2 if use_2cta else 1)
     epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_N, world_size
+        d_torch_gpu_mc, d_peer_torch, m, n, l, tile_M, tile_N, cluster_M, world_size
     )
 
     # No host-side barriers in the loop: the kernel owns cross-invocation sync
@@ -204,7 +199,7 @@ def run(args):
         print(f"  (quack speedup vs cuBLAS+NCCL: {t_base / t_quack:.2f}x)")
 
     dist.barrier()
-    # create_multicast_tensor / make_barrier_flags registered their frees via on_finalize;
+    # make_symmetric_tensor / make_barrier_flags registered their frees via on_finalize;
     # this runs them (reverse order), then nvshmem.core.finalize() + destroy_process_group().
     torchrun_finalize_nvshmem()
 

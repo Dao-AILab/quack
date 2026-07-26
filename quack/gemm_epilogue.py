@@ -163,6 +163,7 @@ from cutlass import const_expr
 
 from quack.cute_dsl_utils import get_device_capacity, mlir_namedtuple, torch2cute_dtype_map
 from quack.epi_composable import ComposableEpiMixin
+from quack.epi_reduce import validate_epi_reduce_args
 from quack.epi_ops import (
     ColVecLoad,
     EpiOp,
@@ -1428,43 +1429,17 @@ class EpiMod:
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
         epi_base_shape = _tile_shape(batch, m_epi, n_gemm, varlen_m)
         if epi_reduce_mode is not None:
-            # Guard what the kernel can only corrupt on: multimem vector width,
-            # kernel-order comm views, and flag/counter capacities (an under-sized
-            # flag array is a silent OOB multimem write). Warm plan-cache hits
-            # skip trace-time asserts, so the host is the only per-call check.
-            import torch
-
-            era = epi_reduce_args
-            if D is None:
-                raise ValueError("epi_reduce_mode requires D (the symmetric work buffer)")
-            vec = 16 // D.element_size()
-            if n_gemm % vec:
-                raise ValueError(f"epi_reduce_mode: n ({n_gemm}) must be divisible by {vec}")
-            if D.stride(-1) != 1:
-                raise ValueError("epi_reduce_mode: D must be n-major (multimem vectors)")
-            if len(era.mD_peers) != num_ranks:
-                raise ValueError(
-                    f"epi_reduce_args.mD_peers has {len(era.mD_peers)} views, world {num_ranks}"
-                )
-            mnl = (m, n_gemm, batch if batch is not None else 1)
-            for name, t in (("mD_mc", era.mD_mc), ("mD_peers[0]", era.mD_peers[0])):
-                if tuple(t.shape) != mnl:
-                    raise ValueError(
-                        f"epi_reduce_args.{name}: kernel-order (m, n, l) {mnl} expected, "
-                        f"got {tuple(t.shape)}"
-                    )
-            use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
-            cta_m = tile_M // (2 if use_2cta else 1)
-            n_tiles = (n_gemm + tile_N - 1) // tile_N
-            ntiles = ((m + cta_m - 1) // cta_m) * n_tiles * mnl[2]
-            if era.tile_flags.numel() < ntiles or era.tile_flags_mc.numel() < ntiles:
-                raise ValueError(f"epi_reduce_args.tile_flags needs >= {ntiles} entries")
-            num_sms = torch.cuda.get_device_properties(A.device).multi_processor_count
-            if era.sync_barrier.numel() < num_sms or era.sync_barrier_mc.numel() < num_sms:
-                raise ValueError(f"epi_reduce_args.sync_barrier needs >= {num_sms} entries")
-            slab_tiles = ((m_epi + cta_m - 1) // cta_m) * n_tiles * mnl[2]
-            if era.consumer_counters.numel() < slab_tiles:
-                raise ValueError(f"epi_reduce_args.consumer_counters needs >= {slab_tiles} entries")
+            validate_epi_reduce_args(
+                epi_reduce_args,
+                D,
+                m,
+                n_gemm,
+                batch if batch is not None else 1,
+                tile_M,
+                tile_N,
+                cluster_M,
+                num_ranks,
+            )
         if packed_c:
             if C.stride(-1) == 1 or varlen_m:
                 packed_shape = _tile_shape(batch, m, 2 * n_gemm, varlen_m)

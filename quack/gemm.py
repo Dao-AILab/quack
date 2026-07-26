@@ -11,7 +11,7 @@ from cutlass import Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
 from quack.cache import jit_cache
-from quack.epi_reduce import EpiReduceArguments
+from quack.epi_reduce import EpiReduceArguments, validate_epi_reduce_args
 from quack.split_k_reduce import split_k_reduce
 from quack.gemm_config import SplitKMode
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -473,6 +473,22 @@ def gemm(
             raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
         if epi_reduce_args is None:
             raise ValueError("epi_reduce_mode requires epi_reduce_args")
+        if D is None:
+            raise ValueError("epi_reduce_mode requires D (the symmetric work buffer)")
+        # Geometry/capacity guards (see validate_epi_reduce_args): checked per
+        # call — the bundle is sized to one problem shape, and reuse across
+        # shapes or a tile-config change silently under-sizes the flags.
+        validate_epi_reduce_args(
+            epi_reduce_args,
+            D,
+            D.shape[-2],
+            D.shape[-1],
+            D.shape[0] if D.ndim == 3 else 1,
+            tile_M,
+            tile_N,
+            cluster_M,
+            dist.get_world_size(),
+        )
         epi_reduce = (epi_reduce_mode, dist.get_world_size(), dist.get_rank())
     elif epi_reduce_args is not None:
         raise ValueError("epi_reduce_args requires epi_reduce_mode")
