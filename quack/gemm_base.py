@@ -1337,13 +1337,8 @@ class GemmTmaBase(GemmBase):
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
             # Under epi_reduce_mode, C is consumed by the reducer warps per epi_reduce_tile.
-            epi_c_tile = (
-                self.epi_reduce_tile
-                if const_expr(self.epi_reduce_mode is not None)
-                else self.epi_tile
-            )
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
-                mC, self.epi_c_smem_layout_staged, epi_c_tile, op_type="load"
+                mC, self.epi_c_smem_layout_staged, self.epi_staging_tile, op_type="load"
             )
         return (
             tma_atom_d,
@@ -1432,6 +1427,12 @@ class GemmTmaBase(GemmBase):
             elect_one_release=True,
             syncwarp_before_release=True,
         )
+
+    @property
+    def epi_staging_tile(self):
+        """C/EpiOp tensors stage per the tile of the warp group that consumes them:
+        the reducer's visit tile under epi_reduce, epi_tile otherwise."""
+        return self.epi_reduce_tile if self.epi_reduce_mode is not None else self.epi_tile
 
     def make_epi_store_pipeline(self):
         num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE

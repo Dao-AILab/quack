@@ -178,6 +178,7 @@ def multimem_reduce_subtile(
     subtile_layout: cute.Layout,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
+    # load_acc_subtile signature compat (acc prepass); a multimem load has nothing to release.
     no_release: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Reduce this subtile's D partials across all ranks into tRS_rD via multimem

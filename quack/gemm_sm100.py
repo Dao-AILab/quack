@@ -552,6 +552,10 @@ class GemmSm100(GemmTmaBase):
 
         # epi_reduce tile (32, cta_N): the epi_reduce warps' reduce/visit unit and the C/aux
         # staging unit; a fixed band keeps the register/smem footprint TP-independent.
+        # Reduce/visit and C/aux staging unit. Full-N: a warp's 16B ld_reduces form one
+        # dense 512B row-span; 32 rows: 8 vectors in flight per thread. Narrower tiles
+        # (e.g. epi_tile) measured slower on both counts (18-35%, RS TP=2), warp scatter
+        # dominant.
         self.epi_reduce_tile = None
         if const_expr(self.epi_reduce_mode is not None):
             self.epi_reduce_tile = (32, self.cta_tile_shape_mnk[1])
@@ -628,9 +632,7 @@ class GemmSm100(GemmTmaBase):
             self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
                 self.c_dtype,
                 self.c_layout,
-                self.epi_reduce_tile
-                if const_expr(self.epi_reduce_mode is not None)
-                else self.epi_tile,
+                self.epi_staging_tile,
                 self.epi_c_stage,
             )
         if const_expr(self.blockscaled):
@@ -991,7 +993,7 @@ class GemmSm100(GemmTmaBase):
         self.epi_load_bytes_per_stage = self.epi_smem_bytes(
             epilogue_args,
             self.cta_tile_shape_mnk,
-            self.epi_reduce_tile if const_expr(self.epi_reduce_mode is not None) else self.epi_tile,
+            self.epi_staging_tile,
             self.epi_smem_warp_shape_mnk(),
         ).c_stage
         if const_expr(mC is not None):
@@ -1683,11 +1685,7 @@ class GemmSm100(GemmTmaBase):
                 )
                 do_epi_load_barrier_wait = Boolean(True)
                 # Under epi_reduce: walk its warps' slab scheduler and stage C per epi_reduce_tile.
-                epi_load_tile = (
-                    self.epi_reduce_tile
-                    if const_expr(self.epi_reduce_mode is not None)
-                    else epi_tile
-                )
+                epi_load_tile = self.epi_staging_tile
                 if const_expr(self.epi_reduce_mode is not None):
                     tile_scheduler = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
                     slab_tiles_m = cute.ceil_div(
