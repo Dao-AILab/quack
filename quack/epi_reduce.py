@@ -16,6 +16,8 @@ reducer's aux stores ride its own epi_store_pipeline instance."""
 
 from typing import NamedTuple, Optional
 
+import torch
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -55,8 +57,6 @@ def validate_epi_reduce_args(epi_reduce_args, D, m, n, l, tile_M, tile_N, cluste
     is a mismatch the kernel can only corrupt or hang on: multimem vector width,
     kernel-order comm views, and flag/counter capacities (an under-sized flag array
     is a silent OOB multimem write)."""
-    import torch
-
     era = epi_reduce_args
     if m % num_ranks:
         raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")

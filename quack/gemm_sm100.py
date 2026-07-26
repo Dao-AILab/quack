@@ -5,7 +5,6 @@
 from typing import Optional, Type, Tuple, Union, Callable, Literal
 from functools import partial
 import math
-import torch
 
 import cuda.bindings.driver as cuda
 
@@ -23,12 +22,7 @@ from cutlass.cute.nvgpu.warp import (
     StMatrix8x8x16bOp,
     StMatrix16x8x8bOp,
 )
-from cutlass import (
-    Int32,
-    Float32,
-    Boolean,
-    const_expr,
-)
+from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.experimental import iket
 
@@ -325,7 +319,6 @@ class GemmSm100(GemmTmaBase):
         )
         self.num_epi_warps = len(self.epilog_warp_id)
         self.num_epi_reduce_warps = len(self.epi_reduce_warp_ids)
-        self.epi_reduce_sync_bar_id = NamedBarrierGemm.EpiReduce
         self.epilogue_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierGemm.Epilogue),
             num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
@@ -335,10 +328,11 @@ class GemmSm100(GemmTmaBase):
                 barrier_id=NamedBarrierGemm.EpiReduce,
                 num_threads=self.num_epi_reduce_warps * cute.arch.WARP_SIZE,
             )
-            self.num_ranks = (
-                num_ranks if num_ranks is not None else torch.distributed.get_world_size()
+            assert num_ranks is not None and rank_id is not None, (
+                "epi_reduce_mode requires explicit num_ranks and rank_id"
             )
-            self.rank_id = rank_id if rank_id is not None else torch.distributed.get_rank()
+            self.num_ranks = num_ranks
+            self.rank_id = rank_id
         # CLC throttle: paces query issue to tile consumption so the multi-stage
         # lookahead can't over-cancel the pending pool. Producer = CTA0 load warp
         # (arrive per tile started), consumer = CTA0 scheduler warp (sync per
@@ -551,11 +545,9 @@ class GemmSm100(GemmTmaBase):
             self.epi_tile = (self.epi_tile[0], cute.coalesce(epi_tile_n_layout))
 
         # epi_reduce tile (32, cta_N): the epi_reduce warps' reduce/visit unit and the C/aux
-        # staging unit; a fixed band keeps the register/smem footprint TP-independent.
-        # Reduce/visit and C/aux staging unit. Full-N: a warp's 16B ld_reduces form one
-        # dense 512B row-span; 32 rows: 8 vectors in flight per thread. Narrower tiles
-        # (e.g. epi_tile) measured slower on both counts (18-35%, RS TP=2), warp scatter
-        # dominant.
+        # staging unit. Full-N: a warp's 16B ld_reduces form one dense 512B row-span;
+        # 32 rows: 8 vectors in flight per thread. Narrower tiles (e.g. epi_tile) measured
+        # slower on both counts (18-35%, RS TP=2), warp scatter dominant.
         self.epi_reduce_tile = None
         if const_expr(self.epi_reduce_mode is not None):
             self.epi_reduce_tile = (32, self.cta_tile_shape_mnk[1])
@@ -2124,7 +2116,6 @@ class GemmSm100(GemmTmaBase):
                 if const_expr(self.use_pdl):
                     cute.arch.griddepcontrol_wait()
                 rank_id = self.rank_id
-                lane_id = cute.arch.lane_idx()
 
                 # Epi ops here see slab-local coords/buffers (C/colvec/aux are m/TP-shaped):
                 # hand them a slab-framed manager so op-side bounds math matches.
@@ -2297,10 +2288,7 @@ class GemmSm100(GemmTmaBase):
                 if warp_idx == self.epi_reduce_warp_ids[0]:
                     epi_store_pipeline.producer_tail()
 
-                cute.arch.barrier(
-                    barrier_id=self.epi_reduce_sync_bar_id,
-                    number_of_threads=32 * len(self.epi_reduce_warp_ids),
-                )
+                self.epi_reduce_barrier.arrive_and_wait()
                 # Tile flags gate the reduce on all ranks' MMA partial stores (no stale peer
                 # reads); this spin-lock exit barrier provides the cross-launch sync.
                 if warp_idx == self.epi_reduce_warp_ids[0]:
