@@ -163,6 +163,7 @@ from cutlass import const_expr
 
 from quack.cute_dsl_utils import get_device_capacity, mlir_namedtuple, torch2cute_dtype_map
 from quack.epi_composable import ComposableEpiMixin
+from quack.epi_reduce import validate_epi_reduce_args
 from quack.epi_ops import (
     ColVecLoad,
     EpiOp,
@@ -1240,6 +1241,8 @@ class EpiMod:
         split_k: int = 1,  # K-dim split factor (SERIAL/PARALLEL only; see quack.gemm)
         split_k_mode: int = SplitKMode.SERIAL,
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
+        epi_reduce_mode=None,  # "reduce_scatter" | "all_reduce" (see quack.epi_reduce)
+        epi_reduce_args=None,  # EpiReduceArguments over torch tensors
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
         varlen_m = cu_seqlens_m is not None
@@ -1273,6 +1276,24 @@ class EpiMod:
                 # With swapped slots kernel-A is the caller's B: the AG gate
                 # would gate the wrong operand (and the wrong M geometry).
                 raise ValueError("swap_ab does not support ag_args (AG shards kernel-A along M)")
+        epi_reduce, num_ranks = None, None
+        if epi_reduce_mode is not None:
+            import torch.distributed as dist
+
+            if varlen_m or gather_A or blockscaled or swap_ab or ag_args is not None:
+                raise ValueError("epi_reduce_mode: dense non-blockscaled unswapped only")
+            if self.mode != "element":
+                raise ValueError("epi_reduce_mode supports element-mode epilogues only")
+            if not persistent:
+                raise ValueError("epi_reduce_mode requires the persistent scheduler")
+            if rounding_mode != RoundingMode.RN:
+                # RS under epi_reduce is unspecified: the skip-epi-ops partial store has no
+                # seed wired and the reducer's final convert is round-to-nearest.
+                raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
+            if epi_reduce_args is None:
+                raise ValueError("epi_reduce_mode requires epi_reduce_args")
+            epi_reduce = (epi_reduce_mode, dist.get_world_size(), dist.get_rank())
+            num_ranks = epi_reduce[1]
         # Warm fast path: probe the plan cache on raw-input metadata before any
         # validation or kind inference — a hit is exactly a replay of a
         # previously validated call (the key subsumes everything validation
@@ -1309,6 +1330,7 @@ class EpiMod:
             split_k,
             int(split_k_mode),
             ag_args is not None,
+            epi_reduce,
         )
         plan = self._plan_cache.get(key)
         if plan is not None:
@@ -1321,6 +1343,7 @@ class EpiMod:
                     C,
                     epi_args,
                     ag_args=ag_args,
+                    epi_reduce_args=epi_reduce_args,
                     tile_count_semaphore=tile_count_semaphore,
                     cu_seqlens_m=cu_seqlens_m,
                     A_idx=A_idx,
@@ -1397,9 +1420,26 @@ class EpiMod:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
         # stays caller-oriented (swap-at-trace transposes those at trace).
-        m_i, n_i = (n_gemm, m) if swap_ab else (m, n_gemm)
+        if epi_reduce_mode is not None and m % num_ranks:
+            raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
+        # epi_reduce_mode: C and every epi output/sink are slab-local (m / world); D stays full-M.
+        m_epi = m if epi_reduce_mode is None else m // num_ranks
+        m_i, n_i = (n_gemm, m) if swap_ab else (m_epi, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
+        epi_base_shape = _tile_shape(batch, m_epi, n_gemm, varlen_m)
+        if epi_reduce_mode is not None:
+            validate_epi_reduce_args(
+                epi_reduce_args,
+                D,
+                m,
+                n_gemm,
+                batch if batch is not None else 1,
+                tile_M,
+                tile_N,
+                cluster_M,
+                num_ranks,
+            )
         if packed_c:
             if C.stride(-1) == 1 or varlen_m:
                 packed_shape = _tile_shape(batch, m, 2 * n_gemm, varlen_m)
@@ -1425,13 +1465,13 @@ class EpiMod:
                     raise ValueError("packed m-major C/D outer strides must permit a f32 view")
                 packed_form = "m"
         else:
-            _require_shape("C", C, base_shape)
+            _require_shape("C", C, epi_base_shape)
             _require_shape("D", D, base_shape)
         for out_name in self.outputs:
             if out_name not in epi_args:
                 raise ValueError(f"missing epilogue output buffer '{out_name}'")
             out_n = n_gemm // 2 if paired_acc else n_gemm
-            _require_shape(out_name, epi_args[out_name], _tile_shape(batch, m, out_n, varlen_m))
+            _require_shape(out_name, epi_args[out_name], _tile_shape(batch, m_epi, out_n, varlen_m))
             if paired_acc:
                 aux = epi_args[out_name]
                 if aux.element_size() != 2:
@@ -1480,7 +1520,7 @@ class EpiMod:
                 expected = (m_i,) if varlen_m else (batch_l, m_i)
                 _require_shape(name, epi_args[name], expected)
             elif visit_kind == "tile":
-                _require_shape(name, epi_args[name], base_shape)
+                _require_shape(name, epi_args[name], epi_base_shape)
             kind_sig.append((name, kind if kind != "pinned" else pins[name].__class__.__name__))
             epi_values[name] = epi_args[name]
         for out_name in self.outputs:
@@ -1491,9 +1531,9 @@ class EpiMod:
             op = self.sinks[sink_name]
             if hasattr(op, "dim"):
                 if op.dim == 0:
-                    inner = (m, (n_gemm + tile_N - 1) // tile_N)
+                    inner = (m_epi, (n_gemm + tile_N - 1) // tile_N)
                 else:
-                    inner = ((m + tile_M - 1) // tile_M, n_gemm)
+                    inner = ((m_epi + tile_M - 1) // tile_M, n_gemm)
                 expected = inner if varlen_m or batch is None else (batch, *inner)
                 _require_shape(sink_name, epi_args[sink_name], expected)
             if getattr(op, "check_oob", True) is False and n_gemm % tile_N:
@@ -1586,6 +1626,7 @@ class EpiMod:
             gemm_cls_ref=self._class_ref(mint_key),
             packed_cd=packed_form,
             has_ag=ag_args is not None,
+            epi_reduce=epi_reduce,
             split_k=split_k,
             split_k_mode=split_k_mode,
         )
@@ -1599,6 +1640,7 @@ class EpiMod:
                 C,
                 epi_values,
                 ag_args=ag_args,
+                epi_reduce_args=epi_reduce_args,
                 tile_count_semaphore=tile_count_semaphore,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,

@@ -863,6 +863,13 @@ class TileStore(EpiOp):
 
     def _make_tiled_copy_r2s(self, gemm, params, tiled_copy_r2s, tiled_copy_t2r):
         """Build the register-to-shared tiled copy for this output."""
+        if tiled_copy_t2r is None:
+            # epi_reduce warps: fragments are partitioned by tiled_copy_r2s
+            # directly (no MMA t2r arrangement to match), so use it as-is.
+            assert getattr(gemm, "epi_reduce_mode", None) is not None, (
+                "tiled_copy_t2r=None outside epi_reduce (fragments not in r2s order?)"
+            )
+            return tiled_copy_r2s
         copy_atom_r2s = self._make_copy_atom_r2s(gemm, params, tiled_copy_t2r)
         if self.gated and gemm.arch == 120:
             # SM120 halved postact: retile through an N-doubled permuted MMA so
