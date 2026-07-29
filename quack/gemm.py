@@ -123,7 +123,8 @@ def _compile_gemm(
     if epi_reduce is not None:
         # Epilogue tensors are slab-local (m / world): a fresh m sym, untied from
         # the operand m; C is epilogue-consumed so it rides the same sym (mirrors
-        # gemm_host._compile_gemm_epi). D stays the full-M symmetric partials view.
+        # gemm_host._compile_gemm_epi), and so does D under reduce_scatter (the
+        # slab-shaped output; all_reduce D stays full-M symmetric).
         m = cute.sym_int()
         if mC is not None:
             mC = fake_batched(
@@ -133,6 +134,15 @@ def _compile_gemm(
                 l if batched else None,
                 1 if c_major == "n" else 0,
                 128 // c_dtype.width,
+            )
+        if epi_reduce[0] == "reduce_scatter":
+            mD = fake_batched(
+                d_dtype,
+                m,
+                n,
+                l if batched else None,
+                1 if d_major == "n" else 0,
+                128 // d_dtype.width,
             )
 
     def fake_scalar(mode, dtype=Float32):
@@ -296,7 +306,7 @@ def _staged_split_k_workspace(D, split_k):
         ].mT
 
 
-def _split_k_buffers(D, split_k_mode, tile_M, tile_N, cluster_M, cluster_N, sm100):
+def _split_k_buffers(D, split_k_mode, tile_M, tile_N, cluster_M, cluster_N, sm100, len_m=None):
     """Semaphore + partials workspace for SplitKMode.SERIAL / PARALLEL.
 
     One Int32 completion flag per output tile (SERIAL: turnstile in split order,
@@ -307,9 +317,12 @@ def _split_k_buffers(D, split_k_mode, tile_M, tile_N, cluster_M, cluster_N, sm10
     protocol), so tile counts are rounded up to cluster multiples. The per-CTA
     tile M must match the kernel exactly (the workspace region stride is
     cta_tile_m * tile_N): SM100/110 2-CTA MMA (cluster_M even, tile_M 128/256)
-    halves it.
+    halves it. len_m overrides D's rows when D is not full-M (reduce_scatter
+    epi_reduce: the GEMM tile grid spans full M, D only the slab).
     """
-    num_l, len_m, len_n = D.shape
+    num_l, d_rows, len_n = D.shape
+    if len_m is None:
+        len_m = d_rows
     use_2cta = sm100 and cluster_M % 2 == 0 and tile_M in (128, 256)
     cta_tile_m = tile_M // 2 if use_2cta else tile_M
     ntile_m = (len_m + cta_tile_m - 1) // cta_tile_m
@@ -438,7 +451,9 @@ def gemm(
     # load-warp arrival gate.
     ag_args: Optional[AllGatherArguments] = None,
     # GEMM+ReduceScatter/AllReduce (SM100+, see quack/epi_reduce.py):
-    # D is the full-M symmetric partials view; C/colvec_bias are slab-local (m / world).
+    # partials live in epi_reduce_args' symmetric workspace; D is the true output
+    # (reduce_scatter: plain slab-local (m / world); all_reduce: full-M symmetric)
+    # and C/colvec_bias are slab-local.
     epi_reduce_mode: Optional[str] = None,  # "reduce_scatter" | "all_reduce"
     epi_reduce_args: Optional[EpiReduceArguments] = None,
 ) -> _GemmPlan:
@@ -474,14 +489,16 @@ def gemm(
         if epi_reduce_args is None:
             raise ValueError("epi_reduce_mode requires epi_reduce_args")
         if D is None:
-            raise ValueError("epi_reduce_mode requires D (the symmetric work buffer)")
+            raise ValueError("epi_reduce_mode requires D (the output tensor)")
         # Geometry/capacity guards (see validate_epi_reduce_args): checked per
         # call — the bundle is sized to one problem shape, and reuse across
-        # shapes or a tile-config change silently under-sizes the flags.
+        # shapes or a tile-config change silently under-sizes the flags. m comes
+        # from A: D carries only the slab under reduce_scatter.
         validate_epi_reduce_args(
             epi_reduce_args,
             D,
-            D.shape[-2],
+            epi_reduce_mode,
+            A.shape[-2],
             D.shape[-1],
             D.shape[0] if D.ndim == 3 else 1,
             tile_M,
@@ -651,6 +668,8 @@ def run_gemm_plan(
                 plan.cluster_M,
                 plan.cluster_N,
                 plan.is_sm100_family,
+                # RS epi_reduce: D is slab-shaped but the GEMM tile grid is full-M.
+                len_m=A.shape[-2] if plan.epi_reduce_mode == "reduce_scatter" else None,
             )
     # No permutes here: the kernel was compiled batch-first and rotates
     # (l, x, y) -> (x, y, l) at trace time (GemmBase.permute_batch_last).

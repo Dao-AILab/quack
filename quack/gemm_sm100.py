@@ -48,7 +48,8 @@ from quack.epi_reduce import (
     make_epi_reduce_tile_scheduler,
     epi_reduce_exit_slot,
     multimem_reduce_subtile,
-    commit_reduced_subtile,
+    commit_subtile_local,
+    commit_subtile_broadcast,
 )
 from quack.gemm_config import SplitKMode
 from quack import layout_utils
@@ -973,7 +974,14 @@ class GemmSm100(GemmTmaBase):
             tma_tensor_d,
             tma_atom_c,
             tma_tensor_c,
-        ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
+        ) = self.make_tma_epilogue_atoms_and_tensors(
+            # epi_reduce: no D TMA — mD crosses into the kernel as a real tensor
+            # (the reducer's commit target), like gather_A's mA slot.
+            mD if const_expr(self.epi_reduce_mode is None) else None,
+            mC,
+            epilogue_args,
+            varlen_m,
+        )
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         if const_expr(self.epi_reduce_mode is not None):
@@ -1006,7 +1014,12 @@ class GemmSm100(GemmTmaBase):
         epi_reduce_sched_params = None
         if const_expr(self.epi_reduce_mode is not None):
             full_ntile = tile_sched_args.problem_shape_ntile_mnl
-            slab_m = mD.shape[0] // self.num_ranks
+            # reduce_scatter D is already slab-shaped; all_reduce D is full-M symmetric.
+            slab_m = (
+                mD.shape[0]
+                if const_expr(self.epi_reduce_mode == "reduce_scatter")
+                else mD.shape[0] // self.num_ranks
+            )
             slab_ntile = (
                 cute.ceil_div(slab_m, self.cta_tile_shape_mnk[0]),
                 full_ntile[1],
@@ -1104,7 +1117,7 @@ class GemmSm100(GemmTmaBase):
             tma_atom_sfb,
             tma_tensor_sfb,
             tma_atom_d,
-            tma_tensor_d,
+            tma_tensor_d if const_expr(self.epi_reduce_mode is None) else mD,
             tma_atom_c,
             tma_tensor_c,
             epilogue_params,
@@ -1179,10 +1192,12 @@ class GemmSm100(GemmTmaBase):
         has_epi_load = const_expr(self.epi_c_stage > 0)
 
         # epi_reduce comm bundle: unpack the kernel-level pieces (reducer views,
-        # exit barrier); flags/counters stay in the bundle for epilogue_split_rank.
-        mD_mc = d_peer_tensors = sync_barrier = sync_barrier_mc = None
+        # exit barrier); flags/counters/workspace stay in the bundle for
+        # epilogue_split_rank. mD_mc is the all_reduce broadcast view (None under
+        # reduce_scatter, whose commit targets the plain kernel mD).
+        mD_mc = ws_mc = sync_barrier = sync_barrier_mc = None
         if const_expr(epi_reduce_args is not None):
-            mD_mc, d_peer_tensors = epi_reduce_args.mD_mc, epi_reduce_args.mD_peers
+            mD_mc, ws_mc = epi_reduce_args.mD_mc, epi_reduce_args.workspace_mc
             sync_barrier = epi_reduce_args.sync_barrier
             sync_barrier_mc = epi_reduce_args.sync_barrier_mc
 
@@ -1680,8 +1695,12 @@ class GemmSm100(GemmTmaBase):
                 epi_load_tile = self.epi_staging_tile
                 if const_expr(self.epi_reduce_mode is not None):
                     tile_scheduler = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
+                    # reduce_scatter D is already slab-shaped.
                     slab_tiles_m = cute.ceil_div(
-                        mD_mnl.shape[0] // self.num_ranks, self.cta_tile_shape_mnk[0]
+                        mD_mnl.shape[0]
+                        if const_expr(self.epi_reduce_mode == "reduce_scatter")
+                        else mD_mnl.shape[0] // self.num_ranks,
+                        self.cta_tile_shape_mnk[0],
                     )
                 else:
                     tile_scheduler = TileSchedulerCls()
@@ -1997,7 +2016,9 @@ class GemmSm100(GemmTmaBase):
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 copy_D = None
-                if const_expr(has_D):
+                # epi_reduce: no D TMA atom — the producer commits to the comm
+                # workspace inside epilogue_split_rank instead.
+                if const_expr(has_D and self.epi_reduce_mode is None):
                     # Staged split-K: D is the f32 partials workspace, whose batch mode is the
                     # combined (l * split_k + split) index from the scheduler.
                     d_batch_idx = batch_idx
@@ -2130,30 +2151,40 @@ class GemmSm100(GemmTmaBase):
                 work_tile = tile_sched.initial_work_tile_info()
 
                 # we want 128bit ld/st for better performance
-                atom_val = 128 // mD_mc.element_type.width
+                atom_val = 128 // ws_mc.element_type.width
                 atom_thr_n = self.mma_tiler[1] // atom_val
                 atom_thr_m = len(self.epi_reduce_warp_ids) * cute.arch.WARP_SIZE // atom_thr_n
                 thr_layout = cute.make_layout((atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1))
                 val_layout = cute.make_layout((1, atom_val), stride=(atom_val, 1))
 
                 copy_atom_load = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), mD_mc.element_type
+                    cute.nvgpu.CopyUniversalOp(), ws_mc.element_type
                 )
                 tiled_copy_fake = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
 
-                # Tile D from this rank's slab start; rows past the slab in the last
-                # M tile are predicated in the load/commit callbacks.
+                # ld_reduce source: the padded workspace at real (m, n) coords from
+                # this rank's slab start, unpredicated. Commit target: reduce_scatter
+                # = the plain slab-shaped kernel mD at slab-local coords; all_reduce
+                # = multimem broadcast through symmetric D's mc view. Rows past the
+                # slab in the last M tile are predicated in the commit callback only.
                 cta_m, cta_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
-                slab_m = mD_mc.shape[0] // self.num_ranks
+                slab_m = (
+                    mD_mnl.shape[0]
+                    if const_expr(self.epi_reduce_mode == "reduce_scatter")
+                    else mD_mnl.shape[0] // self.num_ranks
+                )
                 slab_row0 = rank_id * slab_m
-                gD_mc = cute.local_tile(
-                    cute.domain_offset((slab_row0, 0, 0), mD_mc), (cta_m, cta_n), (None, None, None)
+                gWs_mc = cute.local_tile(
+                    cute.domain_offset((slab_row0, 0, 0), ws_mc), (cta_m, cta_n), (None, None, None)
                 )
-                gD_peer = cute.local_tile(
-                    cute.domain_offset((slab_row0, 0, 0), d_peer_tensors[rank_id]),
-                    (cta_m, cta_n),
-                    (None, None, None),
-                )
+                if const_expr(self.epi_reduce_mode == "reduce_scatter"):
+                    gD_commit = cute.local_tile(mD_mnl, (cta_m, cta_n), (None, None, None))
+                else:
+                    gD_commit = cute.local_tile(
+                        cute.domain_offset((slab_row0, 0, 0), mD_mc),
+                        (cta_m, cta_n),
+                        (None, None, None),
+                    )
 
                 slab_tiles_m = cute.ceil_div(slab_m, cta_m)
 
@@ -2199,12 +2230,12 @@ class GemmSm100(GemmTmaBase):
                         iket.range_push("epi_reduce")
                         row0 = slab_coord[0] * cta_m
                         row_limit = slab_m - row0
-                        col_limit = mD_mc.shape[1] - slab_coord[1] * cta_n
-                        frgD_mc = thr_copy_fake.partition_S(
-                            gD_mc[None, None, slab_coord[0], slab_coord[1], slab_coord[2]]
+                        col_limit = mD_mnl.shape[1] - slab_coord[1] * cta_n
+                        frgWs_mc = thr_copy_fake.partition_S(
+                            gWs_mc[None, None, slab_coord[0], slab_coord[1], slab_coord[2]]
                         )
-                        frgD_peer = thr_copy_fake.partition_S(
-                            gD_peer[None, None, slab_coord[0], slab_coord[1], slab_coord[2]]
+                        frgD_commit = thr_copy_fake.partition_S(
+                            gD_commit[None, None, slab_coord[0], slab_coord[1], slab_coord[2]]
                         )
                         # Epilogue coords are slab-local (C/colvec/aux are m/TP-shaped, with
                         # quack's own boundary predication); comm addressing stays global.
@@ -2215,24 +2246,24 @@ class GemmSm100(GemmTmaBase):
                             slab_coord[2],
                         )
                         # The reducer runs the shared epilogue; these two callbacks
-                        # close over this tile's symmetric-D views and edge limits.
+                        # close over this tile's workspace/D views and edge limits.
                         load_reduce_subtile = partial(
                             multimem_reduce_subtile,
-                            frgD_mc,
-                            frgD_crd,
-                            row_limit,
-                            col_limit,
+                            frgWs_mc,
                             epi_reduce_tile_layout,
                         )
+                        commit_fn = (
+                            commit_subtile_broadcast
+                            if const_expr(self.epi_reduce_mode == "all_reduce")
+                            else commit_subtile_local
+                        )
                         commit_D = partial(
-                            commit_reduced_subtile,
-                            frgD_mc,
-                            frgD_peer,
+                            commit_fn,
+                            frgD_commit,
                             frgD_crd,
                             row_limit,
                             col_limit,
                             epi_reduce_tile_layout,
-                            self.epi_reduce_mode == "all_reduce",
                         )
                         epi_fn = partial(
                             self.epilogue,
@@ -2277,6 +2308,7 @@ class GemmSm100(GemmTmaBase):
                             warp_idx == self.epi_reduce_warp_ids[0],
                             is_producer=False,
                             epi_reduce_args=epi_reduce_args,
+                            slab_m=slab_m,
                         )
                         iket.range_pop()
 

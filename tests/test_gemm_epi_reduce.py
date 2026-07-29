@@ -54,11 +54,7 @@ def _run_gemm_epi_reduce(
     import cutlass.torch as cutlass_torch
 
     from quack.cute_dsl_utils import get_device_capacity
-    from quack.dist_utils import (
-        torchrun_init_nvshmem,
-        torchrun_finalize_nvshmem,
-        make_symmetric_tensor,
-    )
+    from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
     from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
     from quack.gemm import gemm
     from quack.gemm_config import SplitKMode
@@ -100,13 +96,10 @@ def _run_gemm_epi_reduce(
     )
     a_gpu = a_torch_cpu.cuda()
     b_gpu = b_torch_cpu.cuda()
-    d_torch_gpu, d_torch_gpu_mc, d_peer_torch = make_symmetric_tensor((l, m, n), torch_d, (1, 2, 0))
-    # D arg is caller-order (l, m, n); the EpiReduceArguments views stay kernel-order (m, n, l).
-    d_arg = d_torch_gpu.permute(2, 0, 1)
-
-    # torch handles inside the args are the sole refs keeping the symmetric allocs alive
-    epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, tile_m, tile_n, cluster_m, world_size
+    # D output + padded partials workspace + semaphores; torch handles inside the
+    # args are the sole refs keeping the symmetric allocs alive.
+    d_arg, epi_reduce_args = make_epi_reduce_args(
+        epi_reduce_mode, torch_d, m, n, l, tile_m, tile_n, cluster_m, world_size
     )
     tf_torch = epi_reduce_args.tile_flags
     counters_torch = epi_reduce_args.consumer_counters
@@ -127,12 +120,9 @@ def _run_gemm_epi_reduce(
         epi_reduce_mode=epi_reduce_mode,
         epi_reduce_args=epi_reduce_args,
     )
-    # d_torch_gpu is the (m, n, l) view, permuted to (l, m, n): RS owns its m-slab;
-    # AR holds the full reduced D on every rank after the multicast broadcast.
-    if epi_reduce_mode == "reduce_scatter":
-        out = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
-    else:
-        out = d_torch_gpu.permute(2, 0, 1)
+    # d_arg is the output itself: RS a plain (l, m/world, n) slab; AR the full
+    # reduced D on every rank after the multicast broadcast.
+    out = d_arg
 
     # PARALLEL split-K commits partials in arrival order (f32 adds are order-
     # sensitive), so relaunches are not bit-identical: launches still run, but the

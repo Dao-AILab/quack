@@ -232,12 +232,18 @@ def _compile_gemm_epi(
     )
     if epi_reduce is not None:
         # Epilogue tensors are slab-local (m / world): a fresh m sym, untied
-        # from the operand m; C is epilogue-consumed so it rides the same sym.
+        # from the operand m; C is epilogue-consumed so it rides the same sym,
+        # and so does D under reduce_scatter (the slab-shaped output).
         m = cute.sym_int()
         if mC is not None:
             c_leading = 1 if c_major == "n" else 0
             mC = fake_batched(
                 c_dtype, m, n, l if batched else None, c_leading, div_for_dtype(c_dtype)
+            )
+        if epi_reduce[0] == "reduce_scatter":
+            d_leading = 1 if d_major == "n" else 0
+            mD = fake_batched(
+                d_dtype, m, n, l if batched else None, d_leading, div_for_dtype(d_dtype)
             )
     fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab)
     ops = _ops_by_name(GemmCls)
@@ -550,6 +556,10 @@ def run_gemm_epi_plan(
             plan.cluster_M,
             plan.cluster_N,
             plan.is_sm100_family,
+            # RS epi_reduce: D is slab-shaped but the GEMM tile grid is full-M.
+            len_m=A.shape[-2]
+            if getattr(plan, "epi_reduce_mode", None) == "reduce_scatter"
+            else None,
         )
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)

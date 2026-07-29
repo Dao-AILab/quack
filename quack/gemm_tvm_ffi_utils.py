@@ -288,10 +288,11 @@ def make_scheduler_args(
     )
 
 
-def make_fake_epi_reduce_args(d_dtype, num_ranks):
+def make_fake_epi_reduce_args(d_dtype, mode):
     """Fake EpiReduceArguments for epi_reduce_mode compiles (see quack.epi_reduce).
 
-    Comm views are kernel-order (m, n, l): __call__ does not rotate them.
+    Comm views are kernel-order (m, n, l): __call__ does not rotate them. mD_mc
+    exists only under all_reduce (reduce_scatter commits to the plain kernel mD).
     """
     from quack.epi_reduce import EpiReduceArguments
 
@@ -301,8 +302,9 @@ def make_fake_epi_reduce_args(d_dtype, num_ranks):
     )
     flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
     return EpiReduceArguments(
-        mD_mc=d_fake(),
-        mD_peers=tuple(d_fake() for _ in range(num_ranks)),
+        mD_mc=d_fake() if mode == "all_reduce" else None,
+        workspace=d_fake(),
+        workspace_mc=d_fake(),
         tile_flags=flags(),
         tile_flags_mc=flags(),
         sync_barrier=flags(),
@@ -776,7 +778,7 @@ def compile_gemm_kernel(
     sf_args = () if device_capacity[0] in (8, 9, 12) else (mSFA, mSFB)
     er_args = ()
     if epi_reduce is not None:
-        er_args = (make_fake_epi_reduce_args(mD.element_type, epi_reduce[1]),)
+        er_args = (make_fake_epi_reduce_args(mD.element_type, epi_reduce[0]),)
     return cute.compile(
         gemm_obj,
         mA,

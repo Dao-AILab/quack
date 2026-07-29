@@ -22,11 +22,7 @@ import cutlass
 import cutlass.torch as cutlass_torch
 
 from quack.bench.bench_utils_dist import do_bench_all
-from quack.dist_utils import (
-    torchrun_init_nvshmem,
-    torchrun_finalize_nvshmem,
-    make_symmetric_tensor,
-)
+from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
 from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm
@@ -131,13 +127,10 @@ def run(args):
         .to(torch_ab)
         .cuda()
     )
-    # D is (m, n, l) n-major in symmetric memory (the multimem reduce reads partials
-    # there); gemm() takes the caller-order (l, m, n) view.
-    d_torch_gpu, d_torch_gpu_mc, d_peer_torch = make_symmetric_tensor((l, m, n), torch_d, (1, 2, 0))
-    d_arg = d_torch_gpu.permute(2, 0, 1)
-
-    epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, tile_M, tile_N, cluster_M, world_size
+    # D output + padded symmetric partials workspace + semaphores: RS D is a plain
+    # (l, m/world, n) tensor, AR D this rank's view of full symmetric (l, m, n).
+    d_arg, epi_reduce_args = make_epi_reduce_args(
+        mode, torch_d, m, n, l, tile_M, tile_N, cluster_M, world_size
     )
 
     # No host-side barriers in the loop: the kernel owns cross-invocation sync
@@ -177,13 +170,9 @@ def run(args):
         dist.barrier()
         fn_baseline()
         torch.cuda.synchronize()
-        # d_torch_gpu is the (m, n, l) view: RS owns its m-slab; AR holds the full D.
-        if mode == "reduce_scatter":
-            out = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
-            ref = D_rs
-        else:
-            out = d_torch_gpu.permute(2, 0, 1)
-            ref = D_full
+        # d_arg is the output itself: RS the (l, m/world, n) slab; AR the full D.
+        out = d_arg
+        ref = D_rs if mode == "reduce_scatter" else D_full
         torch.testing.assert_close(out, ref, atol=args.tolerance, rtol=1e-3)
         if rank == 0:
             print("Ref check PASSED")

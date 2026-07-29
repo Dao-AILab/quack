@@ -53,19 +53,15 @@ def _dist_setup(m, k, world_size):
     assert k % world_size == 0, f"k ({k}) must be divisible by world_size ({world_size})"
 
 
-def _make_comm(m, n, l, tile_m, tile_n, cluster_m, num_ranks):
-    """Symmetric D work buffer + flags/barriers/counters; torch handles only."""
-    from quack.dist_utils import make_symmetric_tensor
+def _make_comm(mode, m, n, l, tile_m, tile_n, cluster_m, num_ranks):
+    """D output + padded partials workspace + flags/barriers/counters; torch handles only."""
     from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 
-    d_torch_gpu, d_torch_gpu_mc, d_peer_torch = make_symmetric_tensor(
-        (l, m, n), torch.bfloat16, (1, 2, 0)
-    )
-    epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, tile_m, tile_n, cluster_m, num_ranks
+    d_arg, epi_reduce_args = make_epi_reduce_args(
+        mode, torch.bfloat16, m, n, l, tile_m, tile_n, cluster_m, num_ranks
     )
     return (
-        d_torch_gpu,
+        d_arg,
         epi_reduce_args,
         epi_reduce_args.tile_flags,
         epi_reduce_args.consumer_counters,
@@ -122,10 +118,9 @@ def _run_gemm_act_reduce(
     m_per_rank = m // world_size
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
-    d_torch_gpu, epi_reduce_args, tf_torch, counters_torch = _make_comm(
-        m, n, l, tile_m, tile_n, cluster_m, world_size
+    d_arg, epi_reduce_args, tf_torch, counters_torch = _make_comm(
+        epi_reduce_mode, m, n, l, tile_m, tile_n, cluster_m, world_size
     )
-    d_arg = d_torch_gpu.permute(2, 0, 1)  # caller-order (l, m, n) view
     # Aux is slab-local under epi_reduce (epilogue coords are m/TP-shaped).
     aux_gpu = torch.empty(l, m_per_rank, n, dtype=torch.bfloat16, device="cuda")
     # Bias/C add post-reduce on every rank, so they must agree across ranks: common
@@ -167,12 +162,9 @@ def _run_gemm_act_reduce(
         epi_reduce_args=epi_reduce_args,
     )
 
-    # D view: RS owns its m-slab of the (m, n, l) D; AR holds the full reduced D.
-    # Aux is slab-local in both modes.
-    if epi_reduce_mode == "reduce_scatter":
-        out = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
-    else:
-        out = d_torch_gpu.permute(2, 0, 1)
+    # d_arg is the output itself: RS a plain (l, m/world, n) slab; AR the full
+    # reduced D on every rank. Aux is slab-local in both modes.
+    out = d_arg
     aux_out = aux_gpu
 
     # PARALLEL split-K commits partials in arrival order (f32 adds are order-

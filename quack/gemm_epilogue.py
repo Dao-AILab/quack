@@ -1422,7 +1422,8 @@ class EpiMod:
         # stays caller-oriented (swap-at-trace transposes those at trace).
         if epi_reduce_mode is not None and m % num_ranks:
             raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
-        # epi_reduce_mode: C and every epi output/sink are slab-local (m / world); D stays full-M.
+        # epi_reduce_mode: C and every epi output/sink are slab-local (m / world); D
+        # too under reduce_scatter (all_reduce D stays full-M symmetric).
         m_epi = m if epi_reduce_mode is None else m // num_ranks
         m_i, n_i = (n_gemm, m) if swap_ab else (m_epi, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
@@ -1432,6 +1433,7 @@ class EpiMod:
             validate_epi_reduce_args(
                 epi_reduce_args,
                 D,
+                epi_reduce_mode,
                 m,
                 n_gemm,
                 batch if batch is not None else 1,
@@ -1466,7 +1468,10 @@ class EpiMod:
                 packed_form = "m"
         else:
             _require_shape("C", C, epi_base_shape)
-            _require_shape("D", D, base_shape)
+            # reduce_scatter epi_reduce: D is the slab-local output, like C.
+            _require_shape(
+                "D", D, epi_base_shape if epi_reduce_mode == "reduce_scatter" else base_shape
+            )
         for out_name in self.outputs:
             if out_name not in epi_args:
                 raise ValueError(f"missing epilogue output buffer '{out_name}'")

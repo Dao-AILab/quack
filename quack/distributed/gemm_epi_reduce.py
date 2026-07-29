@@ -1,23 +1,37 @@
 import torch
-from quack.dist_utils import make_barrier_flags
-from quack.epi_reduce import EpiReduceArguments
+from quack.dist_utils import make_barrier_flags, make_symmetric_tensor
+from quack.epi_reduce import EpiReduceArguments, epi_reduce_workspace_shape
 
 
-def make_epi_reduce_args(mD_mc, mD_peers, m, n, l, tile_M, tile_N, cluster_M, num_ranks):
-    """Allocate the epi_reduce_mode semaphores and assemble EpiReduceArguments.
+def make_epi_reduce_args(mode, torch_dtype, m, n, l, tile_M, tile_N, cluster_M, num_ranks):
+    """Allocate the epi_reduce_mode buffers and return (D, EpiReduceArguments).
 
-    Call once at setup (make_barrier_flags is a collective symmetric alloc) and
-    reuse across launches: flags are monotonic — never reset — and
-    consumer_counters hold each consumer tile's epoch base, so never re-zero one
-    without the other. Sizing is per (shape, tile config); a mismatched launch is
-    rejected by validate_epi_reduce_args, whose cta_m derivation mirrors this one.
+    D is the caller-order output the launch consumes: reduce_scatter — a plain
+    local (l, m/world, n) tensor; all_reduce — this rank's view of a full
+    symmetric (l, m, n) tensor (the commit broadcasts through its mc view, kept
+    as mD_mc). Partials live in the padded symmetric workspace, never in D.
+
+    Call once at setup (symmetric allocs are collective) and reuse across
+    launches: flags are monotonic — never reset — and consumer_counters hold
+    each consumer tile's epoch base, so never re-zero one without the other.
+    Sizing is per (shape, tile config); a mismatched launch is rejected by
+    validate_epi_reduce_args, whose cta_m derivation mirrors this one.
 
     Returns the torch-tensor flavor the TVM-FFI surfaces consume (EpiMod.gemm /
     quack.gemm.gemm); direct cute.compile callers build the cute flavor themselves.
     """
+    assert mode in ("reduce_scatter", "all_reduce"), f"unknown epi_reduce_mode {mode}"
     assert m % num_ranks == 0, "epi_reduce_mode slab math needs M % num_ranks == 0"
     use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
     cta_m = tile_M // (2 if use_2cta else 1)
+    m_pad, n_pad = epi_reduce_workspace_shape(m, n, cta_m, tile_N)
+    workspace, workspace_mc, _ = make_symmetric_tensor((l, m_pad, n_pad), torch_dtype, (1, 2, 0))
+    mD_mc = None
+    if mode == "all_reduce":
+        d_knl, mD_mc, _ = make_symmetric_tensor((l, m, n), torch_dtype, (1, 2, 0))
+        d = d_knl.permute(2, 0, 1)  # caller-order (l, m, n) view
+    else:
+        d = torch.empty(l, m // num_ranks, n, dtype=torch_dtype, device="cuda")
     n_tiles = (n + tile_N - 1) // tile_N
     num_tiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -25,9 +39,10 @@ def make_epi_reduce_args(mD_mc, mD_peers, m, n, l, tile_M, tile_N, cluster_M, nu
     sync_barrier, sync_barrier_mc, _, _ = make_barrier_flags(num_sms)
     slab_tiles_m = (m // num_ranks + cta_m - 1) // cta_m
     counters = torch.zeros(slab_tiles_m * n_tiles * l, dtype=torch.int32, device="cuda")
-    return EpiReduceArguments(
+    return d, EpiReduceArguments(
         mD_mc=mD_mc,
-        mD_peers=tuple(mD_peers),
+        workspace=workspace,
+        workspace_mc=workspace_mc,
         tile_flags=tile_flags,
         tile_flags_mc=tile_flags_mc,
         sync_barrier=sync_barrier,
