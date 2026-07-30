@@ -3,7 +3,6 @@ import math
 import pytest
 import torch
 
-from quack.testing.fake_compat import assert_aliased
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
 from quack.gemm_interface import (
@@ -26,6 +25,11 @@ sm100_tma_gather_only = pytest.mark.skipif(
     not torch.cuda.is_available() or get_device_capacity(torch.device("cuda"))[0] not in (10, 11),
     reason="TMA gather tests require SM100/SM110",
 )
+
+
+def assert_aliased(a, b) -> None:
+    """Assert two tensors share storage."""
+    assert a.data_ptr() == b.data_ptr()
 
 
 def generate_A_with_gather(total_m, k, device, dtype, gather_A=False):
@@ -214,8 +218,6 @@ def test_gemm_varlen_m(
         dynamic_scheduler=dynamic_scheduler,
         tuned=False,
     )
-    # Aliasing assertion is phase-2-only; ``assert_aliased`` short-circuits
-    # under compile-only mode where FakeTensor's data_ptr() is deprecated.
     if pre_allocate_out:
         assert_aliased(out, out_buf)
     A_f, B_f = A.float(), B.float()

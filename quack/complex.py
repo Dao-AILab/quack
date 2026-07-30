@@ -31,7 +31,7 @@ from cutlass import Float32, Numeric
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith
 from cutlass._mlir.extras import types as T
-from cutlass.base_dsl._mlir_helpers.arith import bitcast as _bitcast
+from cutlass._mlir_helpers.arith import bitcast as _bitcast
 from cutlass.base_dsl.typing import FloatMeta
 
 

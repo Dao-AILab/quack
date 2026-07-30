@@ -25,10 +25,9 @@ build_image() {
     echo "Done: $image"
 }
 
-# cu12.9 image pins torch to cu126 wheels: PyTorch 2.12 skipped cu128/cu129
-# wheels, and our oldest runner (H100) is on driver 575.x which can't run
-# cu13 torch without the compat shim. cu126 is the newest 12.x torch index
-# that ships 2.12 and is runnable on driver 575+ unaided.
+# cu12.9 image pins torch to cu129 wheels now that PyTorch 2.13 ships a cu129
+# wheel. This keeps the cu12.9 image aligned with its CUDA label while still
+# being runnable on driver 575+ unaided.
 #
 # cu13.2 image pins torch to cu132 wheels and adds the CUDA 13.x forward-
 # compatibility libs (the `cu13` Dockerfile target). The user-mode
@@ -36,11 +35,11 @@ build_image() {
 # cute-dsl JIT successfully on the H100 runner's 575 kernel driver, so
 # cu13.2 is a fully testable image — not driver-gated. Bonus: torch's cu13
 # wheel bundles all nvidia libs under a single nvidia/cu13/ tree (~1.5 GB
-# smaller than cu126's per-lib layout).
+# smaller than cu129's per-lib layout).
 case "${1:-all}" in
-    cu129)  build_image cu12.9 cu126 dev base ;;
+    cu129)  build_image cu12.9 cu129 dev base ;;
     cu132)  build_image cu13.2 cu132 cu13,dev cu13 ;;
-    all)    build_image cu12.9 cu126 dev base
+    all)    build_image cu12.9 cu129 dev base
             build_image cu13.2 cu132 cu13,dev cu13 ;;
     *)      echo "Unknown variant: $1 (expected cu129, cu132, or all)" >&2; exit 1 ;;
 esac

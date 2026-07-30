@@ -21,14 +21,6 @@ from quack.cute_dsl_utils import mlir_namedtuple
 from quack.varlen_utils import VarlenArguments
 
 
-# Skip the whole module under ``pytest --compile-only`` — the direct TVM-FFI
-# compile path here does not warm quack's jit cache, so the tests add nothing
-# in phase 1. The marker is registered by ``quack.testing.pytest_plugin`` and
-# evaluated at test-setup time, so it is robust to xdist worksteal item-fetch
-# ordering.
-pytestmark = pytest.mark.compile_only_skip("direct TVM-FFI compile does not warm jit cache")
-
-
 @cute.kernel
 def _copy_if_present(mOut: cute.Tensor, mSrc: cute.Tensor):
     tidx, _, _ = cute.arch.thread_idx()

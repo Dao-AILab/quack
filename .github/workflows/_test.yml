@@ -16,8 +16,8 @@ on:
 
 env:
   # Bump these when pushing a new image; old SIFs are auto-pruned on the next CI run.
-  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.05.27
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.05.27
+  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.07.16
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.07.16
 
 jobs:
   lint:
@@ -27,7 +27,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Install ruff
-        run: pip install ruff
+        # Pin to the same version as .pre-commit-config.yaml — ruff releases
+        # change default rule selection and formatter output (0.16.0 went from
+        # 59 to 413 default rules), so an unpinned install breaks lint on
+        # upstream releases with no repo change.
+        run: pip install ruff==0.11.13
       - name: Ruff check
         run: ruff check quack/ tests/
       - name: Ruff format
@@ -65,10 +69,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The cu129 image with torch 2.12 no longer works with B300 (bc torch is installed
-          # with cu12.6).
           - { gpu: h100, cuda: cu129 }
           - { gpu: h100, cuda: cu132 }
+          - { gpu: b300, cuda: cu129 }
           - { gpu: b300, cuda: cu132 }
           - { gpu: h100, cuda: cu129, arch: '120' }
           - { gpu: h100, cuda: cu132, arch: '120' }

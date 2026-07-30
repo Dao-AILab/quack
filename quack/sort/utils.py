@@ -1,8 +1,6 @@
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
-import quack.utils as utils
-
 
 @cute.jit
 def compare_and_swap(
@@ -23,7 +21,7 @@ def compare_and_swap(
         #         arr[i] = b
         #         arr[j] = a
     else:
-        min_fn = min if const_expr(arr.element_type != Float32) else utils.fmin
+        min_fn = min if const_expr(arr.element_type != Float32) else cute.arch.fmin
         max_fn = max if const_expr(arr.element_type != Float32) else cute.arch.fmax
         if const_expr(ascending):
             arr[i], arr[j] = min_fn(arr[i], arr[j]), max_fn(arr[i], arr[j])

@@ -145,6 +145,9 @@ class GemmSm80(GemmBase):
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
-        trace_ptr: Optional[cutlass.Int64] = None,
+        # unified signature across archs; blockscaled is SM120-only
+        mSFA: Optional[cute.Tensor] = None,
+        mSFB: Optional[cute.Tensor] = None,
     ):
+        assert mSFA is None and mSFB is None, "mSFA/mSFB require a blockscaled GEMM"
         raise NotImplementedError("Gemm Sm80 is not implemented yet")

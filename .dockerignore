@@ -1,0 +1,32 @@
+# Keep the docker build context small.
+# Only pyproject.toml and quack/ are needed for the dependency-install step;
+# the editable install at run time uses the mounted repo.
+__pycache__
+*.pyc
+.git
+.pytest_cache
+.ruff_cache
+build/
+dist/
+*.egg-info
+media/
+AI/
+docs/
+benchmarks/
+tests/
+scripts/
+*.sass
+*.cu
+*.cubin
+*.json
+*.py
+!quack/**/*.py
+
+# Large untracked local artifacts that must never enter the build context.
+*.ncu-rep
+*.sif
+*.html
+*.tmp
+.unison.*
+.pydeps/
+worktrees/

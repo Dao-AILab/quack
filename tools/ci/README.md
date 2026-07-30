@@ -13,7 +13,7 @@ and on PRs.
 | `tools/ci/docker/tag_and_push.sh` | tag and push to `tridao/quack-kernels` on Docker Hub |
 | `.github/workflows/_test.yml` | reusable workflow with lint/changes/test jobs and the matrix; **the image tag pins live here** |
 | `.github/workflows/ci.yml`, `ci-pr.yml` | thin shells that call `_test.yml` on push / PR |
-| `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs two-pass pytest |
+| `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs single-pass pytest |
 
 ## Image variants
 
@@ -22,7 +22,7 @@ and on PRs.
 | `cu129` | `tridao/quack-kernels:cu12.9-DATE` | base cute-dsl |
 | `cu132` | `tridao/quack-kernels:cu13.2-DATE` | cute-dsl[cu13] |
 
-The cu12.9 variant uses torch cu126 wheels (newest CUDA 12.x PyTorch 2.12 index).
+The cu12.9 variant uses torch cu129 wheels (CUDA 12.9 PyTorch 2.13 index).
 The cu13.2 variant uses torch cu132 wheels plus the Dockerfile's CUDA 13 forward-
 compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 
@@ -33,17 +33,23 @@ compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 | GPU | Arch override | cu129 | cu132 |
 |-----|----------------|-------|-------|
 | h100 | (none, sm90) | ✓ | ✓ |
-| b300 | (none, sm100) | — | ✓ |
+| b300 | (none, sm100) | ✓ | ✓ |
 | h100 | sm120 | ✓ | ✓ |
 
-## Two-pass test strategy
+## Test strategy
 
-Per `gpu-test/action.yml`:
+Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
-- **Pass 1** — `pytest tests/ --compile-only -n 24 --dist worksteal` (compile-only
-  flag, no GPU memory needed; warms the persistent kernel cache).
-- **Pass 2** — `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal`
-  on real GPUs (free-memory threshold 50 GB).
+- `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24`
+  (free-memory threshold 50 GB). The action waits up to 5 minutes, polling
+  every 15 seconds, when runner assignment races with transient GPU
+  contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
+  workers (forkserver sidecar, GPU-blind) while the affected tests defer and
+  retry once their `.o` lands; warm runs pay nothing. The
+  persistent kernel cache (`QUACK_CACHE_DIR`) carries `.o` files across runs
+  on the same runner. CI prunes QuACK source-fingerprint cache directories
+  older than 7 days before each test run, plus interrupted `.o.tmp.*` exports
+  older than 1 day.
 
 ## SIF caching on runners
 
