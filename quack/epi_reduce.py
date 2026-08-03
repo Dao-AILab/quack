@@ -7,8 +7,8 @@ epilogue_split_rank / split_rank_partial_commit, the cross-rank siblings of the
 split-K pair.
 
 Dataflow: both warp groups run epilogue_split_rank. The producer's finalize action
-is split_rank_partial_commit — register-direct d_dtype partials into the padded
-symmetric workspace, then the tile signal. The reducer's is epilogue() between two
+is split_rank_partial_commit — register-direct workspace-dtype partials into the
+padded symmetric workspace, then the tile signal. The reducer's is epilogue() between two
 bound functions: multimem ld_reduce from the workspace in, EVT/C_load/aux
 TileStores unchanged in the middle, register-direct store out (this rank's plain
 slab-shaped D for reduce_scatter, multimem_st broadcast into symmetric D for
@@ -39,8 +39,9 @@ class EpiReduceArguments(NamedTuple):
     CTA slot, with num_sms allocation remaining a safe upper bound."""
 
     mD_mc: Optional[cute.Tensor] = None  # multicast view of symmetric D — all_reduce only
-    # d_dtype partials workspace, (M_pad, N_pad, L) at real (m, n) coords: this
-    # rank's view (producer store target) and its multicast view (reducer ld_reduce).
+    # Partials workspace (any multimem-reducible dtype, default d_dtype),
+    # (M_pad, N_pad, L) at real (m, n) coords: this rank's view (producer store
+    # target) and its multicast view (reducer ld_reduce).
     workspace: Optional[cute.Tensor] = None
     workspace_mc: Optional[cute.Tensor] = None
     # producer -> consumer, ceil(M/cta_M) * ceil(N/cta_N) * L entries
@@ -97,8 +98,17 @@ def validate_epi_reduce_args(
                 f"epi_reduce_args.{name}: kernel-order padded (m, n, l) {ws_mnl} expected, "
                 f"got {None if t is None else tuple(t.shape)}"
             )
-    if era.workspace.dtype != D.dtype or era.workspace.stride(1) != 1:
-        raise ValueError("epi_reduce_args.workspace must be n-major with D's dtype")
+    if era.workspace.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"epi_reduce_args.workspace dtype {era.workspace.dtype} not multimem-reducible")
+    if era.workspace_mc.dtype != era.workspace.dtype or era.workspace.stride(1) != 1:
+        raise ValueError("epi_reduce_args.workspace must be n-major, workspace_mc same dtype")
+    if mode == "all_reduce" and era.workspace.dtype != D.dtype:
+        # Not inherent: the broadcast commit hardcodes 16 B multimem_st of D-dtype
+        # atoms; teach it 8/32 B atoms if a workload needs mismatched-dtype AR.
+        raise ValueError("all_reduce requires workspace dtype == D dtype")
+    ws_vec = 16 // era.workspace.element_size()
+    if n % ws_vec:
+        raise ValueError(f"epi_reduce_mode: n ({n}) must be divisible by {ws_vec} (workspace vectors)")
     if mode == "reduce_scatter":
         if era.mD_mc is not None:
             raise ValueError("reduce_scatter commits to plain local D: mD_mc must be None")

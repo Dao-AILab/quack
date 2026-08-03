@@ -1290,9 +1290,14 @@ class EpiMod:
                 # RS under epi_reduce is unspecified: the skip-epi-ops partial store has no
                 # seed wired and the reducer's final convert is round-to-nearest.
                 raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
-            if epi_reduce_args is None:
-                raise ValueError("epi_reduce_mode requires epi_reduce_args")
-            epi_reduce = (epi_reduce_mode, dist.get_world_size(), dist.get_rank())
+            if epi_reduce_args is None or epi_reduce_args.workspace is None:
+                raise ValueError("epi_reduce_mode requires epi_reduce_args with a workspace")
+            epi_reduce = (
+                epi_reduce_mode,
+                dist.get_world_size(),
+                dist.get_rank(),
+                epi_reduce_args.workspace.dtype,
+            )
             num_ranks = epi_reduce[1]
         # Warm fast path: probe the plan cache on raw-input metadata before any
         # validation or kind inference — a hit is exactly a replay of a

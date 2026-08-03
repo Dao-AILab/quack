@@ -27,8 +27,6 @@ from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm
 
-ab_dtype = cutlass.BFloat16
-
 
 def parse_comma_separated_ints(s: str):
     try:
@@ -70,10 +68,22 @@ def parse_arguments() -> argparse.Namespace:
         help="Cluster shape M,N (comma-separated)",
     )
     parser.add_argument(
+        "--ab_dtype",
+        choices=["bfloat16", "mxfp8"],
+        default="bfloat16",
+        help="Operand dtype; mxfp8 = per-rank K-shard quantized mxfp8_e4m3 (sf_vec 32)",
+    )
+    parser.add_argument(
         "--d_dtype",
         type=str,
         default="BFloat16",
-        help="Output dtype (also the symmetric partials dtype): BFloat16/Float16/Float32.",
+        help="Output dtype (also the default symmetric partials dtype): BFloat16/Float16/Float32.",
+    )
+    parser.add_argument(
+        "--ws_dtype",
+        type=str,
+        default=None,
+        help="Partials workspace dtype override (e.g. Float32); default = d_dtype",
     )
     parser.add_argument("--tolerance", type=float, default=3e-02, help="Tolerance for validation")
     parser.add_argument("--warmup_iterations", type=int, default=5, help="Warmup iterations")
@@ -95,8 +105,9 @@ def run(args):
     m, n, k, l = args.mnkl
     mode = args.mode
     d_dtype = cutlass.dtype(args.d_dtype)
-    torch_ab = cutlass_torch.dtype(ab_dtype)
     torch_d = cutlass_torch.dtype(d_dtype)
+    torch_ws = cutlass_torch.dtype(cutlass.dtype(args.ws_dtype)) if args.ws_dtype else None
+    blockscaled = args.ab_dtype == "mxfp8"
     tile_M, tile_N = args.tile_shape_mnk[:2]
     cluster_M, cluster_N = args.cluster_shape_mnk[:2]
     vec = 128 // d_dtype.width  # one 16B multimem vector
@@ -113,24 +124,51 @@ def run(args):
 
     # A: (l, m, k_local), B: (l, n, k_local), rank-seeded, caller order.
     torch.manual_seed(1111 + rank)
-    a_gpu = (
-        torch.empty(l, m, k_local, dtype=torch.float32)
-        .normal_()
-        .mul_(1.0 / (k**0.5))
-        .to(torch_ab)
-        .cuda()
-    )
-    b_gpu = (
-        torch.empty(l, n, k_local, dtype=torch.float32)
-        .normal_()
-        .mul_(1.0 / (k**0.5))
-        .to(torch_ab)
-        .cuda()
-    )
+    bs_kwargs = {}
+    if blockscaled:
+        from quack.blockscaled.utils import (
+            create_blockscaled_operand_quantized,
+            scale_view_for_kernel,
+        )
+
+        sf_vec = 32
+        assert k_local % (4 * sf_vec) == 0, (
+            f"k_local ({k_local}) must be divisible by {4 * sf_vec} (SF tile granularity)"
+        )
+        a_ref_mkl, aq, a_sc = create_blockscaled_operand_quantized(l, m, k_local, False, sf_vec)
+        b_ref_mkl, bq, b_sc = create_blockscaled_operand_quantized(l, n, k_local, False, sf_vec)
+        a_gpu, b_gpu = aq.permute(2, 0, 1), bq.permute(2, 0, 1)
+        bs_kwargs = dict(
+            SFA=scale_view_for_kernel(a_sc, m, k_local // sf_vec, l),
+            SFB=scale_view_for_kernel(b_sc, n, k_local // sf_vec, l),
+            bs_format_a="mxfp8_e4m3",
+            bs_format_b="mxfp8_e4m3",
+        )
+        # Baseline/ref runs on the bf16 dequants (canary pipeline stays bf16).
+        A = a_ref_mkl.permute(2, 0, 1).to(torch_d).contiguous()
+        B = b_ref_mkl.permute(2, 0, 1).to(torch_d).contiguous()
+    else:
+        torch_ab = torch.bfloat16
+        a_gpu = (
+            torch.empty(l, m, k_local, dtype=torch.float32)
+            .normal_()
+            .mul_(1.0 / (k**0.5))
+            .to(torch_ab)
+            .cuda()
+        )
+        b_gpu = (
+            torch.empty(l, n, k_local, dtype=torch.float32)
+            .normal_()
+            .mul_(1.0 / (k**0.5))
+            .to(torch_ab)
+            .cuda()
+        )
+        A = a_gpu.to(torch_d)
+        B = b_gpu.to(torch_d)
     # D output + padded symmetric partials workspace + semaphores: RS D is a plain
     # (l, m/world, n) tensor, AR D this rank's view of full symmetric (l, m, n).
     d_arg, epi_reduce_args = make_epi_reduce_args(
-        mode, torch_d, m, n, l, tile_M, tile_N, cluster_M, world_size
+        mode, torch_d, m, n, l, tile_M, tile_N, cluster_M, world_size, ws_dtype=torch_ws
     )
 
     # No host-side barriers in the loop: the kernel owns cross-invocation sync
@@ -148,10 +186,9 @@ def run(args):
             cluster_N,
             epi_reduce_mode=mode,
             epi_reduce_args=epi_reduce_args,
+            **bs_kwargs,
         )
 
-    A = a_gpu.to(torch_d)
-    B = b_gpu.to(torch_d)
     D_full = torch.empty(l, m, n, dtype=torch_d, device="cuda")
     D_rs = torch.empty(l, m_per_rank, n, dtype=torch_d, device="cuda")
 

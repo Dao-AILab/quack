@@ -47,6 +47,7 @@ def _run_gemm_epi_reduce(
     epi_reduce_mode="reduce_scatter",
     split_k=1,
     split_k_mode="serial",
+    ws_dtype=None,
 ):
     import torch.distributed as dist
 
@@ -72,34 +73,65 @@ def _run_gemm_epi_reduce(
         "float16": cutlass.Float16,
         "float32": cutlass.Float32,
     }
-    ab_dtype, d_dtype = dtype_map[ab_dtype], dtype_map[d_dtype]
+    blockscaled = ab_dtype == "mxfp8"
+    d_dtype = dtype_map[d_dtype]
     tile_m, tile_n = 256, 256
     cluster_m, cluster_n = 2, 1
     vec = 128 // d_dtype.width
     assert n % vec == 0, f"n ({n}) must be divisible by {vec} (16B multimem vectors)"
-    ab_vec = 128 // ab_dtype.width
-    assert (k // world_size) % ab_vec == 0, (
-        f"k_local ({k // world_size}) must be divisible by {ab_vec} (16B TMA alignment on A/B)"
-    )
 
     k_local = k // world_size
     m_per_rank = m // world_size
-    torch_ab = cutlass_torch.dtype(ab_dtype)
     torch_d = cutlass_torch.dtype(d_dtype)
 
     torch.manual_seed(1111 + rank)
-    a_torch_cpu = (
-        torch.empty(l, m, k_local, dtype=torch.float32).normal_().mul_(1.0 / (k**0.5)).to(torch_ab)
-    )
-    b_torch_cpu = (
-        torch.empty(l, n, k_local, dtype=torch.float32).normal_().mul_(1.0 / (k**0.5)).to(torch_ab)
-    )
-    a_gpu = a_torch_cpu.cuda()
-    b_gpu = b_torch_cpu.cuda()
+    bs_kwargs = {}
+    if blockscaled:
+        from quack.blockscaled.utils import (
+            create_blockscaled_operand_quantized,
+            scale_view_for_kernel,
+        )
+
+        sf_vec = 32
+        assert k_local % (4 * sf_vec) == 0, (
+            f"k_local ({k_local}) must be divisible by {4 * sf_vec} (SF tile granularity)"
+        )
+        # Each rank quantizes its own K-shard; a_ref/b_ref are the f32 dequants.
+        a_ref_mkl, aq, a_sc = create_blockscaled_operand_quantized(l, m, k_local, False, sf_vec)
+        b_ref_mkl, bq, b_sc = create_blockscaled_operand_quantized(l, n, k_local, False, sf_vec)
+        a_gpu, b_gpu = aq.permute(2, 0, 1), bq.permute(2, 0, 1)
+        bs_kwargs = dict(
+            SFA=scale_view_for_kernel(a_sc, m, k_local // sf_vec, l),
+            SFB=scale_view_for_kernel(b_sc, n, k_local // sf_vec, l),
+            bs_format_a="mxfp8_e4m3",
+            bs_format_b="mxfp8_e4m3",
+        )
+    else:
+        ab_dtype = dtype_map[ab_dtype]
+        ab_vec = 128 // ab_dtype.width
+        assert k_local % ab_vec == 0, (
+            f"k_local ({k_local}) must be divisible by {ab_vec} (16B TMA alignment on A/B)"
+        )
+        torch_ab = cutlass_torch.dtype(ab_dtype)
+        a_torch_cpu = (
+            torch.empty(l, m, k_local, dtype=torch.float32)
+            .normal_()
+            .mul_(1.0 / (k**0.5))
+            .to(torch_ab)
+        )
+        b_torch_cpu = (
+            torch.empty(l, n, k_local, dtype=torch.float32)
+            .normal_()
+            .mul_(1.0 / (k**0.5))
+            .to(torch_ab)
+        )
+        a_gpu = a_torch_cpu.cuda()
+        b_gpu = b_torch_cpu.cuda()
     # D output + padded partials workspace + semaphores; torch handles inside the
     # args are the sole refs keeping the symmetric allocs alive.
+    torch_ws = cutlass_torch.dtype(dtype_map[ws_dtype]) if ws_dtype is not None else None
     d_arg, epi_reduce_args = make_epi_reduce_args(
-        epi_reduce_mode, torch_d, m, n, l, tile_m, tile_n, cluster_m, world_size
+        epi_reduce_mode, torch_d, m, n, l, tile_m, tile_n, cluster_m, world_size, ws_dtype=torch_ws
     )
     tf_torch = epi_reduce_args.tile_flags
     counters_torch = epi_reduce_args.consumer_counters
@@ -119,6 +151,7 @@ def _run_gemm_epi_reduce(
         split_k_mode=sk_mode,
         epi_reduce_mode=epi_reduce_mode,
         epi_reduce_args=epi_reduce_args,
+        **bs_kwargs,
     )
     # d_arg is the output itself: RS a plain (l, m/world, n) slab; AR the full
     # reduced D on every rank after the multicast broadcast.
@@ -142,9 +175,11 @@ def _run_gemm_epi_reduce(
 
     # Mutation loop: negate A each iter (bit-exact in every dtype) so stale/raced
     # values differ from expected; rotate a forced-skew straggler; no barrier between iters.
+    # For fp8 operands negation is a sign-bit flip (e8m0 scales are unsigned).
+    neg_a = (lambda: aq.view(torch.uint8).bitwise_xor_(0x80)) if blockscaled else a_gpu.neg_
     expected = runs[1].clone()
     for it in range(4 * world_size):
-        a_gpu.neg_()
+        neg_a()
         expected.neg_()
         if it % world_size == rank:
             torch.cuda._sleep(50_000_000)  # ~25 ms straggler: dwarfs one launch
@@ -168,8 +203,13 @@ def _run_gemm_epi_reduce(
     dist.barrier()
 
     # quack convention: fp32 ref is ground truth; kernel error < 2x same-dtype ref error.
-    a_ref = a_torch_cpu.contiguous().cuda()
-    b_ref = b_torch_cpu.contiguous().cuda()
+    # Blockscaled ground truth is the f32 dequant of the quantized operands.
+    if blockscaled:
+        a_ref = a_ref_mkl.permute(2, 0, 1)
+        b_ref = b_ref_mkl.permute(2, 0, 1)
+    else:
+        a_ref = a_torch_cpu.contiguous().cuda()
+        b_ref = b_torch_cpu.contiguous().cuda()
 
     def epilogue_ref(dtype):
         d_full = torch.bmm(a_ref.to(dtype), b_ref.to(dtype).mT)
@@ -252,13 +292,14 @@ def _parse_args():
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--l", type=int, default=1)
     dtypes = ["bfloat16", "float16", "float32"]
-    parser.add_argument("--ab_dtype", choices=dtypes, default="bfloat16")
+    parser.add_argument("--ab_dtype", choices=dtypes + ["mxfp8"], default="bfloat16")
     parser.add_argument("--d_dtype", choices=dtypes, default="bfloat16")
     parser.add_argument(
         "--mode", choices=["reduce_scatter", "all_reduce"], default="reduce_scatter"
     )
     parser.add_argument("--split_k", type=int, default=1)
     parser.add_argument("--split_k_mode", choices=["serial", "parallel"], default="serial")
+    parser.add_argument("--ws_dtype", choices=dtypes, default=None)
     return parser.parse_args()
 
 
@@ -274,4 +315,5 @@ if __name__ == "__main__":
         args.mode,
         args.split_k,
         args.split_k_mode,
+        ws_dtype=args.ws_dtype,
     )

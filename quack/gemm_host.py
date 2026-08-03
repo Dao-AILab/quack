@@ -202,7 +202,7 @@ def _compile_gemm_epi(
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
-    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see quack.epi_reduce)
+    epi_reduce=None,  # (mode, num_ranks, rank, ws_dtype): fused-comm epilogue (see quack.epi_reduce)
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
 ):
@@ -393,7 +393,7 @@ def build_gemm_epi_plan(
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
-    epi_reduce=None,  # (mode, num_ranks, rank): fused-comm epilogue (see quack.epi_reduce)
+    epi_reduce=None,  # (mode, num_ranks, rank, ws_dtype): fused-comm epilogue (see quack.epi_reduce)
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
 ) -> GemmEpiPlan:

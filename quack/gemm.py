@@ -87,7 +87,7 @@ def _compile_gemm(
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
     has_ag=False,
-    epi_reduce=None,  # (mode, num_ranks, rank)
+    epi_reduce=None,  # (mode, num_ranks, rank, ws_dtype)
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -479,8 +479,8 @@ def gemm(
 
         if cu_seqlens_m is not None or cu_seqlens_k is not None or A_idx is not None:
             raise ValueError("epi_reduce_mode requires a dense GEMM")
-        if SFA is not None or ag_args is not None:
-            raise ValueError("epi_reduce_mode: non-blockscaled and no ag_args")
+        if ag_args is not None:
+            raise ValueError("epi_reduce_mode does not compose with ag_args")
         if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
             raise ValueError("epi_reduce_mode composes with SERIAL/PARALLEL split_k only")
         if rounding_mode != RoundingMode.RN:
@@ -507,7 +507,12 @@ def gemm(
             cluster_M,
             dist.get_world_size(),
         )
-        epi_reduce = (epi_reduce_mode, dist.get_world_size(), dist.get_rank())
+        epi_reduce = (
+            epi_reduce_mode,
+            dist.get_world_size(),
+            dist.get_rank(),
+            epi_reduce_args.workspace.dtype,
+        )
     elif epi_reduce_args is not None:
         raise ValueError("epi_reduce_args requires epi_reduce_mode")
     key = (
@@ -763,7 +768,7 @@ def _build_gemm_plan(
     bs_format_a=None,
     bs_format_b=None,
     has_ag=False,
-    epi_reduce=None,  # (mode, num_ranks, rank), see quack/epi_reduce.py
+    epi_reduce=None,  # (mode, num_ranks, rank, ws_dtype), see quack/epi_reduce.py
 ) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -779,9 +784,7 @@ def _build_gemm_plan(
         assert persistent, "AllGather+GEMM requires the persistent scheduler"
         assert split_k == 1, "AllGather+GEMM does not support split_k yet"
     if epi_reduce is not None:
-        assert not varlen and not gather_A and not blockscaled, (
-            "epi_reduce_mode requires a dense non-blockscaled GEMM"
-        )
+        assert not varlen and not gather_A, "epi_reduce_mode requires a dense GEMM"
         assert persistent, "epi_reduce_mode requires the persistent scheduler"
         # SEPARATE finalizes in a second launch; the in-kernel reducer warps can't wait on it.
         assert not (split_k > 1 and split_k_mode == SplitKMode.SEPARATE), (

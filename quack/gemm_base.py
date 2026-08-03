@@ -553,8 +553,9 @@ class GemmBase:
         """Split-rank sibling of split_k_partial_commit: commit this rank's partial
         into the symmetric workspace, run no epi ops (EVT/C/aux belong to the
         reducer warps). Unlike split-K's layout-free f32 stripes, the partial is
-        stored in d_dtype at real (m, n) addresses — the cross-rank multimem
-        contract — as plain register-direct stores: generic-proxy stores need no
+        stored in the workspace dtype (default d_dtype; f32 for exact partials)
+        at real (m, n) addresses — the cross-rank multimem contract — as plain
+        register-direct stores: generic-proxy stores need no
         TMA drain, so ordering is just the epi-group barrier below plus the
         signal's release. tRS_gWs is the r2s-fragment-order workspace partition of
         this tile with the epi-subtile modes trailing; the padded workspace absorbs
@@ -584,8 +585,8 @@ class GemmBase:
         for epi_idx in cutlass.range_constexpr(cute.size(epi_tile_shape)):
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
             load_acc_subtile(tRS_rD, epi_coord)
-            tRS_rWs = cute.make_rmem_tensor(tRS_rD.layout.shape, self.d_dtype)
-            tRS_rWs.store(tRS_rD.load().to(self.d_dtype))
+            tRS_rWs = cute.make_rmem_tensor(tRS_rD.layout.shape, tRS_gWs.element_type)
+            tRS_rWs.store(tRS_rD.load().to(tRS_gWs.element_type))
             # Direct store measures ~1-3% slower than a TMA-pipelined commit
             # (lost async-store overlap) but frees the sD smem and needs no drain.
             cute.autovec_copy(tRS_rWs, tRS_gWs[None, None, None, epi_coord[0], epi_coord[1]])
