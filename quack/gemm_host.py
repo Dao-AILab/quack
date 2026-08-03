@@ -267,7 +267,11 @@ def _compile_gemm_epi(
     epi_args = GemmCls.EpilogueArguments(**fields)
 
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l, has_ag=has_ag
+        (is_dynamic_persistent and device_capacity[0] == 9),
+        False,
+        l,
+        has_ag=has_ag,
+        has_epi_reduce=epi_reduce is not None,
     )
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
     mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None

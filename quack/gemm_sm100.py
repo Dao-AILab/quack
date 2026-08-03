@@ -2150,9 +2150,10 @@ class GemmSm100(GemmTmaBase):
                 tile_sched = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
                 work_tile = tile_sched.initial_work_tile_info()
 
-                # we want 128bit ld/st for better performance
+                # we want 128bit ld/st for better performance; one copy pass spans
+                # the reduce tile's width so subtiles slice cleanly in fragment space
                 atom_val = 128 // ws_mc.element_type.width
-                atom_thr_n = self.mma_tiler[1] // atom_val
+                atom_thr_n = self.epi_reduce_tile[1] // atom_val
                 atom_thr_m = len(self.epi_reduce_warp_ids) * cute.arch.WARP_SIZE // atom_thr_n
                 thr_layout = cute.make_layout((atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1))
                 val_layout = cute.make_layout((1, atom_val), stride=(atom_val, 1))
@@ -2203,23 +2204,20 @@ class GemmSm100(GemmTmaBase):
                         pipeline.PipelineUserType.Consumer, self.epi_c_stage
                     )
 
-                # Per-subtile visit fragments; each epi_idx owns chunk = loop_m /
-                # epi_tile_num rows. Keep the partition's hier atom mode ((1, 8), ...):
-                # a flat (8, ...) compiles, but VecReduce epi ops mis-pair modes.
-                epi_reduce_tile_shape = cute.zipped_divide(
+                # Per-subtile visit fragments; subtile (mi, ni) owns the fragment
+                # block rows [mi*chunk, ...) x cols [ni*sub_loop_n, ...). Keep the
+                # partition's hier atom mode ((1, 8), ...): a flat (8, ...) compiles,
+                # but VecReduce epi ops mis-pair modes.
+                epi_reduce_grid = cute.zipped_divide(
                     cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_reduce_tile
                 ).shape[1]
-                epi_reduce_tile_layout = cute.make_ordered_layout(
-                    epi_reduce_tile_shape,
-                    order=(0, 1) if const_expr(self.epi_m_major) else (1, 0),
-                )
-                epi_reduce_tile_num = cute.size(epi_reduce_tile_shape)
                 _atom, loop_m, loop_n = frgD_crd.shape
-                chunk = loop_m // epi_reduce_tile_num
-                tRS_rD = cute.make_rmem_tensor((_atom, chunk, loop_n), self.acc_dtype)
+                chunk = loop_m // epi_reduce_grid[0]
+                sub_loop_n = loop_n // epi_reduce_grid[1]
+                tRS_rD = cute.make_rmem_tensor((_atom, chunk, sub_loop_n), self.acc_dtype)
                 tRS_rC, tSR_rC = None, None
                 if const_expr(has_C):
-                    tRS_rC = cute.make_rmem_tensor((_atom, chunk, loop_n), self.c_dtype)
+                    tRS_rC = cute.make_rmem_tensor((_atom, chunk, sub_loop_n), self.c_dtype)
                     tSR_rC = tiled_copy_fake.retile(tRS_rC)
 
                 while work_tile.is_valid_tile:
@@ -2250,7 +2248,6 @@ class GemmSm100(GemmTmaBase):
                         load_reduce_subtile = partial(
                             multimem_reduce_subtile,
                             frgWs_mc,
-                            epi_reduce_tile_layout,
                         )
                         commit_fn = (
                             commit_subtile_broadcast
@@ -2263,7 +2260,6 @@ class GemmSm100(GemmTmaBase):
                             frgD_crd,
                             row_limit,
                             col_limit,
-                            epi_reduce_tile_layout,
                         )
                         epi_fn = partial(
                             self.epilogue,

@@ -931,6 +931,7 @@ class GemmBase:
             # Passed as args: DSL control flow can't close over outer variables.
             def spin_flag(flag, base, num_ranks):
                 # Wrap-safe: compare the difference, never absolute values.
+                # (nanosleep backoff on retries was tried: perf-neutral.)
                 res = base
                 while res - base < num_ranks:
                     res = cute.arch.load(flag.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")

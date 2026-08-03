@@ -194,6 +194,7 @@ def _compile_gemm(
         has_batch_idx_permute,
         l,
         has_ag=has_ag,
+        has_epi_reduce=epi_reduce is not None,
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)

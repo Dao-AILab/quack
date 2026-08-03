@@ -192,14 +192,14 @@ def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
 # Tile-agnostic (no GEMM state; a standalone RS kernel could bind them), under a
 # three-part contract: the reduce reads a symmetric padded workspace through its mc
 # view (unpredicated — pad keeps every access in-allocation); the partition's value
-# atom is one contiguous 128b vector (n-major, N % (16B/elem) == 0); subtiles
-# slice fragment rows evenly (chunk = loop_m / num_subtiles).
+# atom is one contiguous 128b vector (n-major, N % (16B/elem) == 0); subtile
+# (mi, ni) owns the even fragment block rows [mi*chunk, (mi+1)*chunk) x cols
+# [ni*sub_loop_n, (ni+1)*sub_loop_n).
 
 
 @cute.jit
 def multimem_reduce_subtile(
     frgWs_mc: cute.Tensor,
-    subtile_layout: cute.Layout,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
     # load_acc_subtile signature compat (acc prepass); a multimem load has nothing to release.
@@ -210,19 +210,19 @@ def multimem_reduce_subtile(
     warps. Unpredicated: the padded workspace keeps every access in-allocation;
     rows/cols past the slab or N edge carry garbage that the commit skips and epi
     ops predicate away (slab-framed limits)."""
-    _atom, chunk, loop_n = tRS_rD.shape
-    epi_idx = subtile_layout(epi_coord)
+    _atom, chunk, sub_loop_n = tRS_rD.shape
     ld_reduce = multimem_ld_reduce_128b(frgWs_mc.element_type)
-    tmp_results = cute.make_rmem_tensor((4, chunk, loop_n), cutlass.Int32)
+    tmp_results = cute.make_rmem_tensor((4, chunk, sub_loop_n), cutlass.Int32)
     for ii in cutlass.range_constexpr(chunk):
-        i = epi_idx * chunk + ii
-        for j in cutlass.range_constexpr(loop_n):
+        i = epi_coord[0] * chunk + ii
+        for jj in cutlass.range_constexpr(sub_loop_n):
+            j = epi_coord[1] * sub_loop_n + jj
             mc_ptr = frgWs_mc[None, i, j].iterator
             x, y, z, w = ld_reduce(mc_ptr)
-            tmp_results[0, ii, j] = x
-            tmp_results[1, ii, j] = y
-            tmp_results[2, ii, j] = z
-            tmp_results[3, ii, j] = w
+            tmp_results[0, ii, jj] = x
+            tmp_results[1, ii, jj] = y
+            tmp_results[2, ii, jj] = z
+            tmp_results[3, ii, jj] = w
     tmp_rD = cute.recast_tensor(tmp_results, frgWs_mc.element_type)
     tRS_rD.store(tmp_rD.load().to(tRS_rD.element_type))
 
@@ -242,7 +242,6 @@ def commit_subtile_local(
     frgD_crd: cute.Tensor,
     row_limit: Int32,
     col_limit: Int32,
-    subtile_layout: cute.Layout,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
 ) -> None:
@@ -251,15 +250,15 @@ def commit_subtile_local(
     as commit_D. Owns d_dtype conversion and edge predication: D has no padding, so
     skip rows past the slab tail and cols past N (n-major D: an OOB column wraps
     into the next row)."""
-    _atom, chunk, loop_n = tRS_rD.shape
-    epi_idx = subtile_layout(epi_coord)
+    _atom, chunk, sub_loop_n = tRS_rD.shape
     tmp_out = _subtile_to_dtype(tRS_rD, frgD.element_type)
     for ii in cutlass.range_constexpr(chunk):
-        i = epi_idx * chunk + ii
-        for j in cutlass.range_constexpr(loop_n):
+        i = epi_coord[0] * chunk + ii
+        for jj in cutlass.range_constexpr(sub_loop_n):
+            j = epi_coord[1] * sub_loop_n + jj
             crd = frgD_crd[((0, 0), i, j)]
             if crd[0] < row_limit and crd[1] < col_limit:
-                cute.autovec_copy(tmp_out[None, ii, j], frgD[None, i, j])
+                cute.autovec_copy(tmp_out[None, ii, jj], frgD[None, i, j])
 
 
 @cute.jit
@@ -268,26 +267,25 @@ def commit_subtile_broadcast(
     frgD_crd: cute.Tensor,
     row_limit: Int32,
     col_limit: Int32,
-    subtile_layout: cute.Layout,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
 ) -> None:
     """all_reduce commit: multimem_st broadcast of the reduced, post-EVT subtile to
     every rank's symmetric D. Passed to epilogue() as commit_D. Same d_dtype
     conversion and edge predication as the local commit (D is exactly (m, n, l))."""
-    _atom, chunk, loop_n = tRS_rD.shape
-    epi_idx = subtile_layout(epi_coord)
+    _atom, chunk, sub_loop_n = tRS_rD.shape
     tmp_out = _subtile_to_dtype(tRS_rD, frgD_mc.element_type)
     out_i32 = cute.recast_tensor(tmp_out, cutlass.Int32)
     for ii in cutlass.range_constexpr(chunk):
-        i = epi_idx * chunk + ii
-        for j in cutlass.range_constexpr(loop_n):
+        i = epi_coord[0] * chunk + ii
+        for jj in cutlass.range_constexpr(sub_loop_n):
+            j = epi_coord[1] * sub_loop_n + jj
             crd = frgD_crd[((0, 0), i, j)]
             if crd[0] < row_limit and crd[1] < col_limit:
                 utils.distributed.multimem_st_4xb32(
                     frgD_mc[None, i, j].iterator,
-                    out_i32[0, ii, j].ir_value(),
-                    out_i32[1, ii, j].ir_value(),
-                    out_i32[2, ii, j].ir_value(),
-                    out_i32[3, ii, j].ir_value(),
+                    out_i32[0, ii, jj].ir_value(),
+                    out_i32[1, ii, jj].ir_value(),
+                    out_i32[2, ii, jj].ir_value(),
+                    out_i32[3, ii, jj].ir_value(),
                 )

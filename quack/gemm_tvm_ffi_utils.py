@@ -12,7 +12,7 @@ from cutlass.cute.runtime import make_ptr
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
+from quack.tile_scheduler import AgSchedulerArguments, RasterOrderOption, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
 
@@ -313,9 +313,18 @@ def make_fake_epi_reduce_args(d_dtype, mode):
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag=False):
+def make_fake_scheduler_args(
+    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_epi_reduce=False
+):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
+        # Baked at trace time. Heuristic picks AlongM on N>M grids, which under
+        # epi_reduce emits each rank's slab at TPx rate in one GEMM fraction and
+        # collapses the RS overlap (out-405B: TP=2 1.55->1.40, TP=4 0.81->0.70;
+        # TP=8 both 405B shapes +37-45 us under AlongM — worsens as slab shrinks).
+        raster_order=(
+            RasterOrderOption.AlongN if has_epi_reduce else RasterOrderOption.Heuristic
+        ),
         max_swizzle_size=Int32(8),
         tile_count_semaphore=(
             make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_semaphore else None
