@@ -16,6 +16,8 @@ bf16 loss parity — FLOOR clips block maxima in (448, 512)·2^e, which hurts
 especially on gradient tensors. The FP4 quantizers remain FLOOR-only.
 """
 
+import inspect
+
 import torch
 
 F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
@@ -454,6 +456,11 @@ def to_nvfp4(x: torch.Tensor, block_size: int = 16, per_tensor_scale=None):
 # on the autograd worker thread, which would still see the default 8.
 # ---------------------------------------------------------------------------
 _COMPILE_KW = dict(dynamic=False, recompile_limit=64)
+if "recompile_limit" not in inspect.signature(torch.compile).parameters:
+    # torch < 2.13: torch.compile has no per-wrapper recompile_limit kwarg. Drop it
+    # to keep the module importable; past 8 distinct shapes dynamo then silently
+    # falls back to eager (slow but correct).
+    del _COMPILE_KW["recompile_limit"]
 
 to_mx_compiled = torch.compile(to_mx, **_COMPILE_KW)
 to_mx_e5m2_compiled = torch.compile(to_mx_e5m2, **_COMPILE_KW)
