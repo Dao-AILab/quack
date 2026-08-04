@@ -573,7 +573,11 @@ def test_epi_mod_rms_fused(tile_N):
     _rel_check(sqsum, sqsum2, "sqsum vs handwritten", tol=1e-4)
 
 
-def test_epi_mod_gated_swiglu():
+# cluster_M=2 with tile_M=128 gives cta_tile_m=64 + 2-CTA on SM100, i.e. the
+# (2, 2) epilogue warp shape. The half-N gated aux store used to corrupt warp 1's
+# smem there (~27% of postact wrong); see TileStore._make_tiled_copy_r2s.
+@pytest.mark.parametrize("cluster_M", [1, 2])
+def test_epi_mod_gated_swiglu(cluster_M):
     """GemmGated as a mod, cross-checked against the hand-written kernel."""
     device = "cuda"
     torch.random.manual_seed(6)
@@ -589,10 +593,7 @@ def test_epi_mod_gated_swiglu():
         epi_args=dict(postact=postact),
         tile_M=128,
         tile_N=256,
-        # cluster_M=1: gated + cluster_M=2 miscomputes ~27% of postact on SM100 —
-        # pre-existing bug in the hand-written kernel (reproduces on main @8ff10ac
-        # via the raw gemm_act dispatch; see dbg_gated6 minimized repro).
-        cluster_M=1,
+        cluster_M=cluster_M,
         cluster_N=1,
     )
 
@@ -602,11 +603,12 @@ def test_epi_mod_gated_swiglu():
     _rel_check(postact, ref, "postact")
 
     postact2 = torch.empty_like(postact)
-    gemm_act(A, B, None, None, postact2, None, "swiglu", 128, 256, 1, 1)
+    gemm_act(A, B, None, None, postact2, None, "swiglu", 128, 256, cluster_M, 1)
     _rel_check(postact, postact2.float(), "postact vs handwritten", tol=1e-3)
 
 
-def test_epi_mod_gated_operands_and_d():
+@pytest.mark.parametrize("cluster_M", [1, 2])
+def test_epi_mod_gated_operands_and_d(cluster_M):
     """Gated mod with rowvec (per-lane tuple), colvec (scalar), and D writeback."""
     device = "cuda"
     torch.random.manual_seed(7)
@@ -625,7 +627,7 @@ def test_epi_mod_gated_operands_and_d():
         epi_args=dict(rstd=rstd, bias=bias, postact=postact),
         tile_M=128,
         tile_N=256,
-        cluster_M=1,  # see cluster_M note in test_epi_mod_gated_swiglu
+        cluster_M=cluster_M,  # see cluster_M note on test_epi_mod_gated_swiglu
         cluster_N=1,
     )
 
