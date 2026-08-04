@@ -964,60 +964,25 @@ class TileStore(EpiOp):
             )
             return cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_c_atom)
         if self.gated and gemm.arch == 100:
-            # SM100 halved postact. ``make_tiled_copy_S(atom, tiled_copy_r2s)``
-            # inherits D's *full-N* tiler MN, which over-emits 2x when applied to
-            # the half-N aux smem. Under the (4, 1) epi-warp shape the extra
-            # emission has stride 0 in smem (a phantom N-warp mode), so it is a
-            # harmless self-overwrite; under the (2, 2) shape (cta_tile_m == 64 +
-            # 2-CTA) it carries the warp-N stride and clobbers warp 1's smem
-            # region with a duplicate of warp 0's data.
-            #
-            # Build the tiler to match aux's (cta_tile_m, epi_tile_aux_n) tile
-            # instead: one thread per (M row, N warp), each holding
-            # epi_tile_aux_n // num_n_warps values along N. That is exactly the
-            # tcgen05.tmem_load ownership the aux registers already carry (32
-            # datapaths per warp => lane l owns M row l of its warp's rows), so
-            # every thread's writes land in its own warp's smem region.
-            #
-            # This tiler models "each of the 128 epilogue threads owns exactly one
-            # M row", which holds iff cta_tile_m * num_n_warps == num_epi_threads
-            # -- true for every SM100 config the tuner or a default can produce
-            # (gemm_config only emits tile_m 128/256, and tile_m=256 forces
-            # 2-CTA). The one shape that breaks it is a hand-pinned tile_m=64
-            # without 2-CTA: 4 warps over a 64-row tile is 16 tmem datapaths per
-            # warp, so a warp's 32 lanes cover 16 rows x 2 N groups -- an N split
-            # that epi_smem_warp_shape_mnk() still reports as warp_n == 1.
-            #
-            # Assert rather than silently fall back: that config is ALREADY
-            # numerically wrong on the inherited tiler (measured on GB200 --
-            # gated tile_m=64 is wrong both with and without this fix, i.e. it is
-            # a separate pre-existing bug, not a regression here). Falling back
-            # would keep emitting wrong data behind a reasoned-looking exclusion;
-            # failing at trace time tells the one person who can hit it.
+            # Gated aux is half of D's N, but make_tiled_copy_S inherits D's full-N
+            # tiler and over-emits 2x — harmless under (4,1) (stride-0 duplicate),
+            # corrupting under (2,2) (cta_tile_m=64 + 2-CTA). Retile from aux's own
+            # tile: one thread per (M row, N warp) = the tmem_load ownership of regs.
             cta_tile_aux_m = gemm.cta_tile_shape_mnk[0]
             _, num_n_warps, _ = gemm.epi_smem_warp_shape_mnk()
             assert cta_tile_aux_m * num_n_warps == gemm.num_epi_warps * cute.arch.WARP_SIZE, (
                 f"gated aux store on SM100 needs one M row per epilogue thread, but "
                 f"cta_tile_m={cta_tile_aux_m} x num_n_warps={num_n_warps} != "
-                f"{gemm.num_epi_warps * cute.arch.WARP_SIZE} threads. tile_m=64 without "
-                f"2-CTA gives 16 tmem datapaths per warp; gated output is wrong there "
-                f"(pre-existing, unfixed). Use tile_m=128 or 256."
+                f"{gemm.num_epi_warps * cute.arch.WARP_SIZE} threads. tile_m=64 without 2-CTA "
+                f"gives 16 tmem datapaths per warp and is already wrong there without this "
+                f"branch too (pre-existing, unfixed). Use tile_m=128 or 256."
             )
-            # Index the tuple in Python first: on SM100 both epi-tile modes are
-            # cute.Layout (e.g. ``(64:1, 32:1)``), so cute.size(..., mode=[1]) --
-            # fine for the int tiles of other arches -- rejects it as a
-            # non-IntTuple. cute.size() on the extracted mode takes either.
+            # Index [1] first: on SM100 both epi-tile modes are Layouts, not ints.
             epi_tile_aux_n = cute.size(getattr(params, self._epi_tile_key())[1])
-            # Exact for every reachable config (every tile_n is a multiple of 16
-            # and the epi-tile N is a gcd of two multiples of 16, so the halved
-            # aux N is a multiple of 8), but a truncating division here would
-            # build a tiler that silently under-covers the tile.
             assert epi_tile_aux_n % num_n_warps == 0, (
                 f"gated aux epi tile N={epi_tile_aux_n} must split evenly across "
                 f"{num_n_warps} N warps"
             )
-            # (m, w_n) -> m + cta_tile_aux_m * w_n, matching tidx % cta_tile_aux_m
-            # = M row and tidx // cta_tile_aux_m = N warp.
             thr_layout = cute.make_layout((cta_tile_aux_m, num_n_warps), stride=(1, cta_tile_aux_m))
             val_layout = cute.make_layout((1, epi_tile_aux_n // num_n_warps))
             return cute.make_tiled_copy_tv(copy_atom_r2s, thr_layout, val_layout)
