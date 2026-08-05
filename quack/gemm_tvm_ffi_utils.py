@@ -308,7 +308,7 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag
     )
 
 
-def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None):
+def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, seqused_k=None):
     if cu_seqlens_m is None and cu_seqlens_k is None:
         return None
     return VarlenArguments(
@@ -316,6 +316,7 @@ def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None):
         mCuSeqlensK=cu_seqlens_k,
         mAIdx=A_idx,
         mCuTilesM=cu_tiles_m,
+        mSequsedK=seqused_k,
     )
 
 
@@ -331,7 +332,9 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
     return torch.cat([tiles.new_zeros(1), tiles.cumsum(0, dtype=torch.int32)])
 
 
-def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False):
+def make_fake_varlen_args(
+    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, seqused_k=False
+):
     if not varlen_m and not varlen_k:
         return None
     num_seqlens = cute.sym_int()
@@ -349,6 +352,11 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m
         mCuTilesM=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
             if has_cu_tiles_m
+            else None
+        ),
+        mSequsedK=(
+            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+            if seqused_k
             else None
         ),
     )

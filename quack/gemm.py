@@ -89,6 +89,7 @@ def _compile_gemm(
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
     has_ag=False,
+    has_seqused_k=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -180,7 +181,9 @@ def _compile_gemm(
         has_ag=has_ag,
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
-    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    varlen_args = make_fake_varlen_args(
+        varlen_m, varlen_k, gather_A, aidx_len, seqused_k=has_seqused_k
+    )
     if sf_dtype is not None:
         # Padded SF buffers have a static batch dim of exactly 1 (not l): SFA for
         # varlen_m (M-padded) and varlen_k (K-padded); SFB is K-padded too for
@@ -400,6 +403,7 @@ def gemm(
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
+    seqused_k: Optional[Tensor] = None,  # (l,) real K-length, decoupled from cu_seqlens_k
     A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
@@ -467,6 +471,7 @@ def gemm(
         tensor_key(colvec_bias),
         tensor_key(cu_seqlens_m),
         tensor_key(cu_seqlens_k),
+        seqused_k is not None,
         A_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
@@ -521,6 +526,7 @@ def gemm(
             colvec_bias=colvec_bias,
             cu_seqlens_m=cu_seqlens_m,
             cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
             A_idx=A_idx,
             batch_idx_permute=batch_idx_permute,
             add_to_output=add_to_output,
@@ -558,6 +564,7 @@ def gemm(
         sr_seed=sr_seed,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
@@ -585,6 +592,7 @@ def run_gemm_plan(
     sr_seed: int | Tensor = 0,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
+    seqused_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
@@ -650,7 +658,7 @@ def run_gemm_plan(
     scheduler_args = plan_scheduler_args(
         plan, tile_count_semaphore, batch_idx_permute, ag_args, A=A
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, seqused_k=seqused_k)
 
     launch_gemm(plan, A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
 
@@ -689,6 +697,7 @@ def _build_gemm_plan(
     colvec_bias,
     cu_seqlens_m,
     cu_seqlens_k,
+    seqused_k,
     A_idx,
     batch_idx_permute,
     add_to_output,
@@ -715,8 +724,10 @@ def _build_gemm_plan(
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
+    has_seqused_k = seqused_k is not None
     blockscaled = SFA is not None
     assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
+    assert not has_seqused_k or varlen_k, "seqused_k requires cu_seqlens_k (varlen_k)"
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
@@ -955,6 +966,7 @@ def _build_gemm_plan(
         a_mma_dtype,
         b_mma_dtype,
         has_ag,
+        has_seqused_k,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K
