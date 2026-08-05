@@ -17,7 +17,6 @@ from quack.gemm_interface import (
     default_config,
     gemm_dact,
     gemm_gated,
-    gemm_gated_tuned,
     gemm_dgated,
     gemm_ref,
     gemm_add_ref,
@@ -190,6 +189,58 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
     if store_preact:
         assert preact is not None and preact_ref is not None
         assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("alpha_kind", ["float", "tensor"])
+@pytest.mark.parametrize("activation", ["tanh", "relu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+def test_gemm_act_alpha(input_dtype, activation, alpha_kind, has_bias):
+    """Pre-activation alpha: postact = act(alpha * A @ B + bias). The scale
+    is applied to the fp32 accumulator BEFORE the activation (and before
+    bias), which no output alpha can reproduce through the nonlinearity --
+    so parity against the alpha-carrying reference pins the application
+    point, not just the value."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m, k, n = 512, 1024, 1504
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = (torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)).T
+    bias = torch.randn(n, device=device) if has_bias else None
+    alpha_val = 0.7371
+    alpha = (
+        alpha_val
+        if alpha_kind == "float"
+        else torch.tensor(alpha_val, device=device, dtype=torch.float32)
+    )
+    preact, postact = gemm_act(A, B, bias=bias, activation=activation, alpha=alpha, tuned=False)
+    preact_ref, postact_ref = gemm_act_ref(
+        A.float(), B.float(), bias=bias, activation=activation, alpha=alpha_val
+    )
+    preact_pt, postact_pt = gemm_act_ref(A, B, bias=bias, activation=activation, alpha=alpha_val)
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
+    assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
+    # Warm-plan replay with a DIFFERENT alpha of the same mode: the scalar is
+    # a runtime argument (mode is what's compiled/keyed), so the cached
+    # interface plan must pick up the new value.
+    alpha2_val = 0.25
+    alpha2 = (
+        alpha2_val
+        if alpha_kind == "float"
+        else torch.tensor(alpha2_val, device=device, dtype=torch.float32)
+    )
+    _, postact2 = gemm_act(A, B, bias=bias, activation=activation, alpha=alpha2, tuned=False)
+    _, postact2_ref = gemm_act_ref(
+        A.float(), B.float(), bias=bias, activation=activation, alpha=alpha2_val
+    )
+    _, postact2_pt = gemm_act_ref(A, B, bias=bias, activation=activation, alpha=alpha2_val)
+    assert (postact2 - postact2_ref).abs().max() < 2 * (
+        postact2_pt - postact2_ref
+    ).abs().max() + 1e-6
+    # alpha=1.0 folds to the alpha-free epilogue: bitwise vs the no-alpha call.
+    _, postact_neutral = gemm_act(A, B, bias=bias, activation=activation, alpha=1.0, tuned=False)
+    _, postact_plain = gemm_act(A, B, bias=bias, activation=activation, tuned=False)
+    assert torch.equal(postact_neutral, postact_plain)
 
 
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx", "tanh"])
@@ -467,17 +518,14 @@ def test_gemm_gated_pingpong_configs(pingpong):
         cluster_n=1,
         device_capacity=device_capacity,
     )
-    gemm_gated_tuned.fn(
+    gemm_act(
         x,
         B,
-        preact,
-        postact,
-        None,
-        None,
-        "swiglu",
-        None,
-        None,
-        False,
+        activation="swiglu",
+        preact_out=preact,
+        postact_out=postact,
+        store_preact=True,
+        tuned=False,
         config=config,
     )
     preact_ref, postact_ref = gemm_gated_ref(
@@ -699,20 +747,17 @@ def test_autocast(fn_name, use_compile):
 
 
 @pytest.mark.parametrize("sr_seed", [0, 42])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n", [512, 1024])
 @pytest.mark.parametrize("k", [256, 768])
 @pytest.mark.parametrize("m", [480, 960])
 def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
-    """Test GEMM with stochastic rounding on SM100/SM110.
+    """Test GEMM with stochastic rounding (hw cvt.rs on SM100/SM103, sw emulation on SM90/SM120).
 
     Validates that SR produces results close to RNE (within BF16 tolerance)
     and that the output has correct shape and dtype.
     """
     device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
-        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype) / math.sqrt(k)
@@ -726,30 +771,13 @@ def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
     assert (out_sr - out_ref).abs().max() < 3 * (out_rn - out_ref).abs().max() + 5e-3
 
 
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-def test_gemm_sr_requires_sm100(input_dtype):
-    """Assert that SR raises on non-SM100 hardware."""
-    device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] == 10:
-        pytest.skip("This test is for non-SM100 hardware")
-    torch.random.manual_seed(0)
-    A = torch.randn((128, 256), device=device, dtype=input_dtype)
-    B = torch.randn((256, 128), device=device, dtype=input_dtype)
-    with pytest.raises(AssertionError, match="SM100"):
-        gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS)
-
-
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n", [512])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("m", [480])
 def test_gemm_sr_different_seeds(m, k, n, input_dtype):
     """Different SR seeds should produce different results (non-deterministic rounding)."""
     device = "cuda"
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
-        pytest.skip("Stochastic rounding requires SM100")
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype)
@@ -833,8 +861,6 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, premult_dtype, u
 @pytest.mark.parametrize("k", [4096])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_ab):
-    from quack.gemm_interface import gemm_norm_act_tuned
-
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1024
@@ -856,15 +882,16 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
     else:
         preact = torch.empty(m, n, device=device, dtype=input_dtype)
         postact = torch.empty(m, n, device=device, dtype=input_dtype)
-        gemm_norm_act_tuned.fn(
+        gemm_norm_act(
             A,
             B,
-            preact,
-            postact,
-            C,
-            rstd,
-            activation,
-            False,
+            rstd=rstd,
+            C=C,
+            activation=activation,
+            preact_out=preact,
+            postact_out=postact,
+            store_preact=True,
+            tuned=False,
             config=replace(default_config(torch.device(device)), swap_ab=True),
         )
     preact_ref, postact_ref = gemm_norm_act_ref(

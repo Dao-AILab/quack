@@ -8,7 +8,7 @@ from cutlass import Float32
 from cutlass.cute.nvgpu import warp, warpgroup, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cutlass_dsl import Numeric
-import cutlass.utils.hopper_helpers as sm90_utils_og
+import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.utils import LayoutEnum
 
@@ -69,31 +69,40 @@ def make_tiled_mma_for_arch(
     acc_dtype: Type[cutlass.Numeric] = Float32,
     permutation_mnk: Optional[Tuple[int, int, int]] = None,
     arch=None,
-    *,
-    cta_group: int = 1,
 ) -> cute.TiledMma:
     """Arch-dispatched TiledMma builder for a MatmulSpec.
 
     Source modes are arch-specific: SM90 accepts SS/RS, SM100 accepts SS/TS.
+    cta_group comes off the spec (a storage-distribution property of the
+    operands); spec.M/N/K are full-tile dims.
     """
     if arch is None:
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    cta_group = spec.cta_group
     if arch.major == 9:  # Hopper — WGMMA
         assert cta_group == 1, f"SM90 tiled_mma requires cta_group=1, got {cta_group}"
         assert source in ("SS", "RS"), f"SM90 tiled_mma source must be SS or RS, got {source}"
         assert permutation_mnk is None, "SM90 tiled_mma does not accept permutation_mnk"
-        a_major = spec._operand_major(spec.A, is_A=True)
+        # WGMMA RS source means the physical A operand is a register fragment,
+        # whose layout convention is K-major. This can differ from the logical
+        # TensorSpec storage (e.g. a P.T view may have MN-major SMEM backing but
+        # be fed directly from registers). Treat RS A as K-major regardless of
+        # the spec's SMEM layout.
+        a_major = "K" if source == "RS" else spec._operand_major(spec.A, is_A=True)
         b_major = spec._operand_major(spec.B, is_A=False)
         mode = {"K": cute.nvgpu.OperandMajorMode.K, "MN": cute.nvgpu.OperandMajorMode.MN}
         a_source = warpgroup.OperandSource.RMEM if source == "RS" else warpgroup.OperandSource.SMEM
-        return sm90_utils_og.make_trivial_tiled_mma(
+        return sm90_utils.make_trivial_tiled_mma(
             spec.A.dtype,
             spec.B.dtype,
             mode[a_major],
             mode[b_major],
             acc_dtype,
             atom_layout_mnk=atom_layout_mnk,
-            tiler_mn=(64, spec.N),
+            # `atom_layout_mnk[1]` partitions the logical/physical N tile across
+            # warp-groups. The WGMMA atom's per-warpgroup N extent is therefore
+            # the full matmul N divided by that atom-layout N factor.
+            tiler_mn=(64, spec.N // atom_layout_mnk[1]),
             a_source=a_source,
         )
     elif arch.major in [8, 12]:  # SM8x and SM12x — warp-level MMA
@@ -123,7 +132,7 @@ def make_tiled_mma_for_arch(
         assert source in ("SS", "TS"), f"SM100 tiled_mma source must be SS or TS, got {source}"
         assert permutation_mnk is None, "SM100 tiled_mma does not accept permutation_mnk"
         cta_group_enum = tcgen05.CtaGroup.TWO if cta_group == 2 else tcgen05.CtaGroup.ONE
-        m_full, n_full = spec.M * cta_group, spec.N * cta_group
+        m_full, n_full = spec.M, spec.N
         n_inst = n_full if n_full <= 256 else n_full // 2
         if source == "TS":
             # TMEM A is a freshly materialized physical operand, not a logical

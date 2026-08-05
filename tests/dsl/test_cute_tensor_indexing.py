@@ -3,19 +3,12 @@
 import pytest
 
 import cutlass.cute as cute
-from cutlass._mlir import ir
 
 import cutlass.cute.tensor as cute_tensor
 
 from quack.dsl import cute_tensor_indexing
 from quack.dsl.cute_tensor_indexing import _canonicalize_cute_tensor_index
-
-# These tests only exercise pure-Python canonicalization, monkey-patch installation,
-# and MLIR-builder construction (no kernel compile, no GPU). Under --compile-only
-# they would contribute nothing to the .o cache, so skip them entirely.
-pytestmark = pytest.mark.compile_only_skip(
-    "pure-Python / MLIR-builder tests; no kernel compile to cache"
-)
+from quack.testing.trace import run_traced
 
 
 def test_canonicalize_colon_and_ellipsis() -> None:
@@ -51,13 +44,17 @@ def test_canonicalize_single_full_slice() -> None:
 
 
 def test_patched_getitem_reaches_real_cute_tensor() -> None:
-    with ir.Context(), ir.Location.unknown():
+    # run_traced, not `with ir.Context()`: raw contexts corrupt the process
+    # (see quack.testing.trace).
+    def check() -> None:
         tensor = cute.make_identity_tensor((2, 3, 4))
         assert str(tensor[:, 1, 2]) == str(tensor[None, 1, 2])
         assert str(tensor[0, ..., 2]) == str(tensor[0, None, 2])
 
         hierarchical = cute.make_identity_tensor(((2, 3), 4))
         assert str(hierarchical[(..., 1), 2]) == str(hierarchical[(None, 1), 2])
+
+    run_traced(check)
 
 
 def test_patch_is_idempotent() -> None:
@@ -79,10 +76,12 @@ def test_patched_setitem_forwards_canonicalized_index(monkeypatch) -> None:
     monkeypatch.setattr(cute_tensor._Tensor, "_quack_original_setitem", spy, raising=False)
     monkeypatch.setattr(cute_tensor._Tensor, "__setitem__", cute_tensor_indexing._make_setitem(spy))
 
-    with ir.Context(), ir.Location.unknown():
+    def check() -> None:
         tensor = cute.make_identity_tensor((2, 3, 4))
         tensor[:, 1, 2] = "sentinel"
         tensor[0, ..., 2] = "sentinel2"
+
+    run_traced(check)
 
     assert captured == [((None, 1, 2), "sentinel"), ((0, None, 2), "sentinel2")]
 

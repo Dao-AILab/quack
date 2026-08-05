@@ -39,9 +39,7 @@ from quack.gemm_interface import (
     act_to_pytorch_fn_map,
     gemm,
     gemm_act,
-    gemm_act_tuned,
     gemm_dgated,
-    gemm_dgated_tuned,
     gemm_tuned,
     gated_to_pytorch_fn_map,
 )
@@ -159,12 +157,13 @@ def benchmark_gemm_act(
     else:
         preact = torch.empty(m, b_n, device="cuda", dtype=dtype)
         postact = torch.empty(m, n if is_gated else b_n, device="cuda", dtype=dtype)
-        fn = lambda: gemm_act_tuned.fn(
+        fn = lambda: gemm_act(
             a,
             b,
-            preact,
-            postact,
             activation=activation,
+            preact_out=preact,
+            postact_out=postact,
+            tuned=False,
             config=config,
         )
     fn()  # warmup / autotune
@@ -212,18 +211,14 @@ def benchmark_gemm_dgated(
     else:
         dx_out = torch.empty(m, 2 * n, device="cuda", dtype=dtype)
         postact_out = torch.empty(m, n, device="cuda", dtype=preact.dtype)
-        fn = lambda: gemm_dgated_tuned.fn(
+        fn = lambda: gemm_dgated(
             a,
             b,
             preact,
-            dx_out,
-            postact_out,
-            None,
-            activation,
-            False,
-            None,
-            None,
-            True,
+            activation=activation,
+            dx_out=dx_out,
+            postact_out=postact_out,
+            tuned=False,
             config=config,
         )
     fn()  # warmup / autotune

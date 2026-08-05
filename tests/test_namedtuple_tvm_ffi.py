@@ -21,24 +21,11 @@ from quack.cute_dsl_utils import mlir_namedtuple
 from quack.varlen_utils import VarlenArguments
 
 
-# Skip the whole module under ``pytest --compile-only`` — the direct TVM-FFI
-# compile path here does not warm quack's jit cache, so the tests add nothing
-# in phase 1. The marker is registered by ``quack.testing.pytest_plugin`` and
-# evaluated at test-setup time, so it is robust to xdist worksteal item-fetch
-# ordering.
-pytestmark = pytest.mark.compile_only_skip("direct TVM-FFI compile does not warm jit cache")
-
-
 @cute.kernel
 def _copy_if_present(mOut: cute.Tensor, mSrc: cute.Tensor):
     tidx, _, _ = cute.arch.thread_idx()
     if tidx < mOut.shape[0]:
         mOut[tidx] = mSrc[tidx]
-
-
-@cute.jit
-def accepts_bool_tensor(mMask: cute.Tensor):
-    assert mMask.element_type == cutlass.Boolean
 
 
 @cute.jit
@@ -55,15 +42,6 @@ def _compile_copy_from_varlen():
     return cute.compile(copy_from_varlen, out_fake, varlen_args, options="--enable-tvm-ffi")
 
 
-def test_boolean_fake_tensor_tvm_ffi_alignment():
-    n = cute.sym_int()
-    cute.compile(
-        accepts_bool_tensor,
-        fake_tensor(cutlass.Boolean, (n,), divisibility=4),
-        options="--enable-tvm-ffi",
-    )
-
-
 @pytest.mark.parametrize("N", [8, 32, 64])
 def test_varlen_namedtuple_tvm_ffi(N):
     """Compile a kernel taking VarlenArguments (NamedTuple) via TVM-FFI and run it."""
@@ -72,6 +50,44 @@ def test_varlen_namedtuple_tvm_ffi(N):
     out = torch.zeros(N, dtype=torch.int32, device="cuda")
     compiled_fn(out, VarlenArguments(mCuSeqlensM=cu_seqlens))
     torch.testing.assert_close(out, cu_seqlens)
+
+
+@cute.kernel
+def _mask_to_int(mOut: cute.Tensor, mMask: cute.Tensor):
+    tidx, _, _ = cute.arch.thread_idx()
+    if tidx < mOut.shape[0]:
+        mOut[tidx] = 1 if mMask[tidx] else 0
+
+
+@cute.jit
+def mask_to_int(mOut: cute.Tensor, mMask: cute.Tensor):
+    assert mMask.element_type == cutlass.Boolean
+    _mask_to_int(mOut, mMask).launch(grid=(1, 1, 1), block=(128, 1, 1))
+
+
+def test_boolean_fake_tensor_tvm_ffi():
+    """Boolean fake tensors compile (regression: Boolean.width == 1 bit made
+    assumed_align = divisibility * width // 8 == 0) and run with real bool tensors."""
+    n = cute.sym_int()
+    out_fake = fake_tensor(cute.Int32, (n,), divisibility=4)
+    mask_fake = fake_tensor(cutlass.Boolean, (n,), divisibility=4)
+    compiled = cute.compile(mask_to_int, out_fake, mask_fake, options="--enable-tvm-ffi")
+
+    torch.manual_seed(0)
+    mask = torch.rand(64, device="cuda") > 0.5
+    out = torch.empty(64, dtype=torch.int32, device="cuda")
+    compiled(out, mask)
+    torch.testing.assert_close(out, mask.to(torch.int32))
+
+
+def test_sub_byte_fake_tensor_alignment():
+    """Sub-byte dtypes are bit-packed: divisibility in elements divides down to
+    bytes (int4 div=32 -> 16B), unlike Boolean which is byte-per-element."""
+    n = cute.sym_int()
+    assert fake_tensor(cutlass.Int4, (n,), divisibility=32)._assumed_align == 16
+    assert fake_tensor(cutlass.Float4E2M1FN, (n,), divisibility=32)._assumed_align == 16
+    assert fake_tensor(cutlass.Boolean, (n,), divisibility=4)._assumed_align == 4
+    assert fake_tensor(cutlass.Boolean, (n,), divisibility=1)._assumed_align == 1
 
 
 def test_varlen_construction():

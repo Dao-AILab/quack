@@ -18,10 +18,16 @@ TMA helper, while SM100 2-CTA loads use a tcgen05 panel map because each peer
 CTA owns instruction panels rather than a contiguous half tile. For SM90/SM120,
 `bind_mma(thr)` returns a `BoundMMA` with per-warpgroup partitioned A/B
 fragments. For SM100 (tcgen05), use `tiled_mma()` + `smem_view_A/B()` or
-`bind_mma(tiled_mma=...)` for fragment views, and
-`with_tma(op, gmem, ...)` for TMA bindings. Shapes are per-CTA tiles and
-`cta_group` is passed at MMA-construction time (a 2-CTA MMA splits A along M and
-B along N; each peer CTA stores half of both operands).
+`bind_mma(tiled_mma=...)` for fragment views, and `with_tma_load(gmem, ...)` /
+`with_tma(op, gmem, ...)` for TMA bindings.
+
+Shapes are FULL logical tiles (what the MMA computes on). Peer-CTA
+distribution is a TensorSpec storage property: `cta_group=2` splits the
+storage-leading (MN) mode across the peer pair, so each CTA allocates/loads
+`storage_shape = (mn/2, k)`. The split rule is role-free — a 2-CTA MMA splits
+A along M and B along N, but both are mode 0 of the `(MN, K)` storage tile —
+so SMEM layouts and TMA atoms never need to know operand roles; MMA
+construction reads `cta_group` back off the operand specs and validates it.
 
 Designed to be marshaled across the `@cute.kernel` boundary: `tma_atom` and
 `gmem` cross via `__extract_mlir_values__` / `__new_from_mlir_values__`;
@@ -42,7 +48,7 @@ from cutlass.utils import LayoutEnum
 import cutlass.utils.blackwell_helpers as sm100_utils
 
 
-from quack import copy_utils, layout_utils
+from quack import copy_utils, layout_utils, pipeline
 from quack import sm90_utils
 from quack.spec import mma as spec_mma
 from quack.spec import smem as spec_smem
@@ -63,6 +69,11 @@ class TensorSpec:
         swizzle); `tma_copy_bytes()` and `_make_tma_atom()` use `mode=[0]`. Cannot
         be used as a matmul operand (`__matmul__` / `bind_mma` are 2D-only).
 
+    `shape` is the FULL logical tile. With `cta_group=2` each peer CTA
+    stores/loads only its shard: `storage_shape` splits the storage-leading
+    (MN) mode in half, and SMEM layouts / TMA atoms / TMEM layouts are derived
+    from that per-CTA shard.
+
     `stage=None` means the tile lives in registers (no SMEM layout, no TMA).
     `transposed=True` is a logical .T view of the same storage (2D only).
 
@@ -80,7 +91,20 @@ class TensorSpec:
     # is only a logical view flag from `.T`: the same storage can be used as a
     # transposed matmul operand without changing its backing layout/bytes.
     layout: LayoutEnum = LayoutEnum.ROW_MAJOR
+    # Optional override for the swizzled major-mode extent used to select the
+    # SMEM atom. Most kernels can derive this from `shape`, but multi-warpgroup
+    # SM90 kernels sometimes intentionally split the major mode per warpgroup
+    # while keeping the same logical tile shape.
+    major_mode_size: Optional[int] = None
     transposed: bool = False
+    # Peer-CTA distribution for tcgen05 2-CTA MMAs. `shape` stays the full
+    # logical tile; with cta_group=2 the storage-leading mode (the MN dim of
+    # the (MN, K) storage convention) is split across the peer pair, so each
+    # CTA allocates/loads `(mn / 2, k)`. This is a storage fact, not an MMA
+    # role: A splits along M and B along N, but both are mode 0 of the storage
+    # tile, so SMEM layouts and TMA atoms stay role-free. MMAs consuming the
+    # spec must be built with a matching cta_group (validated in MatmulSpec).
+    cta_group: int = 1
     # TMA binding: one bundled `cpasync.TmaInfo` (atom + TMA coordinate tensor
     # + construction smem layout) — what _make_tma_atom returns. `tma_atom`/`gmem`
     # are exposed as properties.
@@ -142,8 +166,14 @@ class TensorSpec:
         num_multicast: int = 1,
         internal_type: Optional[Type[cutlass.Numeric]] = None,
         cta_v_map=None,
+        gmem_raw: Optional[cute.Tensor] = None,
     ) -> "TensorSpec":
-        """Return a new spec carrying a generic tile TMA binding."""
+        """Return a new spec carrying a generic tile TMA binding.
+
+        `gmem_tensor` is the TMA coordinate tensor. Use `gmem_raw` when the
+        kernel also needs ordinary GMEM indexing, e.g. when `gmem_tensor` is a
+        ragged/role-specific view used only for TMA.
+        """
         tma = self._make_tma_atom(
             op,
             gmem_tensor,
@@ -151,7 +181,59 @@ class TensorSpec:
             internal_type=internal_type,
             cta_v_map=cta_v_map,
         )
-        return replace(self, tma=tma)
+        return replace(
+            self,
+            tma=tma,
+            gmem_raw=gmem_raw if gmem_raw is not None else self.gmem_raw,
+        )
+
+    def with_tma_load(
+        self,
+        gmem_tensor: cute.Tensor,
+        *,
+        num_multicast: int = 1,
+        internal_type: Optional[Type[cutlass.Numeric]] = None,
+        gmem_raw: Optional[cute.Tensor] = None,
+    ) -> "TensorSpec":
+        """`with_tma` for G2S loads with the op derived from the spec.
+
+        Role-free: the op's cta_group comes from the spec's storage
+        distribution and multicast from `num_multicast` — no A/B distinction
+        (replaces role-named op selectors like `cluster_shape_to_tma_atom_B`
+        at the kernel level).
+        """
+        cg = tcgen05.CtaGroup.TWO if self.cta_group == 2 else tcgen05.CtaGroup.ONE
+        op = (
+            cpasync.CopyBulkTensorTileG2SMulticastOp(cg)
+            if num_multicast > 1
+            else cpasync.CopyBulkTensorTileG2SOp(cg)
+        )
+        return self.with_tma(
+            op,
+            gmem_tensor,
+            num_multicast=num_multicast,
+            internal_type=internal_type,
+            gmem_raw=gmem_raw,
+        )
+
+    def with_tma_info(
+        self,
+        tma_atom: cute.CopyAtom,
+        tma_tensor,
+        smem_layout=None,
+        *,
+        gmem_raw: Optional[cute.Tensor] = None,
+    ) -> "TensorSpec":
+        """Return a new spec carrying an externally-built TMA binding.
+
+        Use this for kernels that need CUTLASS' role-aware TMA construction but
+        still want to pass one TensorSpec across the kernel boundary.
+        """
+        return replace(
+            self,
+            tma=cpasync.TmaInfo(tma_atom, tma_tensor, smem_layout),
+            gmem_raw=gmem_raw if gmem_raw is not None else self.gmem_raw,
+        )
 
     def with_gmem(self, gmem) -> "TensorSpec":
         """Return a new spec with only a plain GMEM tensor attached.
@@ -161,18 +243,57 @@ class TensorSpec:
         """
         return replace(self, gmem_raw=gmem)
 
-    def with_smem(self, storage_or_tensor) -> "TensorSpec":
+    def with_smem(
+        self, storage_or_tensor, *, layout=None, single_stage: bool = False
+    ) -> "TensorSpec":
         """Return a new spec with the SMEM tensor attached (call inside the kernel).
-        Accepts either a SmemAllocator storage field (derives the tensor with this
-        spec's layout) or an already-built cute.Tensor (uses it directly — handy
-        when the kernel allocated SMEM via an external layout)."""
-        if hasattr(storage_or_tensor, "get_tensor"):
+        Semantics:
+        - storage field, no layout: derive this spec's `smem_layout()` and recast
+          the backing pointer to this spec's dtype if the storage field differs.
+        - storage field, layout: use the supplied layout and recast to this spec's dtype.
+        - cute.Pointer, no layout: derive this spec's `smem_layout()` and reinterpret the
+          pointer as this spec's dtype/layout.
+        - cute.Pointer, layout: reinterpret the pointer as this spec's dtype with the layout.
+        - cute.Tensor, no layout: bind the tensor exactly as-is; dtype must already match.
+        - cute.Tensor, layout: unsupported; pass `tensor.iterator` to request reinterpretation."""
+        is_storage_field = const_expr(hasattr(storage_or_tensor, "get_tensor"))
+        is_tensor = const_expr(hasattr(storage_or_tensor, "iterator"))
+        is_pointer = const_expr(isinstance(storage_or_tensor, cute.Pointer))
+
+        if layout is not None:
+            assert not is_tensor, (
+                "with_smem(tensor, layout=...) is unsupported; pass tensor.iterator"
+            )
+            if const_expr(is_storage_field):
+                smem = self.get_smem_tensor(storage_or_tensor, layout)
+            else:
+                assert is_pointer, "with_smem(..., layout=...) expects a storage field or pointer"
+                smem = self._make_smem_tensor_from_ptr(storage_or_tensor, layout)
+        elif is_storage_field:
             smem = self.get_smem_tensor(storage_or_tensor)
+        elif is_pointer:
+            smem = self._make_smem_tensor_from_ptr(storage_or_tensor, self.smem_layout())
         else:
+            assert is_tensor, "with_smem expects a storage field or cute.Tensor"
             smem = storage_or_tensor
+            assert const_expr(smem.element_type == self.dtype), "SMEM tensor dtype mismatch"
+        if const_expr(single_stage):
+            assert self.stage == 1, "single_stage=True requires TensorSpec stage=1"
+            assert const_expr(cute.rank(smem) == self.rank + 1), (
+                "single_stage=True expects a staged SMEM tensor"
+            )
+            smem = smem[..., 0]
         return replace(self, smem=smem)
 
-    def tmem_layout(self, *, cta_group: int = 1):
+    def _make_smem_tensor_from_ptr(self, ptr: cute.Pointer, layout) -> cute.Tensor:
+        """Reinterpret an SMEM pointer with `layout` and this spec's dtype."""
+        if hasattr(layout, "outer"):
+            return cute.make_tensor(
+                cute.recast_ptr(ptr, layout.inner, dtype=self.dtype), layout.outer
+            )
+        return cute.make_tensor(cute.recast_ptr(ptr, dtype=self.dtype), layout)
+
+    def tmem_layout(self):
         """Role-free flat TMEM storage layout for this spec.
 
         TMEM MMAs may need nested role layouts (e.g. tcgen05 A operand), but the
@@ -188,9 +309,8 @@ class TensorSpec:
         """
         assert not self.in_rmem, "register tensor has no TMEM layout"
         assert self.rank == 2, "TMEM TensorSpec storage is currently only defined for 2D tiles"
-        assert cta_group in (1, 2), f"TMEM TensorSpec expects cta_group 1 or 2, got {cta_group}"
         rows, cols = self.storage_shape
-        if cta_group == 2:
+        if self.cta_group == 2:
             assert rows in (64, 128), (
                 f"2CTA TS-A TMEM layout expects per-CTA M=64 or 128, got {rows}"
             )
@@ -203,7 +323,6 @@ class TensorSpec:
         self,
         storage_or_tensor,
         *,
-        cta_group: int = 1,
         m64_partition: Literal["lower", "upper"] = "lower",
     ) -> "TensorSpec":
         """Return a new spec with a TMEM tensor attached.
@@ -222,16 +341,13 @@ class TensorSpec:
 
         ptr = storage_or_tensor
         rows, _ = self.storage_shape
-        assert m64_partition == "lower" or (cta_group == 1 and rows == 64), (
+        assert m64_partition == "lower" or (self.cta_group == 1 and rows == 64), (
             "m64_partition='upper' is only meaningful for 1CTA M=64 TS-A TMEM"
         )
         ptr = cute.recast_ptr(ptr, dtype=self.dtype)
         if m64_partition == "upper":
             ptr = ptr + spec_tmem.m64_half_partition_offset(self.dtype, m64_partition)
-        tmem = cute.make_tensor(
-            ptr,
-            self.tmem_layout(cta_group=cta_group),
-        )
+        tmem = cute.make_tensor(ptr, self.tmem_layout())
         return replace(self, tmem=tmem)
 
     @property
@@ -251,12 +367,31 @@ class TensorSpec:
         `storage_shape` (skip swizzle/matmul-side logic)."""
         return len(self.shape)
 
+    def __post_init__(self):
+        assert self.cta_group in (1, 2), f"cta_group must be 1 or 2, got {self.cta_group}"
+        if self.cta_group == 2:
+            assert len(self.shape) == 2, "cta_group=2 requires a 2D matmul-operand spec"
+
     @property
-    def storage_shape(self) -> Tuple[int, ...]:
+    def full_storage_shape(self) -> Tuple[int, ...]:
+        """Full-tile shape in storage order — the GMEM tile extent for
+        `cute.local_tile` at TMA load sites, independent of cta_group."""
         # 1D has nothing to transpose.
         if self.rank == 1:
             return self.shape
         return (self.shape[1], self.shape[0]) if self.transposed else self.shape
+
+    @property
+    def storage_shape(self) -> Tuple[int, ...]:
+        """Per-CTA storage shape: the full tile with the leading (MN) storage
+        mode split across the peer pair when cta_group=2."""
+        full = self.full_storage_shape
+        if self.rank == 1 or self.cta_group == 1:
+            return full
+        assert full[0] % self.cta_group == 0, (
+            f"leading storage dim {full[0]} not divisible by cta_group {self.cta_group}"
+        )
+        return (full[0] // self.cta_group, full[1])
 
     def smem_layout(self):
         """Derive the SMEM layout for this operand.
@@ -280,12 +415,24 @@ class TensorSpec:
         if self.rank == 1:
             # 1D vector-with-stage: no swizzling needed (small + naturally aligned).
             return cute.make_layout((self.shape[0], self.stage))
-        return spec_smem.make_smem_layout(self.dtype, self.layout, self.storage_shape, self.stage)
+        return spec_smem.make_smem_layout(
+            self.dtype,
+            self.layout,
+            self.storage_shape,
+            self.stage,
+            self.major_mode_size,
+        )
 
-    def tma_copy_bytes(self) -> int:
+    def tma_copy_bytes(self, *, full_tile: bool = False) -> int:
+        """Bytes of one CTA's TMA transfer for a single stage.
+
+        `full_tile=True` scales to the whole logical tile across the peer pair
+        (× cta_group) — the mbarrier tx count for 2-CTA loads, where both
+        peers' transactions arrive at the same barrier."""
         # 1D specs have a single non-stage mode; 2D specs have two.
         modes = [0] if self.rank == 1 else [0, 1]
-        return cute.size_in_bytes(self.dtype, cute.select(self.smem_layout(), mode=modes))
+        per_cta = cute.size_in_bytes(self.dtype, cute.select(self.smem_layout(), mode=modes))
+        return per_cta * self.cta_group if full_tile else per_cta
 
     def _make_tma_atom(
         self,
@@ -298,19 +445,23 @@ class TensorSpec:
         if cta_v_map is not None:
             modes = [0] if self.rank == 1 else [0, 1]
             tma_smem_layout = cute.select(self.smem_layout(), mode=modes)
-        elif (
-            self.rank == 2
-            and isinstance(
-                op, (cpasync.CopyBulkTensorTileG2SOp, cpasync.CopyBulkTensorTileG2SMulticastOp)
-            )
-            and op.cta_group == tcgen05.CtaGroup.TWO
-        ):
+        elif self.rank == 2 and self.cta_group == 2:
+            assert (
+                isinstance(
+                    op,
+                    (cpasync.CopyBulkTensorTileG2SOp, cpasync.CopyBulkTensorTileG2SMulticastOp),
+                )
+                and op.cta_group == tcgen05.CtaGroup.TWO
+            ), f"cta_group=2 spec requires a 2-CTA G2S load op, got {op}"
             # The SMEM descriptor can use the normal flat per-CTA storage view.
             # Only the GMEM coordinate map is non-contiguous: for a full 512-wide
             # leading tile, one CTA owns panels 0..127 and 256..383.
             tma_smem_layout = cute.select(self.smem_layout(), mode=[0, 1])
             cta_v_map = spec_tma._sm100_dense_tma_flat_cta_v_map(self.storage_shape, cta_group=2)
         else:
+            assert getattr(op, "cta_group", None) != tcgen05.CtaGroup.TWO, (
+                "2-CTA load op on a cta_group=1 spec — declare the spec with cta_group=2"
+            )
             modes = [0] if self.rank == 1 else [0, 1]
             tma_smem_layout = cute.select(self.smem_layout(), mode=modes)
             cta_v_map = cute.composition(
@@ -332,12 +483,18 @@ class TensorSpec:
             cute.struct.MemRange[self.dtype, cute.cosize(self.smem_layout())], align
         ]
 
-    def get_smem_tensor(self, storage_field):
-        """Materialize the SMEM tensor backed by `storage_field` with this spec's layout."""
-        layout = self.smem_layout()
+    def get_smem_tensor(self, storage_field, layout=None):
+        """Materialize the SMEM tensor backed by `storage_field` with this spec's
+        layout (or the supplied `layout`), recast to this spec's dtype."""
+        if layout is None:
+            layout = self.smem_layout()
         if hasattr(layout, "outer"):
-            return storage_field.get_tensor(layout.outer, swizzle=layout.inner)
-        return storage_field.get_tensor(layout)
+            smem = storage_field.get_tensor(layout.outer, swizzle=layout.inner, dtype=self.dtype)
+        else:
+            smem = storage_field.get_tensor(layout, dtype=self.dtype)
+        if const_expr(smem.element_type != self.dtype):
+            smem = cute.make_tensor(cute.recast_ptr(smem.iterator, dtype=self.dtype), smem.layout)
+        return smem
 
     @property
     def smem_T(self) -> cute.Tensor:
@@ -347,10 +504,20 @@ class TensorSpec:
         assert self.smem is not None, "smem not bound — call with_smem(...) first"
         return layout_utils.transpose_view(self.smem)
 
-    def tma_load_fn(self, g_tile, cta_coord=0, cta_layout=None, **kwargs):
+    def tma_load_fn(self, g_tile, cta_coord=0, cta_layout=None, *, peer_coord=0, **kwargs):
         """Build a TMA load copy fn (gmem → smem) bound to this spec's tma_atom + smem.
+
+        `g_tile` is the FULL-tile gmem slice — typically
+        `cute.local_tile(m, spec.full_storage_shape, coord)`. For cta_group=2
+        this CTA's leading-mode shard is selected internally from `peer_coord`
+        (the MMA peer rank, `mma_tile_coord_v`), keeping the slice convention
+        paired with the TMA atom's flat CTA-value map.
         Defaults `cta_coord=0`, `cta_layout=cute.make_layout(1)` (no multicast).
         Returns the same `(copy_fn, ...)` tuple as `copy_utils.tma_get_copy_fn`."""
+        if self.cta_group != 1:
+            g_tile = spec_tma.slice_tma_tile_by_mma_cta(
+                g_tile, self.storage_shape[0], peer_coord, self.cta_group
+            )
         if cta_layout is None:
             cta_layout = cute.make_layout(1)
         return copy_utils.tma_get_copy_fn(
@@ -364,6 +531,68 @@ class TensorSpec:
             cta_layout = cute.make_layout(1)
         return copy_utils.tma_get_copy_fn(
             self.tma_atom, cta_coord, cta_layout, self.smem, g_tile, **kwargs
+        )
+
+    def tma_pipeline_umma(
+        self,
+        producer_group,
+        consumer_group,
+        *,
+        barrier_storage=None,
+        full_tile: bool = False,
+        extra_bytes: int = 0,
+        **kwargs,
+    ):
+        """A PipelineTmaUmma sized by this spec — num_stages and tx_count come
+        from the spec (stage count / per-stage TMA bytes), so the pipeline
+        cannot drift from the storage ring it guards and kernels don't repeat
+        the stage/byte bookkeeping per operand.
+
+        Omit `barrier_storage` to let the pipeline allocate reserved smem for
+        its mbarriers.
+
+        `extra_bytes` is added to tx_count, for one pipeline guarding several
+        operands loaded per stage (the gemm A+B pattern):
+        `A.tma_pipeline_umma(..., extra_bytes=B.tma_copy_bytes())`."""
+        return pipeline.PipelineTmaUmma.create(
+            num_stages=self.stage,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self.tma_copy_bytes(full_tile=full_tile) + extra_bytes,
+            barrier_storage=barrier_storage,
+            defer_sync=True,
+            **kwargs,
+        )
+
+    def tma_pipeline_async(
+        self,
+        producer_group,
+        consumer_group,
+        *,
+        barrier_storage=None,
+        extra_bytes: int = 0,
+        **kwargs,
+    ):
+        """SM90 counterpart of `tma_pipeline_umma`: a PipelineTmaAsync (TMA
+        producer -> async thread consumers, e.g. WGMMA warpgroups) sized by
+        this spec's stage count and per-stage TMA bytes. Multicast cluster
+        shape goes through `cta_layout_vmnk=`. No `full_tile` here — peer-CTA
+        storage splitting (cta_group=2) is tcgen05-only.
+
+        Omit `barrier_storage` to let the pipeline allocate reserved smem for
+        its mbarriers.
+
+        `extra_bytes` is added to tx_count, for one pipeline guarding several
+        operands loaded per stage (the gemm A+B pattern):
+        `A.tma_pipeline_async(..., extra_bytes=B.tma_copy_bytes())`."""
+        return pipeline.PipelineTmaAsync.create(
+            num_stages=self.stage,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self.tma_copy_bytes() + extra_bytes,
+            barrier_storage=barrier_storage,
+            defer_sync=True,
+            **kwargs,
         )
 
     def __matmul__(self, other: "TensorSpec") -> "MatmulSpec":
@@ -475,20 +704,25 @@ class BoundMMA:
         return cute.make_rmem_tensor(self.frag_A.layout, self.frag_A.element_type)
 
     def fn(self, acc, zero_init=False, frag_A=None, frag_B=None):
-        """Return a partial that captures `acc`/frags — call per-iteration in a loop.
-        `frag_A`/`frag_B` override the bound fragments (multi-stage RS pattern).
+        """Return a callable that captures `acc`/default frags — call per-iteration in a loop.
+        `frag_A`/`frag_B` override the bound fragments either here or at call time
+        (multi-stage RS pattern where the A fragment is produced in the loop).
         When swap_AB, A_idx/B_idx are user-logical and get swapped internally."""
-        fA = frag_A if frag_A is not None else self.frag_A
-        fB = frag_B if frag_B is not None else self.frag_B
-        inner = partial(sm90_utils.gemm_w_idx, self.tiled_mma, acc, fA, fB, zero_init=zero_init)
-        if self.swap_AB:
-            # Wrap so logical (A_idx, B_idx) map to physical (B_idx, A_idx); all other
-            # kwargs (including caller-overridden zero_init/wg_wait) pass through `inner`.
-            def _fn(A_idx=None, B_idx=None, **kw):
-                return inner(A_idx=B_idx, B_idx=A_idx, **kw)
+        default_A = frag_A if frag_A is not None else self.frag_A
+        default_B = frag_B if frag_B is not None else self.frag_B
 
-            return _fn
-        return inner
+        def _fn(A_idx=None, B_idx=None, wg_wait=-1, zero_init=zero_init, frag_A=None, frag_B=None):
+            fA = frag_A if frag_A is not None else default_A
+            fB = frag_B if frag_B is not None else default_B
+            if self.swap_AB:
+                return sm90_utils.gemm_w_idx(
+                    self.tiled_mma, acc, fA, fB, zero_init, B_idx, A_idx, wg_wait
+                )
+            return sm90_utils.gemm_w_idx(
+                self.tiled_mma, acc, fA, fB, zero_init, A_idx, B_idx, wg_wait
+            )
+
+        return _fn
 
     def fn_zero_init(self, shape=None, frag_A=None, frag_B=None):
         """Return a partial for the zero-init gemm variant (allocates its own acc).
@@ -523,6 +757,11 @@ class BoundMMA:
         return copy_utils.get_smem_store_A(self.tiled_mma, sA, thr, **kwargs)
 
     def s2r_C(self, sC, thr, **kwargs):
+        # Mirror r2s_C's swap_AB handling so epilogue inputs staged in the
+        # logical (M, N) layout read back correctly from a swapped MMA.
+        if self.swap_AB:
+            kwargs["transpose"] = not kwargs.get("transpose", False)
+            sC = layout_utils.transpose_view(sC)
         return copy_utils.get_smem_load_C(self.tiled_mma, sC, thr, **kwargs)
 
     def r2s_C(self, sC, thr, **kwargs):
@@ -556,11 +795,10 @@ class BoundMMASm100(BoundMMA):
       so ACCUMULATE/SFA/SFB mutations stay local to the helper and do not force
       callers to loop-carry `tiled_mma` through dynamic regions.
 
-    `M/N/K` are the user's logical full tile dims (per-CTA spec dims ×
-    cta_group). With `swap_AB=True`, the physical tcgen05 C tile is `(N, M)`;
-    accumulator helpers derive that physical layout internally. The per-CTA
-    storage dims stay on `TensorSpec`/`MatmulSpec`, where TMA and SMEM views
-    need them."""
+    `M/N/K` are the user's logical full tile dims (the spec shapes). With
+    `swap_AB=True`, the physical tcgen05 C tile is `(N, M)`; accumulator
+    helpers derive that physical layout internally. The per-CTA storage shards
+    stay on `TensorSpec.storage_shape`, where TMA and SMEM views need them."""
 
     A: Optional[TensorSpec] = None
     B: Optional[TensorSpec] = None
@@ -647,6 +885,36 @@ class BoundMMASm100(BoundMMA):
             sC = layout_utils.transpose_view(sC)
         return copy_utils.get_smem_store_C(tiled_t2r, sC, thr, **kwargs)
 
+    def s2r_C(self, tiled_t2r: cute.TiledCopy, sC, thr, r_layout, **kwargs):
+        """SMEM-load counterpart of `r2s_C`, for epilogue INPUTS that were
+        TMA-staged into the output buffer (gemm's C, ssd's z): the register
+        fragment is allocated at `r_layout` (pass the t2r fragment's layout)
+        so its linear element order matches the t2r/r2s fragments, and
+        swap_AB handling mirrors `r2s_C` (transpose_view + transposed copy).
+
+        Unless a `copy_atom` is passed, this defaults to vectorized universal
+        loads rather than ldmatrix: the flat TensorSpec SMEM layouts'
+        per-thread partitions cannot statically prove ldmatrix's 16B source
+        alignment (the store side goes through CUTLASS's SM100 store-op
+        selector, which handles that; there is no load-side equivalent).
+        Scalar copies under a transposed view, where per-thread elements are
+        not contiguous.
+
+        Returns `(tiled_copy, tRS_r, tSR_r, tSR_s)`; load via
+        `cute.copy(tiled_copy, tSR_s[..., idx], tSR_r)` then read `tRS_r`."""
+        if self.swap_AB:
+            kwargs["transpose"] = not kwargs.get("transpose", False)
+            sC = layout_utils.transpose_view(sC)
+        if "copy_atom" not in kwargs:
+            dtype = sC.element_type
+            transpose = kwargs.get("transpose", False)
+            kwargs["copy_atom"] = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                dtype,
+                num_bits_per_copy=dtype.width * (1 if transpose else 2),
+            )
+        return copy_utils.s2r_partition_from_t2r(tiled_t2r, sC, thr, r_layout, **kwargs)
+
     def fn(self, acc, zero_init=False, pre_kblock_fn=None):
         """Return a per-iteration tcgen05 GEMM callable.
 
@@ -717,15 +985,22 @@ class BoundMMASm100(BoundMMA):
 
 class MatmulSpec:
     """Result of A @ B on two TensorSpecs. Deduces operand major modes from
-    storage layout + transposed flag; derives tiler_n from B's N dim."""
+    storage layout + transposed flag; derives tiler_n from B's N dim.
+
+    `M/N/K` are the FULL logical matmul dims (spec shapes are full tiles);
+    `cta_group` is read off the operand specs and must agree between A and B."""
 
     def __init__(self, A: TensorSpec, B: TensorSpec):
         assert A.shape[1] == B.shape[0], f"matmul shape mismatch: {A.shape} @ {B.shape}"
+        assert A.cta_group == B.cta_group, (
+            f"matmul operand cta_group mismatch: {A.cta_group} vs {B.cta_group}"
+        )
         # A.dtype and B.dtype may differ for mixed-precision MMAs (e.g. fp8 ops
         # with different a/b widths supported by the underlying tiled_mma).
         self.A, self.B = A, B
         self.M, self.K = A.shape
         self.N = B.shape[1]
+        self.cta_group = A.cta_group
 
     def __extract_mlir_values__(self):
         # MatmulSpec is a compile-time role view over two TensorSpecs, but the
@@ -760,9 +1035,10 @@ class MatmulSpec:
         acc_dtype: Type[cutlass.Numeric] = Float32,
         atom_layout_mnk: Tuple[int, int, int] = (1, 1, 1),
         permutation_mnk: Optional[Tuple[int, int, int]] = None,
-        cta_group: int = 1,
         arch=None,
     ) -> cute.TiledMma:
+        # cta_group is a storage property of the operand specs, not an MMA
+        # parameter — make_tiled_mma_for_arch reads it off `self.cta_group`.
         return spec_mma.make_tiled_mma_for_arch(
             self,
             source=source,
@@ -770,7 +1046,6 @@ class MatmulSpec:
             acc_dtype=acc_dtype,
             permutation_mnk=permutation_mnk,
             arch=arch,
-            cta_group=cta_group,
         )
 
     def bind_mma(
@@ -784,7 +1059,6 @@ class MatmulSpec:
         atom_layout_mnk: Tuple[int, int, int] = (1, 1, 1),
         acc_dtype: Type[cutlass.Numeric] = Float32,
         permutation_mnk: Optional[Tuple[int, int, int]] = None,
-        cta_group: int = 1,
         tiled_mma: Optional[cute.TiledMma] = None,
         swap_AB: bool = False,
         bind_operands: bool = True,
@@ -805,7 +1079,9 @@ class MatmulSpec:
         - `sA`/`sB` default to `spec.smem`, **auto-transposed when the operand's
           major mode is "MN"**.
         - For `source="RS"`, `frag_A` is auto-allocated as an rmem tensor with
-          shape `tiled_mma.partition_shape_A((M, K))`.
+          shape `tiled_mma.partition_shape_A((M, K))`; on SM90 the physical A
+          operand is treated as K-major even if the logical TensorSpec also has
+          an MN-major SMEM backing.
         - `tiled_mma`: pass a pre-built TiledMma to bypass the arch-dispatched
           default (e.g. for warp-level MMA with custom permutation_mnk on SM120,
           or any non-default MMA op selection).
@@ -832,7 +1108,6 @@ class MatmulSpec:
             source = "TS" if tmem_A_ptr is not None else source
             if tiled_mma is None:
                 tiled_mma = phys.tiled_mma(
-                    cta_group=cta_group,
                     acc_dtype=acc_dtype,
                     source=source,
                     permutation_mnk=permutation_mnk,
@@ -864,7 +1139,9 @@ class MatmulSpec:
                 swap_AB=swap_AB,
             )
 
-        assert cta_group == 1, f"{arch.name} bind_mma requires cta_group=1, got {cta_group}"
+        assert self.cta_group == 1, (
+            f"{arch.name} bind_mma requires cta_group=1 operands, got {self.cta_group}"
+        )
         assert source in ("SS", "RS"), f"{arch.name} bind_mma source must be SS or RS, got {source}"
         # `phys` is the *physical* MatmulSpec — what the wgmma is actually built
         # against. When swap_AB, we flip operand roles: logical A becomes the
@@ -961,20 +1238,25 @@ class MatmulSpec:
         return layout_utils.transpose_view(t.smem) if needs_transpose else t.smem
 
     # ---- SM100 (tcgen05) ----------------------------------------------------
-    # Role and cta_group are MMA concerns, so they live here rather than on the
-    # TensorSpec: the same spec (and the same SMEM bytes) can be the A operand
-    # of one MMA and the B operand of another. Spec shapes are per-CTA storage
-    # tiles; for cta_group=2 the full MMA tile is (M*2, N*2, K) — the 2-CTA MMA
-    # splits A along M and B along N, each peer CTA holding half of both.
+    # Role is an MMA concern, so it lives here rather than on the TensorSpec:
+    # the same spec (and the same SMEM bytes) can be the A operand of one MMA
+    # and the B operand of another. Spec shapes are full logical tiles; peer
+    # distribution (cta_group) is a storage property of the specs — the 2-CTA
+    # MMA splits A along M and B along N, each peer CTA holding half of both,
+    # and each spec's `storage_shape` is its per-CTA shard.
     # The role-nested layouts below are byte-identical to the specs' flat
     # `smem_layout()` (same swizzle, same addressing); they only differ in the
     # mode nesting that `partition_A/B` / `make_fragment_A/B` expect.
 
     def mma_tiler_mnk(self, tiled_mma: cute.TiledMma) -> Tuple[int, int, int]:
-        """Full MMA tile (M, N, K): per-CTA spec dims scaled by the tiled_mma's
-        cta_group (read off `thr_id`)."""
-        cta_group = cute.size(tiled_mma.thr_id.shape)
-        return (self.M * cta_group, self.N * cta_group, self.K)
+        """Full MMA tile (M, N, K). Spec shapes are full logical tiles, so this
+        is just (M, N, K); the tiled_mma's cta_group (read off `thr_id`) is
+        validated against the operands' storage distribution."""
+        mma_cta_group = cute.size(tiled_mma.thr_id.shape)
+        assert mma_cta_group == self.cta_group, (
+            f"tiled_mma cta_group {mma_cta_group} != operand spec cta_group {self.cta_group}"
+        )
+        return (self.M, self.N, self.K)
 
     def smem_layout_A(self, tiled_mma: cute.TiledMma, *, stage: Optional[int] = None):
         """Role-nested staged SMEM layout for the A operand — the
@@ -1029,10 +1311,18 @@ class MatmulSpec:
         *,
         stage: Optional[int] = None,
     ) -> cute.Tensor:
-        """tcgen05 A-operand TMEM view over flat TensorSpec TMEM storage."""
+        """tcgen05 A-operand TMEM view over flat TensorSpec TMEM storage.
+
+        The multi-stage stride comes from the bound TMEM tensor: aliased
+        storage (e.g. a bf16 P ring over a wider f32 accumulator ring, see
+        `alias_acc_as_tmem`) strides its stages by the ALIASED region's
+        footprint, not by this operand's own column footprint."""
         tmem = tmem if tmem is not None else self.A.tmem
         assert tmem is not None, "A tmem not bound — call with_tmem(...) or pass tmem"
-        return self.frag_A_tmem(tiled_mma, tmem.iterator, stage=stage)
+        stage_stride = None
+        if cute.rank(tmem.layout) >= 3 and cute.size(tmem.layout, mode=[2]) > 1:
+            stage_stride = tmem.layout.stride[2]
+        return self.frag_A_tmem(tiled_mma, tmem.iterator, stage=stage, stage_stride=stage_stride)
 
     def acc_layout_sm100(self, tiled_mma: cute.TiledMma, *, stages: Optional[int] = None):
         """Staged TMEM accumulator layout ((MMA, MMA_M, MMA_N[, STAGE])) for
@@ -1050,16 +1340,27 @@ class MatmulSpec:
         tmem_ptr,
         *,
         stage: Optional[int] = None,
+        stage_stride: Optional[int] = None,
     ) -> cute.Tensor:
         """TMEM-resident A-operand fragment ((MMA, MMA_M, MMA_K, STAGE)) at
         `tmem_ptr`, for MMAs built with `source="TS"` (the A tile is produced
         into TMEM by a previous stage, e.g. linear attention's masked Q@K^T fed
         to P@V). Also usable standalone by the warp that *writes* the operand
-        into TMEM (tcgen05 store partitioning)."""
+        into TMEM (tcgen05 store partitioning).
+
+        `stage_stride` (elements of the operand dtype) overrides the trailing
+        stage-mode stride, for storage whose stages are NOT packed at this
+        operand's own footprint (e.g. a bf16 ring aliased over a wider f32
+        accumulator ring)."""
         layout = self.smem_layout_A(tiled_mma, stage=stage)
         shape = layout.outer.shape if hasattr(layout, "outer") else layout.shape
         fake = tiled_mma.make_fragment_A(shape)
-        return cute.make_tensor(cute.recast_ptr(tmem_ptr, dtype=fake.element_type), fake.layout)
+        frag_layout = fake.layout
+        if stage_stride is not None:
+            rank = cute.rank(frag_layout)
+            new_stride = tuple(frag_layout.stride[i] for i in range(rank - 1)) + (stage_stride,)
+            frag_layout = cute.make_layout(frag_layout.shape, stride=new_stride)
+        return cute.make_tensor(cute.recast_ptr(tmem_ptr, dtype=fake.element_type), frag_layout)
 
     @staticmethod
     def _operand_major(t: TensorSpec, is_A: bool) -> Literal["K", "MN"]:

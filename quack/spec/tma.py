@@ -10,13 +10,14 @@ because a peer CTA owns instruction panels, not a contiguous half tile.
 from typing import Any, Optional, Tuple, Type, Union, cast
 
 import cutlass
+from cutlass import const_expr
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir import ir
 import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
 import cutlass.cute as cute
 import cutlass.cute.atom as cute_atom
 import cutlass.cute.core as cute_core
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.cpasync.copy import (
     CopyBulkTensorTileG2SNonExecTrait,
     CopyBulkTensorTileG2SMulticastNonExecTrait,
@@ -25,7 +26,6 @@ from cutlass.cute.nvgpu.cpasync.copy import (
 )
 from cutlass.cute.nvgpu.cpasync.helpers import TmaInfo
 from cutlass.cute.typing import NumericMeta
-from cutlass.utils import LayoutEnum
 
 from quack.spec import mma as spec_mma
 from quack.spec import smem as spec_smem
@@ -230,83 +230,49 @@ def _sm100_dense_tma_flat_cta_v_map(
     )
 
 
-def _sm100_dense_tma_layout_and_cta_v_map(
-    dtype: Type[cutlass.Numeric],
-    shape: Tuple[int, int],
-    stage: int,
-    layout: LayoutEnum,
+def slice_tma_tile_by_mma_cta(
+    g_tile: cute.Tensor,
+    rows_per_cta: int,
+    mma_tile_coord_v,
     cta_group: int = 1,
     mma_inst_k: Optional[int] = None,
-):
-    smem_layout = (
-        spec_smem.make_smem_layout_kmajor(dtype, shape, stage, cta_group, mma_inst_k)
-        if layout == LayoutEnum.ROW_MAJOR
-        else spec_smem.make_smem_layout_mnmajor(dtype, shape, stage, cta_group, mma_inst_k)
-    )
-    if cute.rank(smem_layout) == 4:
-        smem_layout = cute.slice_(smem_layout, (None, None, None, 0))
-    cta_v_map = _sm100_dense_tma_cta_v_map_from_shape(dtype, shape, cta_group, mma_inst_k)
-    return smem_layout, cta_v_map
-
-
-def _make_tma_atom_operand_from_op(
-    op: Union[cpasync.CopyBulkTensorTileG2SOp, cpasync.CopyBulkTensorTileG2SMulticastOp],
-    dtype: Type[cutlass.Numeric],
-    shape: Tuple[int, int],
-    stage: int,
-    layout: LayoutEnum,
-    gmem_tensor: cute.Tensor,
     *,
-    num_multicast: int = 1,
-    cta_group: int = 1,
-    mma_inst_k: Optional[int] = None,
-    internal_type: Optional[Type[cutlass.Numeric]] = None,
-):
-    """Role-free SM100 TMA load atom for a swizzled dense operand tile.
+    dtype: Optional[Type[cutlass.Numeric]] = None,
+    exact_layout: bool = False,
+) -> cute.Tensor:
+    """Select this CTA's leading-mode slice from a full tcgen05 operand tile.
 
-    Returns a `TmaInfo` whose atom and tensor are equivalent to CUTLASS'
-    role-aware `make_tiled_tma_atom_A/B` for the same operand distribution.
+    TMA atom construction owns the CTA-value map for a per-CTA tile. If the
+    caller starts from a full MMA operand tile, it must first select the CTA
+    slice that `thr_mma.partition_A/B` would have selected before calling
+    `tma_partition`. By default this returns the flat per-CTA tile used by
+    TensorSpec TMA; `exact_layout=True` additionally reshapes static probes into
+    the nested layout produced by `partition_A/B`.
     """
-    smem_layout, cta_v_map = _sm100_dense_tma_layout_and_cta_v_map(
-        dtype, shape, stage, layout, cta_group, mma_inst_k
-    )
-    return _make_tiled_tma_atom_from_cta_v_map(
-        op,
-        gmem_tensor,
-        smem_layout,
-        cta_v_map,
-        num_multicast,
-        internal_type=internal_type,
-    )
-
-
-def _make_tma_atom_operand(
-    dtype: Type[cutlass.Numeric],
-    shape: Tuple[int, int],
-    stage: int,
-    layout: LayoutEnum,
-    gmem_tensor: cute.Tensor,
-    *,
-    num_multicast: int = 1,
-    cta_group: int = 1,
-    mma_inst_k: Optional[int] = None,
-    internal_type: Optional[Type[cutlass.Numeric]] = None,
-):
-    cg = tcgen05.CtaGroup.TWO if cta_group == 2 else tcgen05.CtaGroup.ONE
-    op = (
-        cpasync.CopyBulkTensorTileG2SMulticastOp(cg)
-        if num_multicast > 1
-        else cpasync.CopyBulkTensorTileG2SOp(cg)
-    )
-    return _make_tma_atom_operand_from_op(
-        op,
-        dtype,
-        shape,
-        stage,
-        layout,
-        gmem_tensor,
-        num_multicast=num_multicast,
-        cta_group=cta_group,
+    if const_expr(cta_group == 1):
+        return g_tile
+    assert cta_group == 2, f"expected cta_group 1 or 2, got {cta_group}"
+    rank = cute.rank(g_tile)
+    sliced = cute.flat_divide(g_tile, (rows_per_cta,))[
+        (None, mma_tile_coord_v, *([None] * (rank - 1)))
+    ]
+    if const_expr(not exact_layout):
+        return sliced
+    head_dtype = dtype if dtype is not None else g_tile.element_type
+    head_layout = _sm100_dense_tma_cta_v_map_from_shape(
+        head_dtype,
+        (rows_per_cta, cute.size(sliced.shape[1])),
+        cta_group=1,
         mma_inst_k=mma_inst_k,
-        internal_type=internal_type,
     )
+    if const_expr(rank == 2):
+        tiled_layout = head_layout
+    else:
+        tiled_layout = cute.make_layout(
+            (*head_layout.shape, *sliced.shape[2:]),
+            stride=(
+                *head_layout.stride,
+                *tuple(cute.E(i) for i in range(2, rank)),
+            ),
+        )
+    return cute.composition(sliced, tiled_layout)

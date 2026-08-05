@@ -590,7 +590,7 @@ def exchange(
     # `load_s2r` preserves a layout like the swizzled smem source; the values are correct, but
     # that swizzled rmem layout is not contiguous, e.g, ((1,(4,2,2,2,2))):((0,(1,4,8,16,32))).
     # We call contiguous to materialize into a compact rmem layout.
-    vals_exchanged = copy_utils.contiguous(vals_exchanged)
+    vals_exchanged = vals_exchanged.contiguous()
     if const_expr(bit_shift < log_ept):
         # Tail exchanges leave the loaded value bits in `(exchanged, leftover)` order.
         # Before the N=2048/ept=64 tail exchange, for example, ownership is
@@ -601,7 +601,7 @@ def exchange(
         # 64 registers as (32,2) = (exchanged bits, leftover bit), transpose to (2,32),
         # and compact so the leftover bit 0 becomes the leading local value bit again.
         vals_exchanged = cute.composition(vals_exchanged, cute.make_layout((radix, ept // radix)))
-        vals_exchanged = copy_utils.contiguous(layout_utils.select(vals_exchanged, [1, 0]))
+        vals_exchanged = layout_utils.select(vals_exchanged, [1, 0]).contiguous()
     return cute.composition(vals_exchanged, cute.make_layout((ept, 1)))
 
 
@@ -752,8 +752,7 @@ class HadamardTransform:
                     copy(tXgX[..., row_block], tXrX)
 
             x_flat = cute.composition(tXrX, cute.make_layout((cute.size(tXrX), 1)))
-            x_vals = cute.make_rmem_tensor_like(x_flat, dtype=Float32)
-            x_vals.store(x_flat.load().to(Float32))
+            x_vals = x_flat.to(Float32)
 
             if const_expr(self.use_shuffle):
                 _hadamard_thread_col(x_vals)
@@ -778,7 +777,7 @@ class HadamardTransform:
                 x_store = cute.composition(
                     x_vals, cute.make_layout((tail_size, plan.copy_vecsize, rest_size))
                 )
-                x_store = copy_utils.contiguous(layout_utils.select(x_store, [1, 0, 2]))
+                x_store = layout_utils.select(x_store, [1, 0, 2]).contiguous()
                 gO_store = gO[row_in_cta, None, row_block]
                 thr_store = tail_store_copy.get_slice(tidx)
                 tOgO = thr_store.partition_D(cute.composition(gO_store, tail_store_layout))

@@ -6,7 +6,7 @@ FROM ubuntu:24.04 AS base
 # Defaults match build.sh's cu12.9 invocation so a bare `docker build` (no
 # --build-arg) produces a working image on our cu12.9 runners. Pass
 # --build-arg QUACK_EXTRAS=cu13,dev (plus --target cu13) for the cu13.2 variant.
-ARG TORCH_CUDA=cu126
+ARG TORCH_CUDA=cu129
 ARG QUACK_EXTRAS=dev
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -16,20 +16,19 @@ RUN apt-get update -y && apt-get install -y \
         git ca-certificates gcc && \
     rm -rf /var/lib/apt/lists/*
 
-# Install latest stable torch from the matching cu wheel index. Torch's wheel
+# Install pinned stable torch from the matching cu wheel index. Torch's wheel
 # brings cublas/cudnn/cudart/etc. and triton brings ptxas — together these are
 # everything cute-dsl needs to JIT. cusolver isn't linked from libtorch_cuda
 # (we don't use torch.linalg here), so we drop it in the same RUN to shrink
-# the layer (~470 MB on cu12.6, ~235 MB on cu13.x).
+# the layer (~hundreds of MB).
 #
-# Note: build.sh pins TORCH_CUDA=cu126 for the cu12.9 image (PyTorch 2.12
-# skipped cu128/cu129 wheels; cu126 is the newest 12.x index that ships 2.12
-# and is runnable against any CUDA 12.x driver) and TORCH_CUDA=cu132 for the
-# cu13.2 image (matches the cu13 cute-dsl backend and the cu13.x compat
-# shim added by the `cu13` target). The cu13 target's compat libcuda.so
-# is what makes cu132 torch runnable on older kernel drivers like 575.x.
+# Note: build.sh pins TORCH_CUDA=cu129 for the cu12.9 image now that PyTorch
+# 2.13 ships cu129 wheels, and TORCH_CUDA=cu132 for the cu13.2 image (matches
+# the cu13 cute-dsl backend and the cu13.x compat shim added by the `cu13`
+# target). The cu13 target's compat libcuda.so is what makes cu132 torch
+# runnable on older kernel drivers like 575.x.
 RUN pip install --break-system-packages --no-cache-dir \
-        "torch==2.12.1" \
+        "torch==2.13.0" \
         --index-url https://download.pytorch.org/whl/${TORCH_CUDA} && \
     rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cusolver \
            /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcusolver*.so.*

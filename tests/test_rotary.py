@@ -4,31 +4,16 @@ import pytest
 import torch
 
 from quack.rotary import apply_rotary, apply_rotary_emb, apply_rotary_emb_kv_, apply_rotary_emb_qkv_
-from quack.testing.fake_compat import assert_aliased
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
-# Marker alias for tests whose entire point is a runtime invariant that
-# FakeTensorMode cannot represent:
-#   * data_ptr() aliasing (FakeTensor has no real storage; .data_ptr() emits a
-#     DeprecationWarning and will raise in PyTorch 2.5).
-#   * torch.profiler kernel counts (no real kernel launches under --compile-only).
-#   * torch.compile / Dynamo dispatch traces (Dynamo skips frames when an outer
-#     FakeTensorMode dispatch is active, producing "no compiled frames" warnings).
-# Skipping in phase 1 (--compile-only / cache warming) is safe: the underlying
-# rotary kernel signatures are still warmed by other parametrized tests in this
-# file. Phase 2 (real GPU) runs them normally.
-#
-# Backed by the ``compile_only_skip`` marker registered in
-# ``quack.testing.pytest_plugin``; evaluated at test-setup time so it is
-# robust to xdist worksteal item-fetch ordering.
-_skip_under_compile_only = pytest.mark.compile_only_skip(
-    "runtime invariant (data_ptr aliasing / profiler kernel count / "
-    "torch.compile dispatch) cannot be validated under FakeTensorMode"
-)
+
+def assert_aliased(a: torch.Tensor, b: torch.Tensor) -> None:
+    """Assert two tensors share storage."""
+    assert a.data_ptr() == b.data_ptr()
 
 
 def _rotary_grid_dim_pairs():
@@ -93,10 +78,8 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
 
 
 def unpad_input(x, padding_mask):
-    from quack.testing.fake_compat import fake_safe_nonzero
-
     batch, seqlen = padding_mask.shape
-    indices = fake_safe_nonzero(padding_mask)
+    indices = torch.nonzero(padding_mask.reshape(-1), as_tuple=False).flatten()
     x_unpad = x.reshape(batch * seqlen, *x.shape[2:])[indices]
     lengths = padding_mask.sum(dim=1, dtype=torch.int32)
     cu_seqlens = torch.cat(
@@ -216,7 +199,6 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
-@_skip_under_compile_only
 def test_rotary_emb_compile():
     torch.manual_seed(42)
     device = "cuda"
@@ -248,7 +230,6 @@ def test_rotary_emb_compile():
     torch.testing.assert_close(x.grad, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
-@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_inplace_backward_no_copy(use_compile):
     torch._dynamo.reset()
@@ -291,8 +272,21 @@ def test_rotary_emb_inplace_backward_no_copy(use_compile):
 
     assert out.data_ptr() == x.data_ptr()
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
-    assert_one_cuda_kernel_no_memcpy(prof)
-    assert dx.data_ptr() == grad.data_ptr()
+    if use_compile:
+        # The bwd op declares its mutation (Tensor(a!)) so graph transforms see
+        # real dataflow edges — the old ordered-effect route hid the in-place
+        # rotation from reorder passes, which silently corrupted training when
+        # comm-overlap scheduling moved consumers across it. The cost: when the
+        # mutated tensor is a GRAPH INPUT (the tangent here, compiled
+        # standalone), functionalization materializes one clone, and dx no
+        # longer aliases grad. Inside a larger compiled region the grad is an
+        # intermediate and no clone is emitted.
+        names = cuda_event_names(prof)
+        if names:
+            assert len([n for n in names if not n.startswith("Memcpy")]) <= 2, names
+    else:
+        assert_one_cuda_kernel_no_memcpy(prof)
+        assert dx.data_ptr() == grad.data_ptr()
     torch.testing.assert_close(dx, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -604,15 +598,11 @@ def test_rotary_emb_qkv(interleaved, rotary_fraction, seqlen_offsets_type, gqa, 
     out.backward(grad)
     out_pt.backward(grad_pt)
 
-    # data_ptr() comparison is deprecated on FakeTensor; under --compile-only the
-    # Aliasing assertion only meaningful with real storage; the helper
-    # short-circuits under compile-only mode.
     assert_aliased(out, qkv)
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
     torch.testing.assert_close(qkv.grad, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
-@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
     """Regression test for Dynamo dispatch across packed 5D QKV then 4D GQA QKV."""
@@ -695,7 +685,6 @@ def test_rotary_emb_qkv_compile_packed_then_gqa(use_compile):
     run_case(gqa=True)
 
 
-@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_qkv_inplace_kernel_count(use_compile):
     torch._dynamo.reset()
@@ -758,13 +747,24 @@ def test_rotary_emb_qkv_inplace_kernel_count(use_compile):
     ) as prof:
         (dqkv,) = torch.autograd.grad(out, qkv, grad)
         torch.cuda.synchronize()
-    assert_one_cuda_kernel_no_memcpy(prof)
-    assert dqkv.data_ptr() == grad.data_ptr()
+    if use_compile:
+        # bwd mutation is schema-declared (Tensor(a!)): compiled standalone,
+        # the tangent is a graph input, so functionalization materializes one
+        # clone and dqkv no longer aliases grad (inside a larger region the
+        # grad is an intermediate and stays clone-free). Declared dataflow is
+        # what keeps graph transforms from reordering across the in-place
+        # rotation (hidden ordered-effect mutation corrupted training under
+        # comm-overlap scheduling).
+        names = cuda_event_names(prof)
+        if names:
+            assert len([n for n in names if not n.startswith("Memcpy")]) <= 2, names
+    else:
+        assert_one_cuda_kernel_no_memcpy(prof)
+        assert dqkv.data_ptr() == grad.data_ptr()
     out_pt.backward(grad_pt)
     torch.testing.assert_close(dqkv, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
 
-@_skip_under_compile_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rotary_emb_qkv_packed_reshape_backward_no_copy(use_compile):
     torch._dynamo.reset()
@@ -821,8 +821,20 @@ def test_rotary_emb_qkv_packed_reshape_backward_no_copy(use_compile):
     ) as prof:
         (dqkv,) = torch.autograd.grad(out, qkv, grad)
         torch.cuda.synchronize()
-    assert_one_cuda_kernel_no_memcpy(prof)
-    assert dqkv.data_ptr() == grad.data_ptr()
+    if use_compile:
+        # bwd mutation is schema-declared (Tensor(a!)): compiled standalone,
+        # the tangent is a graph input, so functionalization materializes one
+        # clone and dqkv no longer aliases grad (inside a larger region the
+        # grad is an intermediate and stays clone-free). Declared dataflow is
+        # what keeps graph transforms from reordering across the in-place
+        # rotation (hidden ordered-effect mutation corrupted training under
+        # comm-overlap scheduling).
+        names = cuda_event_names(prof)
+        if names:
+            assert len([n for n in names if not n.startswith("Memcpy")]) <= 2, names
+    else:
+        assert_one_cuda_kernel_no_memcpy(prof)
+        assert dqkv.data_ptr() == grad.data_ptr()
     out_pt.backward(grad_pt)
     torch.testing.assert_close(dqkv, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 

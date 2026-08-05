@@ -1,23 +1,21 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 """pytest configuration for quack kernel tests.
 
-Supports:
-  --compile-only    Compile all kernels (populating .o cache), skip actual execution.
-                    Uses FakeTensorMode (no GPU memory) so you can use many xdist workers.
-                    Works without a GPU if QUACK_ARCH and CUTE_DSL_ARCH are set.
-                    Implemented by the reusable `quack.testing.pytest_plugin`
-                    plugin (loaded below) — downstream projects can opt into the
-                    same workflow by adding the same `pytest_plugins =` line.
+Kernel-compile workflow (implemented by the reusable
+`quack.testing.pytest_plugin` plugin loaded below — downstream projects opt
+in with the same `pytest_plugins =` line):
 
-Two-pass workflow (after changing kernel source):
-  pytest tests/test_softmax.py --compile-only -n 64   # parallel compile, no GPU memory
-  pytest tests/test_softmax.py                         # instant .o loads
+  --async-compile[=N]  Single-pass workflow: on a kernel-compile cache miss,
+                       the compile is shipped to a pool of N CPU workers
+                       (forkserver sidecar: ~0.1 s/worker, GPU-blind), the
+                       test is deferred, other tests run meanwhile, and the
+                       deferred test retries once its .o is exported.
+                       Zero overhead when the cache is warm. Works with and
+                       without xdist.
 
-CPU-only compilation (no GPU needed):
-  QUACK_ARCH=90 CUTE_DSL_ARCH=sm_90a pytest tests/ --compile-only -n 64
-
-Single-pass workflow (cache already warm):
-  pytest tests/test_softmax.py                         # all .o cache hits
+Single-pass workflow (cold or warm cache, after changing kernel source):
+  pytest tests/test_softmax.py --async-compile=16      # compiles overlap tests
+  pytest tests/ -n 8 --async-compile=32
 
 Multi-GPU with xdist:
   pytest tests/ -n 4                                   # workers round-robin across GPUs
@@ -32,13 +30,6 @@ from pathlib import Path
 from getpass import getuser
 
 import pytest
-
-
-def _compile_only_enabled(config) -> bool:
-    try:
-        return bool(config.getoption("--compile-only", default=False))
-    except (ValueError, AttributeError):
-        return False
 
 
 def _get_gpu_ids():
@@ -100,59 +91,11 @@ def _assign_xdist_worker_gpu():
 
 _PRECONFIGURED_WORKER_GPU = _assign_xdist_worker_gpu()
 
-# `--compile-only` flag, FakeTensorMode setup, and the per-phase error-swallow
-# hooks live in the reusable plugin. We defer to it only after xdist workers
+# The `--async-compile` pool and defer-and-retry loop
+# live in the reusable plugin. We defer to it only after xdist workers
 # have been narrowed to a single GPU, because importing the `quack` package can
 # touch CUDA via CUTLASS/PyTorch.
 pytest_plugins = ["quack.testing.pytest_plugin"]
-
-
-# Per-session bookkeeping for the xdist worker-crash retry hook below.
-_crash_retried: set[str] = set()
-
-
-def pytest_handlecrashitem(crashitem, report, sched):
-    """Re-queue a worker-crashed test on a fresh worker.
-
-    Background. Sometimes a worker crahses (idk why, still investigating).
-    --max-worker-restart spawns a fresh
-    replacement worker, but xdist still marks the test that was in flight
-    when the death happened as 'failed' (see xdist.dsession.handle_crashitem,
-    which synthesises a TestReport with longrepr only and no excinfo).
-
-    pytest-rerunfailures' --only-rerun matches against excinfo and so cannot
-    see worker-crash failures. This hook is the xdist-specific entry point:
-    it re-queues the crashed test via the scheduler's mark_test_pending API
-    and downgrades the synthetic crash report from 'failed' to 'skipped' so
-    the run isn't marked red on the leak alone. The retry produces its own
-    pass/fail report; if a test deterministically crashes any worker, the
-    second crash isn't retried and the failure stands.
-    """
-    if crashitem in _crash_retried:
-        # Already gave this nodeid one retry. If we're here again the bug is
-        # in the test (or in code the test exercises), not in cumulative RSS.
-        # Let xdist log the failure normally.
-        return
-    _crash_retried.add(crashitem)
-
-    try:
-        sched.mark_test_pending(crashitem)
-    except (NotImplementedError, AttributeError, ValueError):
-        # loadscope / each / unexpected scheduler shape: don't try to be
-        # clever, just let the failure go through.
-        return
-
-    # Mutate the synthetic crash report so it isn't counted as a failure.
-    # outcome='skipped' is the standard pytest signal; longrepr for skipped
-    # tests is conventionally a (path, lineno, reason) tuple.
-    fspath = report.location[0] if getattr(report, "location", None) else ""
-    report.outcome = "skipped"
-    report.longrepr = (
-        fspath,
-        0,
-        f"worker crashed; re-queued for one retry on a fresh worker "
-        f"({crashitem}). See cutlass#3062 background in tests/conftest.py.",
-    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -175,41 +118,6 @@ def pytest_configure(config):
                 assigned_gpu,
                 gpu_ids,
             )
-
-
-def pytest_collection_modifyitems(config, items):
-    """Deselect ``use_compile=True`` parametrizations under ``--compile-only``.
-
-    Compile-only runs exist to populate the cute kernel .o cache via FakeTensorMode.
-    The ``use_compile=True`` parametrizations wrap the kernel entry point in
-    ``torch.compile(...)``, but the cute kernel is already an opaque ``cute_op``
-    (see ``quack/dsl/torch_library_op.py``), so Dynamo+Inductor add no cache
-    coverage — both branches hit the same ``cute.compile`` path through the fake
-    impl. Inductor's pre-codegen alignment check (``_inductor/utils.py:tensor_is_aligned``)
-    also calls ``data_ptr()`` on the FakeTensor input, which emits a noisy
-    deprecation warning. Deselecting these parametrizations removes the warning and
-    saves the redundant Inductor compile work. The real GPU pass (no
-    ``--compile-only``) still exercises ``torch.compile`` for coverage.
-    """
-    if not _compile_only_enabled(config):
-        return
-
-    # ``tests/test_cache.py`` is no longer special-cased here — R1 made the
-    # leak-on-reset bug impossible (no module-level ``COMPILE_ONLY`` attribute
-    # to assign to) and R2 added a ``compile_only_skip`` marker that
-    # ``test_cache.py`` uses as ``pytestmark``, evaluated at setup time. The
-    # belt-and-suspenders deselect that used to live here is no longer needed.
-    deselected = [
-        item
-        for item in items
-        if getattr(item, "callspec", None) is not None
-        and item.callspec.params.get("use_compile") is True
-    ]
-    if not deselected:
-        return
-    config.hook.pytest_deselected(items=deselected)
-    deselected_ids = {id(item) for item in deselected}
-    items[:] = [item for item in items if id(item) not in deselected_ids]
 
 
 def pytest_collection_finish(session):
@@ -247,10 +155,40 @@ def _is_oom(exc_type, exc_val):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    """Retry once on CUDA OOM after freeing GPU memory. No-op under --compile-only."""
-    if _compile_only_enabled(item.config):
-        yield
-        return
+    """Retry once on CUDA OOM after freeing GPU memory.
+
+    The retry runs inside this hookwrapper's *teardown* (the code after
+    ``yield``), and pluggy's contract for old-style hookwrappers is that
+    teardown code must not raise: an escaping exception triggers
+    ``PluggyTeardownRaisedWarning`` and skips the remaining (outer) wrapper
+    teardowns (see pluggy ``_callers.py::_multicall``). So everything the
+    retried ``item.runtest()`` raises must be routed through the pluggy
+    ``Result`` (``outcome``), never re-raised.
+
+    The case that found this (CI, shared GPU + cold kernel cache): a test
+    OOMs while allocating its *inputs* (before any kernel call), memory is
+    freed, and the retry then reaches ``jit_cache`` where a cold ``.o`` miss
+    under ``--async-compile`` raises ``CompilePending`` — a ``BaseException``
+    by design, so nothing below can swallow it. Letting it escape here meant:
+
+    * pluggy warned (``PluggyTeardownRaisedWarning: CompilePending: kernel
+      compile pending in pool: _compile_rmsnorm_bwd [...]``), and
+    * the defer machinery in ``quack.testing.pytest_plugin`` (whose own
+      ``pytest_runtest_call`` wrapper had already run, or was skipped by the
+      teardown abort) never saw it, so ``item._quack_pending_sha`` stayed
+      unset and the test was reported from this half-run attempt instead of
+      being deferred and retried once its ``.o`` landed.
+
+    Hence the shape below: ``CompilePending`` is handed to the defer
+    machinery exactly the way ``_defer_if_compile_pending`` would
+    (``_quack_pending_sha`` + force-pass; the defer loop discards this
+    attempt's reports and re-runs the test later), and any other retry
+    exception — including a second OOM — becomes the recorded outcome via
+    ``force_exception`` so it is reported as an ordinary failure.
+
+    Regression test:
+    ``tests/test_async_compile.py::test_oom_retry_compile_pending_defers_not_warns``.
+    """
     outcome = yield
     if outcome.excinfo is not None and _is_oom(*outcome.excinfo[:2]):
         import gc
@@ -259,5 +197,19 @@ def pytest_runtest_call(item):
         logging.warning("OOM in %s, freeing GPU memory and retrying once", item.nodeid)
         gc.collect()
         torch.cuda.empty_cache()
-        outcome.force_result(None)
-        item.runtest()
+        try:
+            item.runtest()
+        except BaseException as e:
+            from quack.cache.async_compile import CompilePending
+
+            if isinstance(e, CompilePending):
+                # Defer: mirror _defer_if_compile_pending (force-pass; the
+                # defer loop discards this attempt and retries the test).
+                item._quack_pending_sha = e.sha
+                outcome.force_result(None)
+            else:
+                # Real retry failure: report it through the outcome instead
+                # of raising out of the teardown (see docstring).
+                outcome.force_exception(e)
+        else:
+            outcome.force_result(None)

@@ -12,7 +12,7 @@ from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.utils import LayoutEnum
+from cutlass.utils import LayoutEnum, block_copy
 import cutlass.pipeline
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
@@ -129,12 +129,89 @@ def cvt_copy(
 ) -> None:
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
-        src_cvt.store(src.load().to(dst.element_type))
-        src = src_cvt
+        src = src.to(dst.element_type, loc=loc, ip=ip)
     if const_expr(retile):
         src = tiled_copy.retile(src)
     cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+
+
+def _pair_leaf_slices(layout):
+    """Slice coords for the two slots of the contiguous (shape 2, stride 1) leaf.
+
+    Also asserts the pair is the fastest nontrivial mode (all earlier modes
+    size 1), so the flat colex value order is (slot, rest...).
+
+    Why not flat_divide by 2 like the acc_pair idiom in epilogue/visit.py:
+    that works there because compact rmem fragments have the stride-1 pair as
+    mode 0 by construction. Here the split also applies to the smem-side
+    partition, whose flattened layout carries degenerate leading modes from
+    the copy-atom nesting (e.g. (1,2,2,2,1,2):(0,1,256,8,0,16)) — dividing
+    mode 0 would fail on the 1:0, and coalescing first can restructure the
+    compact src differently from the strided dst, breaking the mode-for-mode
+    slot correspondence the caller's select relies on. This helper is the
+    same divide with its preconditions made explicit and checked."""
+    pair_mode = None
+    for i in range(cute.rank(layout)):
+        if const_expr(layout[i].shape == 2 and layout[i].stride == 1):
+            pair_mode = i
+            break
+    assert pair_mode is not None, "no contiguous pair leaf; use a plain copy instead"
+    assert all(layout[i].shape == 1 for i in range(pair_mode)), (
+        "pair leaf must be the fastest nontrivial mode"
+    )
+    coord0 = tuple(0 if i == pair_mode else None for i in range(cute.rank(layout)))
+    coord1 = tuple(1 if i == pair_mode else None for i in range(cute.rank(layout)))
+    return coord0, coord1
+
+
+@dsl_user_op
+def cvt_copy_pair_xor_sts32(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    tidx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store 32-bit acc fragments as two conflict-free full-warp STS.32.
+
+    The acc layout gives lane L the contiguous column pair (2q, 2q+1),
+    q = L%4, of row L>>2. Under every TMA-legal swizzle the pair's bank is
+    4*((q>>1)^r) + 2*(q&1) + slot: the vectorized STS.64 spends the slot bit
+    on vector width, leaving 16 reachable banks per half-warp (uniformly
+    2-way conflicted, 4 wavefronts/instr measured). Two STS.32 that store
+    the pair in per-lane order slot = h, 1-h with h = (L>>1)&1 make the bank
+    a bijection on all 32 lanes: 2x1 conflict-free wavefronts instead. Each
+    thread still writes only its own two values to the same cells, so the
+    smem image (and TMA) is unchanged; the reorder costs one select per
+    stored word on the otherwise-idle ALU pipe.
+
+    Costs a handful of extra registers (w fragments + second address base);
+    only use in epilogues with register headroom — gemm_add's fp32-C
+    epilogue sits exactly at the setmaxnreg cap and spills.
+    """
+    from cutlass.cute.tensor import TensorSSA
+
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    if const_expr(src.element_type != dst.element_type):
+        src = src.to(dst.element_type, loc=loc, ip=ip)
+    assert const_expr(dst.element_type.width == 32)
+    src_flat = cute.make_tensor(src.iterator, cute.flatten(src.layout))
+    dst_flat = cute.make_tensor(dst.iterator, cute.flatten(dst.layout))
+    assert const_expr(src_flat.layout.shape == dst_flat.layout.shape)
+    coord0, coord1 = _pair_leaf_slices(dst_flat.layout)
+    v0, v1 = src_flat[coord0].load(), src_flat[coord1].load()
+    h = (tidx >> 1) & 1
+    hb = h != 0
+    w0 = cute.make_rmem_tensor(v0.shape, dst.element_type)
+    w1 = cute.make_rmem_tensor(v1.shape, dst.element_type)
+    w0.store(TensorSSA(cutlass.select_(hb, v1, v0), v0.shape, dst.element_type))  # slot h
+    w1.store(TensorSSA(cutlass.select_(hb, v0, v1), v1.shape, dst.element_type))  # slot 1 - h
+    dst0 = dst_flat[coord0]
+    # dst leaves are stride >= 2 after slicing off the pair, so these can
+    # never re-vectorize into a 64-bit store
+    cute.autovec_copy(w0, cute.make_tensor(dst0.iterator + h, dst0.layout))
+    cute.autovec_copy(w1, cute.make_tensor(dst0.iterator + (1 - h), dst0.layout))
 
 
 @dsl_user_op
@@ -145,19 +222,30 @@ def sr_cvt_copy(
     seed: Int32,
     tidx: Int32,
     *,
+    retile: bool = False,
     loc=None,
     ip=None,
 ) -> None:
-    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
+    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16/FP16 conversion."""
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
-    from quack.rounding import convert_f32_to_bf16_sr
+    from quack.rounding import convert_f32_to_bf16_sr, convert_f32_to_f16_sr
     from cutlass.cute.tensor import TensorSSA
 
+    assert const_expr(dst.element_type in (cutlass.BFloat16, cutlass.Float16)), (
+        "stochastic rounding supports BF16/FP16 output only"
+    )
+    convert_sr = (
+        convert_f32_to_bf16_sr
+        if const_expr(dst.element_type == cutlass.BFloat16)
+        else convert_f32_to_f16_sr
+    )
     src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
     src_vec = src.load()
-    raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx, loc=loc, ip=ip)
+    raw_vec = convert_sr(src_vec, seed, tidx, loc=loc, ip=ip)
     src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
     src = src_cvt
+    if const_expr(retile):
+        src = tiled_copy.retile(src)
     cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
 
 
@@ -198,6 +286,7 @@ def load_t2r(
     tiled_copy: cute.TiledCopy,
     src: cute.Tensor,
     *,
+    fence: bool = False,
     loc=None,
     ip=None,
 ) -> cute.Tensor:
@@ -208,6 +297,8 @@ def load_t2r(
     """
     dst = tmem_reg_frag(tiled_copy, src, loc=loc, ip=ip)
     cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
+    if const_expr(fence):
+        cute.arch.fence_view_async_tmem_load()
     return dst
 
 
@@ -245,6 +336,27 @@ def tiled_copy_1d(
     thr_layout = cute.make_layout(num_threads)
     val_layout = cute.make_layout(num_copy_elems)
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
+def vectorized_thread_partition(
+    tensor: cute.Tensor,
+    tidx: Int32,
+    num_threads: int,
+    num_copy_elems: int = 1,
+    *,
+    is_source: bool,
+) -> Tuple[cute.ThrCopy, cute.Tensor]:
+    """Partition a flat tensor into adjacent per-thread vectors.
+
+    At a fixed vector iteration, thread ``t`` owns
+    ``[t * num_copy_elems, (t + 1) * num_copy_elems)``. Returns the thread
+    copy together with its source or destination partition of ``tensor``.
+    """
+    thr_copy = tiled_copy_1d(tensor.element_type, num_threads, num_copy_elems).get_slice(tidx)
+    partition = (
+        thr_copy.partition_S(tensor) if const_expr(is_source) else thr_copy.partition_D(tensor)
+    )
+    return thr_copy, partition
 
 
 def tiled_copy_2d(
@@ -681,6 +793,79 @@ def get_smem_load_A(
     return copy_fn if not with_dst_tensor else copy_fn_w_dst_tensor, thr_copy, tSR_sA
 
 
+def _cpasync_reduction_kind_name(reduction_kind: Any) -> str:
+    name = (
+        reduction_kind.lower() if isinstance(reduction_kind, str) else reduction_kind.name.lower()
+    )
+    assert name in {"add", "min", "max", "inc", "dec", "and", "or", "xor"}, (
+        f"Unsupported cp.reduce.async.bulk reduction kind: {reduction_kind}"
+    )
+    return name
+
+
+def _cpasync_bulk_reduce_suffix(
+    reduction_kind: Any,
+    dtype: Type[cutlass.Numeric],
+) -> str:
+    op = _cpasync_reduction_kind_name(reduction_kind)
+    if dtype is cutlass.Float16:
+        assert op in {"add", "min", "max"}, f"{op} is not supported for f16 bulk reduce"
+        return f"{op}.noftz.f16" if op == "add" else f"{op}.f16"
+    if dtype is cutlass.BFloat16:
+        assert op in {"add", "min", "max"}, f"{op} is not supported for bf16 bulk reduce"
+        return f"{op}.noftz.bf16" if op == "add" else f"{op}.bf16"
+    if dtype is cutlass.Float32:
+        assert op == "add", f"{op} is not supported for f32 bulk reduce"
+        return "add.f32"
+    if dtype is cutlass.Float64:
+        assert op == "add", f"{op} is not supported for f64 bulk reduce"
+        return "add.f64"
+
+    signed = getattr(dtype, "signed", None)
+    width = getattr(dtype, "width", None)
+    if signed is not None:
+        assert width in (32, 64), f"Unsupported integer bulk-reduce width: {width}"
+        if op in {"and", "or", "xor"}:
+            return f"{op}.b{width}"
+        if op in {"min", "max", "add"}:
+            return f"{op}.{'s' if signed else 'u'}{width}"
+        assert op in {"inc", "dec"} and dtype is cutlass.Uint32, (
+            f"{op} bulk reduce is only supported for u32"
+        )
+        return f"{op}.u32"
+
+    raise TypeError(f"Unsupported cp.reduce.async.bulk dtype: {dtype}")
+
+
+@dsl_user_op
+def cpasync_bulk_s2g(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: int | Int32,
+    *,
+    reduction_kind: Optional[Any] = None,
+    dtype: Optional[Type[cutlass.Numeric]] = None,
+    loc=None,
+    ip=None,
+):
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
+    if reduction_kind is None:
+        ptx = "cp.async.bulk.global.shared::cta.bulk_group [{$r0}], [{$r1}], {$r2};"
+    else:
+        assert dtype is not None, "dtype is required for cp.reduce.async.bulk"
+        ptx = (
+            "cp.reduce.async.bulk.global.shared::cta.bulk_group."
+            f"{_cpasync_bulk_reduce_suffix(reduction_kind, dtype)} "
+            "[{$r0}], [{$r1}], {$r2};"
+        )
+    cute.arch.inline_ptx(
+        ptx,
+        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
+        loc=loc,
+        ip=ip,
+    )
+
+
 @dsl_user_op
 def cpasync_reduce_bulk_add_f32(
     smem_ptr: cute.Pointer,
@@ -690,14 +875,12 @@ def cpasync_reduce_bulk_add_f32(
     loc=None,
     ip=None,
 ):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
-    # cache_hint = cutlass.Int64(0x14F0000000000000)  # EVICT_LAST
-    cute.arch.inline_ptx(
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [{$r0}], [{$r1}], {$r2};",
-        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
-        # [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value(), cache_hint.ir_value()],
-        # "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32 [$0], [$1], $2, $3;",
-        # "l,r,r,l",
+    cpasync_bulk_s2g(
+        smem_ptr,
+        gmem_ptr,
+        store_bytes,
+        reduction_kind=cpasync.ReductionOp.ADD,
+        dtype=cutlass.Float32,
         loc=loc,
         ip=ip,
     )
@@ -836,32 +1019,135 @@ def cpasync_bulk_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
     single_stage: bool = False,
+    reduction_kind: Optional[cute.nvgpu.cpasync.ReductionKind] = None,
     **kwargs,
 ) -> Callable:
+    src_is_smem = const_expr(
+        isinstance(src_tensor.iterator, cute.Pointer)
+        and src_tensor.memspace == cute.AddressSpace.smem
+    )
+    dst_is_smem = const_expr(
+        isinstance(dst_tensor.iterator, cute.Pointer)
+        and dst_tensor.memspace == cute.AddressSpace.smem
+    )
+    if const_expr(reduction_kind is not None):
+        assert src_is_smem and not dst_is_smem, "cp.reduce.async.bulk only supports SMEM -> GMEM"
     group_rank_src = const_expr(cute.rank(src_tensor) - (1 if not single_stage else 0))
     group_rank_dst = const_expr(cute.rank(dst_tensor) - (1 if not single_stage else 0))
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
     src = cute.group_modes(src_tensor, 0, group_rank_src)
     dst = cute.group_modes(dst_tensor, 0, group_rank_dst)
 
+    if const_expr(src_is_smem and not dst_is_smem):
+
+        def copy_bulk_s2g(src_idx, dst_idx, **new_kwargs):
+            store_bytes = const_expr(cute.size(src.shape[:-1]) * src.element_type.width // 8)
+            with cute.arch.elect_one():
+                cpasync_bulk_s2g(
+                    src[None, src_idx].iterator,
+                    dst[None, dst_idx].iterator,
+                    store_bytes,
+                    reduction_kind=reduction_kind,
+                    dtype=src.element_type,
+                    **new_kwargs,
+                    **kwargs,
+                )
+
+        def copy_bulk_s2g_single_stage(**new_kwargs):
+            store_bytes = const_expr(cute.size(src.shape) * src.element_type.width // 8)
+            with cute.arch.elect_one():
+                cpasync_bulk_s2g(
+                    src.iterator,
+                    dst.iterator,
+                    store_bytes,
+                    reduction_kind=reduction_kind,
+                    dtype=src.element_type,
+                    **new_kwargs,
+                    **kwargs,
+                )
+
+        return copy_bulk_s2g if const_expr(not single_stage) else copy_bulk_s2g_single_stage
+
     def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
+        assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        with cute.arch.elect_one():
-            cute.copy(
-                atom,
-                src[None, src_idx],
-                dst[None, dst_idx],
-                mbar_ptr=tma_bar_ptr,
-                **new_kwargs,
-                **kwargs,
-            )
+        cute.copy(
+            atom,
+            src[None, src_idx],
+            dst[None, dst_idx],
+            mbar_ptr=tma_bar_ptr,
+            **new_kwargs,
+            **kwargs,
+        )
 
     def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
+        assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        with cute.arch.elect_one():
-            cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
+        cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
 
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
+
+
+def cpasync_bulk_get_store_or_add_fn(
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    store_first_contribution: bool,
+    single_stage: bool = False,
+    **kwargs,
+) -> Callable:
+    assert not single_stage, "store-or-add helper only supports staged SMEM -> GMEM tensors"
+    src_is_smem = const_expr(
+        isinstance(src_tensor.iterator, cute.Pointer)
+        and src_tensor.memspace == cute.AddressSpace.smem
+    )
+    dst_is_smem = const_expr(
+        isinstance(dst_tensor.iterator, cute.Pointer)
+        and dst_tensor.memspace == cute.AddressSpace.smem
+    )
+    assert src_is_smem and not dst_is_smem, "store-or-add helper only supports SMEM -> GMEM"
+    group_rank_src = const_expr(cute.rank(src_tensor))
+    group_rank_dst = const_expr(cute.rank(dst_tensor))
+    src = cute.group_modes(src_tensor, 0, group_rank_src - 1)
+    dst = cute.group_modes(dst_tensor, 0, group_rank_dst - 1)
+
+    @cute.jit
+    def copy_bulk_s2g_store_or_add(src_idx, dst_idx, idx, **new_kwargs):
+        store_bytes = const_expr(cute.size(src.shape[:-1]) * src.element_type.width // 8)
+        src_ptr = src[None, src_idx].iterator
+        dst_ptr = dst[None, dst_idx].iterator
+        with cute.arch.elect_one():
+            if const_expr(store_first_contribution):
+                if idx == 0:
+                    cpasync_bulk_s2g(
+                        src_ptr,
+                        dst_ptr,
+                        store_bytes,
+                        reduction_kind=None,
+                        **new_kwargs,
+                        **kwargs,
+                    )
+                else:
+                    cpasync_bulk_s2g(
+                        src_ptr,
+                        dst_ptr,
+                        store_bytes,
+                        reduction_kind=cpasync.ReductionOp.ADD,
+                        dtype=src.element_type,
+                        **new_kwargs,
+                        **kwargs,
+                    )
+            else:
+                cpasync_bulk_s2g(
+                    src_ptr,
+                    dst_ptr,
+                    store_bytes,
+                    reduction_kind=cpasync.ReductionOp.ADD,
+                    dtype=src.element_type,
+                    **new_kwargs,
+                    **kwargs,
+                )
+
+    return copy_bulk_s2g_store_or_add
 
 
 @dsl_user_op
@@ -911,6 +1197,72 @@ def tma_get_copy_fn(
         cute.copy(atom, src, dst, **new_kwargs, **kwargs, loc=loc, ip=ip)
 
     return (copy_tma if const_expr(not single_stage) else copy_tma_single_stage), s, g
+
+
+@dsl_user_op
+def tma_get_block_copy_fn(
+    atom: cute.CopyAtom,
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    tma_multicast: Optional[dict] = None,
+    single_stage: bool = False,
+    *,
+    loc=None,
+    ip=None,
+    **kwargs,
+) -> Callable:
+    src_is_smem = const_expr(
+        isinstance(src_tensor.iterator, cute.Pointer)
+        and src_tensor.memspace == cute.AddressSpace.smem
+    )
+    if const_expr(tma_multicast is not None and "use_2cta_mma_inst" not in tma_multicast):
+        op = atom.op if const_expr(hasattr(atom, "op")) else atom
+        tma_multicast = {
+            **tma_multicast,
+            "use_2cta_mma_inst": getattr(op, "cta_group", None) == tcgen05.CtaGroup.TWO,
+        }
+    smem_tensor, gmem_tensor = (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
+    group_rank_smem = const_expr(cute.rank(smem_tensor) - (1 if not single_stage else 0))
+    group_rank_gmem = const_expr(cute.rank(gmem_tensor) - (1 if not single_stage else 0))
+    s = cute.group_modes(smem_tensor, 0, group_rank_smem)
+    g = cute.group_modes(gmem_tensor, 0, group_rank_gmem)
+    src, dst = (s, g) if src_is_smem else (g, s)
+
+    @dsl_user_op
+    def copy_tma(src_idx, dst_idx, *, loc=None, ip=None, **new_kwargs):
+        src_cur = src[None, src_idx]
+        dst_cur = dst[None, dst_idx]
+        if const_expr(tma_multicast is None):
+            block_copy(atom, src_cur, dst_cur, **new_kwargs, **kwargs, loc=loc, ip=ip)
+        else:
+            block_copy(
+                atom,
+                src_cur,
+                dst_cur,
+                tma_multicast=tma_multicast,
+                **new_kwargs,
+                **kwargs,
+                loc=loc,
+                ip=ip,
+            )
+
+    @dsl_user_op
+    def copy_tma_single_stage(*, loc=None, ip=None, **new_kwargs):
+        if const_expr(tma_multicast is None):
+            block_copy(atom, src, dst, **new_kwargs, **kwargs, loc=loc, ip=ip)
+        else:
+            block_copy(
+                atom,
+                src,
+                dst,
+                tma_multicast=tma_multicast,
+                **new_kwargs,
+                **kwargs,
+                loc=loc,
+                ip=ip,
+            )
+
+    return copy_tma if const_expr(not single_stage) else copy_tma_single_stage
 
 
 def s2t_get_copy_fn(
@@ -989,6 +1341,15 @@ def tmem_reg_frag(
     iters = tuple(partitioned.shape[i] for i in range(1, rank - num_extra_modes))
     frag_dtype = partitioned.element_type if const_expr(dtype is None) else dtype
     return cute.make_rmem_tensor((val_shape, *iters), frag_dtype, loc=loc, ip=ip)
+
+
+def coord_frag(tiled_copy: cute.TiledCopy, tidx: Int32, shape) -> cute.Tensor:
+    """Per-thread (row, col) coordinates aligned with a tiled copy's register
+    fragments (`tmem_reg_frag` / `load_t2r`): the register-side partition of
+    an identity tensor over `shape`. Deliberately partition_D — partition_S of
+    a TMEM tiled copy keeps whole warp-addressed atom tiles instead of
+    distributing elements over lanes."""
+    return tiled_copy.get_slice(tidx).partition_D(cute.make_identity_tensor(shape))
 
 
 def r2s_partition_from_t2r(
@@ -1244,9 +1605,7 @@ def gather_k_get_copy_fn(
         for k in cutlass.range(cols_per_thread):
             col_idx = tAcA[0, 0, k][1]
             k_idx[k] = sAIdx_cur[col_idx]
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
         return k_idx, tApA_k
 
     def copy_fn(
@@ -1358,9 +1717,7 @@ def gather_k_get_tma_copy_fn(
     ) -> cute.Tensor:
         a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
         tSR_rAIdx = load_s2r(tSR_sAIdx[None, None, dst_idx])
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
         return tSR_rAIdx
 
     def copy_fn(src_idx, dst_idx, tSR_rAIdx, tma_bar_ptr: cute.Pointer):
