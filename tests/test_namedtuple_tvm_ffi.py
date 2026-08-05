@@ -81,12 +81,14 @@ def test_boolean_fake_tensor_tvm_ffi():
 
 
 def test_sub_byte_fake_tensor_alignment():
-    """Sub-byte dtypes are bit-packed: divisibility in elements divides down to
-    bytes (int4 div=32 -> 16B), unlike Boolean which is byte-per-element."""
+    """Sub-byte dtypes divide down to bytes (int4 div=32 -> 16B) and floor to
+    at least 1: bool never claims more than the always-safe 1 byte, since
+    callers pick divisibility for wide dtypes' vectorization and a sliced bool
+    mask can sit at any byte offset."""
     n = cute.sym_int()
     assert fake_tensor(cutlass.Int4, (n,), divisibility=32)._assumed_align == 16
     assert fake_tensor(cutlass.Float4E2M1FN, (n,), divisibility=32)._assumed_align == 16
-    assert fake_tensor(cutlass.Boolean, (n,), divisibility=4)._assumed_align == 4
+    assert fake_tensor(cutlass.Boolean, (n,), divisibility=4)._assumed_align == 1
     assert fake_tensor(cutlass.Boolean, (n,), divisibility=1)._assumed_align == 1
 
 

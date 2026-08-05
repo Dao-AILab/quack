@@ -2,7 +2,6 @@
 
 from typing import Optional
 
-import cutlass
 import cutlass.cute as cute
 
 
@@ -15,9 +14,12 @@ def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1) -> Optional[c
     (matching ``mark_layout_dynamic()`` on a tensor without a contiguous dim).
 
     ``divisibility`` is in elements; ``assumed_align`` (bytes) is
-    ``divisibility`` elements' worth of storage. Boolean is 1 byte per element
-    in memory (DLPack kDLBool) despite ``width == 1`` bit; sub-byte dtypes
-    (int4/fp4) are truly bit-packed, so their byte count divides down.
+    ``divisibility * dtype.width // 8``, floored to at least 1 so sub-byte
+    dtypes (bool width=1, int4/fp4 width=4) never claim more alignment than
+    ``divisibility`` elements guarantee. Callers pick ``divisibility`` for wide
+    dtypes' vectorization, so bool tensors flowing through generic paths only
+    get the always-safe 1-byte claim; floor (not ceil) keeps non-divisible
+    sub-byte cases from over-claiming.
     """
     if dtype is None:
         return None
@@ -27,8 +29,7 @@ def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1) -> Optional[c
         cute.sym_int64(divisibility=divisibility) if i != leading_dim else 1
         for i in range(len(shape))
     )
-    storage_bits = 8 if dtype is cutlass.Boolean else dtype.width
-    assumed_align = max(divisibility * storage_bits // 8, 1)
+    assumed_align = max(divisibility * dtype.width // 8, 1)
     return cute.runtime.make_fake_tensor(dtype, shape, stride=stride, assumed_align=assumed_align)
 
 
