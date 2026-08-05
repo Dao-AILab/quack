@@ -31,6 +31,16 @@ inputs:
       matters (cross-toolchain cubin collisions → cuModuleLoad SEGV).
     required: false
     default: ''
+  gpu_wait_seconds:
+    description: >-
+      Maximum time to wait for a GPU with at least 50 GB free when contention
+      races with runner assignment.
+    required: false
+    default: '300'
+  gpu_poll_seconds:
+    description: Seconds between GPU availability checks.
+    required: false
+    default: '15'
 
 runs:
   using: composite
@@ -84,7 +94,45 @@ runs:
         ARCH: ${{ inputs.arch }}
         CUDA: ${{ inputs.cuda }}
         GPU: ${{ inputs.gpu }}
+        GPU_WAIT_SECONDS: ${{ inputs.gpu_wait_seconds }}
+        GPU_POLL_SECONDS: ${{ inputs.gpu_poll_seconds }}
       run: |
+        if ! [[ "$GPU_WAIT_SECONDS" =~ ^[0-9]+$ && "$GPU_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::gpu_wait_seconds must be non-negative and gpu_poll_seconds must be positive"
+          exit 2
+        fi
+
+        # Runner placement checks the host before the listener starts, but a
+        # tenant can allocate memory between that check and job assignment.
+        # Absorb short races here instead of immediately failing the CI leg.
+        # 50000 MiB covers the measured ~45 GiB peak of the largest fp32
+        # forward/backward RMSNorm case with a small safety margin.
+        GPU_DEADLINE=$(( $(date +%s) + GPU_WAIT_SECONDS ))
+        while :; do
+          FREE_GPUS=$(
+            nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null |
+              awk -F', ' '$2 >= 50000 {print $1}' |
+              paste -sd,
+          ) || true
+          if [ -n "$FREE_GPUS" ]; then
+            break
+          fi
+
+          NOW=$(date +%s)
+          if (( NOW >= GPU_DEADLINE )); then
+            echo "::error::No GPUs with >= 50GB free memory after waiting ${GPU_WAIT_SECONDS}s"
+            nvidia-smi --query-gpu=index,memory.used,memory.free \
+              --format=csv,noheader,nounits || true
+            exit 1
+          fi
+          REMAINING=$(( GPU_DEADLINE - NOW ))
+          echo "No GPU has >= 50GB free; retrying in ${GPU_POLL_SECONDS}s (${REMAINING}s remaining)"
+          sleep "$GPU_POLL_SECONDS"
+        done
+
+        NUM_GPUS=$(tr ',' '\n' <<< "$FREE_GPUS" | wc -l)
+        echo "Running tests on GPUs: $FREE_GPUS"
+
         # The cu13.2 image's Dockerfile bakes LD_LIBRARY_PATH=/usr/local/cuda/compat
         # so its libcuda.so.590 forward-compat shim wins over apptainer's
         # host-injected libcuda in /.singularity.d/libs. That's correct on h100
@@ -100,7 +148,11 @@ runs:
         # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
         # this Python inside the SIF picks up packages from the runner user's
         # ~/.local/lib/python3.12/site-packages, shadowing the SIF's copies.
-        apptainer exec --nv --writable-tmpfs --env PYTHONNOUSERSITE=1 $EXTRA_APPTAINER_ENV "$QUACK_SIF" bash -c "
+        apptainer exec --nv --writable-tmpfs \
+          --env PYTHONNOUSERSITE=1 \
+          --env FREE_GPUS="$FREE_GPUS" \
+          --env NUM_GPUS="$NUM_GPUS" \
+          $EXTRA_APPTAINER_ENV "$QUACK_SIF" bash -c "
           # Editable-install over the container's baked-in quack so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
@@ -148,15 +200,5 @@ runs:
           # across the xdist workers) while the tests defer and retry; warm
           # runs pay nothing. Replaces the old two-pass
           # \"--compile-only then real run\" strategy.
-          # >= 50000 MiB free: the largest test (test_rmsnorm_large_tensor,
-          # M=32K N=262144 bf16) peaks at a measured 35.0 GiB (x + out fully
-          # materialized + chunked reference). test_rmsnorm_forward_backward
-          # reaches ~45 GiB for M=8192, N=131072 fp32. The large-tensor test
-          # also gates on free memory itself, so a tenant allocating after
-          # this check degrades to a skip rather than an OOM.
-          FREE_GPUS=\$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F', ' '\$2 >= 50000 {print \$1}' | paste -sd,) &&
-          if [ -z \"\$FREE_GPUS\" ]; then echo 'No GPUs with >= 50GB free memory'; exit 1; fi &&
-          echo \"Running tests on GPUs: \$FREE_GPUS\" &&
-          NUM_GPUS=\$(echo \"\$FREE_GPUS\" | tr ',' '\n' | wc -l) &&
           CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24
         "

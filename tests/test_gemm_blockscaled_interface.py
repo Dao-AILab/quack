@@ -25,11 +25,18 @@ from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
 from quack.blockscaled.utils import blockscaled_quantize_dim0
 from quack.gemm_interface import (
+    act_to_pytorch_fn_map,
+    gated_to_pytorch_fn_map,
     gemm,
     gemm_act,
     gemm_add,
     gemm_add_inplace,
     gemm_blockscaled_ref,
+    gemm_dact,
+    gemm_dgated,
+    gemm_norm_act,
+    gemm_rms,
+    gemm_symmetric,
 )
 
 
@@ -52,6 +59,10 @@ def _quantized_operands(fmt, m, n, k, batched, seed=0):
     A = BlockScaledOperand.from_parts(qa, sfa, fmt_obj)
     W = BlockScaledOperand.from_parts(qw, sfw, fmt_obj)
     return A, W.mT  # B = (K, N) logical view; qdata stride-swap, scale unchanged
+
+
+def _rel_err(out, ref):
+    return (out.float() - ref.float()).abs().max().item() / (ref.float().abs().max().item() + 1e-9)
 
 
 @pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
@@ -332,6 +343,209 @@ def test_blockscaled_gemm_act_bias_no_preact():
     assert rel < 1e-2, f"bias+relu: rel_err={rel}"
 
 
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("activation", ["relu", "gelu_tanh_approx"])
+def test_blockscaled_gemm_dact(fmt, activation):
+    """gemm_dact with blockscaled A (dout) and B (weight): dout crosses the
+    mainloop quantized, PreAct rides the C slot in bf16."""
+    _skip_if_not_sm100()
+    m, n, k = 512, 512, 512
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    preact = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    dout_ref = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
+    dx, postact = gemm_dact(A, B, preact, activation=activation, tuned=False)
+    assert dx.dtype == torch.bfloat16 and postact.dtype == torch.bfloat16
+    assert dx.shape == (m, n) and postact.shape == (m, n)
+    preact_f = preact.float().requires_grad_(True)
+    postact_ref = act_to_pytorch_fn_map[activation](preact_f)
+    (dx_ref,) = torch.autograd.grad(postact_ref, preact_f, dout_ref)
+    assert _rel_err(dx, dx_ref) < 1e-2, f"{fmt} {activation}: dx"
+    assert _rel_err(postact, postact_ref) < 1e-2, f"{fmt} {activation}: postact"
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("scale_reduce", [False, True])
+def test_blockscaled_gemm_dgated(fmt, scale_reduce):
+    """gemm_dgated with blockscaled A/B: the packed-C/D epilogue (interleaved
+    gate/up PreAct, 2*N-wide dx) on the blockscaled mainloop, optionally with
+    the colvec scale + reduce sinks."""
+    _skip_if_not_sm100()
+    m, n, k = 512, 512, 512
+    activation = "swiglu"
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    preact = torch.randn(m, 2 * n, device="cuda", dtype=torch.bfloat16)
+    colvec_scale = torch.randn(m, device="cuda") if scale_reduce else None
+    dout_ref = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
+    dx, postact, *rest = gemm_dgated(
+        A,
+        B,
+        preact,
+        activation=activation,
+        colvec_scale=colvec_scale,
+        colvec_reduce=scale_reduce,
+        tuned=False,
+    )
+    assert dx.shape == (m, 2 * n) and postact.shape == (m, n)
+    gate = preact.float()[..., ::2].requires_grad_(True)
+    up = preact.float()[..., 1::2].requires_grad_(True)
+    postact_ref = gated_to_pytorch_fn_map[activation](gate, up)
+    dout_scaled = dout_ref * colvec_scale[:, None] if scale_reduce else dout_ref
+    dgate, dup = torch.autograd.grad(postact_ref, [gate, up], dout_scaled)
+    dx_ref = torch.stack([dgate, dup], dim=-1).reshape(m, 2 * n)
+    if scale_reduce:
+        # The reduce folds UNSCALED dout; the returned postact is scaled after.
+        colvec_reduce_ref = (postact_ref * dout_ref).sum(dim=-1)
+        rel = _rel_err(rest[0], colvec_reduce_ref)
+        assert rel < 1e-2, f"{fmt}: colvec_reduce rel_err={rel}"
+        postact_ref = postact_ref * colvec_scale[:, None]
+    assert _rel_err(dx, dx_ref) < 1e-2, f"{fmt}: dx"
+    assert _rel_err(postact, postact_ref) < 1e-2, f"{fmt}: postact"
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+def test_blockscaled_gemm_rms(fmt):
+    """gemm_rms with blockscaled A/B: normalized D, the rstd from the sq-reduce
+    partials, and the premult aux, all against the dequant reference."""
+    _skip_if_not_sm100()
+    m, n, k = 512, 512, 512
+    eps = 1e-6
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    norm_weight = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    premult_out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    out, rstd = gemm_rms(
+        A, B, norm_weight=norm_weight, premult_out=premult_out, eps=eps, tuned=False
+    )
+    ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
+    rstd_ref = torch.rsqrt(ref_mm.square().mean(dim=-1) + eps)
+    out_ref = ref_mm * norm_weight.float()
+    assert out.dtype == torch.bfloat16 and rstd.dtype == torch.float32
+    assert _rel_err(out, out_ref) < 1e-2, f"{fmt}: D"
+    assert _rel_err(rstd, rstd_ref) < 5e-3, f"{fmt}: rstd"
+    assert _rel_err(premult_out, ref_mm) < 5e-3, f"{fmt}: premult"
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("activation", ["gelu_tanh_approx", "swiglu"])
+def test_blockscaled_gemm_norm_act(fmt, activation):
+    """gemm_norm_act / gemm_norm_gated with blockscaled A/B and an rstd colvec."""
+    _skip_if_not_sm100()
+    m, n, k = 512, 512, 512
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    rstd = torch.rand(m, device="cuda", dtype=torch.float32) + 0.5
+    preact, postact = gemm_norm_act(
+        A, B, rstd=rstd, activation=activation, store_preact=True, tuned=False
+    )
+    ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
+    pre_ref = ref_mm * rstd[:, None]
+    if activation == "swiglu":
+        post_ref = F.silu(pre_ref[..., ::2]) * pre_ref[..., 1::2]
+        assert postact.shape == (m, n // 2)
+    else:
+        post_ref = F.gelu(pre_ref, approximate="tanh")
+        assert postact.shape == (m, n)
+    assert preact.dtype == torch.bfloat16 and postact.dtype == torch.bfloat16
+    assert _rel_err(preact, pre_ref) < 1e-2, f"{fmt} {activation}: preact"
+    assert _rel_err(postact, post_ref) < 1e-2, f"{fmt} {activation}: postact"
+
+
+def test_blockscaled_gemm_rms_norm_act_per_tensor_scale():
+    """NVFP4 per-tensor scales through gemm_rms / gemm_norm_act (eager + compile).
+
+    The per-tensor scale must multiply the accumulator BEFORE the sq-reduce and
+    the norm scales. RMSNorm's scale invariance makes the normalized output
+    nearly insensitive to a dropped scale, so this test pins the outputs that
+    DO break: rstd and the premult/preact values (wrong by 1/s if dropped)."""
+    _skip_if_not_sm100()
+    m, n, k = 256, 256, 512
+    eps = 1e-6
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    xq = BlockScaledOperand.quantize(
+        x, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(x.float().abs().amax())
+    )
+    wq = BlockScaledOperand.quantize(
+        w, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(w.float().abs().amax())
+    )
+    s = (xq.per_tensor_scale * wq.per_tensor_scale).item()
+    assert not math.isclose(s, 1.0), "vacuous: scale ~ 1 cannot distinguish dropped scales"
+    ref_mm = gemm_blockscaled_ref(xq, wq.mT, out_dtype=torch.float32)  # applies the scales
+    rstd_ref = torch.rsqrt(ref_mm.square().mean(dim=-1) + eps)
+
+    def frms(a, b):
+        premult = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        out, rstd = gemm_rms(a, b, premult_out=premult, eps=eps, tuned=False)
+        return out, rstd, premult
+
+    for fn in (frms, torch.compile(frms, dynamic=False, fullgraph=True)):
+        out, rstd, premult = fn(xq, wq.mT)
+        assert _rel_err(rstd, rstd_ref) < 5e-3, "per-tensor-scale rms: rstd"
+        assert _rel_err(premult, ref_mm) < 5e-3, "per-tensor-scale rms: premult"
+        assert _rel_err(out, ref_mm) < 5e-3, "per-tensor-scale rms: D (no norm_weight)"
+
+    rstd_in = torch.rand(m, device="cuda", dtype=torch.float32) + 0.5
+    pre_ref = ref_mm * rstd_in[:, None]
+    post_ref = F.gelu(pre_ref, approximate="tanh")
+
+    def fna(a, b):
+        return gemm_norm_act(
+            a, b, rstd=rstd_in, activation="gelu_tanh_approx", store_preact=True, tuned=False
+        )
+
+    for fn in (fna, torch.compile(fna, dynamic=False, fullgraph=True)):
+        preact, postact = fn(xq, wq.mT)
+        assert _rel_err(preact, pre_ref) < 1e-2, "per-tensor-scale norm_act: preact"
+        assert _rel_err(postact, post_ref) < 1e-2, "per-tensor-scale norm_act: postact"
+
+
+def _quantized_symmetric_operand(fmt, m, k, batched=False):
+    torch.manual_seed(0)
+    shape = (2, m, k) if batched else (m, k)
+    a_hp = torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * k**-0.5
+    qa, sfa = blockscaled_quantize(a_hp, fmt)
+    return BlockScaledOperand.from_parts(qa, sfa, BlockScaledFormat.from_name(fmt))
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("batched", [False, True])
+def test_blockscaled_gemm_symmetric(fmt, batched):
+    """gemm_symmetric with a blockscaled pair (B = A.mT of the same quantized
+    tensor): the mirror store must keep the output exactly symmetric, and the
+    values must track the dequant reference."""
+    _skip_if_not_sm100()
+    m, k = 512, 512
+    A = _quantized_symmetric_operand(fmt, m, k, batched=batched)
+    out = gemm_symmetric(A, A.mT)
+    ref = gemm_blockscaled_ref(A, A.mT, out_dtype=torch.float32)
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, out.mT), f"{fmt}: mirror output is not exactly symmetric"
+    assert _rel_err(out, ref) < 5e-3, f"{fmt} batched={batched}"
+
+
+def test_blockscaled_gemm_symmetric_per_tensor_scale():
+    """NVFP4 per-tensor scales fold into gemm_symmetric's alpha (as scale^2 —
+    both slots are the same tensor), composing with C/beta and an explicit
+    alpha; eager + compile."""
+    _skip_if_not_sm100()
+    m, k = 256, 512
+    torch.manual_seed(0)
+    a_hp = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    A = BlockScaledOperand.quantize(
+        a_hp, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(a_hp.float().abs().amax())
+    )
+    c_half = torch.randn(m, m, device="cuda", dtype=torch.bfloat16)
+    C = c_half + c_half.mT  # C must be symmetric: the kernel mirrors D tiles
+    alpha, beta = 0.375, 0.5
+    ref = gemm_blockscaled_ref(A, A.mT, alpha=alpha, out_dtype=torch.float32) + beta * C.float()
+
+    def f(a, c):
+        return gemm_symmetric(a, a.mT, C=c, alpha=alpha, beta=beta)
+
+    for fn in (f, torch.compile(f, dynamic=False, fullgraph=True)):
+        out = fn(A, C)
+        assert _rel_err(out, ref) < 5e-3
+
+
 @pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
 def test_blockscaled_gemm_tuned(fmt):
     """Autotuned path: config pruning + sweep must produce a correct result."""
@@ -399,9 +613,9 @@ def test_tuple_operand_rejected():
 
 
 def test_nvfp4_per_tensor_scale_folding():
-    """NVFP4 quantized with non-unit per-tensor scales, default alpha: the pts
+    """NVFP4 quantized with non-unit per-tensor scales, default alpha: the scales
     product must be folded into alpha automatically. Encodes the silent-accuracy
-    trap where a dropped pts leaves every output off by pts_A * pts_B (all
+    trap where dropped scales leave every output off by scale_A * scale_B (all
     unit-scale tests stay green)."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
@@ -419,16 +633,16 @@ def test_nvfp4_per_tensor_scale_folding():
     out = gemm(xq, wq.mT, tuned=False)
     ref = gemm_blockscaled_ref(xq, wq.mT)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
-    assert rel < 5e-3, f"pts folding: rel_err={rel}"
-    # The result must track the hp product (pts applied), not be off by pts_A*pts_B.
+    assert rel < 5e-3, f"per-tensor-scale folding: rel_err={rel}"
+    # The result must track the hp product (scales applied), not be off by scale_A*scale_B.
     hp = x.float() @ w.float().T
     rel_hp = (out.float() - hp).abs().max().item() / hp.abs().max().item()
-    assert rel_hp < 0.2, f"pts appears dropped: rel_err vs hp = {rel_hp}"
-    # Explicit alpha composes multiplicatively with the folded pts.
+    assert rel_hp < 0.2, f"per-tensor scales appear dropped: rel_err vs hp = {rel_hp}"
+    # Explicit alpha composes multiplicatively with the folded per-tensor scales.
     out_a = gemm(xq, wq.mT, alpha=0.5, tuned=False)
     ref_a = gemm_blockscaled_ref(xq, wq.mT, alpha=0.5)
     rel_a = (out_a.float() - ref_a.float()).abs().max().item() / ref_a.float().abs().max().item()
-    assert rel_a < 5e-3, f"pts+alpha: rel_err={rel_a}"
+    assert rel_a < 5e-3, f"per-tensor-scale+alpha: rel_err={rel_a}"
 
 
 def test_square_weight_orientation():
@@ -734,7 +948,7 @@ def test_e5m2_from_parts_kernel():
 
 
 @pytest.mark.parametrize("activation", ["relu", "swiglu"])
-def test_gemm_act_pts_alpha(activation):
+def test_gemm_act_per_tensor_scale_alpha(activation):
     """NVFP4 per-tensor scales compose with pre-activation alpha."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512

@@ -135,6 +135,85 @@ def cvt_copy(
     cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
 
 
+def _pair_leaf_slices(layout):
+    """Slice coords for the two slots of the contiguous (shape 2, stride 1) leaf.
+
+    Also asserts the pair is the fastest nontrivial mode (all earlier modes
+    size 1), so the flat colex value order is (slot, rest...).
+
+    Why not flat_divide by 2 like the acc_pair idiom in epilogue/visit.py:
+    that works there because compact rmem fragments have the stride-1 pair as
+    mode 0 by construction. Here the split also applies to the smem-side
+    partition, whose flattened layout carries degenerate leading modes from
+    the copy-atom nesting (e.g. (1,2,2,2,1,2):(0,1,256,8,0,16)) — dividing
+    mode 0 would fail on the 1:0, and coalescing first can restructure the
+    compact src differently from the strided dst, breaking the mode-for-mode
+    slot correspondence the caller's select relies on. This helper is the
+    same divide with its preconditions made explicit and checked."""
+    pair_mode = None
+    for i in range(cute.rank(layout)):
+        if const_expr(layout[i].shape == 2 and layout[i].stride == 1):
+            pair_mode = i
+            break
+    assert pair_mode is not None, "no contiguous pair leaf; use a plain copy instead"
+    assert all(layout[i].shape == 1 for i in range(pair_mode)), (
+        "pair leaf must be the fastest nontrivial mode"
+    )
+    coord0 = tuple(0 if i == pair_mode else None for i in range(cute.rank(layout)))
+    coord1 = tuple(1 if i == pair_mode else None for i in range(cute.rank(layout)))
+    return coord0, coord1
+
+
+@dsl_user_op
+def cvt_copy_pair_xor_sts32(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    tidx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store 32-bit acc fragments as two conflict-free full-warp STS.32.
+
+    The acc layout gives lane L the contiguous column pair (2q, 2q+1),
+    q = L%4, of row L>>2. Under every TMA-legal swizzle the pair's bank is
+    4*((q>>1)^r) + 2*(q&1) + slot: the vectorized STS.64 spends the slot bit
+    on vector width, leaving 16 reachable banks per half-warp (uniformly
+    2-way conflicted, 4 wavefronts/instr measured). Two STS.32 that store
+    the pair in per-lane order slot = h, 1-h with h = (L>>1)&1 make the bank
+    a bijection on all 32 lanes: 2x1 conflict-free wavefronts instead. Each
+    thread still writes only its own two values to the same cells, so the
+    smem image (and TMA) is unchanged; the reorder costs one select per
+    stored word on the otherwise-idle ALU pipe.
+
+    Costs a handful of extra registers (w fragments + second address base);
+    only use in epilogues with register headroom — gemm_add's fp32-C
+    epilogue sits exactly at the setmaxnreg cap and spills.
+    """
+    from cutlass.cute.tensor import TensorSSA
+
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    if const_expr(src.element_type != dst.element_type):
+        src = src.to(dst.element_type, loc=loc, ip=ip)
+    assert const_expr(dst.element_type.width == 32)
+    src_flat = cute.make_tensor(src.iterator, cute.flatten(src.layout))
+    dst_flat = cute.make_tensor(dst.iterator, cute.flatten(dst.layout))
+    assert const_expr(src_flat.layout.shape == dst_flat.layout.shape)
+    coord0, coord1 = _pair_leaf_slices(dst_flat.layout)
+    v0, v1 = src_flat[coord0].load(), src_flat[coord1].load()
+    h = (tidx >> 1) & 1
+    hb = h != 0
+    w0 = cute.make_rmem_tensor(v0.shape, dst.element_type)
+    w1 = cute.make_rmem_tensor(v1.shape, dst.element_type)
+    w0.store(TensorSSA(cutlass.select_(hb, v1, v0), v0.shape, dst.element_type))  # slot h
+    w1.store(TensorSSA(cutlass.select_(hb, v0, v1), v1.shape, dst.element_type))  # slot 1 - h
+    dst0 = dst_flat[coord0]
+    # dst leaves are stride >= 2 after slicing off the pair, so these can
+    # never re-vectorize into a 64-bit store
+    cute.autovec_copy(w0, cute.make_tensor(dst0.iterator + h, dst0.layout))
+    cute.autovec_copy(w1, cute.make_tensor(dst0.iterator + (1 - h), dst0.layout))
+
+
 @dsl_user_op
 def sr_cvt_copy(
     tiled_copy: cute.TiledCopy,

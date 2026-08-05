@@ -1360,6 +1360,25 @@ def rmsnorm_bwd(
     device = x.device
     N = x.size(-1)
     per_head = x.dim() == 3
+    # plain-dense fast path -> the functional ops: identical eager behavior,
+    # but under torch.compile the graph gets one insertable node per site
+    # instead of empties + an auto_functionalized cluster (which downstream
+    # graph passes must never mutate)
+    if not per_head and weight is not None and not has_bias and x.numel() > 0:
+        sm_count = get_sm_count(N, device)
+        if dresidual_out is not None and dresidual_out.dtype != x.dtype:
+            dx, dw_partial, dresidual = torch.ops.quack.rmsnorm_bwd_f_dual(
+                x, weight, dout, rstd, dresidual_out, sm_count, weight_offset=weight_offset
+            )
+        else:
+            dx, dw_partial = torch.ops.quack.rmsnorm_bwd_f(
+                x, weight, dout, rstd, dresidual_out, sm_count, weight_offset=weight_offset
+            )
+            dresidual = None
+        dw = dw_partial.sum(dim=0).to(weight.dtype)
+        if has_residual and dresidual is None:
+            dresidual = dx
+        return dx, dw, None, dresidual
     dx = torch.empty_like(x)
     if dresidual_out is not None and dresidual_out.dtype != dx.dtype:
         dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
@@ -1404,6 +1423,103 @@ def rmsnorm_bwd(
     if has_residual and dresidual is None:
         dresidual = dx
     return dx, dw, db, dresidual
+
+
+@torch.library.custom_op("quack::rmsnorm_bwd_f", mutates_args=(), device_types="cuda")
+def _rmsnorm_bwd_f(
+    x: Tensor,
+    weight: Tensor,
+    dout: Tensor,
+    rstd: Tensor,
+    dresidual_out: Optional[Tensor] = None,
+    sm_count: int = 0,
+    is_layernorm: bool = False,
+    weight_offset: float = 0.0,
+) -> tuple[Tensor, Tensor]:
+    """Functional (graph-insertable) 2D rmsnorm backward: allocation inside,
+    real fake. Returns (dx, dw_partial); when dresidual_out (same dtype as x)
+    is given, the kernel folds the grad-accumulate add into dx (the
+    has_residual path). Compiler-facing; eager code uses rmsnorm_bwd()."""
+    dx = torch.empty_like(x)
+    dw_partial = torch.empty((sm_count, x.size(-1)), device=x.device, dtype=torch.float32)
+    _rmsnorm_bwd(
+        x,
+        weight,
+        dout,
+        rstd,
+        dx,
+        dw_partial,
+        None,
+        dresidual_out,
+        None,
+        sm_count,
+        is_layernorm=is_layernorm,
+        weight_offset=weight_offset,
+    )
+    return dx, dw_partial
+
+
+@_rmsnorm_bwd_f.register_fake
+def _(x, weight, dout, rstd, dresidual_out=None, sm_count=0, is_layernorm=False, weight_offset=0.0):
+    return (
+        torch.empty_like(x),
+        torch.empty((sm_count, x.size(-1)), device=x.device, dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op("quack::rmsnorm_bwd_f_dual", mutates_args=(), device_types="cuda")
+def _rmsnorm_bwd_f_dual(
+    x: Tensor,
+    weight: Tensor,
+    dout: Tensor,
+    rstd: Tensor,
+    dresidual_out: Tensor,
+    sm_count: int = 0,
+    is_layernorm: bool = False,
+    weight_offset: float = 0.0,
+    dx_dtype: Optional[torch.dtype] = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Dual-dtype functional rmsnorm backward: dh = norm_bwd(dout) +
+    dresidual_out written twice by one kernel — dx in dx_dtype (a gemm-ready
+    operand) and dresidual in dresidual_out's dtype (the stream continuation).
+    Returns (dx, dw_partial, dresidual)."""
+    dx = torch.empty_like(x, dtype=dx_dtype if dx_dtype is not None else x.dtype)
+    dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
+    dw_partial = torch.empty((sm_count, x.size(-1)), device=x.device, dtype=torch.float32)
+    _rmsnorm_bwd(
+        x,
+        weight,
+        dout,
+        rstd,
+        dx,
+        dw_partial,
+        None,
+        dresidual_out,
+        dresidual,
+        sm_count,
+        is_layernorm=is_layernorm,
+        weight_offset=weight_offset,
+    )
+    return dx, dw_partial, dresidual
+
+
+@_rmsnorm_bwd_f_dual.register_fake
+def _(
+    x,
+    weight,
+    dout,
+    rstd,
+    dresidual_out,
+    sm_count=0,
+    is_layernorm=False,
+    weight_offset=0.0,
+    dx_dtype=None,
+):
+    return (
+        torch.empty_like(x, dtype=dx_dtype if dx_dtype is not None else x.dtype),
+        torch.empty((sm_count, x.size(-1)), device=x.device, dtype=torch.float32),
+        torch.empty_like(x, dtype=dresidual_out.dtype),
+    )
 
 
 @autotune(

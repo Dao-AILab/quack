@@ -1,20 +1,21 @@
 # Copyright (c) 2026, Han Guo, Tri Dao.
 """Ready-to-use fused-GEMM epilogues, written with the @gemm_epilogue fn
-contract (quack.gemm_epilogue) on top of the EpiOp library (quack.epi_ops).
+contract (quack.epilogue.frontend) on top of the EpiOp library (quack.epilogue.ops).
 
 Each entry is a plain function over the accumulator plus declared resources;
 kernels are minted/cached per (fn source, op config, tensor metadata). Pass
 tensors via ``mod.gemm(A, B, D, C, epi_args={...}, tile_M=..., ...)``.
 
 Sections:
-  * packed-polymorphic math helpers (pexp, pabs) — raw cute.math fns are not
-    F2/Pair-aware; wrap transcendentals like these do.
+  * packed-polymorphic math helpers (pexp) — raw cute.math fns are not
+    F2/Pair-aware; wrap transcendentals like this does.
   * reusable domain resources live in ``quack.epilogue``: rotary table loads
     in ``rotary`` and per-head RMSNorm statistics in ``head_rmsnorm``.
   * elementwise mods: linear/bias, residual, activation factories, RMS-fused
     (sq-sum reduce), amax (quantization stats), per-tile LSE partials, online
-    LSE (stable), transformer-block forward (rms_partial -> rstd_swiglu) and
-    the rmsnorm-backward link.
+    LSE (stable, plus the CE-eval variant with target-logit gather),
+    transformer-block forward (rms_partial -> rstd_swiglu) and the
+    rmsnorm-backward link.
   * paired mods (gated / RoPE) and packed-C/D mods (dgated), via unpack/pack.
 
 Numerics of every mod here are pinned by tests/test_gemm_epilogue.py against
@@ -25,7 +26,6 @@ from __future__ import annotations
 
 import functools
 
-import cutlass.cute as cute
 
 from cutlass import Int32
 
@@ -35,23 +35,26 @@ from quack.activation import (
     dgate_fn_map,
     dgelu_tanh_approx,
     dswiglu,
+    dswiglu_oai,
     gate_fn_map,
     gelu_tanh_approx,
     relu,
     relu_sq,
     swiglu,
 )
-from quack.epi_ops import (
+from quack.epilogue.ops import (
     ColVecLoad,
     ColVecReduce,
+    ColVecSelect,
     OnlineLSEReduce,
     RowVecLoad,
     RowVecReduce,
     Scalar,
 )
-from quack.epilogue.head_rmsnorm import HeadRMSNormStats
+from quack.epilogue.head_rmsnorm import HeadRstd
 from quack.epilogue.rotary import rotary_cos_sin_load
-from quack.gemm_epilogue import F2, gemm_epilogue, pack, unpack
+from quack.epilogue.math import pack, pexp, unpack
+from quack.epilogue.frontend import gemm_epilogue
 
 
 @gemm_epilogue(outputs=("postact",))
@@ -94,6 +97,14 @@ def dgelu_mod(acc, c):
     return {"D": dx, "postact": out}
 
 
+@gemm_epilogue(outputs=("postact",), reduces={"dbias": RowVecReduce("dbias")})
+def dgelu_dbias_mod(acc, c):
+    """dgelu_mod + fused bias grad: dbias[n] = sum_m dx, the post-act-grad
+    rowvec (the preact bias's gradient)."""
+    dx, out = dgelu_tanh_approx(c, acc)
+    return {"D": dx, "postact": out, "dbias": dx}
+
+
 @gemm_epilogue(outputs=("premult",), reduces={"sqsum": ColVecReduce("sqsum", scaled=True)})
 def rms_fused(acc, weight):
     """GemmSqReduce as a mod: sqsum accumulated on pre-scale acc, D = acc * weight.
@@ -110,6 +121,63 @@ def dswiglu_mod(acc, c):
     return {"D": pack(dx, dy), "postact": out}
 
 
+def make_dgated_moe_mod(dgate):
+    """MoE-expert fc2-dgrad epilogue factory (the gpt-oss shape: biased FFN +
+    per-token router score on the expert output). acc = d(expert_out) @ W2^T
+    UNSCALED, score colvec = the router weight. Emits:
+      * D = packed dpreact with the score folded (dpreact = dgate(x, y, s*dout))
+        — both fc1 backward GEMMs stay plain;
+      * postact = score-scaled recomputed activation, so fc2-wgrad pairs it
+        with the plain dout;
+      * dscore[m] = sum_n(postact * unscaled dout) = <expert_out, d(final)>
+        per token — the router score grad, one fma via the scaled reduce;
+      * the fc1 bias grad as an N-wide rowvec PAIR (the preact is 2N-wide and
+        a rowvec slot is one f32): host interleaves db[0::2] = dbias_g,
+        db[1::2] = dbias_u, matching the packed (x, y) preact layout."""
+
+    @gemm_epilogue(
+        outputs=("postact",),
+        ops={"score": ColVecLoad("score")},
+        reduces={
+            "dscore": ColVecReduce("dscore", scaled=True),
+            "dbias_g": RowVecReduce("dbias_g"),
+            "dbias_u": RowVecReduce("dbias_u"),
+        },
+        mode="packed_cd_b16x2",
+    )
+    def dgated_moe_mod(acc, c, score):
+        x, y = unpack(c)
+        dx, dy, out = dgate(x, y, acc * score)
+        return {
+            "D": pack(dx, dy),
+            "postact": out * score,
+            "dscore": (out, acc),
+            "dbias_g": dx,
+            "dbias_u": dy,
+        }
+
+    return dgated_moe_mod
+
+
+dswiglu_moe_mod = make_dgated_moe_mod(dswiglu)
+
+
+# gpt-oss exact: swiglu_oai with the swiglu_limit=7.0 preact clamp (grads
+# zeroed where the clamp saturates).
+dswiglu_oai_moe_mod = make_dgated_moe_mod(lambda x, y, dout: dswiglu_oai(x, y, dout, limit=7.0))
+
+
+@gemm_epilogue(outputs=("postact",), reduces={"dsum": ColVecReduce("dsum")}, mode="packed_cd_b16x2")
+def dswiglu_dpreact_mod(acc, c):
+    """dswiglu_mod + the rstd-correction stat on the raw preact: dsum[m] =
+    sum over the full 2N preact dim of dpreact * preact (= dx*x + dy*y per
+    pair — dswiglu_rstd_preact_mod's dsum without the deferred rstd). A
+    two-product sum, so the scaled (val, scale) fma fold does not apply."""
+    x, y = unpack(c)
+    dx, dy, out = dswiglu(x, y, acc)
+    return {"D": pack(dx, dy), "postact": out, "dsum": dx * x + dy * y}
+
+
 @gemm_epilogue(
     outputs=("postact",),
     reduces={"dsum": ColVecReduce("dsum", scaled=True)},
@@ -121,28 +189,6 @@ def dswiglu_norm_mod(acc, c, rstd):
     x, y = unpack(c)
     dx, dy, out = dswiglu(x, y, acc * rstd)
     return {"D": pack(dx, dy), "postact": out * rstd, "dsum": (out, acc)}
-
-
-@gemm_epilogue(
-    outputs=("postact",),
-    ops={"rstd": ColVecLoad("rstd")},
-    reduces={"dsum": ColVecReduce("dsum")},
-    mode="packed_cd_b16x2",
-)
-def dswiglu_rstd_preact_mod(acc, c, rstd):
-    """Backward of s = swiglu(rstd * GU) — scale BEFORE activation, the
-    llama/rstd_swiglu_preact_epi convention (dswiglu_norm_mod above inverts
-    s = rstd * swiglu(GU), scale-after). acc = ds (dout), c = packed UNSCALED
-    preact GU, rstd colvec. Emits D = dGU (grad wrt the unscaled preact —
-    rstd folded here so both downstream bwd GEMMs are plain), the exact
-    recomputed postact s (fc2-wgrad operand), and the rstd-gradient stat
-    dsum = sum_pairs(dgs*g + dus*u) per tile (host: corr = -(rstd^3/d)*sum).
-    dsum is a plain reduce: the stat is a two-product sum, so the scaled
-    (val, scale) fma fold does not apply."""
-    g, u = unpack(c)
-    gs, us = g * rstd, u * rstd
-    dgs, dus, s = dswiglu(gs, us, acc)
-    return {"D": pack(dgs * rstd, dus * rstd), "postact": s, "dsum": dgs * g + dus * u}
 
 
 @gemm_epilogue(outputs=("postact",), mode="acc_pair")
@@ -187,21 +233,41 @@ def rope_epi(acc, table):
     return {"D": pack(x1 * cos - x2 * sin, x1 * sin + x2 * cos)}
 
 
-def pexp(v):
-    """Tuple-polymorphic exp, activation.py-style: raw cute.math fns are not
-    F2-aware, so mods needing transcendentals wrap them like this (candidate
-    for a shared quack epi-math module)."""
-    if isinstance(v, tuple):
-        return F2(*cute.arch.exp_packed_f32x2(v))
-    return cute.math.exp(v, fastmath=True)
-
-
 @gemm_epilogue(reduces={"sexp": ColVecReduce("sexp")})
 def lse_partial_epi(acc, scale):
     """Coda LSE, per-tile flavor: sexp[m, tile] = sum_n exp(acc * scale);
     the host finalizes log(sum(partials)). NOTE: no online max — needs a
     max-combine reduce for large-logit stability (Coda's LSEReduce is online)."""
     return {"D": acc, "sexp": pexp(acc * scale)}
+
+
+@gemm_epilogue(outs={"lse": OnlineLSEReduce("lse")})
+def lse_epi(acc):
+    """Logits + stable online (max, sum) LSE partials (l, m, n_tiles). Host:
+    lse = logsumexp(partials, -1)."""
+    return {"D": acc, "lse": acc}
+
+
+_lse_target_idx = ColVecLoad("target")
+
+
+@gemm_epilogue(
+    outs={
+        "lse": OnlineLSEReduce("lse"),
+        "target_logit": ColVecSelect("target_logit", idx_op=_lse_target_idx),
+    },
+    extra_ops=(_lse_target_idx,),
+)
+def lse_target_epi(acc):
+    """Cross-entropy-eval LM-head epilogue: write the logits, accumulate stable online
+    (max, sum) LSE partials (l, m, n_tiles), and gather each row's target-column logit into an
+    (l, m) f32 colvec — exact, never rounded through the D dtype (the anchor for the
+    fused linear-cross-entropy backward). ``target`` (an (l, m) int32/int64
+    colvec in epi_args) feeds the select through its companion load, not the
+    fn; rows with out-of-range targets (e.g. ignore_index -100) leave
+    target_logit untouched. Host CE forward:
+    loss = logsumexp(lse, -1) - target_logit."""
+    return {"D": acc, "lse": acc, "target_logit": acc}
 
 
 @gemm_epilogue(ops={"rstd": ColVecLoad("rstd")}, outs={"lse": OnlineLSEReduce("lse")})
@@ -214,18 +280,12 @@ def rstd_lse_epi(acc, rstd):
     return {"D": v, "lse": v}
 
 
-def pabs(v):
-    if isinstance(v, tuple):
-        return F2(pabs(v[0]), pabs(v[1]))
-    return cute.arch.fmax(v, -v)
-
-
-@gemm_epilogue(reduces={"amax": ColVecReduce("amax", combine="max")})
+@gemm_epilogue(reduces={"amax": ColVecReduce("amax", combine="max_abs")})
 def amax_epi(acc):
     """Per-tile column amax — the quantized-output (SFD) building block.
-    |x| >= 0, so the zero OOB accumulator lanes of a ragged last tile can't
-    corrupt the max (see VecReduce.combine note)."""
-    return {"D": acc, "amax": pabs(acc)}
+    max_abs folds raw inputs with the fused PTX max.abs operation; OOB zeros
+    are its identity, so ragged last N tiles need no per-element mask."""
+    return {"D": acc, "amax": acc}
 
 
 def _sq_prepass(acc):
@@ -235,40 +295,75 @@ def _sq_prepass(acc):
     return {"qk": acc * acc}
 
 
+_head_rstd_op = HeadRstd("qk", eps=1e-6)
+
+
 @gemm_epilogue(
-    ops={"qk": HeadRMSNormStats("qk", eps=1e-6)},
+    ops={"qk": _head_rstd_op},
     prepass=_sq_prepass,
     prepass_outs=("qk",),
+    extra_ops=(_head_rstd_op.out("rstd_out"),),
 )
-def qknorm_epi(acc, qk):
+def head_rmsnorm_epi(acc, qk):
+    """Per-head RMSNorm, no weight: qk is the per-(row, head) rstd from the
+    HeadRstd statistic (its (head_dim,) host arg only fixes the head width).
+    Optional rstd_out (l?, m, n/head_dim): the finalized rstd per (row,
+    head), written from the prepass stats — the backward needs it."""
     return {"D": acc * qk}
 
 
+_qknorm_rstd_op = HeadRstd("qk", eps=1e-6)
+
+
 @gemm_epilogue(
-    ops={"cs": rotary_cos_sin_load("cs"), "qk": HeadRMSNormStats("qk", eps=1e-6)},
+    ops={"qk": _qknorm_rstd_op, "w": RowVecLoad("w")},
+    prepass=_sq_prepass,
+    prepass_outs=("qk",),
+    extra_ops=(_qknorm_rstd_op.out("rstd_out"),),
+)
+def qknorm_epi(acc, qk, w):
+    """Weighted per-head RMSNorm: the rstd statistic and the norm weight are
+    independent resources, multiplied in plain sight. w is an ordinary (N,)
+    rowvec — pass the head weight repeated per head; qk's host arg fixes
+    head_dim (an int, or any tensor whose length is head_dim).
+    Optional rstd_out (l?, m, n/head_dim): the finalized rstd per (row,
+    head) — the backward needs it."""
+    return {"D": acc * qk * w}
+
+
+@gemm_epilogue(
+    ops={
+        "cs": rotary_cos_sin_load("cs"),
+        "qk": HeadRstd("qk", eps=1e-6),
+        "w": RowVecLoad("w"),
+    },
     prepass=_sq_prepass,
     prepass_outs=("qk",),
     mode="acc_pair",
 )
-def qk_rope_epi(acc, cs, qk):
-    """The full epirope composition: per-head RMSNorm (prepass stats) then
-    rotary, in five lines of fn math. TMA table (see rotary_cos_sin_load):
-    at the winning clustered-pingpong configs the LDG table's register cost
-    is what tips this composition into spills."""
-    x1, x2 = unpack(acc * qk)
+def qk_rope_epi(acc, cs, qk, w):
+    """The full epirope composition: per-head RMSNorm (prepass stats x weight
+    rowvec) then rotary, in five lines of fn math. TMA table (see
+    rotary_cos_sin_load): at the winning clustered-pingpong configs the LDG
+    table's register cost is what tips this composition into spills."""
+    x1, x2 = unpack(acc * qk * w)
     c, s = unpack(cs)
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 
 
 @gemm_epilogue(
-    ops={"cs": rotary_cos_sin_load("cs", tma=False), "qk": HeadRMSNormStats("qk", eps=1e-6)},
+    ops={
+        "cs": rotary_cos_sin_load("cs", tma=False),
+        "qk": HeadRstd("qk", eps=1e-6),
+        "w": RowVecLoad("w"),
+    },
     prepass=_sq_prepass,
     prepass_outs=("qk",),
     mode="acc_pair",
 )
-def qk_rope_ldg_epi(acc, cs, qk):
+def qk_rope_ldg_epi(acc, cs, qk, w):
     """qk_rope_epi on the gmem->rmem table op (see rope_table_ldg_epi)."""
-    x1, x2 = unpack(acc * qk)
+    x1, x2 = unpack(acc * qk * w)
     c, s = unpack(cs)
     return {"D": pack(x1 * c - x2 * s, x1 * s + x2 * c)}
 
@@ -284,24 +379,6 @@ def rms_partial_epi(acc, c, weight):
     the NEXT gemm), and the per-tile sq-sum partials for rstd finalization."""
     y = acc + c
     return {"D": y * weight, "resid_out": y, "sqsum": (y, y)}
-
-
-@gemm_epilogue(outputs=("postact",), ops={"rstd": ColVecLoad("rstd")}, mode="acc_pair")
-def rstd_swiglu_epi(acc, rstd):
-    """GEMM2 of a block: apply the deferred rstd (colvec), then swiglu pairs."""
-    g, u = unpack(acc * rstd)
-    return {"postact": swiglu(g, u)}
-
-
-@gemm_epilogue(outputs=("postact",), ops={"rstd": ColVecLoad("rstd")}, mode="acc_pair")
-def rstd_swiglu_preact_epi(acc, rstd):
-    """rstd_swiglu_epi that ALSO stores the UNSCALED preact (D = the raw
-    accumulator pairs) — the training-mode gate_up epilogue: the saved preact
-    is the exact operand dswiglu_rstd_preact_mod's backward needs (rstd is
-    saved separately as an f32 colvec, so scaling stays exact in bwd)."""
-    g, u = unpack(acc)
-    gs, us = unpack(acc * rstd)
-    return {"D": pack(g, u), "postact": swiglu(gs, us)}
 
 
 @gemm_epilogue(reduces={"dots": ColVecReduce("dots", scaled=True)})
@@ -364,10 +441,10 @@ def rms_bwd_entry_epi(acc, c, y, rstd, w):
 
 
 # --- Variant mod factories ----------------------------------------------------
-# The public gemm_act / gemm_dact / gemm_norm_act / gemm_sq_reduce wrappers
-# ride these. The operand names (mAuxOut, mRowVecBroadcast, mColVecBroadcast,
-# mColVecReduce, sr_seed) are the wire names shared with run_*_plan epi_values
-# and concat_layout keys.
+# The gemm_interface entry points (gemm_act / gemm_dact / gemm_norm_act /
+# gemm_rms) ride these. The operand names (mAuxOut, mRowVecBroadcast,
+# mColVecBroadcast, mColVecReduce, sr_seed) are the wire names shared with
+# run_gemm_epi_plan epi_values and concat_layout keys.
 #
 # The frontend derives a fn's operands from its SIGNATURE, and an absent
 # operand must not exist in the signature at all (that is what compiles the
@@ -394,7 +471,7 @@ def _gen_epi_fn(fname, tag, params, body, ns):
     lines += [f"    {ln}" for ln in body]
     src = "\n".join(lines)
     code = compile(src, f"<quack-epilogue:{tag}>", "exec")
-    ns = {**ns, "unpack": unpack, "pack": pack, "__name__": "quack.epilogues_generated"}
+    ns = {**ns, "unpack": unpack, "pack": pack, "__name__": "quack.epilogue.library_generated"}
     exec(code, ns)
     return ns[fname]
 
@@ -465,12 +542,16 @@ def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False
 
 
 @functools.lru_cache(maxsize=None)
-def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
-    """gemm_norm_act as a mod: x = (acc + C) * colvec * rowvec; D = x,
-    aux = act(x). Scale order: colvec then rowvec."""
+def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False, has_alpha=False):
+    """gemm_norm_act as a mod: x = (alpha * acc + C) * colvec * rowvec; D = x,
+    aux = act(x). Scale order: colvec then rowvec. ``alpha`` scales the
+    accumulator ONLY (before C and the norm scales) — it exists to carry NVFP4
+    per-tensor dequant scales, which belong to the matmul product alone."""
     fn_map = gate_fn_map if gated else act_fn_map
     act = fn_map[activation]
     params, body = [], []
+    if has_alpha:
+        params.append("alpha")
     if has_c:
         params.append("c")
     if has_rowvec:
@@ -478,8 +559,11 @@ def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
     if has_colvec:
         params.append("mColVecBroadcast")
     expr = "acc"
+    if has_alpha:
+        body.append("x = acc * alpha")
+        expr = "x"
     if has_c:
-        body.append("x = acc + c")
+        body.append(f"x = {expr} + c")
         expr = "x"
     if has_colvec:
         body.append(f"x = {expr} * mColVecBroadcast")
@@ -494,26 +578,48 @@ def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False):
         body.append(f'return {{"D": {expr}, "mAuxOut": act({expr})}}')
     else:
         body.append(f'return {{"D": {expr}, "mAuxOut": {expr}}}')
-    tag = f"norm_act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}v{int(has_colvec)}"
+    tag = (
+        f"norm_act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}"
+        f"v{int(has_colvec)}a{int(has_alpha)}"
+    )
     fn = _gen_epi_fn("norm_act_epi", tag, params, body, {"act": act})
+    ops = _vec_pins(params)
+    if has_alpha:
+        ops["alpha"] = Scalar("alpha")
     return gemm_epilogue(
         outputs=("mAuxOut",),
-        ops=_vec_pins(params),
+        ops=ops,
         mode="acc_pair" if gated else None,
         extra_ops=_SR_OPS if sr else (),
     )(fn)
 
 
 @functools.lru_cache(maxsize=None)
-def dact_mod(activation):
-    """gemm_dact as a mod: c is the preact, acc is dout; D = dx, aux = act(c)."""
+def dact_mod(activation, *, has_scale=False, has_reduce=False):
+    """gemm_dact as a mod: c is the preact, acc is dout; D = dx, aux = act(c).
+    Scale multiplies dout (dact is linear in it) and the postact; reduce
+    accumulates postact * unscaled dout, matching dgated_mod."""
     dact = dact_fn_map[activation]
+    params = ["c", "mColVecBroadcast"] if has_scale else ["c"]
+    dout = "acc * mColVecBroadcast" if has_scale else "acc"
     if dact is None:
-        body = ['return {"D": acc, "mAuxOut": c}']
+        body, dx, out = [], dout, "c"
     else:
-        body = ["dx, out = dact(c, acc)", 'return {"D": dx, "mAuxOut": out}']
-    fn = _gen_epi_fn("dact_epi", f"dact:{activation}", ["c"], body, {"dact": dact})
-    return gemm_epilogue(outputs=("mAuxOut",))(fn)
+        body, dx, out = [f"dx, out = dact(c, {dout})"], "dx", "out"
+    postact = f"{out} * mColVecBroadcast" if has_scale else out
+    if has_reduce:
+        body.append(f'return {{"D": {dx}, "mAuxOut": {postact}, "mColVecReduce": ({out}, acc)}}')
+    else:
+        body.append(f'return {{"D": {dx}, "mAuxOut": {postact}}}')
+    tag = f"dact:{activation}:s{int(has_scale)}r{int(has_reduce)}"
+    fn = _gen_epi_fn("dact_epi", tag, params, body, {"dact": dact})
+    return gemm_epilogue(
+        outputs=("mAuxOut",),
+        ops=_vec_pins(params),
+        reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)}
+        if has_reduce
+        else None,
+    )(fn)
 
 
 @functools.lru_cache(maxsize=None)
@@ -549,17 +655,98 @@ def dgated_mod(activation, *, has_scale, has_reduce):
 
 
 @functools.lru_cache(maxsize=None)
-def sq_reduce_mod(*, has_c, has_rowvec, has_aux):
-    """gemm_sq_reduce as a mod: x = acc (+ C); reduce[m] += sum_n x^2 (before
-    the rowvec scale); optional aux = x; D = x * rowvec."""
+def rstd_gated_mod(activation):
+    """GEMM2 of a block: apply the deferred rstd (colvec), then gated-activation
+    pairs (gate_fn_map key: swiglu = llama, geglu = Gemma)."""
+    gate = gate_fn_map[activation]
+    body = [
+        "g, u = unpack(acc * rstd)",
+        'return {"postact": gate(g, u)}',
+    ]
+    fn = _gen_epi_fn("rstd_gated_epi", f"rstd_gated:{activation}", ["rstd"], body, {"gate": gate})
+    return gemm_epilogue(outputs=("postact",), ops={"rstd": ColVecLoad("rstd")}, mode="acc_pair")(
+        fn
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def rstd_gated_preact_mod(activation):
+    """rstd_gated_mod that ALSO stores the UNSCALED preact (D = the raw
+    accumulator pairs) — the training-mode gate_up epilogue: the saved preact
+    is the exact operand dgated_rstd_preact_mod's backward needs (rstd is
+    saved separately as an f32 colvec, so scaling stays exact in bwd)."""
+    gate = gate_fn_map[activation]
+    body = [
+        "g, u = unpack(acc)",
+        "gs, us = unpack(acc * rstd)",
+        'return {"D": pack(g, u), "postact": gate(gs, us)}',
+    ]
+    fn = _gen_epi_fn(
+        "rstd_gated_preact_epi", f"rstd_gated_preact:{activation}", ["rstd"], body, {"gate": gate}
+    )
+    return gemm_epilogue(outputs=("postact",), ops={"rstd": ColVecLoad("rstd")}, mode="acc_pair")(
+        fn
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def dgated_rstd_preact_mod(activation):
+    """Backward of s = gate(rstd * GU) — scale BEFORE activation, the
+    llama/Gemma rstd_gated_preact_mod convention (dgated_mod/dswiglu_norm_mod
+    invert s = rstd * gate(GU), scale-after). acc = ds (dout), c = packed
+    UNSCALED preact GU, rstd colvec. Emits D = dGU (grad wrt the unscaled
+    preact — rstd folded here so both downstream bwd GEMMs are plain), the
+    exact recomputed postact s (fc2-wgrad operand), and the rstd-gradient stat
+    dsum = sum_pairs(dgs*g + dus*u) per tile (host: corr = -(rstd^3/d)*sum).
+    dsum is a plain reduce: the stat is a two-product sum, so the scaled
+    (val, scale) fma fold does not apply."""
+    dgate = dgate_fn_map[activation]
+    body = [
+        "g, u = unpack(c)",
+        "gs, us = g * rstd, u * rstd",
+        "dgs, dus, s = dgate(gs, us, acc)",
+        'return {"D": pack(dgs * rstd, dus * rstd), "postact": s, "dsum": dgs * g + dus * u}',
+    ]
+    fn = _gen_epi_fn(
+        "dgated_rstd_preact_epi",
+        f"dgated_rstd_preact:{activation}",
+        ["c", "rstd"],
+        body,
+        {"dgate": dgate},
+    )
+    return gemm_epilogue(
+        outputs=("postact",),
+        ops={"rstd": ColVecLoad("rstd")},
+        reduces={"dsum": ColVecReduce("dsum")},
+        mode="packed_cd_b16x2",
+    )(fn)
+
+
+rstd_swiglu_epi = rstd_gated_mod("swiglu")
+rstd_swiglu_preact_epi = rstd_gated_preact_mod("swiglu")
+dswiglu_rstd_preact_mod = dgated_rstd_preact_mod("swiglu")
+
+
+@functools.lru_cache(maxsize=None)
+def sq_reduce_mod(*, has_c, has_rowvec, has_aux, has_alpha=False):
+    """gemm_rms's sq-reduce as a mod: x = alpha * acc (+ C); reduce[m] +=
+    sum_n x^2 (before the rowvec scale); optional aux = x; D = x * rowvec.
+    ``alpha`` scales the accumulator ONLY (NVFP4 per-tensor dequant scales);
+    it MUST land before the sq-reduce or the host rsqrt normalizes the wrong
+    magnitude (RMSNorm's scale invariance would hide most of the error)."""
     params, body = [], []
+    if has_alpha:
+        params.append("alpha")
     if has_c:
         params.append("c")
     if has_rowvec:
         params.append("mRowVecBroadcast")
     expr = "acc"
+    if has_alpha:
+        body.append("x = acc * alpha")
+        expr = "x"
     if has_c:
-        body.append("x = acc + c")
+        body.append(f"x = {expr} + c")
         expr = "x"
     d = f"{expr} * mRowVecBroadcast" if has_rowvec else expr
     # Scaled reduce: (x, x) folds as one fma(x, x, acc) per pair instead of
@@ -568,16 +755,19 @@ def sq_reduce_mod(*, has_c, has_rowvec, has_aux):
     if has_aux:
         ret += f', "mAuxOut": {expr}'
     body.append(f"return {{{ret}}}")
-    tag = f"sq_reduce:c{int(has_c)}r{int(has_rowvec)}a{int(has_aux)}"
+    tag = f"sq_reduce:c{int(has_c)}r{int(has_rowvec)}a{int(has_aux)}s{int(has_alpha)}"
     fn = _gen_epi_fn("sq_reduce_epi", tag, params, body, {})
     # No host finalize: __call__ returns the RAW per-tile partials, and
     # gemm_rms fuses sum + rsqrt in rms_final_reduce (bitwise-equal to the
     # pre-object pipeline; a host torch.sum would reorder the fold).
     reduce = ColVecReduce("mColVecReduce", scaled=True)
     reduce.host_finalize = None
+    ops = _vec_pins(params)
+    if has_alpha:
+        ops["alpha"] = Scalar("alpha")
     return gemm_epilogue(
         outputs=("mAuxOut",) if has_aux else (),
-        ops=_vec_pins(params),
+        ops=ops,
         reduces={"mColVecReduce": reduce},
     )(fn)
 
@@ -611,20 +801,35 @@ def ln_affine_epi(acc, s, t, wg, wb):
     return {"D": (acc * s - t * wg) + wb}
 
 
-@gemm_epilogue(
-    outputs=("postact",),
-    ops={
-        "s": ColVecLoad("s"),
-        "t": ColVecLoad("t"),
-        "wg": RowVecLoad("wg"),
-        "wb": RowVecLoad("wb"),
-    },
-)
-def ln_affine_gelu_epi(acc, s, t, wg, wb):
-    """SigLIP fc1: deferred-LN affine then tanh-GELU; D = the bf16 preact
-    (saved for dgelu in bwd), postact feeds fc2."""
-    z = (acc * s - t * wg) + wb
-    return {"D": z, "postact": gelu_tanh_approx(z)}
+@functools.lru_cache(maxsize=None)
+def ln_affine_act_mod(activation):
+    """SigLIP/ViT fc1: deferred-LN affine then activation (act_fn_map key —
+    gelu_tanh_approx for SigLIP, gelu_erf for timm/torchvision ViT, quick_gelu
+    for CLIP); D = the bf16 preact (saved for dact in bwd), postact feeds fc2."""
+    act = act_fn_map[activation]
+    body = [
+        "z = (acc * s - t * wg) + wb",
+        'return {"D": z, "postact": act(z)}',
+    ]
+    fn = _gen_epi_fn(
+        "ln_affine_act_epi",
+        f"ln_affine_act:{activation}",
+        ["s", "t", "wg", "wb"],
+        body,
+        {"act": act},
+    )
+    return gemm_epilogue(
+        outputs=("postact",),
+        ops={
+            "s": ColVecLoad("s"),
+            "t": ColVecLoad("t"),
+            "wg": RowVecLoad("wg"),
+            "wb": RowVecLoad("wb"),
+        },
+    )(fn)
+
+
+ln_affine_gelu_epi = ln_affine_act_mod("gelu_tanh_approx")
 
 
 @gemm_epilogue(
@@ -644,23 +849,33 @@ def ln_partial_epi(acc, c, bias, weight):
     return {"D": y * weight, "resid_out": y, "hsum": y, "sqsum": (y, y)}
 
 
-@gemm_epilogue(
-    ops={"s": ColVecLoad("s"), "t": ColVecLoad("t")},
-    reduces={
-        "r1": ColVecReduce("r1", scaled=True),
-        "dwb": RowVecReduce("dwb"),
-        "dwg": RowVecReduce("dwg", scaled=True),
-    },
-)
-def dgelu_ln_stats_epi(acc, c, s, t):
-    """SigLIP fc2-dgrad: acc = dpostact, c = saved bf16 preact z. dz through
-    tanh-GELU'; D = s*dz (the boundary's sig folded so fc1-dgrad AND
-    fc1-wgrad stay plain). Boundary-bwd stats: r1 = per-row sum dz*z (feeds
-    dsig with the wb-dot host correction), dwb = column-sum dz (dbeta +
-    linear-bias grad + rank-1 dW term), dwg = column-sum t*dz (dgamma's
-    W-path + rank-1 dW term)."""
-    dz, _ = dgelu_tanh_approx(c, acc)
-    return {"D": dz * s, "r1": (dz, c), "dwb": dz, "dwg": (dz, t)}
+@functools.lru_cache(maxsize=None)
+def dact_ln_stats_mod(activation):
+    """SigLIP/ViT fc2-dgrad: acc = dpostact, c = saved bf16 preact z. dz
+    through act' (dact_fn_map key); D = s*dz (the boundary's sig folded so
+    fc1-dgrad AND fc1-wgrad stay plain). Boundary-bwd stats: r1 = per-row sum
+    dz*z (feeds dsig with the wb-dot host correction), dwb = column-sum dz
+    (dbeta + linear-bias grad + rank-1 dW term), dwg = column-sum t*dz
+    (dgamma's W-path + rank-1 dW term)."""
+    dact = dact_fn_map[activation]
+    body = [
+        "dz, _ = dact(c, acc)",
+        'return {"D": dz * s, "r1": (dz, c), "dwb": dz, "dwg": (dz, t)}',
+    ]
+    fn = _gen_epi_fn(
+        "dact_ln_stats_epi", f"dact_ln_stats:{activation}", ["c", "s", "t"], body, {"dact": dact}
+    )
+    return gemm_epilogue(
+        ops={"s": ColVecLoad("s"), "t": ColVecLoad("t")},
+        reduces={
+            "r1": ColVecReduce("r1", scaled=True),
+            "dwb": RowVecReduce("dwb"),
+            "dwg": RowVecReduce("dwg", scaled=True),
+        },
+    )(fn)
+
+
+dgelu_ln_stats_epi = dact_ln_stats_mod("gelu_tanh_approx")
 
 
 @gemm_epilogue(
@@ -687,11 +902,19 @@ def ln_bwd_apply_epi(acc, c, y, w, corr_mul, corr_add):
     return {"D": dh, "dw": (acc, y), "dbias": dh}
 
 
-@gemm_epilogue(reduces={"dwb": RowVecReduce("dwb")})
-def dgelu_dbias_epi(acc, c):
-    """Standard-organization fc2-dgrad (SigLIP): tanh-GELU' from the saved
-    preact c, UNSCALED dz out (the boundary's LN-bwd runs as a separate
-    narrow fused kernel), plus the fc1-bias grad column-sums. Contrast
-    dgelu_ln_stats_epi (deferred org: sig-folded D + 3 boundary-stat sinks)."""
-    dz, _ = dgelu_tanh_approx(c, acc)
-    return {"D": dz, "dwb": dz}
+@functools.lru_cache(maxsize=None)
+def dact_dbias_mod(activation):
+    """Standard-organization fc2-dgrad (SigLIP/ViT): act' (dact_fn_map key)
+    from the saved preact c, UNSCALED dz out (the boundary's LN-bwd runs as a
+    separate narrow fused kernel), plus the fc1-bias grad column-sums. Contrast
+    dact_ln_stats_mod (deferred org: sig-folded D + 3 boundary-stat sinks)."""
+    dact = dact_fn_map[activation]
+    body = [
+        "dz, _ = dact(c, acc)",
+        'return {"D": dz, "dwb": dz}',
+    ]
+    fn = _gen_epi_fn("dact_dbias_epi", f"dact_dbias:{activation}", ["c"], body, {"dact": dact})
+    return gemm_epilogue(reduces={"dwb": RowVecReduce("dwb")})(fn)
+
+
+dgelu_dbias_epi = dact_dbias_mod("gelu_tanh_approx")

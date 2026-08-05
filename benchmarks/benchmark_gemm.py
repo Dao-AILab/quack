@@ -4,8 +4,16 @@ import time
 import torch
 from triton.testing import do_bench
 
+import cutlass
+
+from quack.cute_dsl_utils import get_device_capacity, torch2cute_dtype_map
 from quack.gemm import gemm as quack_gemm
-from quack.gemm_interface import SplitKMode
+from quack.gemm_default_epi import GemmDefaultSm100
+
+# SplitKMode from gemm_config, not gemm_interface (same object): gemm_interface
+# pulls in the blockscaled modules, which would defeat the deferred import in
+# _run_blockscaled and cost every dense run ~0.5s of startup.
+from quack.gemm_config import SplitKMode
 
 """
 GEMM benchmark using quack.gemm.gemm() for both the dense path and the SM100
@@ -24,6 +32,13 @@ Usage (dense):
 Usage (blockscaled MXFP8, with cuBLAS comparison):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
         --tile_shape_mnk 256,256 --cluster_shape_mnk 2,1 --sf_vec_size 32
+
+NOTE: --tile_shape_mnk/--cluster_shape_mnk default to the SM100 shape (128,256).
+On SM120 (RTX 50) the blockscaled config that blockscaled_default_config picks --
+and the only one competitive with cuBLAS -- is (128,128) pingpong + dynamic
+persistent, so pass those flags explicitly or the numbers mean nothing:
+    python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 --sf_vec_size 32 \
+        --tile_shape_mnk 128,128 --pingpong --dynamic_persistent
 
 Usage (blockscaled MXFP4):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
@@ -251,24 +266,24 @@ def _run_blockscaled(args):
     Both dense and varlen_m run through the unified quack.gemm.gemm() dispatch
     (SFA/SFB tensors, dynamic-shape compile cache).
     """
-    import cutlass
+    # Deferred on purpose: the only blockscaled-only module here that the top of
+    # the file doesn't already pull in transitively. It drags in
+    # quack.blockscaled.operand + .quantize for ~0.5s -- ~30% of startup that
+    # dense runs would pay for nothing. See the SplitKMode import note above.
     from quack.blockscaled.utils import (
         create_blockscaled_varlen_m_operands,
         scale_blocked_for_cublas,
         torch_dtype_for_cutlass,
     )
-    from quack.cute_dsl_utils import get_device_capacity, torch2cute_dtype_map
-    from quack.gemm_default_epi import GemmDefaultSm100
 
     sm_major = get_device_capacity(torch.device("cuda"))[0]
-    assert sm_major in (10, 11), (
-        f"Blockscaled GEMM requires SM100 (B200/B300) or SM110; got SM{sm_major}x. "
-        "MXFP8/MXFP4/NVFP4 use tcgen05 UMMA which is SM100+."
+    assert sm_major in (10, 11, 12), (
+        f"Blockscaled GEMM requires SM100 (B200/B300), SM110, or SM120 (RTX 50); got SM{sm_major}x."
     )
 
-    if args.varlen_k or args.gather_A or args.pingpong:
+    if args.varlen_k or args.gather_A:
         raise NotImplementedError(
-            "blockscaled + varlen_k/gather/pingpong is not wired up yet. "
+            "blockscaled + varlen_k/gather is not wired up yet. "
             "Only same-format --varlen_m is currently supported for blockscaled."
         )
 
@@ -407,6 +422,7 @@ def _run_blockscaled(args):
                 tile_N=mma_tiler_mnk[1],
                 cluster_M=cluster_shape_mn[0],
                 cluster_N=cluster_shape_mn[1],
+                pingpong=args.pingpong,
                 persistent=True,
                 is_dynamic_persistent=args.dynamic_persistent,
                 max_swizzle_size=args.max_swizzle_size,
@@ -437,6 +453,7 @@ def _run_blockscaled(args):
                 tile_N=mma_tiler_mnk[1],
                 cluster_M=cluster_shape_mn[0],
                 cluster_N=cluster_shape_mn[1],
+                pingpong=args.pingpong,
                 persistent=True,
                 is_dynamic_persistent=args.dynamic_persistent,
                 max_swizzle_size=args.max_swizzle_size,
@@ -462,7 +479,7 @@ def _run_blockscaled(args):
             torch.testing.assert_close(mD.float(), ref, atol=tol, rtol=1e-3)
         print("Ref check PASSED")
 
-    print("Running SM100 Blockscaled GEMM with:")
+    print(f"Running SM{sm_major}0 Blockscaled GEMM with:")
     print(f"mnkl: {args.mnkl}")
     print(f"tile_shape_mnk: {mma_tiler_mnk}, cluster_shape_mnk: {cluster_shape_mnk}")
     print(f"format A: {fmt_a.name}, format B: {fmt_b.name}, d_dtype: {args.d_dtype}")
@@ -552,8 +569,6 @@ def run(args):
     tolerance = args.tolerance
     ab_dtype = _torch_dtype(args.ab_dtype) if args.ab_dtype is not None else torch.bfloat16
     d_dtype = _torch_dtype(args.d_dtype)
-
-    from quack.cute_dsl_utils import get_device_capacity
 
     device_capacity = get_device_capacity(torch.device("cuda"))
     if device_capacity[0] in [10, 11]:

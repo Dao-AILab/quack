@@ -40,7 +40,7 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
 from quack.cute_dsl_utils import ParamsBase
-from quack.epi_ops import EpiContext, EpiSmemBytes, Scalar
+from quack.epilogue.ops import EpiContext, EpiSmemBytes, Scalar
 
 
 def _make_epi_params(epi_ops, extra_fields, bases):
@@ -67,7 +67,11 @@ class ComposableEpiMixin:
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        if cls._epi_ops:
+        # _extra_param_fields alone must also trigger generation: an op-LESS
+        # minted mod (e.g. identity_epi) still carries the split_k param
+        # fields its epi_to_underlying_arguments unconditionally sets, and
+        # would otherwise fall back to GemmBase's empty EpilogueParams.
+        if cls._epi_ops or cls._extra_param_fields:
             # Auto-generate EpilogueParams if not explicitly defined on this class
             if "EpilogueParams" not in cls.__dict__:
                 cls.EpilogueParams = _make_epi_params(

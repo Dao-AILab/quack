@@ -428,9 +428,9 @@ def _register_ordered_effect(op) -> None:
 
 @cute_op(
     "quack::_rotary_inplace_bwd",
-    mutates_args=(),
+    mutates_args=("dout",),
     device_types="cuda",
-    schema="(Tensor dout, Tensor cos, Tensor sin, Tensor? seqlen_offsets, Tensor? cu_seqlens, int? max_seqlen, bool interleaved) -> ()",
+    schema="(Tensor(a!) dout, Tensor cos, Tensor sin, Tensor? seqlen_offsets, Tensor? cu_seqlens, int? max_seqlen, bool interleaved) -> ()",
 )
 def _rotary_inplace_bwd(
     dout: Tensor,
@@ -459,7 +459,7 @@ def _rotary_inplace_bwd(
     )
 
 
-_register_ordered_effect(_rotary_inplace_bwd)
+# mutation declared in the schema (see _rotary_qkv_inplace_bwd note)
 
 
 def apply_rotary(
@@ -625,8 +625,41 @@ def _apply_rotary_qkv_inplace(
     num_heads_q: int,
     interleaved: bool,
     conjugate: bool,
+    cu_seqlens: Optional[Tensor] = None,
+    max_seqlen: Optional[int] = None,
+    headdim: Optional[int] = None,
 ) -> None:
-    if qkv.dim() == 5:
+    if headdim is not None and qkv.shape[-1] != headdim:
+        # flat packed layout (..., nheads * headdim): the head view happens
+        # here, inside the custom op, so callers can pass the projection
+        # output itself — mark_dirty on a non-view input keeps autograd's
+        # rebase free (a dirtied *view* routes gradients through CopySlices:
+        # clone + copy-back around every backward call)
+        assert qkv.shape[-1] % headdim == 0
+        qkv = qkv.view(*qkv.shape[:-1], qkv.shape[-1] // headdim, headdim)
+    if cu_seqlens is not None and qkv.dim() == 4:
+        # dense-shaped (batch, seqlen, nheads, headdim) with cu_seqlens:
+        # varlen over the flattened batch (contiguous input, so a view)
+        qkv = qkv.view(-1, qkv.shape[2], qkv.shape[3])
+    if qkv.dim() == 3:
+        # varlen: (total_seqlen, nheads, headdim) with per-sequence boundaries
+        # from cu_seqlens (GQA packed layout, like the 4-dim path)
+        assert cu_seqlens is not None, "3-dim qkv requires cu_seqlens (varlen)"
+        num_heads_k = (qkv.shape[1] - num_heads_q) // 2
+        assert qkv.shape[1] == num_heads_q + 2 * num_heads_k
+        qk = qkv[:, : num_heads_q + num_heads_k]
+        apply_rotary(
+            qk,
+            cos,
+            sin,
+            seqlen_offsets=seqlen_offsets,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            interleaved=interleaved,
+            inplace=True,
+            conjugate=conjugate,
+        )
+    elif qkv.dim() == 5:
         batch, seqlen, three, nheads, headdim = qkv.shape
         assert three == 3
         if qkv.is_contiguous():
@@ -683,7 +716,7 @@ def _apply_rotary_qkv_inplace(
     "quack::_rotary_qkv_inplace",
     mutates_args=("qkv",),
     device_types="cuda",
-    schema="(Tensor(a!) qkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, bool conjugate) -> ()",
+    schema="(Tensor(a!) qkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, bool conjugate, Tensor? cu_seqlens, int? max_seqlen, int? headdim) -> ()",
 )
 def _rotary_qkv_inplace(
     qkv: Tensor,
@@ -693,15 +726,29 @@ def _rotary_qkv_inplace(
     num_heads_q: int,
     interleaved: bool,
     conjugate: bool,
+    cu_seqlens: Optional[Tensor],
+    max_seqlen: Optional[int],
+    headdim: Optional[int],
 ) -> None:
-    _apply_rotary_qkv_inplace(qkv, cos, sin, seqlen_offsets, num_heads_q, interleaved, conjugate)
+    _apply_rotary_qkv_inplace(
+        qkv,
+        cos,
+        sin,
+        seqlen_offsets,
+        num_heads_q,
+        interleaved,
+        conjugate,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        headdim=headdim,
+    )
 
 
 @cute_op(
     "quack::_rotary_qkv_inplace_bwd",
-    mutates_args=(),
+    mutates_args=("dqkv",),
     device_types="cuda",
-    schema="(Tensor dqkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved) -> ()",
+    schema="(Tensor(a!) dqkv, Tensor cos, Tensor sin, Tensor? seqlen_offsets, int num_heads_q, bool interleaved, Tensor? cu_seqlens, int? max_seqlen, int? headdim) -> ()",
 )
 def _rotary_qkv_inplace_bwd(
     dqkv: Tensor,
@@ -710,6 +757,9 @@ def _rotary_qkv_inplace_bwd(
     seqlen_offsets: Optional[Tensor],
     num_heads_q: int,
     interleaved: bool,
+    cu_seqlens: Optional[Tensor],
+    max_seqlen: Optional[int],
+    headdim: Optional[int],
 ) -> None:
     _apply_rotary_qkv_inplace(
         dqkv,
@@ -719,14 +769,23 @@ def _rotary_qkv_inplace_bwd(
         num_heads_q,
         interleaved,
         conjugate=True,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        headdim=headdim,
     )
 
 
-# The backward consumes and mutates grad_output in place. If this op is declared
-# as a normal mutating custom op, AOTAutograd functionalizes it by cloning dqkv
-# first. Mark it as an ordered effect instead so Dynamo keeps the call without
-# inserting that clone; the returned grad input is the same mutated dqkv tensor.
-_register_ordered_effect(_rotary_qkv_inplace_bwd)
+# The backward consumes and mutates grad_output in place, declared as a normal
+# mutating custom op (Tensor(a!) + mutates_args) so functionalization gives it
+# auto_functionalized_v2 form: downstream reads become getitem DATAFLOW edges.
+# The earlier ordered-effect registration (chosen to dodge functionalization's
+# clone) hid the mutation from graph transforms entirely — any pass that
+# reorders by data deps (inductor's fx comm-overlap movers, the legacy comm
+# scheduler passes) could hoist consumers of dqkv above the in-place rotation,
+# silently corrupting the wqkv gradient chain (bisected at 180m/8xH100,
+# 2026-07-27). The clone the effect route avoided is eliminated by inductor's
+# reinplacing when the pre-rotation dqkv has no other readers — the normal
+# case (attention-bwd output feeds only this op).
 
 
 class ApplyRotaryEmbQKV_(torch.autograd.Function):
@@ -739,6 +798,9 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
         interleaved=False,
         seqlen_offsets=None,
         num_heads_q=0,
+        cu_seqlens=None,
+        max_seqlen=None,
+        headdim=None,
     ):
         num_heads_q = int(num_heads_q)
         _rotary_qkv_inplace(
@@ -749,18 +811,33 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
             num_heads_q,
             interleaved,
             conjugate=False,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            headdim=headdim,
         )
-        ctx.save_for_backward(cos, sin, seqlen_offsets)
+        ctx.save_for_backward(cos, sin, seqlen_offsets, cu_seqlens)
         ctx.interleaved = interleaved
         ctx.num_heads_q = num_heads_q
+        ctx.max_seqlen = max_seqlen
+        ctx.headdim = headdim
         _mark_dirty(ctx, qkv)
         return qkv
 
     @staticmethod
     def backward(ctx, dqkv):
-        cos, sin, seqlen_offsets = ctx.saved_tensors
-        _rotary_qkv_inplace_bwd(dqkv, cos, sin, seqlen_offsets, ctx.num_heads_q, ctx.interleaved)
-        return dqkv, None, None, None, None, None
+        cos, sin, seqlen_offsets, cu_seqlens = ctx.saved_tensors
+        _rotary_qkv_inplace_bwd(
+            dqkv,
+            cos,
+            sin,
+            seqlen_offsets,
+            ctx.num_heads_q,
+            ctx.interleaved,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=ctx.max_seqlen,
+            headdim=ctx.headdim,
+        )
+        return dqkv, None, None, None, None, None, None, None, None
 
 
 def apply_rotary_emb_qkv_(
@@ -770,9 +847,64 @@ def apply_rotary_emb_qkv_(
     interleaved: bool = False,
     seqlen_offsets: Optional[Tensor] = None,
     num_heads_q: Optional[int] = None,
+    cu_seqlens: Optional[Tensor] = None,
+    max_seqlen: Optional[int] = None,
+    headdim: Optional[int] = None,
 ) -> Tensor:
+    if not torch.is_grad_enabled():
+        # No-grad fast path: skip the autograd.Function entirely — no ctx to
+        # build (save_for_backward would pin cos/sin for nothing) and no
+        # mark_dirty. The latter also matters under torch.compile: Dynamo's
+        # no_grad trace inlines Function.forward without the apply machinery,
+        # and ctx.mark_dirty there is an unrecoverable graph break — inside a
+        # module loop it makes Dynamo skip the CALLING frame's code object
+        # process-wide, so one eval pass permanently shatters the compiled
+        # training graph too.
+        _rotary_qkv_inplace(
+            qkv,
+            cos,
+            sin,
+            seqlen_offsets,
+            int(num_heads_q or 0),
+            interleaved,
+            conjugate=False,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            headdim=headdim,
+        )
+        return qkv
+
+    if headdim is not None:
+        # flat packed layout: (batch, seqlen, nheads * headdim) or
+        # (total_seqlen, nheads * headdim) — the head view (and, with
+        # cu_seqlens, the batch flatten) happens inside the custom op, so the
+        # projection output can be passed directly. mark_dirty then sees a
+        # non-view input, keeping autograd's rebase free of the CopySlices
+        # clone + copy-back that a dirtied view pays in backward.
+        assert num_heads_q is not None
+        assert qkv.shape[-1] % headdim == 0
+        assert cu_seqlens is None or max_seqlen is not None
+        return ApplyRotaryEmbQKV_.apply(
+            qkv,
+            cos,
+            sin,
+            interleaved,
+            seqlen_offsets,
+            int(num_heads_q),
+            cu_seqlens,
+            max_seqlen,
+            headdim,
+        )
+
     if qkv.dim() == 5:
         return ApplyRotaryEmbQKV_.apply(qkv, cos, sin, interleaved, seqlen_offsets, 0)
+
+    if qkv.dim() == 3:
+        # varlen: (total_seqlen, nheads, headdim) + cu_seqlens boundaries
+        assert cu_seqlens is not None and max_seqlen is not None and num_heads_q is not None
+        return ApplyRotaryEmbQKV_.apply(
+            qkv, cos, sin, interleaved, seqlen_offsets, int(num_heads_q), cu_seqlens, max_seqlen
+        )
 
     assert qkv.dim() == 4
     assert num_heads_q is not None

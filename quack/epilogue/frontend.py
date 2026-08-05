@@ -4,22 +4,29 @@ accumulator, lowered onto the EpiOp machinery. The design in one page:
 
 Layer map
 ---------
-* quack.epi_ops       — EpiOps: per-tensor RESOURCE lifecycle (smem, TMA,
-                        fragments, flushes: begin/begin_loop/end_loop/end),
-                        host schema hooks (host_arg_key/host_fake_arg/
-                        host_call_arg), and VALUE PORTS (below).
-* quack.gemm_host     — generic host layer: one jit-cached compile fn (the
-                        kernel CLASS is a key argument — classes pickle by
-                        module+qualname, so disk keys are stable and async
-                        workers import the right module by unpickling), plan
-                        cache/build/run driven entirely by the op schema.
-* this module         — the fn contract + kernel-class minting. A mod is ONE
-                        Python function called per element at trace time; the
-                        minted class is a standard ComposableEpiMixin subclass,
-                        so hand-written mixins remain first-class and anything
-                        the fn form can't express (e.g. symmetric's scheduler)
-                        stays a mixin.
-* quack.epilogues     — the library of ready mods and reusable ops.
+* quack.epilogue.ops        — EpiOps: per-tensor RESOURCE lifecycle (smem, TMA,
+                              fragments, flushes: begin/begin_loop/end_loop/
+                              end), host schema hooks (host_arg_key/
+                              host_fake_arg/host_call_arg), and VALUE PORTS
+                              (below).
+* quack.gemm_runtime.identity — the LEAF: semantic fingerprints, digest
+                              registries, picklable class/mod refs.
+* quack.gemm_runtime.host   — generic host layer: one jit-cached compile fn
+                              (the kernel CLASS is a key argument — classes
+                              pickle by module+qualname, so disk keys are
+                              stable and async workers import the right module
+                              by unpickling), plan cache/build/run driven
+                              entirely by the op schema.
+* this module               — the fn contract + kernel-class minting. A mod is
+                              ONE Python function called per element at trace
+                              time; the minted class is a standard
+                              ComposableEpiMixin subclass (its traced loops
+                              live in quack.epilogue.visit), so hand-written
+                              mixins remain first-class and anything the fn
+                              form can't express (e.g. symmetric's scheduler)
+                              stays a mixin. Value vocabulary (Pair/F2/pexp):
+                              quack.epilogue.math.
+* quack.epilogue.library    — the library of ready mods and reusable ops.
 
 The fn contract
 ---------------
@@ -45,7 +52,7 @@ guesses about vectorization.
   full-width D, no aux).
 * SINKS: ``outputs=(names,)`` declares aux tile stores (each TileStore owns
   its own dtype/rounding, so multiple mixed-dtype outputs compose); ``reduces={name:
-  ColVecReduce/RowVecReduce(name, combine="add"|"max")}`` declares reduce
+  ColVecReduce/RowVecReduce(name, combine="add"|"max"|"max_abs")}`` declares reduce
   outputs (fn returns the per-element value; buffers are per-CTA-tile
   partials). A reduce of a PRODUCT should use ``scaled=True`` and return the
   two factors — ``{"sqsum": (x, x)}`` — so the fold is one fused
@@ -67,7 +74,10 @@ guesses about vectorization.
 
 Value ports (how new ops join the fn dataflow)
 ----------------------------------------------
-An EpiOp declares ``fn_port``:
+An EpiOp declares ``fn_port`` — the frontend dispatches on it alone, never on
+the op's type:
+* "row" / "col" / "tile" / "scalar": the built-in fragment kinds (the load
+  ops declare these; inference picks the same strings from tensor metadata).
 * "value": the fn receives op.name as a value; ``fn_prepare`` turns the op's
   begin_loop state into a dense per-loop-index fragment.
 * "apply": the fn receives a CALLABLE — ``y = rope(acc)`` — so the op's math
@@ -75,7 +85,7 @@ An EpiOp declares ``fn_port``:
 * "sink": the fn returns op.name; the frontend collects a dense fragment and
   hands it to ``fn_sink_flush`` once per subtile (fragment-level, so sinks own
   aliasing/coupled-accumulator numerics and per-subtile rescales).
-One method makes a custom op compose with everything else here.
+One attribute makes a custom op compose with everything else here.
 
 Speed-of-light rules (bugs otherwise; all were hit once)
 --------------------------------------------------------
@@ -86,10 +96,11 @@ Speed-of-light rules (bugs otherwise; all were hit once)
   with an unrolled scalar copy first; see the _dense helpers).
 * Sinks fold at fragment level: per-element accumulation into the zero-stride
   aliased accumulator slice double-counts on the SM100 packed path.
-* Ragged last N-tile: OOB accumulator lanes are ZERO — the identity for add,
-  not for max (reduce |x|-like quantities) and not for LSE (OnlineLSEReduce
-  predicates OOB per element by default; check_oob=False compiles the
-  predicate out and the host then requires divisible N).
+* Ragged last tile along the reduce dim: OOB accumulator lanes are ZERO —
+  the identity for add and max_abs, but not for max or LSE, so max/LSE mask
+  OOB lanes to -inf per element by default; check_oob=False compiles the
+  predicate out and the host then requires the reduce dim tile-divisible
+  (N for colvec/LSE, M for rowvec — varlen_m rejected).
 
 Caching and identity
 --------------------
@@ -105,7 +116,7 @@ must never reach the compile cache, because a too-coarse key silently reuses
 the wrong kernel. EpiOps implement the protocol as their ``cache_key()``.
 Kernel classes are minted per (semantic digest, operand kinds, SM, modes)
 but never cross the jit-cache boundary directly: compiles carry a picklable
-:class:`~quack.gemm_host.GemmClassRef` recipe that re-mints the class at the
+:class:`~quack.gemm_runtime.identity.GemmClassRef` recipe that re-mints the class at the
 point of use — by importing the module-global EpiMod, or, for EpiMods with
 no importable anchor (``__main__``, notebooks), via a digest-validated
 cloudpickle payload installed into async workers as a side channel that
@@ -144,26 +155,16 @@ and <=1% perf vs the hand-written mixins for every expressible epilogue.
 
 from __future__ import annotations
 
-import dataclasses
-import enum
-import functools
 import hashlib
 import inspect
-import os
 import sys
-import sysconfig
-import types
 from typing import NamedTuple, Optional
 
-from cutlass import Float32
 
-import cutlass
 import cutlass.cute as cute
-from cutlass import const_expr
 
 from quack.cute_dsl_utils import get_device_capacity, mlir_namedtuple, torch2cute_dtype_map
-from quack.epi_composable import ComposableEpiMixin
-from quack.epi_ops import (
+from quack.epilogue.ops import (
     ColVecLoad,
     EpiOp,
     RowVecLoad,
@@ -173,17 +174,23 @@ from quack.epi_ops import (
     VecLoad,
     VecReduce,
 )
-from quack.gemm_host import (
-    GemmClassRef,
+from quack.epilogue.math import F2, F16Lanes, Pair, pack, unpack  # noqa: F401  (re-exports)
+from quack.epilogue.visit import _EpiModMixinBase
+from quack.gemm_runtime.host import (
     GemmEpiPlan,
     build_gemm_epi_plan,
-    register_local_epi_mod,
     run_gemm_epi_plan,
+)
+from quack.gemm_runtime.identity import (
+    GemmClassRef,
+    TORCH_OP_EPI_MODS,
+    function_semantic_key as _function_semantic_key,
+    module_locator,
+    register_local_epi_mod,
 )
 from quack.gemm_config import SplitKMode, blockscaled_default_config, default_config
 from quack.gemm_tvm_ffi_utils import tensor_key
 from quack.gemm_sm80 import GemmSm80
-import quack.layout_utils as layout_utils
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
@@ -192,661 +199,6 @@ from quack.rounding import RoundingMode
 _SM_BASE = {8: GemmSm80, 9: GemmSm90, 10: GemmSm100, 11: GemmSm100, 12: GemmSm120}
 
 _EPI_MODES = {"element", "acc_pair", "packed_cd_b16x2"}
-
-
-def _semantic_value_key(value, seen):
-    """Fail-closed semantic fingerprint of a value an epilogue fn depends on.
-
-    Supported: primitives, containers, enums, modules/classes (by qualname —
-    their source is covered by the package fingerprint), functions/methods/
-    builtins/partials, dataclasses, and anything implementing
-    ``__quack_semantic_key__(self) -> object`` (recursed through this same
-    keyer). Everything else raises: a value we cannot fingerprint must never
-    reach the compile cache, because a too-coarse key silently reuses the
-    wrong kernel.
-    """
-    if value is None or isinstance(value, (bool, int, float, complex, str, bytes)):
-        return value
-    qsk = getattr(type(value), "__quack_semantic_key__", None)
-    if qsk is not None:
-        marker = ("id", id(value))
-        if marker in seen:
-            return ("qsk_ref", type(value).__module__, type(value).__qualname__)
-        seen.add(marker)
-        return (
-            "qsk",
-            type(value).__module__,
-            type(value).__qualname__,
-            _semantic_value_key(qsk(value), seen),
-        )
-    if isinstance(value, enum.Enum):
-        return ("enum", type(value).__module__, type(value).__qualname__, value.value)
-    if isinstance(value, tuple):
-        return ("tuple", tuple(_semantic_value_key(v, seen) for v in value))
-    if isinstance(value, list):
-        return ("list", tuple(_semantic_value_key(v, seen) for v in value))
-    if isinstance(value, dict):
-        return (
-            "dict",
-            tuple(sorted((repr(k), _semantic_value_key(v, seen)) for k, v in value.items())),
-        )
-    if isinstance(value, (set, frozenset)):
-        return ("set", tuple(sorted(repr(_semantic_value_key(v, seen)) for v in value)))
-    if isinstance(value, types.ModuleType):
-        return ("module", value.__name__)
-    if inspect.isfunction(value):
-        return _function_semantic_key(value, seen)
-    if inspect.ismethod(value):
-        return (
-            "method",
-            _function_semantic_key(value.__func__, seen),
-            _semantic_value_key(value.__self__, seen),
-        )
-    if isinstance(value, (types.BuiltinFunctionType, types.MethodWrapperType)):
-        return ("builtin", getattr(value, "__module__", None), value.__qualname__)
-    wrapped = getattr(value, "__wrapped__", None)
-    if callable(value) and wrapped is not None:
-        # Decorator wrappers (functools.wraps chains: lru_cache, dsl_user_op,
-        # cute.jit): the semantics live in the wrapped function.
-        return ("wrapped", _semantic_value_key(wrapped, seen))
-    if isinstance(value, functools.partial):
-        return (
-            "partial",
-            _semantic_value_key(value.func, seen),
-            _semantic_value_key(value.args, seen),
-            _semantic_value_key(value.keywords, seen),
-        )
-    if inspect.isclass(value):
-        return ("class", value.__module__, value.__qualname__)
-    if dataclasses.is_dataclass(value):
-        marker = ("id", id(value))
-        if marker in seen:
-            return ("dataclass_ref", type(value).__module__, type(value).__qualname__)
-        seen.add(marker)
-        return (
-            "dataclass",
-            type(value).__module__,
-            type(value).__qualname__,
-            tuple(
-                (f.name, _semantic_value_key(getattr(value, f.name), seen))
-                for f in dataclasses.fields(value)
-            ),
-        )
-    if type(value).__module__ == "torch" and type(value).__name__ == "dtype":
-        return ("torch.dtype", str(value))
-    raise TypeError(
-        f"epilogue fn depends on {value!r} (type {type(value).__module__}."
-        f"{type(value).__qualname__}), which has no fail-closed semantic key. "
-        "Supported: primitives, containers, enums, functions, dataclasses, "
-        "modules/classes. For anything else, implement "
-        "__quack_semantic_key__(self) -> object returning a supported value "
-        "that changes whenever the traced math would."
-    )
-
-
-@functools.lru_cache(maxsize=1)
-def _stdlib_root() -> str:
-    return os.path.abspath(sysconfig.get_paths()["stdlib"]) + os.sep
-
-
-def _is_extern_function(fn) -> bool:
-    """True for functions defined in installed (stdlib / site-packages /
-    dist-packages) code outside the quack package. Like classes and modules,
-    they fingerprint by qualname only: their source is pinned by the installed
-    distribution (the disk cache additionally stamps the cutlass version and
-    hashes every quack source file), and recursing into them would pull
-    runtime-MUTABLE library globals into the digest — e.g. any fn touching
-    cutlass's dsl_user_op machinery reaches cutlass._mlir_helpers.op, which
-    lazily materializes _DSL_PACKAGE_ROOT(S) on the first traced op, so the
-    digest would depend on whether this process compiled anything yet (async
-    workers resolve module-global EpiMods by re-import and reject the ref as
-    "changed" on any mismatch)."""
-    module = getattr(fn, "__module__", None) or ""
-    if module == "quack" or module.startswith("quack."):
-        return False
-    code = getattr(fn, "__code__", None)
-    if code is None:
-        return False
-    filename = code.co_filename
-    if f"{os.sep}site-packages{os.sep}" in filename or f"{os.sep}dist-packages{os.sep}" in filename:
-        return True
-    return filename.startswith(_stdlib_root())
-
-
-def _function_semantic_key(fn, seen=None):
-    """Fingerprint source plus the globals/closures that can change its math."""
-    seen = set() if seen is None else seen
-    ident = (fn.__module__, fn.__qualname__)
-    if ident in seen:
-        return ("function_ref", *ident)
-    seen.add(ident)
-    if _is_extern_function(fn):
-        return ("extern_function", *ident)
-    try:
-        source = inspect.getsource(fn).encode()
-    except (OSError, TypeError):
-        code = getattr(fn, "__code__", None)
-        if code is None:
-            raise TypeError(f"cannot fingerprint epilogue callable {fn!r}") from None
-        source = code.co_code + repr(code.co_consts).encode()
-    try:
-        closure_vars = inspect.getclosurevars(fn)
-        referenced = {
-            **closure_vars.globals,
-            **closure_vars.nonlocals,
-        }
-    except TypeError:
-        referenced = {}
-    deps = tuple(
-        (name, _semantic_value_key(value, seen))
-        for name, value in sorted(referenced.items())
-        if not name.startswith("__")
-    )
-    return (
-        "function",
-        *ident,
-        hashlib.sha256(source).hexdigest(),
-        _semantic_value_key(fn.__defaults__, seen),
-        _semantic_value_key(fn.__kwdefaults__, seen),
-        deps,
-    )
-
-
-class Pair(NamedTuple):
-    """A two-lanes-per-logical-element epilogue value.
-
-    Pairing is declared with ``mode=`` — the fn body calls ``unpack``/``pack``
-    where it uses the lanes:
-
-    * aux output buffer at half of GEMM-N — the accumulator pairs over
-      adjacent N columns (gated): ``gate, up = unpack(acc)``; aux values are
-      per-pair, and returning ``"D": pack(g, u)`` writes both lanes back.
-    * 16-bit C at twice GEMM-N — C and D pack two lanes per 32-bit element
-      (dgated): ``x, y = unpack(c)``, return ``"D": pack(dx, dy)``; pass C/D
-      as their natural 16-bit tensors.
-
-    As a value it is a plain tuple of the two lanes with lane-wise ``+ - *``
-    (scalars broadcast), so ``acc * rstd + bias`` works before unpacking."""
-
-    a: object
-    b: object
-
-    @staticmethod
-    def _lift(v):
-        return v if isinstance(v, tuple) else (v, v)
-
-    def __add__(self, other):
-        o = Pair._lift(other)
-        return Pair(self.a + o[0], self.b + o[1])
-
-    __radd__ = __add__
-
-    def __mul__(self, other):
-        o = Pair._lift(other)
-        return Pair(self.a * o[0], self.b * o[1])
-
-    __rmul__ = __mul__
-
-    def __sub__(self, other):
-        o = Pair._lift(other)
-        return Pair(self.a - o[0], self.b - o[1])
-
-    def __rsub__(self, other):
-        o = Pair._lift(other)
-        return Pair(o[0] - self.a, o[1] - self.b)
-
-    def __neg__(self):
-        return Pair(-self.a, -self.b)
-
-
-def unpack(value):
-    """Split a paired epilogue value into its two lanes: ``x, y = unpack(c)``.
-    Fails loudly at trace time if the tensors didn't imply pairing."""
-    assert isinstance(value, Pair), (
-        "unpack() got a non-paired value. Declare mode='acc_pair' to pair adjacent "
-        "accumulator lanes or mode='packed_cd_b16x2' to unpack 16-bit C/D lanes."
-    )
-    return value.a, value.b
-
-
-pack = Pair  # returning {"D": pack(dx, dy)} packs both lanes back
-
-
-class F2(NamedTuple):
-    """A packed f32x2 lane pair. IS a tuple, so ``quack.activation`` functions
-    take it on their packed path; arithmetic lowers to packed intrinsics.
-    Scalar operands broadcast: ``x * alpha`` and ``alpha * x`` both work."""
-
-    lo: object
-    hi: object
-
-    @staticmethod
-    def _pair(v):
-        return v if isinstance(v, tuple) else (v, v)
-
-    def __add__(self, other):
-        if isinstance(other, F16Lanes):
-            return other.__radd__(self)
-        return F2(*cute.arch.add_packed_f32x2(self, F2._pair(other)))
-
-    __radd__ = __add__
-
-    def __mul__(self, other):
-        return F2(*cute.arch.mul_packed_f32x2(self, F2._pair(other)))
-
-    __rmul__ = __mul__
-
-    def __sub__(self, other):
-        return F2(*cute.arch.sub_packed_f32x2(self, F2._pair(other)))
-
-    def __rsub__(self, other):
-        return F2(*cute.arch.sub_packed_f32x2(F2._pair(other), self))
-
-    def __neg__(self):
-        return F2(-self.lo, -self.hi)
-
-    def fma(self, mul, add):
-        """self * mul + add as one packed FMA."""
-        return F2(*cute.arch.fma_packed_f32x2(self, F2._pair(mul), F2._pair(add)))
-
-
-class F16Lanes(F2):
-    """An F2 whose lanes were promoted from a 16-bit float C fragment (fp16 OR
-    bf16 — "f16" as in floating-point compute; the PTX forms below take both
-    .atypes), remembering the raw 16-bit lanes. Semantically it IS the promoted F2 (activation fns,
-    muls, packed intrinsics — every existing use behaves identically), but the
-    operations with a mixed-precision ISA form pick the scalar lowering where
-    the promote folds into the op, exactly:
-
-    * ``x + c`` / ``c + x`` -> PTX ``add.rn.f32.{f16,bf16}`` -> SASS FHADD
-    * ``c - x``             -> PTX ``sub.rn.f32.{f16,bf16}`` -> FHADD w/ neg
-      (``x - c`` has no mixed form; it materializes like everything else)
-
-    When only these consume the value, the eager promotes emitted here are
-    dead code and NVVM removes them. Not yet exploited: ``fma.rn.f32.abtype``
-    (BOTH multiplicands 16-bit -> FHFMA, always bitwise-safe because a 16-bit
-    x 16-bit product is exact in f32) — needs a lazy-product value type and a
-    consumer; no current epilogue fn multiplies two raw 16-bit operands."""
-
-    def __new__(cls, a16, b16):
-        self = super().__new__(cls, a16.to(Float32), b16.to(Float32))
-        self._a16 = a16
-        self._b16 = b16
-        return self
-
-    def __add__(self, other):
-        if isinstance(other, F16Lanes):
-            # both sides 16-bit: promote one side, mixed-add the other
-            other = other._f2()
-        if isinstance(other, F2):
-            return F2(other.lo + self._a16.to(Float32), other.hi + self._b16.to(Float32))
-        return self._f2() + other
-
-    __radd__ = __add__
-
-    def __sub__(self, other):
-        if isinstance(other, F16Lanes):
-            other = other._f2()
-        if isinstance(other, F2):
-            return F2(self._a16.to(Float32) - other.lo, self._b16.to(Float32) - other.hi)
-        return self._f2() - other
-
-    def _f2(self):
-        return F2(self.lo, self.hi)
-
-
-class _EpiModMixinBase(ComposableEpiMixin):
-    """Generic hooks for minted epilogue-mod kernels. The minted class supplies
-    ``_epi_ops``, ``_epi_mod_fn``, ``_epi_mod_operands`` ((name, kind) pairs),
-    ``_epi_mod_outputs``, and ``EpilogueArguments``."""
-
-    _epi_mod_fn = None
-    _epi_mod_operands = ()
-    _epi_mod_outputs = ()
-    _epi_mod_sinks = ()  # names of sink-port ops (fn returns them; op consumes)
-    _epi_mod_group_n = 1  # 2 = gated: fn consumes adjacent-N pairs, aux is half-width
-    _epi_mod_packed_cd = False  # dgated: C/D pack 2 x implicit_dtype lanes per f32
-    _epi_mod_prepass_fn = None  # fn run over the raw accumulator before any store
-    _epi_mod_prepass_operands = ()  # ((name, kind), ...) subset the prepass fn reads
-    _epi_mod_prepass_outs = ()  # sink-op names the prepass fn returns
-    _epi_mod_rounding = RoundingMode.RN  # kernel-global rounding (D store + default for TileStores)
-    _epi_mod_vectorize = None  # False = keep the SM100 loop vectorizer off (escape hatch)
-    _extra_param_fields = ()  # the fn is a class attr, not a param
-
-    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
-        self.rounding_mode = self._epi_mod_rounding
-        self.epi_needs_acc_prepass = self._epi_mod_prepass_fn is not None
-        if self._epi_mod_packed_cd:
-            assert self.implicit_dtype.width == 16, "packed_cd lanes must be 16-bit"
-            assert self.d_dtype.width == 32, "packed_cd D storage must be 32-bit (f32 view)"
-            assert self.c_dtype.width == 32, "packed_cd C storage must be 32-bit (f32 view)"
-        # Aux-output constraints (gated 16-bit n-major, SM90 tile_N % 32) are
-        # asserted by each TileStore op in to_params; the store path itself is
-        # the generic ComposableEpiMixin/TileStore one.
-        d = self._epi_ops_to_params_dict(args)
-        for key in getattr(self, "concat_layout", None) or ():
-            if key in d:
-                d[key] = layout_utils.concat_to_interleave(d[key], 1)
-        d["split_k_semaphore"] = getattr(args, "split_k_semaphore", None)
-        d["split_k_workspace"] = getattr(args, "split_k_workspace", None)
-        return self.EpilogueParams(**d)
-
-    def _make_sink_tmps(self, ops_by_name, shape):
-        """One collection fragment per sink op; scaled reduces get a
-        (val, scale) fragment pair so the fold can be a single fused FMA."""
-        return tuple(
-            (
-                (
-                    cute.make_rmem_tensor(shape, self.acc_dtype),
-                    cute.make_rmem_tensor(shape, self.acc_dtype),
-                )
-                if getattr(ops_by_name[s], "scaled", False)
-                else cute.make_rmem_tensor(shape, self.acc_dtype)
-            )
-            for s in self._epi_mod_sinks
-        )
-
-    @cute.jit
-    def _flush_sinks(self, ops_by_name, epi_loop_tensors, sink_tmps):
-        for sname, stmp in zip(self._epi_mod_sinks, sink_tmps):
-            if const_expr(isinstance(stmp, tuple)):
-                ops_by_name[sname].fn_sink_flush(
-                    self, epi_loop_tensors[sname], stmp[0], scale=stmp[1]
-                )
-            else:
-                ops_by_name[sname].fn_sink_flush(self, epi_loop_tensors[sname], stmp)
-
-    @cute.jit
-    def epi_prepass_subtile(self, params, epi_tensors, tRS_rD, epi_coord, epi_idx):
-        """Driver prepass hook (epi_needs_acc_prepass): run the prepass fn over
-        this subtile's raw accumulator, collect its returns, flush to the
-        prepass sink ops. Scalar unrolled loop — the prepass is a statistics
-        sweep, not the store path."""
-        pfn = self._epi_mod_prepass_fn
-        ops_by_name = {op.name: op for op in self._epi_ops}
-        frags = {}
-        for name, kind in self._epi_mod_prepass_operands:
-            state = ops_by_name[name].begin_loop(self, epi_tensors[name], epi_coord)
-            if const_expr(kind == "tile"):
-                state = state.to(self.acc_dtype)
-            frags[name] = state
-        sink_states = {
-            name: ops_by_name[name].begin_loop(self, epi_tensors[name], epi_coord)
-            for name in self._epi_mod_prepass_outs
-        }
-        tmps = {
-            name: cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            for name in self._epi_mod_prepass_outs
-        }
-        for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
-            kw = {
-                name: (frags[name] if kind == "scalar" else frags[name][i])
-                for name, kind in self._epi_mod_prepass_operands
-            }
-            res = pfn(tRS_rD[i], **kw)
-            for name in self._epi_mod_prepass_outs:
-                tmps[name][i] = res[name]
-        for name in self._epi_mod_prepass_outs:
-            ops_by_name[name].fn_sink_flush(self, sink_states[name], tmps[name])
-
-    @cute.jit
-    def epi_prepass_end(self, params, epi_tensors):
-        # Flush register-accumulated statistics to smem (ops that batch the
-        # prepass sweep in registers expose fn_prepass_end), then order every
-        # thread's prepass sink writes before the store pass reads the
-        # finalized statistics.
-        ops_by_name = {op.name: op for op in self._epi_ops}
-        for name in self._epi_mod_prepass_outs:
-            op = ops_by_name[name]
-            if const_expr(hasattr(op, "fn_prepass_end")):
-                op.fn_prepass_end(self, epi_tensors[name])
-        self.epilogue_barrier.arrive_and_wait()
-
-    @cute.jit
-    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
-        fn = self._epi_mod_fn
-        ops_by_name = {op.name: op for op in self._epi_ops}
-        paired = self._epi_mod_group_n == 2
-        # SM100 element mode with 16-bit full-tile inputs (the C operand,
-        # TileLoad residual streams): keep them unwidened and hand the fn
-        # F16Lanes pairs — additive uses lower to mixed-precision scalar adds
-        # (FHADD.BF16/.F16: the promote folds into the add, exactly, saving
-        # the cvt/PRMT per lane); every other use sees the promoted F2 and the
-        # unused promotes are DCE'd. Only the packed-lane loop needs this;
-        # scalar loops get the same fusion from NVVM automatically.
-        mixed_lanes_ok = const_expr(
-            self.arch == 100
-            and not paired
-            and not self._epi_mod_packed_cd
-            and self.acc_dtype == Float32
-            and cute.size(tRS_rD) % 2 == 0  # only the packed-lane loop consumes F16Lanes
-        )
-        mixed_names = set()
-        frags = {}
-        for name, kind in self._epi_mod_operands:
-            if const_expr(kind == "apply"):
-                # Apply-port op: per-subtile port state; the fn gets a callable.
-                frags[name] = ops_by_name[name].fn_prepare(self, epi_loop_tensors[name], paired)
-            elif const_expr(kind == "c"):
-                assert tRS_rC is not None, f"epilogue operand '{name}' requires the C operand"
-                if const_expr(mixed_lanes_ok and tRS_rC.element_type.width == 16):
-                    frags[name] = tRS_rC
-                    mixed_names.add(name)
-                elif const_expr(not self._epi_mod_packed_cd):
-                    frags[name] = tRS_rC.to(self.acc_dtype)
-                # packed_cd: C is recast/unpacked in the packed branch below.
-            elif const_expr(kind == "tile"):
-                if const_expr(mixed_lanes_ok and epi_loop_tensors[name].element_type.width == 16):
-                    frags[name] = epi_loop_tensors[name]
-                    mixed_names.add(name)
-                else:
-                    frags[name] = epi_loop_tensors[name].to(self.acc_dtype)
-            elif const_expr(kind == "value"):
-                # Custom value-source op: fn_prepare turns its begin_loop state
-                # into the dense per-element fragment the loops index (default
-                # fn_prepare is identity for ops whose begin_loop IS the frag).
-                frags[name] = ops_by_name[name].fn_prepare(self, epi_loop_tensors[name], paired)
-            else:  # "row" / "col" fragments are already acc dtype; "scalar" is a value
-                frags[name] = epi_loop_tensors[name]
-        if const_expr(self._epi_mod_packed_cd):
-            # dgated shape: the accumulator is already per-pair (one dout per
-            # gate/up pair); C and D pack two implicit-dtype (16-bit) lanes
-            # into each 32-bit element. Structure mirrors the hand-written
-            # GemmDGatedMixin: recast C -> widen to f32 -> pair views; scalar
-            # calls with vectorize on SM100; pack (dx, dy) back into tRS_rD.
-            implicit = self.implicit_dtype
-            xy16 = cute.recast_tensor(tRS_rC, implicit)
-            xy = xy16.to(Float32)
-            xy_pair = cute.flat_divide(xy, cute.make_layout(2))
-            xv, yv = xy_pair[0, ...], xy_pair[1, ...]
-            dxy = cute.make_rmem_tensor(xy16.layout, Float32)
-            dxy_pair = cute.flat_divide(dxy, cute.make_layout(2))
-            dxv, dyv = dxy_pair[0, ...], dxy_pair[1, ...]
-            n_el = cute.size(tRS_rD)
-
-            def _dense1(view):
-                # Zero-stride broadcast frags are invalid vectorized loads.
-                out = cute.make_rmem_tensor(n_el, self.acc_dtype)
-                for j in cutlass.range(n_el, unroll_full=True):
-                    out[j] = view[j]
-                return out
-
-            views = {}
-            for name, kind in self._epi_mod_operands:
-                if const_expr(kind in ("row", "col")):
-                    views[name] = _dense1(frags[name])
-                elif const_expr(kind != "c"):
-                    views[name] = frags[name]  # scalar / dense tile frag / apply pstate
-            outs = tuple(
-                cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-                for _ in self._epi_mod_outputs
-            )
-            sink_tmps = self._make_sink_tmps(ops_by_name, tRS_rD.layout.shape)
-            val_names = self._epi_mod_outputs + self._epi_mod_sinks
-            val_frags = outs + sink_tmps
-            vectorize = const_expr(self.arch == 100 and self._epi_mod_vectorize is not False)
-            for i in cutlass.range(n_el, vectorize=vectorize):
-                kw = {
-                    name: (
-                        (lambda v, _n=name, _i=i: ops_by_name[_n].fn_apply(self, views[_n], _i, v))
-                        if kind == "apply"
-                        else Pair(xv[i], yv[i])
-                        if kind == "c"
-                        else (views[name] if kind == "scalar" else views[name][i])
-                    )
-                    for name, kind in self._epi_mod_operands
-                }
-                res = fn(tRS_rD[i], **kw)
-                d = res["D"]  # required: it carries the (dx, dy) pair to pack
-                dxv[i], dyv[i] = d[0], d[1]
-                for vname, vfrag in zip(val_names, val_frags):
-                    if const_expr(isinstance(vfrag, tuple)):
-                        # Scaled sink: the fn returns the (val, scale) factors.
-                        v, s = res[vname]
-                        vfrag[0][i], vfrag[1][i] = v, s
-                    else:
-                        vfrag[i] = res[vname]
-            dxy16 = dxy.to(implicit)
-            tRS_rD.store(cute.recast_tensor(dxy16, Float32).load())
-            self._flush_sinks(ops_by_name, epi_loop_tensors, sink_tmps)
-            return outs
-
-        if const_expr(paired):
-            # Gated pairs: adjacent-N accumulator lanes feed one fn call; aux
-            # fragments are half-width. Same structure as the hand-written
-            # GemmGatedMixin: flat_divide pair views built OUTSIDE the loop so
-            # every in-loop access is a plain loop index (the SM100 vectorizer
-            # rejects affine indices like 2*i), scalar calls + vectorize=True.
-            aux_shape = cute.recast_layout(2, 1, tRS_rD.layout).shape
-            outs = tuple(
-                cute.make_rmem_tensor(aux_shape, self.acc_dtype) for _ in self._epi_mod_outputs
-            )
-            # Sink values span both lanes (full N): collect through pair views.
-            # (Scaled sinks are rejected in acc_pair mode at EpiMod init: a
-            # tuple return already means the two lanes here.)
-            sink_tmps = tuple(
-                cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-                for _ in self._epi_mod_sinks
-            )
-            sink_views = tuple(
-                (p[0, ...], p[1, ...])
-                for p in (cute.flat_divide(t, cute.make_layout(2)) for t in sink_tmps)
-            )
-            acc_pair = cute.flat_divide(tRS_rD, cute.make_layout(2))
-            acc0, acc1 = acc_pair[0, ...], acc_pair[1, ...]
-            n_groups = cute.size(acc0)
-
-            def _dense(view):
-                # Broadcast-vector fragments have zero-stride modes, which the
-                # vectorizer rejects as loop loads; materialize a stride-1 copy
-                # with an unrolled scalar loop (legal on zero-stride views).
-                out = cute.make_rmem_tensor(n_groups, self.acc_dtype)
-                for j in cutlass.range(n_groups, unroll_full=True):
-                    out[j] = view[j]
-                return out
-
-            views = {}
-            for name, kind in self._epi_mod_operands:
-                if const_expr(kind in ("scalar", "apply")):
-                    views[name] = frags[name]
-                else:
-                    p = cute.flat_divide(frags[name], cute.make_layout(2))
-                    if const_expr(kind == "col"):
-                        # colvec broadcasts along N: both lanes are identical.
-                        views[name] = _dense(p[0, ...])
-                    elif const_expr(kind == "row"):
-                        views[name] = (_dense(p[0, ...]), _dense(p[1, ...]))
-                    else:  # tile / c views are dense by construction
-                        views[name] = (p[0, ...], p[1, ...])
-            vectorize = const_expr(self.arch == 100 and self._epi_mod_vectorize is not False)
-            for i in cutlass.range(cute.size(acc0), unroll_full=True, vectorize=vectorize):
-                kw = {
-                    name: (
-                        (lambda v, _n=name, _i=i: ops_by_name[_n].fn_apply(self, views[_n], _i, v))
-                        if kind == "apply"
-                        else views[name]
-                        if kind == "scalar"
-                        else (
-                            views[name][i]
-                            if kind == "col"
-                            else Pair(views[name][0][i], views[name][1][i])
-                        )
-                    )
-                    for name, kind in self._epi_mod_operands
-                }
-                res = fn(Pair(acc0[i], acc1[i]), **kw)
-                for oname, ofrag in zip(self._epi_mod_outputs, outs):
-                    ofrag[i] = res[oname]
-                for (s0, s1), sname in zip(sink_views, self._epi_mod_sinks):
-                    v = res[sname]
-                    s0[i], s1[i] = v[0], v[1]
-                if const_expr("D" in res):
-                    d = res["D"]
-                    acc0[i], acc1[i] = d[0], d[1]
-            for sname, stmp in zip(self._epi_mod_sinks, sink_tmps):
-                ops_by_name[sname].fn_sink_flush(self, epi_loop_tensors[sname], stmp)
-            return outs
-
-        outs = tuple(
-            cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            for _ in self._epi_mod_outputs
-        )
-        # Sink values are collected into a plain fragment per sink op (a
-        # (val, scale) fragment pair for scaled reduces), then handed to the
-        # op's fn_sink_flush (fragment-level: the op owns the fold into its —
-        # possibly aliased, possibly coupled — accumulators).
-        sink_tmps = self._make_sink_tmps(ops_by_name, tRS_rD.layout.shape)
-        # Names written by the fn, in collection order after "D".
-        val_names = self._epi_mod_outputs + self._epi_mod_sinks
-        val_frags = outs + sink_tmps
-        if const_expr(self.arch == 100 and cute.size(tRS_rD) % 2 == 0):
-            # Packed f32x2 lanes: same loop shape as the hand-written SM100 mixins.
-            for i in cutlass.range(cute.size(tRS_rD) // 2, unroll_full=True):
-                kw = {
-                    name: (
-                        (lambda v, _n=name, _i=i: ops_by_name[_n].fn_apply(self, frags[_n], _i, v))
-                        if kind == "apply"
-                        else frags[name]
-                        if kind == "scalar"
-                        else F16Lanes(frags[name][2 * i], frags[name][2 * i + 1])
-                        if name in mixed_names
-                        else F2(frags[name][2 * i], frags[name][2 * i + 1])
-                    )
-                    for name, kind in self._epi_mod_operands
-                }
-                res = fn(F2(tRS_rD[2 * i], tRS_rD[2 * i + 1]), **kw)
-                if const_expr("D" in res):
-                    d = res["D"]
-                    tRS_rD[2 * i], tRS_rD[2 * i + 1] = d[0], d[1]
-                for vname, vfrag in zip(val_names, val_frags):
-                    if const_expr(isinstance(vfrag, tuple)):
-                        v, s = res[vname]
-                        vfrag[0][2 * i], vfrag[0][2 * i + 1] = v[0], v[1]
-                        vfrag[1][2 * i], vfrag[1][2 * i + 1] = s[0], s[1]
-                    else:
-                        v = res[vname]
-                        vfrag[2 * i], vfrag[2 * i + 1] = v[0], v[1]
-        else:
-            for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
-                kw = {
-                    name: (
-                        (lambda v, _n=name, _i=i: ops_by_name[_n].fn_apply(self, frags[_n], _i, v))
-                        if kind == "apply"
-                        else (frags[name] if kind == "scalar" else frags[name][i])
-                    )
-                    for name, kind in self._epi_mod_operands
-                }
-                res = fn(tRS_rD[i], **kw)
-                if const_expr("D" in res):
-                    tRS_rD[i] = res["D"]
-                for vname, vfrag in zip(val_names, val_frags):
-                    if const_expr(isinstance(vfrag, tuple)):
-                        v, s = res[vname]
-                        vfrag[0][i], vfrag[1][i] = v, s
-                    else:
-                        vfrag[i] = res[vname]
-        self._flush_sinks(ops_by_name, epi_loop_tensors, sink_tmps)
-        return outs
 
 
 _KIND_TO_OP = {
@@ -1039,15 +391,14 @@ class EpiMod:
             tuple(op.cache_key() for _, op in sorted(self.sinks.items())),
             tuple(op.cache_key() for _, op in sorted(self.output_ops.items())),
             tuple(op.cache_key() for op in self.extra_ops),
-            # Appended only when set so default-config digests (and their
-            # disk-cached kernels) are unchanged.
-            *(() if self.vectorize is None else (("vectorize", self.vectorize),)),
+            ("vectorize", self.vectorize),
         )
         self.semantic_digest = hashlib.sha256(repr(self.semantic_key).encode()).hexdigest()
         self._ident = f"{fn.__name__}_{self.semantic_digest[:16]}"
         self._minted = {}
         self._plan_cache = {}
         self._call_cache = {}  # eager __call__ fast path: metadata -> launch recipe
+        TORCH_OP_EPI_MODS[self.semantic_digest] = self  # quack::gemm_epi resolution
 
     def __getstate__(self):
         # Shipped by value (cloudpickle) to async-compile workers when there
@@ -1063,19 +414,7 @@ class EpiMod:
         """(module, global_name) if this EpiMod is reachable by import in a
         fresh process (async workers rebuild it that way), else None: defined
         in __main__ (scripts, notebooks) or never bound to a module global."""
-        module_name = self.fn.__module__
-        if module_name == "__main__":
-            return None
-        module = sys.modules.get(module_name)
-        if module is None:
-            return None
-        preferred = self.fn.__name__
-        if getattr(module, preferred, None) is self:
-            return module_name, preferred
-        names = sorted(name for name, value in vars(module).items() if value is self)
-        if not names:
-            return None
-        return module_name, names[0]
+        return module_locator(self, self.fn)
 
     def _class_ref(self, mint_key):
         locator = self._module_locator()
@@ -1099,8 +438,10 @@ class EpiMod:
             semantic_digest=self.semantic_digest,
         )
 
-    def _mint(self, kind_sig, sm, paired_acc, packed_c, prepass_sig=(), rounding=RoundingMode.RN):
-        key = (kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding)
+    def _mint(
+        self, kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms, add_to_output
+    ):
+        key = (kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms, add_to_output)
         cls = self._minted.get(key)
         if cls is not None:
             return cls
@@ -1131,13 +472,9 @@ class EpiMod:
         # The DSL's TVM-FFI arg-spec converter reads per-field type hints off
         # the NamedTuple, so mint through typing.NamedTuple with the same
         # annotations the hand-written EpilogueArguments use.
+        forms_by_name = dict(arg_forms)
         arg_specs = [
-            (
-                op.name,
-                Optional[(op.dtype or Float32) | cute.Tensor]
-                if isinstance(op, Scalar)
-                else Optional[cute.Tensor],
-            )
+            (op.name, op.arg_spec_type(const=forms_by_name.get(op.name) == "Const"))
             for op in epi_ops
         ]
         # Split-K (SERIAL/PARALLEL) per-tile flag + partials workspace; None (and
@@ -1149,12 +486,20 @@ class EpiMod:
         Args = NamedTuple("EpilogueArguments", arg_specs)
         Args.__new__.__defaults__ = (None,) * len(arg_specs)
         Args = mlir_namedtuple(Args)
+        # Class attribute, not a field: GemmBase reads epilogue_args.add_to_output
+        # (duck-typed) to pick the D TMA atom — "add" (cp.reduce.async.bulk,
+        # D += delta with no C load) vs "store". A plain bool on the class is
+        # trace-time constexpr and invisible to the FFI field walk.
+        Args.add_to_output = add_to_output
         cls_name = (
             f"GemmMod_{self._ident}_{'g' if paired_acc else ''}{'p' if packed_c else ''}_"
-            f"{'_'.join(k for _, k in kind_sig) or 'none'}_sm{sm}"
-            # rounding is a call-time knob on an otherwise identical mint:
-            # it must distinguish the class name or remints collide.
+            f"{'_'.join(k for _, k in kind_sig) or 'none'}"
+            f"{''.join(f'_{n}{f}' for n, f in arg_forms)}_sm{sm}"
+            # rounding / add_to_output are call-time knobs on an otherwise
+            # identical mint: they must distinguish the class name or remints
+            # collide.
             f"{'' if rounding == RoundingMode.RN else f'_r{int(rounding)}'}"
+            f"{'_ao' if add_to_output else ''}"
         )
         class_semantic_key = (self.semantic_digest, key)
         existing = getattr(sys.modules[__name__], cls_name, None)
@@ -1198,10 +543,10 @@ class EpiMod:
         return cls
 
     def gemm_tuned(self, A, B, D, C=None, *, epi_args: dict, b_kn: bool = False):
-        """Autotuned gemm(): config-space sweep via quack.epi_autotune (lazy
+        """Autotuned gemm(): config-space sweep via quack.gemm_runtime.autotune (lazy
         import — this module sits below gemm_config in the import graph).
         Returns TunedModGemm(plan, config, sinks); see tuned_mod_gemm."""
-        from quack.epi_autotune import tuned_mod_gemm
+        from quack.gemm_runtime.autotune import tuned_mod_gemm
 
         return tuned_mod_gemm(self, A, B, D, C, epi_args=epi_args, b_kn=b_kn)
 
@@ -1239,15 +584,80 @@ class EpiMod:
         swap_ab=False,  # swap-at-trace: requires b_kn (B given (k, n)); dense element mode
         split_k: int = 1,  # K-dim split factor (SERIAL/PARALLEL only; see quack.gemm)
         split_k_mode: int = SplitKMode.SERIAL,
+        add_to_output: bool = False,  # D += result via the TMA reduce-add store atom
+        #                               (cp.reduce.async.bulk — no C load, half the
+        #                               accumulate traffic of C=D). The fn still
+        #                               returns the DELTA; requires C=None.
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
+        # A-operand transform (SM90 RS / SM120 warp-MMA mainloop). Value
+        # transforms leave the
+        # call contract unchanged. Layout-owning (packed-weight) transforms
+        # flip the slots: caller A = ACTIVATIONS (m, k), caller B = the
+        # repacked BLOB from fmt.prepare (+ its SF strip via transform_sf);
+        # D and tile-shaped epi operands stay caller-oriented (m, n_full) —
+        # kernel m is the weight/output-channel dim, so caller row/col vec
+        # labels flip exactly like swap_ab.
+        transform_a=None,
+        transform_sf=None,
+        post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
+        #                      (constexpr-like knobs, e.g. ("use_pdl", False))
+        split_k_buffers=None,  # (sem, ws) from quack.gemm._split_k_buffers: reuse across
+        #                        calls when the kernel leaves them reusable (serial
+        #                        split-k self-resets); None = fresh per call
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
         varlen_m = cu_seqlens_m is not None
         gather_A = A_idx is not None
         blockscaled = SFA is not None
         concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
+        owned_fmt = None
+        transform_key = None
+        arg_sf = None
+        n_over = None
+        if transform_a is not None:
+            from quack.operand_transform.host import as_transform_mod
+
+            transform_a = as_transform_mod(transform_a)
+            owned_fmt = transform_a.owned_fmt
+            transform_key = transform_a.plan_key()
+            if varlen_m or gather_A or blockscaled or concat_key or ag_args is not None:
+                raise ValueError("transform_a: plain dense GEMM only")
+            if swap_ab:
+                raise ValueError("transform_a + swap_ab: not supported")
+            if owned_fmt is not None:
+                if pingpong:
+                    raise ValueError("layout-owning transform_a does not support pingpong")
+                if self.mode != "element" or self.sinks or self.prepass is not None:
+                    raise ValueError(
+                        "layout-owning transform_a supports element-mode sink-less epilogues only"
+                    )
+                if C is not None:
+                    raise ValueError("layout-owning transform_a + C operand: not supported yet")
+            # Slot/bundle/geometry resolution is the handle's — ONE statement
+            # of the call contract (TransformModBase.resolve_operands).
+            resolved = transform_a.resolve_operands(A, B, transform_sf, tile_M, tile_K)
+            A_slot, B_slot, A = resolved.a_slot, resolved.b_slot, resolved.A
+            arg_sf, tile_K, n_over = resolved.arg_sf, resolved.tile_k, resolved.n_gemm
+        elif transform_sf is not None:
+            raise ValueError("transform_sf without a layout-owning transform_a")
+        else:
+            A_slot, B_slot = (B, A) if swap_ab else (A, B)
         if tile_count_semaphore is not None and not is_dynamic_persistent:
             raise ValueError("tile_count_semaphore requires is_dynamic_persistent=True")
+        if add_to_output:
+            import torch
+
+            if C is not None:
+                raise ValueError("add_to_output accumulates onto D (no C operand); pass C=None")
+            if D is None:
+                raise ValueError("add_to_output requires the D output tensor")
+            if varlen_m:
+                raise ValueError("add_to_output under varlen_m: not supported")
+            if D.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "add_to_output needs an f32/f16/bf16 D (cp.reduce.async.bulk add), "
+                    f"got {D.dtype}"
+                )
         if split_k > 1:
             split_k_mode = SplitKMode(split_k_mode)
             if split_k_mode == SplitKMode.SEPARATE:
@@ -1301,6 +711,7 @@ class EpiMod:
             b_kn,
             use_tma_gather,
             concat_key,
+            tuple(post_init_attrs),
             tensor_key(SFA),
             tensor_key(SFB),
             bs_format_a,
@@ -1308,15 +719,36 @@ class EpiMod:
             swap_ab,
             split_k,
             int(split_k_mode),
+            add_to_output,
             ag_args is not None,
+            transform_key,
+            # one slot for the transform's sf-side tensor: the W4 SF strip
+            # (owned) or the runtime-operand view (value mods with args)
+            tensor_key(transform_sf if arg_sf is None else arg_sf),
+            # Per-op host arg keys: dtypes/ranks/static widths that the
+            # compiled kernel specializes on (host_arg_key's documented
+            # role). Without these, a same-shape call with e.g. a different
+            # grouped-stats width would alias a stale plan — the tensor form
+            # was only ever saved by the launch-time shape check, and a
+            # constexpr-form width has no runtime footprint to check.
+            tuple(
+                sorted(
+                    (name, op.host_arg_key(epi_args.get(name)))
+                    for name, op in {
+                        **self.ops,
+                        **self.sinks,
+                        **{o.name: o for o in self.extra_ops},
+                    }.items()
+                )
+            ),
         )
         plan = self._plan_cache.get(key)
         if plan is not None:
             if _launch:
                 run_gemm_epi_plan(
                     plan,
-                    B if swap_ab else A,
-                    A if swap_ab else B,
+                    A_slot,
+                    B_slot,
                     D,
                     C,
                     epi_args,
@@ -1326,6 +758,7 @@ class EpiMod:
                     A_idx=A_idx,
                     SFA=SFA,
                     SFB=SFB,
+                    split_k_buffers=split_k_buffers,
                 )
             return plan
         if blockscaled:
@@ -1356,16 +789,17 @@ class EpiMod:
                 raise ValueError("gather_A requires varlen")
             if cluster_N != 1:
                 raise ValueError("gather_A requires cluster_N=1")
-        n_gemm = B.shape[-1] if b_kn else B.shape[-2]
-        # Kernel coords under swap-at-trace: kernel m = caller n, kernel n =
-        # caller m. Shape checks on D/C/outputs stay caller-oriented (the
-        # tensors cross natively; the trace transposes); operand-kind
-        # inference and vec shape checks use kernel coords.
+        n_gemm = n_over if n_over is not None else (B.shape[-1] if b_kn else B.shape[-2])
+        # Kernel coords under swap-at-trace (and layout-owning transforms):
+        # kernel m = caller n, kernel n = caller m. Shape checks on
+        # D/C/outputs stay caller-oriented (the tensors cross natively; the
+        # trace transposes); operand-kind inference and vec shape checks use
+        # kernel coords.
         paired_acc = self.mode == "acc_pair"
         packed_c = self.mode == "packed_cd_b16x2"
         if paired_acc and (n_gemm % 2 or tile_N % 2):
             raise ValueError("acc_pair mode requires even GEMM N and tile_N")
-        post_init_attrs = ()
+        post_init_attrs = tuple(post_init_attrs)
         packed_form = None
         if packed_c:
             import torch
@@ -1384,7 +818,7 @@ class EpiMod:
                 raise ValueError("packed C requires a matching D of the same dtype and shape")
             if C.dtype not in (torch.float16, torch.bfloat16):
                 raise TypeError("C must be float16 or bfloat16 in packed_cd_b16x2 mode")
-            post_init_attrs = (("implicit_dtype", torch2cute_dtype_map[C.dtype]),)
+            post_init_attrs = (*post_init_attrs, ("implicit_dtype", torch2cute_dtype_map[C.dtype]))
         n = n_gemm
         if varlen_m:
             # total_m for operand inference (colvec length); A rows differ
@@ -1397,7 +831,7 @@ class EpiMod:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
         # stays caller-oriented (swap-at-trace transposes those at trace).
-        m_i, n_i = (n_gemm, m) if swap_ab else (m, n_gemm)
+        m_i, n_i = (n_gemm, m) if (swap_ab or owned_fmt is not None) else (m, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
         if packed_c:
@@ -1442,13 +876,14 @@ class EpiMod:
         # caller colvec is the swapped kernel's rowvec (and vice versa), so the
         # pin's class flips for this call. Other orientation-sensitive vec pins
         # (varlen subclasses, reduces) have no swapped form and fail loudly.
+        flipped = swap_ab or owned_fmt is not None
         pins = {}
         for name, op in self.ops.items():
-            if swap_ab and type(op) in (ColVecLoad, RowVecLoad):
+            if flipped and type(op) in (ColVecLoad, RowVecLoad):
                 pins[name] = (RowVecLoad if type(op) is ColVecLoad else ColVecLoad)(name)
-            elif swap_ab and isinstance(op, (VecLoad, VecReduce)):
+            elif flipped and isinstance(op, (VecLoad, VecReduce)):
                 raise ValueError(
-                    f"swap_ab: pinned vec op {name!r} of type {type(op).__name__} "
+                    f"swap_ab/transform_a: pinned vec op {name!r} of type {type(op).__name__} "
                     "has no swapped orientation"
                 )
             else:
@@ -1473,7 +908,18 @@ class EpiMod:
             # Pinned ops own their host schema (host_arg_key validates the
             # value); the built-in shape rules only apply to inferred kinds.
             if kind == "pinned":
-                pass
+                validate = getattr(pins[name], "host_validate", None)
+                if validate is not None:
+                    validate(
+                        epi_args[name],
+                        m=m_i,
+                        n=n_i,
+                        tile_M=tile_M,
+                        tile_N=tile_N,
+                        batch=batch,
+                        varlen_m=varlen_m,
+                        epi_args=epi_args,
+                    )
             elif visit_kind == "row":
                 _require_shape(name, epi_args[name], (batch_l, n_i))
             elif visit_kind == "col":
@@ -1489,21 +935,54 @@ class EpiMod:
             if sink_name not in epi_args:
                 raise ValueError(f"missing sink output buffer '{sink_name}'")
             op = self.sinks[sink_name]
-            if hasattr(op, "dim"):
-                if op.dim == 0:
-                    inner = (m, (n_gemm + tile_N - 1) // tile_N)
-                else:
-                    inner = ((m + tile_M - 1) // tile_M, n_gemm)
-                expected = inner if varlen_m or batch is None else (batch, *inner)
-                _require_shape(sink_name, epi_args[sink_name], expected)
-            if getattr(op, "check_oob", True) is False and n_gemm % tile_N:
-                raise ValueError(
-                    f"sink '{sink_name}': check_oob=False requires N divisible by tile_N "
-                    f"(N={n_gemm}, tile_N={tile_N})"
+            validate = getattr(op, "host_validate", None)
+            if validate is not None:
+                validate(
+                    epi_args[sink_name],
+                    m=m,
+                    n=n_gemm,
+                    tile_M=tile_M,
+                    tile_N=tile_N,
+                    batch=batch,
+                    varlen_m=varlen_m,
+                    epi_args=epi_args,
                 )
+            alloc = getattr(op, "sink_alloc_shape", None)
+            if alloc is not None:
+                lead_k = (m,) if varlen_m or batch is None else (batch, m)
+                _require_shape(
+                    sink_name, epi_args[sink_name], alloc(lead_k, n_gemm, tile_M, tile_N)
+                )
+            if getattr(op, "check_oob", True) is False:
+                # The reduce dim must be tile-divisible: dim 0 (colvec) reduces
+                # along N, dim 1 (rowvec) along M (varlen_m boundaries are
+                # always potentially ragged).
+                if getattr(op, "dim", 0) == 0:
+                    if n_gemm % tile_N:
+                        raise ValueError(
+                            f"sink '{sink_name}': check_oob=False requires N divisible by "
+                            f"tile_N (N={n_gemm}, tile_N={tile_N})"
+                        )
+                elif varlen_m or m % tile_M:
+                    raise ValueError(
+                        f"sink '{sink_name}': check_oob=False requires M divisible by tile_M "
+                        f"and no varlen_m (M={m}, tile_M={tile_M})"
+                    )
             epi_values[sink_name] = epi_args[sink_name]
         for op in self.extra_ops:
             if op.name in epi_args:
+                validate = getattr(op, "host_validate", None)
+                if validate is not None:
+                    validate(
+                        epi_args[op.name],
+                        m=m,
+                        n=n_gemm,
+                        tile_M=tile_M,
+                        tile_N=tile_N,
+                        batch=batch,
+                        varlen_m=varlen_m,
+                        epi_args=epi_args,
+                    )
                 epi_values[op.name] = epi_args[op.name]
         kind_sig = tuple(kind_sig)
 
@@ -1543,6 +1022,14 @@ class EpiMod:
                 if out_name not in {n for n, _ in visit_sig} | set(self.sinks):
                     raise ValueError(f"prepass out '{out_name}' must be a declared op")
             prepass_sig = tuple((n, k) for n, k in visit_sig if n in self.prepass_operand_names)
+        # Arg FORMS that change the compiled signature (e.g. a constexpr
+        # width vs a tensor descriptor) distinguish the mint; kinds stay pure
+        # (they drive device-loop dispatch).
+        arg_forms = tuple(
+            (name, pins[name].host_arg_form(epi_args[name]))
+            for name, _ in kind_sig
+            if name in pins and pins[name].host_arg_form(epi_args[name])
+        )
         mint_key = (
             visit_sig,
             device_capacity[0],
@@ -1550,14 +1037,15 @@ class EpiMod:
             packed_c,
             prepass_sig,
             rounding_mode,
+            arg_forms,
+            add_to_output,
         )
         GemmCls = self._mint(*mint_key)
-        A_s, B_s = (B, A) if swap_ab else (A, B)
         plan = build_gemm_epi_plan(
             GemmCls,
             device_capacity,
-            A_s,
-            B_s,
+            A_slot,
+            B_slot,
             D,
             C,
             epi_values=epi_values,
@@ -1573,8 +1061,11 @@ class EpiMod:
             max_swizzle_size=max_swizzle_size,
             varlen_m=varlen_m,
             gather_A=gather_A,
-            b_kn=b_kn and not swap_ab,  # slot-A relabels via a_transposed instead
+            # slot-A relabels via a_transposed (swap_ab); owned transforms
+            # pass B (= caller A activations) natively (n, k)
+            b_kn=b_kn and not swap_ab and owned_fmt is None,
             swap_ab=swap_ab,
+            transform_a=transform_a,
             use_tma_gather=use_tma_gather,
             concat_layout=concat_key,
             sf_dtype=sf_dtype,
@@ -1593,8 +1084,8 @@ class EpiMod:
         if _launch:
             run_gemm_epi_plan(
                 plan,
-                B if swap_ab else A,
-                A if swap_ab else B,
+                A_slot,
+                B_slot,
                 D,
                 C,
                 epi_values,
@@ -1604,12 +1095,13 @@ class EpiMod:
                 A_idx=A_idx,
                 SFA=SFA,
                 SFB=SFB,
+                split_k_buffers=split_k_buffers,
             )
         return plan
 
     # ── Torch-facing interface (Tier 4 surface) ──────────────────────────
     # One interface parameterized by the epilogue object (see HANDOFF Tier 4):
-    # eager ``__call__`` (autotunes via quack.epi_autotune, allocates missing
+    # eager ``__call__`` (autotunes via quack.gemm_runtime.autotune, allocates missing
     # outputs), ``plan()`` -> EpiPlan (resolve once; ``run()`` makes zero host
     # decisions). B is (k, n) logical at this surface — the torch convention —
     # with the physical layout free.
@@ -1619,12 +1111,25 @@ class EpiMod:
             return ((A_idx.shape[0] if A_idx is not None else A.shape[0]),)
         return tuple(A.shape[:-1])
 
-    def _alloc_outputs(self, out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx):
+    def _default_config(self, A, B, transform_a):
+        """Per-arch default config; the transform handle may override (the
+        measured W4 coverage rule). split_k is not threaded through the
+        eager/plan surface yet — pass it explicitly via mod.gemm for the
+        starved-grid decode-shape win."""
+        if transform_a is not None:
+            cfg = transform_a.default_config(A, B)
+            if cfg is not None:
+                return cfg
+        return default_config(A.device)
+
+    def _alloc_outputs(
+        self, out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx, n_override=None
+    ):
         """Fill in the outputs the caller left out; out= buffers win."""
         import torch
 
         out = dict(out) if out else {}
-        n = B.shape[-1]
+        n = B.shape[-1] if n_override is None else n_override
         lead = self._lead_shape(A, cu_seqlens_m, A_idx)
         dt = out_dtype if out_dtype is not None else A.dtype
         if store_d and out.get("D") is None:
@@ -1650,10 +1155,10 @@ class EpiMod:
         for name, op in self.sinks.items():
             if epi_args.get(name) is not None:
                 continue
-            if op.dim == 0:
-                shape = (*lead, -(-n // config.tile_n))
-            else:
-                shape = (*lead[:-1], -(-lead[-1] // config.tile_m), n)
+            # NOTE: for full-vector sinks (ColVecSelect), rows the kernel
+            # never writes (out-of-range select indices) stay uninitialized —
+            # callers who care pass the buffer.
+            shape = op.sink_alloc_shape(lead, n, config.tile_m, config.tile_n)
             bufs[name] = epi_args[name] = torch.empty(shape, dtype=torch.float32, device=device)
         return bufs
 
@@ -1672,8 +1177,9 @@ class EpiMod:
             else None
         )
         blockscaled = ctx.get("SFA") is not None
+        A_bundle = ctx.get("A_bundle")  # runtime-operand transform: A crosses bundled
         plan = self.gemm(
-            A,
+            A if A_bundle is None else A_bundle,
             ctx["B_d"],
             D,
             C,
@@ -1700,6 +1206,9 @@ class EpiMod:
             swap_ab=config.swap_ab,
             use_tma_gather=config.use_tma_gather,
             concat_layout=ctx.get("concat_layout"),
+            transform_a=ctx.get("transform_a"),
+            transform_sf=ctx.get("transform_sf"),
+            add_to_output=ctx.get("add_to_output", False),
             _launch=_launch,
         )
         return config, dyn, plan, sink_bufs
@@ -1725,31 +1234,85 @@ class EpiMod:
         rounding_mode=RoundingMode.RN,
         epi_key_overrides=None,
         concat_layout=None,  # tensors whose non-contiguous dim is concat [gate; up]
+        transform_a=None,  # A-operand transform (see EpiMod.gemm); with a
+        transform_sf=None,  # layout-owning transform, B is the repacked blob
+        transform_operands=None,  # {name: tensor} for a runtime-operand transform_a
+        #                           (raw values; the bundle is built here from
+        #                           the resolved config's tile_M/tile_K)
+        add_to_output=False,  # D += result via the TMA reduce-add store atom (see
+        #                       EpiMod.gemm); requires out={"D": buf} and C=None
         **operands,  # epilogue operand tensors/scalars by fn-parameter name
     ):
         """Eager torch-facing call: resolve config (autotune via
-        quack.epi_autotune on first sight of a metadata class), allocate
+        quack.gemm_runtime.autotune on first sight of a metadata class), allocate
         missing outputs, launch. Returns {"D": ..., <declared outputs>,
         <finalized reduces>}; reduce sinks come back finalized via their op's
         ``host_finalize`` (partials are internal scratch) unless the caller
         passed the partial buffer as an operand.
 
-        The tuned path covers the non-SR surface (see quack.epi_autotune,
-        incl. varlen/gather/blockscaled/concat and dynamic_scheduler=True);
-        other calls resolve with the explicit ``config=`` or the per-arch
-        default.
+        The tuned path covers the non-SR surface (see quack.gemm_runtime.autotune,
+        incl. varlen/gather/blockscaled/concat, A-operand transforms and
+        dynamic_scheduler=True); other calls resolve with the explicit
+        ``config=`` or the per-arch default.
 
         Under torch.compile the call records the single ``quack::gemm_epi``
-        custom op (see quack.epi_torch_op); with reduce sinks the config is
-        pinned there (partials must be graph-allocated at exact shapes)."""
+        custom op (see quack.gemm_runtime.torch_op); with reduce sinks the config is
+        pinned there (partials must be graph-allocated at exact shapes).
+        transform_a rides the same op: the handle crosses by semantic digest
+        (bind it to a module global for cross-process graphs), runtime
+        operand tensors ride the op's input list, and the bundle is rebuilt
+        inside the op body."""
         import torch
+
+        owned_fmt = None
+        transform_key = None
+        if transform_a is not None:
+            if not hasattr(transform_a, "semantic_digest"):
+                if torch.compiler.is_compiling():
+                    raise NotImplementedError(
+                        "transform_a under torch.compile needs a digest-carrying handle "
+                        "(@a_transform / dropout_a / w4_transform)"
+                    )
+                from quack.operand_transform.host import as_transform_mod
+
+                transform_a = as_transform_mod(transform_a)
+            owned_fmt = transform_a.owned_fmt
+            transform_key = transform_a.plan_key()
+        # Runtime-operand transforms: the torch-facing surface takes the RAW
+        # operand tensors and builds the TransformAOperand bundle itself from
+        # the resolved config's tiles (bundles — whose views bake tile_M/
+        # tile_K — stay a mod.gemm/direct-layer contract).
+        needs_transform_operands = transform_a is not None and transform_a.needs_operands
+        if needs_transform_operands:
+            from quack.operand_transform.transform import TransformAOperand
+
+            if isinstance(A, TransformAOperand):
+                raise ValueError(
+                    "__call__ builds the operand bundle itself from the resolved config: "
+                    "pass the plain (M, K) A plus transform_operands={name: tensor} "
+                    "(pre-built bundles go to mod.gemm)"
+                )
+            if not transform_operands:
+                raise ValueError(
+                    f"transform_a {getattr(transform_a, 'name', transform_a)!r} declares "
+                    "runtime operands: pass transform_operands={name: tensor}"
+                )
+        elif transform_operands:
+            raise ValueError("transform_operands requires a transform_a with declared args")
+        if add_to_output:
+            # The accumulator must be caller-provided: an auto-allocated D
+            # would reduce-add onto garbage.
+            if C is not None:
+                raise ValueError("add_to_output accumulates onto D (no C operand); pass C=None")
+            if not store_d or out is None or out.get("D") is None:
+                raise ValueError('add_to_output requires the accumulator as out={"D": buf}')
 
         if torch.compiler.is_compiling():
             if dynamic_scheduler or epi_key_overrides is not None:
                 raise NotImplementedError(
                     "dynamic_scheduler/epi_key_overrides under torch.compile: not supported yet"
                 )
-            from quack.epi_torch_op import compile_call
+            from quack.gemm_runtime.torch_op import compile_call
 
             return compile_call(
                 self,
@@ -1769,6 +1332,10 @@ class EpiMod:
                 bs_format_b=bs_format_b,
                 rounding_mode=rounding_mode,
                 operands=operands,
+                transform_a=transform_a,
+                transform_sf=transform_sf,
+                transform_operands=transform_operands,
+                add_to_output=add_to_output,
             )
 
         # ── Eager warm fast path: one metadata key -> captured launch recipe.
@@ -1776,9 +1343,10 @@ class EpiMod:
         # winner, output recipes, sink shapes, slot order) was recorded by a
         # previous identical-metadata call; only allocation + launch remain.
         # packed_cd rides it too (the f32 recast is trace-level, cd_packed);
-        # concat is excluded (its per-call B views live in mod.gemm).
+        # concat and transforms are excluded (their per-call views live in
+        # mod.gemm, whose own plan cache is the warm path).
         ck = None
-        if concat_layout is None:
+        if concat_layout is None and transform_a is None:
             ck = (
                 tensor_key(A),
                 tensor_key(B),
@@ -1808,6 +1376,9 @@ class EpiMod:
                 bs_format_b,
                 rounding_mode,
                 None if epi_key_overrides is None else tuple(sorted(epi_key_overrides.items())),
+                transform_key,
+                tensor_key(transform_sf),
+                add_to_output,
             )
             entry = self._call_cache.get(ck)
             if entry is not None:
@@ -1851,20 +1422,24 @@ class EpiMod:
         # concat reads B (k, n) through per-call views, so it vetoes the b_kn
         # trace-time relabel (the interleave lives in mod.gemm).
         b_kn = get_device_capacity(A.device)[0] >= 9 and not concat_layout
-        B_d = B if b_kn else B.mT
+        B_d = B if (b_kn or owned_fmt is not None) else B.mT
+        n_override = transform_a.padded_n(B) if transform_a is not None else None
         provided_out = frozenset(k for k, v in (out or {}).items() if v is not None)
-        out = self._alloc_outputs(out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx)
+        out = self._alloc_outputs(
+            out, A, B, C, store_d, out_dtype, cu_seqlens_m, A_idx, n_override=n_override
+        )
         D = out.get("D") if store_d else None
         lead = self._lead_shape(A, cu_seqlens_m, A_idx)
-        n = B.shape[-1]
+        n = B.shape[-1] if n_override is None else n_override
         use_tuner = (
             tuned
             and config is None
             and rounding_mode == RoundingMode.RN
             and epi_key_overrides is None
+            and not add_to_output  # the reduce-add D mint is not swept
         )
         if use_tuner:
-            from quack.epi_autotune import sink_arg_shapes, tuned_mod_gemm
+            from quack.gemm_runtime.autotune import sink_arg_shapes, tuned_mod_gemm
 
             epi_args = dict(operands)
             for name in self.outputs:
@@ -1900,6 +1475,10 @@ class EpiMod:
                 bs_format_a=bs_format_a,
                 bs_format_b=bs_format_b,
                 concat_layout=concat_layout,
+                # raw operand tensors: the sweep builds per-config bundles
+                transform_a=transform_a,
+                transform_sf=transform_sf,
+                transform_operands=transform_operands,
             )
             sink_bufs = {name: res.sinks[name] for name in owned_sinks}
             cfg_used, plan_used = res.config, res.plan
@@ -1923,13 +1502,22 @@ class EpiMod:
                 rounding_mode=rounding_mode,
                 epi_key_overrides=epi_key_overrides,
                 concat_layout=concat_layout,
+                transform_a=transform_a,
+                transform_sf=transform_sf,
+                add_to_output=add_to_output,
             )
             if config is not None:
                 cfg = config
             elif SFA is not None:
-                cfg = blockscaled_default_config(A.shape[-2], n)
+                cfg = blockscaled_default_config(
+                    A.shape[-2], n, device_capacity=get_device_capacity(A.device)[0]
+                )
             else:
-                cfg = default_config(A.device)
+                cfg = self._default_config(A, B, transform_a)
+            if needs_transform_operands:
+                # tile_K None resolves inside bundle() to the 16-bit kernel
+                # default, mirrored by fake_bundle at trace.
+                ctx["A_bundle"] = transform_a.bundle(A, transform_operands, cfg.tile_m, cfg.tile_k)
             _, _, plan_used, sink_bufs = self._iface_execute(cfg, dynamic_scheduler, ctx)
             cfg_used = cfg
         if ck is not None:
@@ -1978,6 +1566,10 @@ class EpiMod:
         bs_format_b=None,
         rounding_mode=RoundingMode.RN,
         epi_key_overrides=None,
+        transform_a=None,  # A-operand transform (see EpiMod.gemm); with a
+        transform_sf=None,  # layout-owning transform, B is the repacked blob
+        transform_operands=None,  # {name: tensor}, as in __call__ (bundle built here)
+        add_to_output=False,  # D += result via the TMA reduce-add store atom (see EpiMod.gemm)
         **operands,
     ):
         """Resolve (and compile on a cold cache) WITHOUT launching; returns an
@@ -1987,21 +1579,39 @@ class EpiMod:
         varlen_m = cu_seqlens_m is not None
         b_kn = get_device_capacity(A.device)[0] >= 9
         B_d = B if b_kn else B.mT
-        cfg = config if config is not None else default_config(A.device)
+        if transform_a is not None:
+            from quack.operand_transform.host import as_transform_mod
+
+            transform_a = as_transform_mod(transform_a)
+        cfg = config if config is not None else self._default_config(A, B, transform_a)
         dyn = dynamic_scheduler or cfg.is_dynamic_persistent
         out = dict(out)
         D = out.get("D")
         for name in self.outputs:
             if out.get(name) is None:
                 raise ValueError(f"plan() requires a buffer for output {name!r}")
+        n = B.shape[-1]
+        A_bundle = None
+        if transform_a is not None:
+            if transform_a.owned_fmt is not None:
+                B_d = B  # the blob crosses kernel-native
+                n = transform_a.padded_n(B)
+            elif transform_a.needs_operands:
+                if not transform_operands:
+                    raise ValueError(
+                        f"transform_a {transform_a.name!r} declares "
+                        "runtime operands: pass transform_operands={name: tensor}"
+                    )
+                A_bundle = transform_a.bundle(A, transform_operands, cfg.tile_m, cfg.tile_k)
         ctx = dict(
             A=A,
+            A_bundle=A_bundle,
             B_d=B_d,
             C=C,
             D=D,
             out=out,
             operands=dict(operands),
-            n=B.shape[-1],
+            n=n,
             lead=self._lead_shape(A, cu_seqlens_m, A_idx),
             b_kn=b_kn,
             cu_seqlens_m=cu_seqlens_m,
@@ -2012,6 +1622,9 @@ class EpiMod:
             bs_format_b=bs_format_b,
             rounding_mode=rounding_mode,
             epi_key_overrides=epi_key_overrides,
+            transform_a=transform_a,
+            transform_sf=transform_sf,
+            add_to_output=add_to_output,
         )
         _, _, gemm_plan, sink_bufs = self._iface_execute(cfg, dyn, ctx, _launch=False)
         return EpiPlan(
@@ -2027,23 +1640,23 @@ class EpiMod:
         )
 
 
+# fn_port values a pinned OPERAND may declare. "value": the op's begin_loop
+# fragment must be elementwise congruent with tRS_rD and DENSE (the
+# vectorizer rejects zero-stride loop loads); it is indexed like a tile
+# fragment in every mode. "sink" ports are fn RETURNS, never operands.
+_OPERAND_PORTS = {"apply", "col", "row", "scalar", "tile", "value"}
+
+
 def _pinned_visit_kind(op):
-    if op.fn_port == "apply":
-        return "apply"
-    if op.fn_port == "value":
-        # Custom value-source op: its begin_loop fragment must be elementwise
-        # congruent with tRS_rD and DENSE (the vectorizer rejects zero-stride
-        # loop loads); it is indexed like a tile fragment in every mode.
-        return "value"
-    if isinstance(op, RowVecLoad):
-        return "row"
-    if isinstance(op, ColVecLoad):
-        return "col"
-    if isinstance(op, TileLoad):
-        return "tile"
-    if isinstance(op, Scalar):
-        return "scalar"
-    raise ValueError(f"cannot use {type(op).__name__} as a fn-frontend operand (write a mixin)")
+    """The fn-loop visit kind of a pinned operand op: its declared fn_port —
+    one method makes any op compose (no isinstance dispatch)."""
+    port = op.fn_port
+    if port not in _OPERAND_PORTS:
+        raise ValueError(
+            f"cannot use {type(op).__name__} (fn_port={port!r}) as a fn-frontend "
+            "operand (write a mixin)"
+        )
+    return port
 
 
 def gemm_epilogue(

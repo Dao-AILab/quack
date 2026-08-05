@@ -54,6 +54,33 @@ class GemmConfig:
     use_tma_gather: bool = False
 
 
+def blockscaled_config_ok(c: GemmConfig) -> bool:
+    """Can this config run a blockscaled GEMM (SM100 tcgen05 MMA, or SM120
+    warp MMA)? THE single statement of the constraint set — both autotune
+    prune paths call this."""
+    if c.device_capacity == 12:
+        # SM120 warp-MMA blockscaled (MXFP8): the SF smem layouts and fragment
+        # partition helpers are whole-128-tile granular.
+        return (
+            not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
+            and c.tile_k is None  # tile_k is derived from the SF atom column
+            and c.tile_m in (128, 256)
+            and c.tile_n in (128, 256)
+        )
+    return (
+        c.device_capacity in (10, 11)
+        and not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
+        and c.tile_k is None  # tile_k is derived from the MMA instruction
+        and c.tile_m in (128, 256)
+        # SF tmem datapath is 64-N granular; tcgen05 MMA N is capped at 256
+        and c.tile_n % 64 == 0
+        and 64 <= c.tile_n <= 256
+        # SF multicast is limited to 4 CTAs per cluster dim
+        and c.cluster_m <= 4
+        and c.cluster_n <= 4
+    )
+
+
 def config_supports(config: GemmConfig, *, gather_A: bool = False, varlen_m: bool = False) -> bool:
     """Structural validity of a config for gather_A / varlen_m.
 
@@ -244,14 +271,26 @@ def default_config(device) -> GemmConfig:
     return _default_config_for_cap(get_device_capacity(device)[0])
 
 
-def blockscaled_default_config(m: int, n: int) -> GemmConfig:
-    """Default SM100 config for blockscaled GEMM.
+def blockscaled_default_config(m: int, n: int, device_capacity: int = 10) -> GemmConfig:
+    """Default config for blockscaled GEMM (SM100 unless ``device_capacity``
+    says otherwise).
 
-    Large shapes use a (256, 256) tile: it makes num_acc_stage == 1, which turns
-    on ``overlap_accum_sf`` (a second TMEM accumulator stage) so the per-tile
-    scale-apply + TMEM drain overlaps the next tile's MMA instead of
-    serializing after it.
+    On SM100, large shapes use a (256, 256) tile: it makes num_acc_stage == 1,
+    which turns on ``overlap_accum_sf`` (a second TMEM accumulator stage) so
+    the per-tile scale-apply + TMEM drain overlaps the next tile's MMA instead
+    of serializing after it.
+
+    On SM120 (warp MMA, no clusters), (128, 128) pingpong — riding CLC via
+    is_dynamic_persistent — measured best across mxfp8/nvfp4/mxfp4 at 2048³
+    through 8192³ on RTX 5090 (interleaved medians, 2026-07-30). The older
+    snapshot codebase's fp4-at->=8192 (256, 128) cooperative rule (see
+    AI/sm120_blockscaled_gemm_worklog.md) no longer holds: (256, 128) is now
+    the WORST of the three candidates at 8192³ (nvfp4 1051 vs pingpong 1354
+    TF); the sole exception is mxfp4 8192³ where (128, 128) coop leads
+    pingpong by ~5% — not enough for a format-special rule.
     """
+    if device_capacity == 12:
+        return _blockscaled_config(128, 128, (1, 1), device_capacity=12, pingpong=True)
     if m >= 512 and n >= 256:
         tile_m, tile_n, cluster = 256, 256, (2, 1)
     elif m >= 512 and n >= 128:
@@ -262,15 +301,15 @@ def blockscaled_default_config(m: int, n: int) -> GemmConfig:
 
 
 @lru_cache(maxsize=None)
-def _blockscaled_config(tile_m, tile_n, cluster):
+def _blockscaled_config(tile_m, tile_n, cluster, device_capacity=10, pingpong=False):
     return GemmConfig(
         tile_m=tile_m,
         tile_n=tile_n,
         cluster_m=cluster[0],
         cluster_n=cluster[1],
-        pingpong=False,
+        pingpong=pingpong,
         is_dynamic_persistent=True,
-        device_capacity=10,
+        device_capacity=device_capacity,
     )
 
 

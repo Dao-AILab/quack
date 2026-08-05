@@ -20,17 +20,21 @@ map the public signature onto ``epi_values`` dicts.
 
 from __future__ import annotations
 
-import importlib
 from typing import NamedTuple, Optional
 
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 
 from quack.cache import jit_cache
-from quack.cache.async_compile import PoolPayload
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_config import SplitKMode
+from quack.epilogue.ops import EpiOp
+from quack.gemm_runtime.identity import (
+    resolve_gemm_class,
+    resolve_transform_a,
+    static_gemm_class_ref,
+)
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
     launch_gemm,
@@ -41,7 +45,6 @@ from quack.gemm_tvm_ffi_utils import (
     make_scheduler_args,
     make_varlen_args,
     plan_scheduler_args,
-    tensor_key,
 )
 
 
@@ -61,106 +64,6 @@ class FakeArgCtx(NamedTuple):
     swapped: bool = False
 
 
-class GemmClassRef(NamedTuple):
-    """Picklable recipe for resolving a GEMM class in async workers.
-
-    Dynamic epilogue classes must never cross the cache boundary directly:
-    their module registration exists only in the creating process. Instead an
-    epi_mod reference imports the module-global EpiMod and asks it to mint the
-    same class from a semantic digest plus the runtime kind signature.
-
-    ``epi_mod_local`` covers EpiMods with no importable anchor (defined in
-    ``__main__`` — scripts, notebooks — or never bound to a module global):
-    the semantic digest still keys the disk cache correctly and resolution
-    goes through a process-local registry. To reach async workers, the ref
-    ships the EpiMod by value as a side-channel payload (cloudpickle, see
-    ``__quack_pool_payload__``) — the payload never enters the cache key, so
-    shas stay deterministic. If the payload can't be serialized the pool
-    refuses the key and the cold miss compiles in-process.
-    """
-
-    kind: str  # "static", "epi_mod", or "epi_mod_local"
-    module: str
-    qualname: str
-    mint_key: tuple = ()
-    semantic_digest: str = ""
-
-    def __quack_pool_payload__(self):
-        """Worker setup for a local EpiMod, or None for importable refs."""
-        if self.kind != "epi_mod_local":
-            return None
-        import cloudpickle
-
-        payload = cloudpickle.dumps(_LOCAL_EPI_MODS[self.semantic_digest])
-        return PoolPayload(
-            "quack.gemm_host",
-            "install_epi_mod_payload",
-            self.semantic_digest,
-            payload,
-        )
-
-
-# semantic_digest -> EpiMod, for refs with no importable module anchor.
-# Populated by EpiMod._class_ref before the compile that needs it (and by
-# install_epi_mod_payload in async workers). Cold compile resolution consumes
-# entries so long-lived workers do not retain user closures.
-_LOCAL_EPI_MODS: dict[str, object] = {}
-
-
-def register_local_epi_mod(digest: str, epi_mod) -> None:
-    _LOCAL_EPI_MODS[digest] = epi_mod
-
-
-def install_epi_mod_payload(expected_digest: str, data: bytes) -> None:
-    """Worker-side installer for ``epi_mod_local`` payloads (see
-    ``GemmClassRef.__quack_pool_payload__``)."""
-    import cloudpickle
-
-    epi_mod = cloudpickle.loads(data)
-    if epi_mod.semantic_digest != expected_digest:
-        raise ValueError(
-            "local epilogue payload digest mismatch: "
-            f"expected {expected_digest}, got {epi_mod.semantic_digest}"
-        )
-    register_local_epi_mod(expected_digest, epi_mod)
-
-
-def _resolve_qualname(obj, qualname):
-    for part in qualname.split("."):
-        obj = getattr(obj, part)
-    return obj
-
-
-def static_gemm_class_ref(GemmCls):
-    return GemmClassRef("static", GemmCls.__module__, GemmCls.__qualname__)
-
-
-def resolve_gemm_class(ref: GemmClassRef):
-    if ref.kind == "epi_mod_local":
-        # Consume the registration: worker payloads may close over sizeable
-        # Python state and workers live for the whole test/autotune session.
-        obj = _LOCAL_EPI_MODS.pop(ref.semantic_digest, None)
-        if obj is None:
-            raise RuntimeError(
-                "process-local epilogue reference is not registered here (created in "
-                "another process and its payload was not installed); bind the "
-                "@gemm_epilogue object to a module-global name in an importable module "
-                "to make it resolvable by import"
-            )
-        return obj._mint(*ref.mint_key)
-    module = importlib.import_module(ref.module)
-    obj = _resolve_qualname(module, ref.qualname)
-    if ref.kind == "static":
-        return obj
-    if ref.kind != "epi_mod":
-        raise ValueError(f"unknown GEMM class reference kind {ref.kind!r}")
-    if obj.semantic_digest != ref.semantic_digest:
-        raise RuntimeError(
-            f"epilogue {ref.module}.{ref.qualname} changed while resolving a compile request"
-        )
-    return obj._mint(*ref.mint_key)
-
-
 def _ops_by_name(GemmCls):
     return {op.name: op for op in GemmCls._epi_ops}
 
@@ -169,7 +72,8 @@ def _ops_by_name(GemmCls):
 def _compile_gemm_epi(
     gemm_cls_ref,
     device_capacity,
-    a_dtype,
+    a_dtype,  # the gemm ctor a_dtype: the MMA dtype (= A's dtype except for
+    # layout-owning transforms, where A crosses as a storage blob)
     b_dtype,
     d_dtype,
     c_dtype,
@@ -202,6 +106,14 @@ def _compile_gemm_epi(
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
+    # A-operand transform (SM90 RS / SM120 warp-MMA mainloop,
+    # quack.operand_transform): a
+    # picklable TransformARef. Layout-owning (packed W4) transforms replace
+    # the standard fake operands: A is the repacked blob (static geometry
+    # from transform_dims = (n_full, k)), the SF strip rides a trailing AuxA
+    # arg, kernel-N (the activation M) is the only symbolic dim.
+    transform_a_ref=None,
+    transform_dims=None,
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -209,25 +121,63 @@ def _compile_gemm_epi(
     the disk key and to ship cold misses to async-compile workers).
     """
     GemmCls = resolve_gemm_class(gemm_cls_ref)
-    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
-        a_dtype,
-        b_dtype,
-        d_dtype,
-        c_dtype,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
-        varlen_m=varlen_m,
-        gather_A=gather_A,
-        batched=batched,
-        b_kn=b_kn,
-        swap_ab=swap_ab,
-        packed_cd=packed_cd,
-        a_mma_dtype=a_mma_dtype,
-        b_mma_dtype=b_mma_dtype,
-    )
-    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab)
+    transform_mod = None
+    owned_fmt = None
+    if transform_a_ref is not None:
+        transform_mod = resolve_transform_a(transform_a_ref)
+        owned_fmt = transform_mod.owned_fmt
+    if owned_fmt is not None:
+        assert not (varlen_m or gather_A or batched or b_kn or swap_ab or concat_layout), (
+            "layout-owning transforms support the plain dense path only"
+        )
+        n_full, k_static = transform_dims
+        # mA is the TransformAOperand bundle (blob + optional strip): ONE
+        # argument slot, the same shape as the runtime views
+        mA = transform_mod.fake_operands(n_full, k_static, tile_shape_mn[0])
+        n_sym = cute.sym_int()
+        # activations: (m_act, k) k-major with a STATIC compact stride
+        # (mark_compact_shape_dynamic(mode=0)). D crosses CALLER-oriented
+        # (m_act, n_full) row-major and is relabeled at trace via
+        # cd_transposed (kernel D = (n_full, m_act) m-major) — the swap-at-
+        # trace convention, so tile-shaped epi operands stay caller-oriented
+        # too (fctx.swapped below).
+        mB = cute.runtime.make_fake_tensor(
+            b_dtype, (n_sym, k_static), stride=(k_static, 1), assumed_align=16
+        )
+        mD = cute.runtime.make_fake_tensor(
+            d_dtype, (n_sym, n_full), stride=(n_full, 1), assumed_align=16
+        )
+        mC = None
+        m, n, k, l = n_full, n_sym, k_static, 1
+    else:
+        mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
+            a_dtype,
+            b_dtype,
+            d_dtype,
+            c_dtype,
+            a_major,
+            b_major,
+            d_major,
+            c_major,
+            varlen_m=varlen_m,
+            gather_A=gather_A,
+            batched=batched,
+            b_kn=b_kn,
+            swap_ab=swap_ab,
+            packed_cd=packed_cd,
+            a_mma_dtype=a_mma_dtype,
+            b_mma_dtype=b_mma_dtype,
+        )
+        if transform_mod is not None and transform_mod.needs_operands:
+            # value transform with runtime operands: A crosses as a (plain A,
+            # operand view) bundle in the one mA slot (same-arity trick as W4)
+            assert not (varlen_m or gather_A or batched or swap_ab or concat_layout), (
+                "transform runtime operands support the plain dense path only"
+            )
+            mA = transform_mod.fake_bundle(
+                mA, a_dtype, tile_shape_mn[0], tile_shape_mn[2] if len(tile_shape_mn) == 3 else None
+            )
+    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab or owned_fmt is not None)
     ops = _ops_by_name(GemmCls)
     fields = {}
     for name, key in epi_keys:
@@ -279,6 +229,7 @@ def _compile_gemm_epi(
         scheduler_args,
         varlen_args,
         post_init=post_init,
+        transform_a=transform_mod,
         mSFA=mSFA,
         mSFB=mSFB,
         use_tma_gather=use_tma_gather,
@@ -288,7 +239,7 @@ def _compile_gemm_epi(
         b_mma_dtype=b_mma_dtype,
         b_transposed=b_kn,
         a_transposed=swap_ab,
-        cd_transposed=swap_ab,
+        cd_transposed=swap_ab or owned_fmt is not None,
         cd_packed=packed_cd,
         split_k=split_k,
         split_k_mode=split_k_mode,
@@ -307,7 +258,7 @@ class GemmEpiPlan(NamedTuple):
 
     compiled_fn: object
     gemm_cls: type
-    is_sm100_family: bool  # SM100/110 take trailing (SFA, SFB) args
+    is_sm100_family: bool  # SM100/110 use 2-CTA MMA
     max_active_clusters: int
     max_swizzle_size: int
     scheduler_uses_semaphore: bool  # only the SM90 dynamic scheduler consumes the semaphore
@@ -329,6 +280,9 @@ class GemmEpiPlan(NamedTuple):
     split_k_mode: object = SplitKMode.SERIAL
     tile_N: int = 0
     cluster_N: int = 1
+    # D crosses caller-oriented and is transposed at trace (layout-owning
+    # transforms): split-k buffer sizing must use kernel orientation (D.mT).
+    d_transposed: bool = False
 
 
 def _get_major(t, m_label, n_label):
@@ -371,9 +325,39 @@ def build_gemm_epi_plan(
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
+    # A-operand transform handle (format name / DecodeFormat / a_transform
+    # mod). Layout-owning transforms: A is the TransformAOperand bundle from
+    # operand_transform.host.w4_operand_views (blob view + optional strip);
+    # the ctor a_dtype comes from the format's mma_dtype.
+    transform_a=None,
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
+    transform_ref, owned_fmt, transform_dims = None, None, None
+    if transform_a is not None:
+        from quack.operand_transform.host import as_transform_mod
+
+        transform_mod = as_transform_mod(transform_a)
+        transform_ref = transform_mod.compile_ref()
+        owned_fmt = transform_mod.owned_fmt
+        if owned_fmt is not None:
+            # A is the TransformAOperand bundle; recover the static problem
+            # geometry for the fake construction (the handle owns the blob
+            # anatomy). Metadata derivation below reads the blob; the bundle
+            # itself never crosses into the picklable compile args.
+            transform_dims = transform_mod.compile_dims(A)
+            A = A.blob
+        elif transform_mod.needs_operands:
+            # value transform with runtime operands: A arrives bundled with
+            # the operand view (transform_a_operand); metadata derivation
+            # reads the plain operand, the bundle itself crosses at launch.
+            from quack.operand_transform.transform import TransformAOperand
+
+            assert isinstance(A, TransformAOperand), (
+                "a transform with runtime operands takes A as "
+                "transform_a_operand(mod, A, values, tile_M)"
+            )
+            A = A.blob
     batched = A.ndim == 3 or varlen_m
     a_major = _get_major(A, "m", "k")
     b_major = _get_major(B, "n", "k")
@@ -392,7 +376,13 @@ def build_gemm_epi_plan(
         a_major = "m" if A.stride(-1) == 1 else "k"
         d_major = ("m" if D.stride(-1) == 1 else "n") if D is not None else None
         c_major = ("m" if C.stride(-1) == 1 else "n") if C is not None else None
-    a_dtype = torch2cute_dtype_map[A.dtype]
+    if owned_fmt is not None:
+        # the ctor a_dtype is the MMA compute dtype the format decodes to,
+        # decoupled from the blob's storage dtype
+        a_dtype = owned_fmt.mma_dtype
+        batched = False
+    else:
+        a_dtype = torch2cute_dtype_map[A.dtype]
     b_dtype = torch2cute_dtype_map[B.dtype]
     d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
     c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
@@ -442,6 +432,8 @@ def build_gemm_epi_plan(
         has_ag=has_ag,
         split_k=split_k,
         split_k_mode=split_k_mode,
+        transform_a_ref=transform_ref,
+        transform_dims=transform_dims,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -455,8 +447,6 @@ def build_gemm_epi_plan(
         if not scheduler_uses_semaphore and not has_ag
         else None
     )
-    from quack.epi_ops import EpiOp
-
     plan_ops = _ops_by_name(GemmCls)
     call_ops = tuple(
         (
@@ -485,6 +475,7 @@ def build_gemm_epi_plan(
         split_k_mode=split_k_mode,
         tile_N=tile_N,
         cluster_N=cluster_N,
+        d_transposed=owned_fmt is not None,
     )
 
 
@@ -503,6 +494,8 @@ def run_gemm_epi_plan(
     A_idx=None,
     SFA=None,
     SFB=None,
+    split_k_buffers=None,  # (sem, ws) raw from _split_k_buffers: reuse across
+    # calls when the kernel leaves them reusable (serial self-resets)
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -520,44 +513,25 @@ def run_gemm_epi_plan(
         if value is not None:
             fields[name] = value
     if plan.split_k > 1:
-        # Fresh per-call buffers (mirrors quack.gemm.run_gemm_plan); lazy import —
-        # quack.gemm sits above this module in the import graph.
-        from quack.gemm import _split_k_buffers
+        if split_k_buffers is None:
+            # Fresh per-call buffers (mirrors quack.gemm.run_gemm_plan); lazy import —
+            # quack.gemm sits above this module in the import graph.
+            from quack.gemm import _split_k_buffers
 
-        sem, ws = _split_k_buffers(
-            D if D.ndim == 3 else D[None],
-            plan.split_k_mode,
-            plan.tile_M,
-            plan.tile_N,
-            plan.cluster_M,
-            plan.cluster_N,
-            plan.is_sm100_family,
-        )
+            Dk = D.mT if plan.d_transposed else D  # size in KERNEL orientation
+            split_k_buffers = _split_k_buffers(
+                Dk if Dk.ndim == 3 else Dk[None],
+                plan.split_k_mode,
+                plan.tile_M,
+                plan.tile_N,
+                plan.cluster_M,
+                plan.cluster_N,
+                plan.is_sm100_family,
+            )
+        sem, ws = split_k_buffers
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
     scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
     launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
-
-
-def gemm_epi_plan_key(A, B, D, C, epi_values, epi_key_overrides=None, *config) -> tuple:
-    """Standard plan-cache key: full tensor metadata for the operands and every
-    epilogue tensor (shapes and strides subsume the majors and the validation
-    asserts), scalar-mode overrides for scalar epi args, plus the config tail.
-    A cache hit is exactly a replay of a previously validated call with
-    different data pointers."""
-    epi_meta = tuple(
-        (name, tensor_key(v) if hasattr(v, "stride") else v is not None)
-        for name, v in sorted(epi_values.items(), key=lambda nv: nv[0])
-    )
-    overrides = tuple(sorted((epi_key_overrides or {}).items()))
-    return (
-        tensor_key(A),
-        tensor_key(B),
-        tensor_key(D),
-        tensor_key(C),
-        epi_meta,
-        overrides,
-        *config,
-    )

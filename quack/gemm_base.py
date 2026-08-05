@@ -3,7 +3,7 @@
 import enum
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -15,8 +15,9 @@ from cutlass.utils import LayoutEnum
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 import quack.utils as utils
+from quack import pipeline_checks
 from quack.cute_dsl_utils import ParamsBase
-from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
+from quack.epilogue.ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
@@ -44,6 +45,30 @@ class NamedBarrierGemm(enum.IntEnum):
     # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
     # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
     ClcThrottle = enum.auto()
+
+
+def reinterpret_packed_fp6(mT, dtype):
+    """View a (mn, 3k/4[, l]) Uint8 tensor as a (mn, k[, l]) packed-fp6 tensor.
+
+    The byte tensor holds a little-endian 6-bit stream along K (element i at
+    bits [6i, 6i+6) of its row), so the K mode (mode 1, stride 1 - sub-byte
+    operands are K-major) scales by 8/6 in extent and keeps stride 1. The K
+    EXTENT conversion is exact: K % 128 makes every row whole 96-byte groups.
+
+    The non-K STRIDE conversion (x4//3, floor) is NOT exact for byte pitches
+    that aren't multiples of 3 (e.g. a padded 416 B row pitch -> 554.67 fp6
+    elements, floored to 554 = 415.5 B). This is safe because the FFI arg
+    spec admits only 32 B-aligned pitches and the tensormap encode rounds the
+    element stride back to the nearest TMA granule, recovering the true pitch
+    exactly: the residue is < 0.75 B either way (verified bit-exact with
+    poisoned padding at pitches 416/448/544/4128, both floor and ceil -
+    AI/probe_fp6_pitch.py). The 32 B stride validation is load-bearing for
+    correctness here, not just for the tensormap's alignment rule.
+    """
+    shape = tuple(s * 4 // 3 if i == 1 else s for i, s in enumerate(mT.shape))
+    stride = tuple(st if i == 1 else st * 4 // 3 for i, st in enumerate(mT.stride))
+    ptr = cute.recast_ptr(mT.iterator, dtype=dtype)
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
 
 
 class GemmBase:
@@ -99,8 +124,15 @@ class GemmBase:
         8-element-divisible fakes, so halves are 4-divisible)."""
         packed_dim = 1 if self.cd_packed == "n" else 0
         shape = tuple(s // 2 if i == packed_dim else s for i, s in enumerate(mT.shape))
+        # Halve every stride except the packed dim's unit stride. Static
+        # strides halve too (a fully-static tensor, e.g. a direct-compiled
+        # prototype, carries its real row stride statically); only the
+        # interface's dynamic fakes hit the assume branch.
         stride = tuple(
-            s if const_expr(cute.is_static(s)) else cute.assume(s // 2, divby=4) for s in mT.stride
+            s
+            if const_expr(i == packed_dim)
+            else (s // 2 if const_expr(cute.is_static(s)) else cute.assume(s // 2, divby=4))
+            for i, s in enumerate(mT.stride)
         )
         return cute.make_tensor(
             cute.recast_ptr(mT.iterator, dtype=cutlass.Float32),
@@ -200,6 +232,13 @@ class GemmBase:
     def epi_smem_warp_shape_mnk(self):
         return (self.num_epi_warps, 1, 1)
 
+    def epi_r2s_pair_xor(self) -> bool:
+        """Whether the D r2s copy uses the conflict-free pair-XOR STS.32 split
+        (see copy_utils.cvt_copy_pair_xor_sts32) instead of vectorized STS.64.
+        Only valid where the acc fragment holds contiguous column pairs and the
+        epi smem swizzle makes the vectorized store 2-way conflicted."""
+        return False
+
     def _init_split_k(self, split_k: int, split_k_mode: int):
         """Validate and store the constexpr split-K configuration. Call after self.gather_A."""
         assert split_k >= 1, "split_k must be >= 1"
@@ -237,6 +276,8 @@ class GemmBase:
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        from cutlass.cute.experimental import iket
+
         has_C = const_expr(tRS_rC is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
@@ -332,7 +373,10 @@ class GemmBase:
             load_acc_subtile(tRS_rD, epi_coord)
             if const_expr(has_epi_load):
                 if const_expr(use_tma_c):
+                    iket.range_push("epi_c_wait")
                     epi_pipeline.consumer_wait(epi_read_state)
+                    iket.range_pop()
+                    iket.range_push("epi_c_s2r")
                     if const_expr(has_C):
                         cute.copy(
                             tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
@@ -341,6 +385,7 @@ class GemmBase:
                     cute.arch.fence_view_async_shared()
                     epi_pipeline.consumer_release(epi_read_state)
                     epi_read_state.advance()
+                    iket.range_pop()
                 else:
                     c_buffer = epi_idx % self.epi_c_stage
                     cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, c_buffer], tSR_rC)
@@ -364,7 +409,9 @@ class GemmBase:
             # Returns a tuple of register tensors — one per aux output.
             # Length matches ``aux_out_ctxs``. ``()`` for the default
             # epilogue (no aux output).
+            iket.range_push("epi_math")
             tRS_rAuxOuts = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            iket.range_pop()
             self.epi_end_loop(
                 params,
                 epi_tensors,
@@ -389,6 +436,7 @@ class GemmBase:
                 )
                 for i in range(len(aux_out_ctxs))
             )
+            iket.range_push("epi_store_acq")
             if const_expr(use_tma_epi):
                 if is_tma_warp:
                     epi_store_pipeline.producer_acquire()
@@ -396,7 +444,9 @@ class GemmBase:
                 epilogue_barrier.arrive_and_wait()
             if const_expr(use_tma_epi):
                 epilogue_barrier.arrive_and_wait()
+            iket.range_pop()
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+            iket.range_push("epi_r2s")
             if const_expr(has_D):
                 tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
                 if const_expr(use_stochastic_rounding):
@@ -406,6 +456,8 @@ class GemmBase:
                         num_prev_subtiles + epi_idx,
                     )
                     copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
+                elif const_expr(self.epi_r2s_pair_xor()):
+                    copy_utils.cvt_copy_pair_xor_sts32(tRS_rD, tRS_sD_cur, tidx)
                 else:
                     copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
             # Copy each aux output from registers to shared memory. All share
@@ -419,7 +471,9 @@ class GemmBase:
                     tiled_copy_aux_out_r2s.retile(tRS_rAuxOuts_out[i]).contiguous(),
                     tRS_sAuxOut[None, None, None, epi_buffer],
                 )
+            iket.range_pop()
             if const_expr(use_tma_epi):
+                iket.range_push("epi_store_issue")
                 cute.arch.fence_view_async_shared()
                 epilogue_barrier.arrive_and_wait()
                 if is_tma_warp:
@@ -433,6 +487,7 @@ class GemmBase:
                             if store_pred:
                                 copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
+                iket.range_pop()
             else:
                 epilogue_barrier.arrive_and_wait()
                 if const_expr(has_D):
@@ -727,8 +782,14 @@ class GemmBase:
                 # scheduler needs the true L (it scales the work-id space by num_split_k
                 # itself). B always carries the true L here (varlen is rejected).
                 num_problems = mB.shape[2]
+            # Layout-owning transform_a: mA is not an (M, K) operand (e.g. a
+            # repacked blob), so the M extent comes from D instead.
+            a_owned = (
+                getattr(self, "transform_a", None) is not None and self.transform_a.owns_a_layout
+            )
+            m_size = cute.size(mA, mode=[0]) if const_expr(not a_owned) else cute.size(mD, mode=[0])
             problem_shape_ntile_mnl = (
-                cute.ceil_div(cute.size(mA, mode=[0]), self.cta_tile_shape_mnk[0]),
+                cute.ceil_div(m_size, self.cta_tile_shape_mnk[0]),
                 cute.ceil_div(cute.size(mB, mode=[0]), self.cta_tile_shape_mnk[1]),
                 num_problems,
             )
@@ -1008,6 +1069,8 @@ class GemmTmaBase(GemmBase):
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         varlen_k: bool,
+        a_internal_type: Optional[Type[cutlass.Numeric]] = None,
+        b_internal_type: Optional[Type[cutlass.Numeric]] = None,
     ):
         tma_atom_a, tma_tensor_a = None, None
         if const_expr(not self.gather_A):
@@ -1018,12 +1081,14 @@ class GemmTmaBase(GemmBase):
                 a_smem_layout,
                 (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
                 self.cluster_shape_mnk[1],
+                internal_type=a_internal_type,
             )
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
             b_smem_layout,
             (self.cta_tile_shape_mnk[1], self.cta_tile_shape_mnk[2]),
             self.cluster_shape_mnk[0],
+            internal_type=b_internal_type,
         )
         return tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b
 
@@ -1101,10 +1166,39 @@ class GemmTmaBase(GemmBase):
     ):
         # Threads/warps participating in this pipeline
         producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
+        # B's TMA warp contributes 1 (elect_one arrive_and_expect_tx); with gather_A the
+        # cp.async producer warps contribute all 32 lanes each (cp.async.mbarrier.arrive).
+        pipeline_checks.check_arrive_count(
+            "sm90 ab_pipeline.producer",
+            producer_cnt,
+            pipeline_checks.tma_producer_arrives(
+                num_tma_warps=1,
+                cpasync_warps=0 if const_expr(not self.gather_A) else self.num_ab_load_warps,
+            ),
+            gather_A=self.gather_A,
+            num_ab_load_warps=self.num_ab_load_warps,
+        )
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         consumer_arrive_cnt = mcast_size * tiled_mma.size // cute.arch.WARP_SIZE
+        # One arrive per consumer (mma) warp, delivered to every CTA in this CTA's A- and
+        # B-multicast groups (self counted once).
+        pipeline_checks.check_arrive_count(
+            "sm90 ab_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(
+                tiled_mma.size // cute.arch.WARP_SIZE,
+                per_warp=True,
+                ctas_routed=pipeline_checks.mcast_peer_ctas(
+                    num_mcast_ctas_a=self.num_mcast_ctas_a,
+                    num_mcast_ctas_b=self.num_mcast_ctas_b,
+                ),
+            ),
+            num_mma_warps=tiled_mma.size // cute.arch.WARP_SIZE,
+            num_mcast_ctas_a=self.num_mcast_ctas_a,
+            num_mcast_ctas_b=self.num_mcast_ctas_b,
+        )
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1125,6 +1219,15 @@ class GemmTmaBase(GemmBase):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         # Each warp will contribute 1 to the arrive count
         consumer_arrive_cnt = self.num_epi_warps
+        # One arrive per epilogue warp (elected lane), CTA-local barrier; per_warp bound
+        # to the elect_one_release flag passed to create below.
+        elect_one_release = True
+        pipeline_checks.check_arrive_count(
+            "epi_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(self.num_epi_warps, per_warp=elect_one_release),
+            num_epi_warps=self.num_epi_warps,
+        )
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1134,7 +1237,7 @@ class GemmTmaBase(GemmBase):
             consumer_group=epi_pipeline_consumer_group,
             tx_count=tx_count,
             defer_sync=True,
-            elect_one_release=True,
+            elect_one_release=elect_one_release,
             syncwarp_before_release=True,
         )
 
@@ -1172,10 +1275,18 @@ class GemmTmaBase(GemmBase):
         smem_layout: cute.ComposedLayout,
         smem_tile: Tuple[int, int],
         mcast_dim: int,
+        internal_type: Optional[Type[cutlass.Numeric]] = None,
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
-        """Create TMA atoms and tensors for input tensors."""
+        """Create TMA atoms and tensors for input tensors.
+
+        ``internal_type=Int8`` with a packed-fp4 gmem tensor selects the
+        16U4_ALIGN8B tensormap (SM120 mixed fp4 x fp8): each 16-element group
+        lands as 8 packed-nibble bytes + 8 pad bytes of smem footprint, ready
+        for the ldsm.b4x16_p64 unpacking ldmatrix."""
         # block_copy takes compiler-driven multicast metadata at the copy site,
         # so the TMA atom itself must stay the non-multicast variant here.
         op = cpasync.CopyBulkTensorTileG2SOp()
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(op, tensor, smem_layout, smem_tile)
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+            op, tensor, smem_layout, smem_tile, internal_type=internal_type
+        )
         return tma_atom, tma_tensor

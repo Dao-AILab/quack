@@ -248,6 +248,106 @@ def dgelu_tanh_approx(
 
 
 @dsl_user_op
+def gelu_erf(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    """Exact GELU (torch approximate='none', timm/torchvision ViT default):
+    gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    """
+    inv_sqrt_2 = 1.0 / math.sqrt(2.0)
+    if const_expr(not isinstance(x, tuple)):
+        u = cute.math.erf(x * inv_sqrt_2, fastmath=True, loc=loc, ip=ip)
+        return 0.5 * (x * u + x)
+    else:
+        x_scaled = cute.arch.mul_packed_f32x2(x, (inv_sqrt_2, inv_sqrt_2))
+        u = (
+            cute.math.erf(x_scaled[0], fastmath=True, loc=loc, ip=ip),
+            cute.math.erf(x_scaled[1], fastmath=True, loc=loc, ip=ip),
+        )
+        x_u_plus_x = cute.arch.fma_packed_f32x2(u, x, x)
+        return cute.arch.mul_packed_f32x2((0.5, 0.5), x_u_plus_x)
+
+
+@dsl_user_op
+def dgelu_erf(
+    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
+) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    """Exact-GELU backward: computes gradient w.r.t. x and recomputes forward.
+    d/dx[gelu(x)] = Phi(x) + x * phi(x), with Phi(x) = 0.5 * (1 + erf(x/sqrt(2)))
+    (the standard normal CDF) and phi(x) = exp(-x^2/2) / sqrt(2*pi) (the PDF).
+    Returns: (dx, gelu_out)
+    """
+    inv_sqrt_2 = 1.0 / math.sqrt(2.0)
+    inv_sqrt_2pi = 1.0 / math.sqrt(2.0 * math.pi)
+    neg_half_log2_e = -0.5 * math.log2(math.e)  # exp(-x^2/2) = exp2(x^2 * this)
+    if const_expr(not isinstance(x, tuple)):
+        u = cute.math.erf(x * inv_sqrt_2, fastmath=True, loc=loc, ip=ip)
+        cdf = 0.5 + 0.5 * u
+        gelu_out = x * cdf
+        pdf_exp = cute.math.exp2(x * x * neg_half_log2_e, fastmath=True, loc=loc, ip=ip)
+        dgelu = x * (inv_sqrt_2pi * pdf_exp) + cdf
+        dx = dout * dgelu
+        return dx, gelu_out
+    else:
+        x_scaled = cute.arch.mul_packed_f32x2(x, (inv_sqrt_2, inv_sqrt_2))
+        u = (
+            cute.math.erf(x_scaled[0], fastmath=True, loc=loc, ip=ip),
+            cute.math.erf(x_scaled[1], fastmath=True, loc=loc, ip=ip),
+        )
+        cdf = cute.arch.fma_packed_f32x2(u, (0.5, 0.5), (0.5, 0.5))
+        gelu_out = cute.arch.mul_packed_f32x2(x, cdf)
+        x_sq_scaled = cute.arch.mul_packed_f32x2(
+            cute.arch.mul_packed_f32x2(x, x), (neg_half_log2_e, neg_half_log2_e)
+        )
+        pdf_exp = (
+            cute.math.exp2(x_sq_scaled[0], fastmath=True, loc=loc, ip=ip),
+            cute.math.exp2(x_sq_scaled[1], fastmath=True, loc=loc, ip=ip),
+        )
+        x_pdf = cute.arch.mul_packed_f32x2(
+            cute.arch.mul_packed_f32x2(x, (inv_sqrt_2pi, inv_sqrt_2pi)), pdf_exp
+        )
+        dgelu = cute.arch.add_packed_f32x2(x_pdf, cdf)
+        dx = cute.arch.mul_packed_f32x2(dout, dgelu)
+        return dx, gelu_out
+
+
+@dsl_user_op
+def quick_gelu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    """QuickGELU (CLIP lineage): x * sigmoid(1.702 * x)."""
+    alpha = 1.702
+    if const_expr(not isinstance(x, tuple)):
+        return x * sigmoid(alpha * x, loc=loc, ip=ip)
+    else:
+        s = sigmoid(cute.arch.mul_packed_f32x2(x, (alpha, alpha)), loc=loc, ip=ip)
+        return cute.arch.mul_packed_f32x2(x, s)
+
+
+@dsl_user_op
+def dquick_gelu(
+    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
+) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    """QuickGELU backward: computes gradient w.r.t. x and recomputes forward.
+    With s = sigmoid(1.702 * x) and out = x * s:
+    d/dx = s + 1.702 * x * s * (1 - s) = s + 1.702 * out * (1 - s)
+    Returns: (dx, out)
+    """
+    alpha = 1.702
+    if const_expr(not isinstance(x, tuple)):
+        s = sigmoid(alpha * x, loc=loc, ip=ip)
+        out = x * s
+        dgelu = alpha * (out * (1.0 - s)) + s
+        dx = dout * dgelu
+        return dx, out
+    else:
+        s = sigmoid(cute.arch.mul_packed_f32x2(x, (alpha, alpha)), loc=loc, ip=ip)
+        out = cute.arch.mul_packed_f32x2(x, s)
+        one_minus_s = sub_packed_f32x2((1.0, 1.0), s)
+        dgelu = cute.arch.fma_packed_f32x2(
+            cute.arch.mul_packed_f32x2(out, one_minus_s), (alpha, alpha), s
+        )
+        dx = cute.arch.mul_packed_f32x2(dout, dgelu)
+        return dx, out
+
+
+@dsl_user_op
 @cute.jit
 def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     if const_expr(not isinstance(x, tuple)):
@@ -514,13 +614,92 @@ def dswiglu_tanh(
 
 
 @dsl_user_op
+def _minnumf(x: F32_or_F32x2, c: float, *, loc=None, ip=None) -> F32_or_F32x2:
+    # NaN-PROPAGATING arith.minimumf -> ONE FMNMX.NAN, and the DSL vectorizer
+    # handles arith ops (see relu's note). NOT arith.minnumf: its IEEE minNum
+    # semantics (NaN -> other operand) cost a 4-op FSETP.NAN/FSETP/FSELx2
+    # expansion in SASS, and would silently clamp NaN preacts to the limit
+    # where torch.clamp propagates them.
+    if const_expr(not isinstance(x, tuple)):
+        return Float32(
+            arith.minimumf(
+                Float32(x).ir_value(loc=loc, ip=ip),
+                Float32(c).ir_value(loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
+        )
+    else:
+        return _minnumf(x[0], c, loc=loc, ip=ip), _minnumf(x[1], c, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _maxnumf(x: F32_or_F32x2, c: float, *, loc=None, ip=None) -> F32_or_F32x2:
+    if const_expr(not isinstance(x, tuple)):
+        return Float32(
+            arith.maximumf(
+                Float32(x).ir_value(loc=loc, ip=ip),
+                Float32(c).ir_value(loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
+        )
+    else:
+        return _maxnumf(x[0], c, loc=loc, ip=ip), _maxnumf(x[1], c, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@cute.jit
+def _where_le(val: F32_or_F32x2, x: F32_or_F32x2, c: float, *, loc=None, ip=None) -> F32_or_F32x2:
+    """val where x <= c else 0, elementwise — the clamp-saturation grad mask
+    (boundary-inclusive, matching torch.clamp backward)."""
+    if const_expr(not isinstance(val, tuple)):
+        return val if Boolean(x <= c) else Float32(0.0)
+    else:
+        return (
+            _where_le(val[0], x[0], c, loc=loc, ip=ip),
+            _where_le(val[1], x[1], c, loc=loc, ip=ip),
+        )
+
+
+@dsl_user_op
+@cute.jit
+def _where_abs_le(
+    val: F32_or_F32x2, x: F32_or_F32x2, c: float, *, loc=None, ip=None
+) -> F32_or_F32x2:
+    """val where |x| <= c else 0 — the two-sided clamp mask as ONE compare +
+    one select: FSETP takes an |x| operand modifier, so this beats the naive
+    (x <= c) & (x >= -c) spelling by a setp+sel pair per element. NaN corner:
+    |NaN| <= c is false, so val(NaN) masks to 0 either way."""
+    if const_expr(not isinstance(val, tuple)):
+        return val if Boolean(abs(x) <= c) else Float32(0.0)
+    else:
+        return (
+            _where_abs_le(val[0], x[0], c, loc=loc, ip=ip),
+            _where_abs_le(val[1], x[1], c, loc=loc, ip=ip),
+        )
+
+
+@dsl_user_op
 def swiglu_oai(
-    x: F32_or_F32x2, y: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
+    x: F32_or_F32x2,
+    y: F32_or_F32x2,
+    alpha: float = 1.702,
+    limit: float = math.inf,
+    *,
+    loc=None,
+    ip=None,
 ) -> F32_or_F32x2:
     """The swiglu variant used in gpt-oss, which has a scaling factor on x and bias of 1 to y.
     https://github.com/openai/gpt-oss/blob/7be9334950053a888e24887a57dac797a17d6e00/gpt_oss/torch/model.py#L249
     x * sigmoid(alpha * x) * (y + 1)
+    A finite ``limit`` applies the gpt-oss preact clamp (their swiglu_limit=7.0):
+    x <- min(x, limit) (above only), y <- clamp(y, -limit, limit). The default
+    inf compiles the clamp out.
     """
+    if const_expr(limit != math.inf):
+        x = _minnumf(x, limit, loc=loc, ip=ip)
+        y = _maxnumf(_minnumf(y, limit, loc=loc, ip=ip), -limit, loc=loc, ip=ip)
     if const_expr(not isinstance(x, tuple)):
         sigmoid_alpha_x = sigmoid(alpha * x)
         silu_x = x * sigmoid_alpha_x
@@ -534,9 +713,18 @@ def swiglu_oai(
 
 @dsl_user_op
 def swiglu_oai_tanh(
-    x: F32_or_F32x2, y: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
+    x: F32_or_F32x2,
+    y: F32_or_F32x2,
+    alpha: float = 1.702,
+    limit: float = math.inf,
+    *,
+    loc=None,
+    ip=None,
 ) -> F32_or_F32x2:
     """Tanh-based swiglu_oai kept for SASS/accuracy comparison."""
+    if const_expr(limit != math.inf):
+        x = _minnumf(x, limit, loc=loc, ip=ip)
+        y = _maxnumf(_minnumf(y, limit, loc=loc, ip=ip), -limit, loc=loc, ip=ip)
     if const_expr(not isinstance(x, tuple)):
         x_half = 0.5 * x
         silu_x = x_half * tanh(alpha * x_half) + x_half
@@ -551,7 +739,14 @@ def swiglu_oai_tanh(
 
 @dsl_user_op
 def dswiglu_oai(
-    x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
+    x: F32_or_F32x2,
+    y: F32_or_F32x2,
+    dout: F32_or_F32x2,
+    alpha: float = 1.702,
+    limit: float = math.inf,
+    *,
+    loc=None,
+    ip=None,
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
     """
     Swiglu OAI backward pass: computes gradients w.r.t. x and y
@@ -560,7 +755,16 @@ def dswiglu_oai(
 
     Derivative of x * sigmoid(alpha * x) w.r.t. x:
     d/dx[x * sigmoid(alpha * x)] = sigmoid(alpha * x) + alpha * x * sigmoid(alpha * x) * (1 - sigmoid(alpha * x))
+
+    A finite ``limit`` applies the gpt-oss preact clamp (see swiglu_oai): the
+    math runs on the clamped preacts and the grads are zeroed where the clamp
+    saturates (dx where x > limit; dy where |y| > limit), boundary-inclusive
+    like torch.clamp backward.
     """
+    x_raw, y_raw = x, y
+    if const_expr(limit != math.inf):
+        x = _minnumf(x, limit, loc=loc, ip=ip)
+        y = _maxnumf(_minnumf(y, limit, loc=loc, ip=ip), -limit, loc=loc, ip=ip)
     if const_expr(not isinstance(x, tuple)):
         sigmoid_alpha_x = sigmoid(alpha * x)
         silu_x = x * sigmoid_alpha_x
@@ -574,7 +778,6 @@ def dswiglu_oai(
         dx = d_silu_x_dout * y + d_silu_x_dout
         dy = silu_x_dout
         swiglu_out = silu_x * y + silu_x
-        return dx, dy, swiglu_out
     else:
         alpha_x = cute.arch.mul_packed_f32x2((alpha, alpha), x)
         sigmoid_alpha_x = sigmoid(alpha_x)
@@ -590,14 +793,28 @@ def dswiglu_oai(
         dx = cute.arch.fma_packed_f32x2(d_silu_x_dout, y, d_silu_x_dout)
         dy = silu_x_dout
         swiglu_out = cute.arch.fma_packed_f32x2(silu_x, y, silu_x)
-        return dx, dy, swiglu_out
+    if const_expr(limit != math.inf):
+        dx = _where_le(dx, x_raw, limit, loc=loc, ip=ip)
+        dy = _where_abs_le(dy, y_raw, limit, loc=loc, ip=ip)
+    return dx, dy, swiglu_out
 
 
 @dsl_user_op
 def dswiglu_oai_tanh(
-    x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
+    x: F32_or_F32x2,
+    y: F32_or_F32x2,
+    dout: F32_or_F32x2,
+    alpha: float = 1.702,
+    limit: float = math.inf,
+    *,
+    loc=None,
+    ip=None,
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
     """Tanh-based dswiglu_oai kept for SASS/accuracy comparison."""
+    x_raw, y_raw = x, y
+    if const_expr(limit != math.inf):
+        x = _minnumf(x, limit, loc=loc, ip=ip)
+        y = _maxnumf(_minnumf(y, limit, loc=loc, ip=ip), -limit, loc=loc, ip=ip)
     if const_expr(not isinstance(x, tuple)):
         alpha_x_half = (0.5 * alpha) * x
         sigmoid_alpha_x = 0.5 + 0.5 * tanh(alpha_x_half)
@@ -611,7 +828,6 @@ def dswiglu_oai_tanh(
         dx = d_silu_x_dout * y + d_silu_x_dout
         dy = silu_x_dout
         swiglu_out = silu_x * y + silu_x
-        return dx, dy, swiglu_out
     else:
         alpha_x_half = cute.arch.mul_packed_f32x2(((0.5 * alpha), (0.5 * alpha)), x)
         tanh_alpha_x_half = tanh(alpha_x_half)
@@ -628,7 +844,10 @@ def dswiglu_oai_tanh(
         dx = cute.arch.fma_packed_f32x2(d_silu_x_dout, y, d_silu_x_dout)
         dy = silu_x_dout
         swiglu_out = cute.arch.fma_packed_f32x2(silu_x, y, silu_x)
-        return dx, dy, swiglu_out
+    if const_expr(limit != math.inf):
+        dx = _where_le(dx, x_raw, limit, loc=loc, ip=ip)
+        dy = _where_abs_le(dy, y_raw, limit, loc=loc, ip=ip)
+    return dx, dy, swiglu_out
 
 
 @dsl_user_op
@@ -776,6 +995,8 @@ act_fn_map = {
     "relu": relu,
     "relu_sq": relu_sq,
     "gelu_tanh_approx": gelu_tanh_approx,
+    "gelu_erf": gelu_erf,
+    "quick_gelu": quick_gelu,
     "tanh": tanh,
 }
 
@@ -786,6 +1007,8 @@ dact_fn_map = {
     "relu": drelu,
     "relu_sq": drelu_sq,
     "gelu_tanh_approx": dgelu_tanh_approx,
+    "gelu_erf": dgelu_erf,
+    "quick_gelu": dquick_gelu,
     "tanh": dtanh,
 }
 

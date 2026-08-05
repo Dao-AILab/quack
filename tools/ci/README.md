@@ -13,7 +13,7 @@ and on PRs.
 | `tools/ci/docker/tag_and_push.sh` | tag and push to `tridao/quack-kernels` on Docker Hub |
 | `.github/workflows/_test.yml` | reusable workflow with lint/changes/test jobs and the matrix; **the image tag pins live here** |
 | `.github/workflows/ci.yml`, `ci-pr.yml` | thin shells that call `_test.yml` on push / PR |
-| `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs two-pass pytest |
+| `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs single-pass pytest |
 
 ## Image variants
 
@@ -41,9 +41,11 @@ compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
 - `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24`
-  (free-memory threshold 50 GB). Cold kernel-compile misses are shipped to a
-  pool of 24 CPU workers (forkserver sidecar, GPU-blind) while the affected
-  tests defer and retry once their `.o` lands; warm runs pay nothing. The
+  (free-memory threshold 50 GB). The action waits up to 5 minutes, polling
+  every 15 seconds, when runner assignment races with transient GPU
+  contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
+  workers (forkserver sidecar, GPU-blind) while the affected tests defer and
+  retry once their `.o` lands; warm runs pay nothing. The
   persistent kernel cache (`QUACK_CACHE_DIR`) carries `.o` files across runs
   on the same runner. CI prunes QuACK source-fingerprint cache directories
   older than 7 days before each test run, plus interrupted `.o.tmp.*` exports

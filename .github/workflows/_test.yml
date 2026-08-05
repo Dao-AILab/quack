@@ -27,7 +27,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Install ruff
-        run: pip install ruff
+        # Pin to the same version as .pre-commit-config.yaml — ruff releases
+        # change default rule selection and formatter output (0.16.0 went from
+        # 59 to 413 default rules), so an unpinned install breaks lint on
+        # upstream releases with no repo change.
+        run: pip install ruff==0.11.13
       - name: Ruff check
         run: ruff check quack/ tests/
       - name: Ruff format

@@ -76,9 +76,7 @@ def _run_rank():
         sfa_full = pack_scale_2d_to_blocked_contig(
             sc_full.view(torch.float8_e8m0fnu).view(1, m_total, k // SF_VEC)
         )
-        packed_shard = pack_scale_2d_to_blocked_contig(
-            a_sc.view(1, a_sc.shape[0], k // SF_VEC)
-        )
+        packed_shard = pack_scale_2d_to_blocked_contig(a_sc.view(1, a_sc.shape[0], k // SF_VEC))
         sfa_cat = torch.empty(sfa_full.numel(), dtype=torch.uint8, device=device)
         dist.all_gather_into_tensor(sfa_cat, packed_shard.view(torch.uint8).view(-1))
         if not torch.equal(sfa_cat, sfa_full.view(torch.uint8).view(-1)):
@@ -88,9 +86,20 @@ def _run_rank():
     def gated(runner, fmt_a, fmt_b, shard_op, b_q, sfb, d):
         with runner.gather(shard_op) as (a_op, ag_args):
             quack_gemm(
-                a_op.qdata, b_q, d, None, None, tm, tn, cm, cn,
-                SFA=a_op.scale, SFB=sfb,
-                bs_format_a=fmt_a, bs_format_b=fmt_b, ag_args=ag_args,
+                a_op.qdata,
+                b_q,
+                d,
+                None,
+                None,
+                tm,
+                tn,
+                cm,
+                cn,
+                SFA=a_op.scale,
+                SFB=sfb,
+                bs_format_a=fmt_a,
+                bs_format_b=fmt_b,
+                ag_args=ag_args,
             )
         return a_op
 
@@ -108,18 +117,36 @@ def _run_rank():
             sfb = pack_scale_2d_to_blocked_contig(b_sc.view(1, n, k // SF_VEC))
             for it in range(3):
                 torch.manual_seed(1000 * it + 10 * hash((fmt_a, fmt_b)) % 7919 + rank)
-                a_hp = (torch.randn(shard_m, k, dtype=torch.bfloat16, device=device) / 8).contiguous()
+                a_hp = (
+                    torch.randn(shard_m, k, dtype=torch.bfloat16, device=device) / 8
+                ).contiguous()
                 a_q, a_sc = quantize(fmt_a, a_hp)
                 a_q_full, sfa_full = nccl_gathered(fmt_a, a_q, a_sc, m_total, k)
                 d_ref = torch.empty(m_total, n, dtype=torch.bfloat16, device=device)
                 quack_gemm(
-                    a_q_full, b_q, d_ref, None, None, tm, tn, cm, cn,
-                    SFA=sfa_full, SFB=sfb, bs_format_a=fmt_a, bs_format_b=fmt_b,
+                    a_q_full,
+                    b_q,
+                    d_ref,
+                    None,
+                    None,
+                    tm,
+                    tn,
+                    cm,
+                    cn,
+                    SFA=sfa_full,
+                    SFB=sfb,
+                    bs_format_a=fmt_a,
+                    bs_format_b=fmt_b,
                 )
                 d = torch.empty_like(d_ref)
                 a_op = gated(
-                    runners[fmt_a], fmt_a, fmt_b,
-                    shard_operand(fmt_a, a_q, a_sc, shard_m, k), b_q, sfb, d,
+                    runners[fmt_a],
+                    fmt_a,
+                    fmt_b,
+                    shard_operand(fmt_a, a_q, a_sc, shard_m, k),
+                    b_q,
+                    sfb,
+                    d,
                 )
                 torch.cuda.synchronize(device)
                 dist.barrier()  # peers' pushes into MY buffers must have landed
@@ -145,8 +172,21 @@ def _run_rank():
     a_q, a_sc = quantize(fmt, a_hp)
     a_q_full, sfa_full = nccl_gathered(fmt, a_q, a_sc, m_total, k)
     d_ref = torch.empty(m_total, n, dtype=torch.bfloat16, device=device)
-    quack_gemm(a_q_full, b_q, d_ref, None, None, tm, tn, cm, cn,
-               SFA=sfa_full, SFB=sfb, bs_format_a=fmt, bs_format_b=fmt)
+    quack_gemm(
+        a_q_full,
+        b_q,
+        d_ref,
+        None,
+        None,
+        tm,
+        tn,
+        cm,
+        cn,
+        SFA=sfa_full,
+        SFB=sfb,
+        bs_format_a=fmt,
+        bs_format_b=fmt,
+    )
     with torch.cuda.stream(ag.push_stream):
         torch.cuda._sleep(int(50e6))  # ~25 ms at 2 GHz
     d = torch.empty_like(d_ref)
@@ -160,8 +200,20 @@ def _run_rank():
     d = torch.empty_like(d_ref)
     with ag.gather(a_q.view(torch.uint8).contiguous()) as (a_full_u8, ag_args):
         quack_gemm(
-            a_full_u8.view(a_dtypes[fmt]), b_q, d, None, None, tm, tn, cm, cn,
-            SFA=sfa_full, SFB=sfb, bs_format_a=fmt, bs_format_b=fmt, ag_args=ag_args,
+            a_full_u8.view(a_dtypes[fmt]),
+            b_q,
+            d,
+            None,
+            None,
+            tm,
+            tn,
+            cm,
+            cn,
+            SFA=sfa_full,
+            SFB=sfb,
+            bs_format_a=fmt,
+            bs_format_b=fmt,
+            ag_args=ag_args,
         )
     torch.cuda.synchronize(device)
     dist.barrier()
@@ -174,8 +226,9 @@ def _run_rank():
     # --- Outer-capture smoke: THREE whole calls (odd — the parity-hard case,
     # see test_distributed_gemm.py), replayed with mutated inputs.
     in_q = torch.zeros_like(a_q.view(torch.uint8))
-    in_sf = torch.zeros(shard_m // 128, k // SF_VEC // 4, 32, 4, 4,
-                        dtype=torch.uint8, device=device)
+    in_sf = torch.zeros(
+        shard_m // 128, k // SF_VEC // 4, 32, 4, 4, dtype=torch.uint8, device=device
+    )
     cap_op = BlockScaledOperand(in_q.view(a_dtypes[fmt]), in_sf, fmt)
     d1 = torch.empty_like(d_ref)
     d2 = torch.empty_like(d_ref)
@@ -195,16 +248,29 @@ def _run_rank():
         a_q_it, a_sc_it = quantize(fmt, a_hp)
         in_q.copy_(a_q_it.view(torch.uint8))
         in_sf.copy_(
-            pack_scale_2d_to_blocked_contig(
-                a_sc_it.view(1, shard_m, k // SF_VEC)
-            ).view(torch.uint8).squeeze(0)
+            pack_scale_2d_to_blocked_contig(a_sc_it.view(1, shard_m, k // SF_VEC))
+            .view(torch.uint8)
+            .squeeze(0)
         )
         g.replay()
         torch.cuda.synchronize(device)
         dist.barrier()
         a_q_full, sfa_full = nccl_gathered(fmt, a_q_it, a_sc_it, m_total, k)
-        quack_gemm(a_q_full, b_q, d_ref, None, None, tm, tn, cm, cn,
-                   SFA=sfa_full, SFB=sfb, bs_format_a=fmt, bs_format_b=fmt)
+        quack_gemm(
+            a_q_full,
+            b_q,
+            d_ref,
+            None,
+            None,
+            tm,
+            tn,
+            cm,
+            cn,
+            SFA=sfa_full,
+            SFB=sfb,
+            bs_format_a=fmt,
+            bs_format_b=fmt,
+        )
         torch.cuda.synchronize(device)
         for name, dd in (("d1", d1), ("d2", d2)):
             if not torch.equal(dd, d_ref):

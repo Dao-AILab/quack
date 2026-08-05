@@ -6,9 +6,9 @@ torch references, independent of the variant wrappers."""
 import pytest
 import torch
 
-from quack.epi_ops import ColVecReduce, RowVecReduce
+from quack.epilogue.ops import ColVecReduce, RowVecReduce
 from quack.gemm_config import GemmConfig
-from quack.gemm_epilogue import gemm_epilogue
+from quack.epilogue.frontend import gemm_epilogue
 
 torch.manual_seed(0)
 
@@ -162,7 +162,7 @@ def test_batched_3d():
 
 
 def test_eager_tuned_smoke():
-    """tuned=True rides quack.epi_autotune (sweep once per metadata class,
+    """tuned=True rides quack.gemm_runtime.autotune (sweep once per metadata class,
     warm replay after); numerics must match the pinned-config call."""
     A, B = _inputs(m=256, n=512, k=256)
     bias = torch.randn(1, B.shape[-1], device="cuda", dtype=torch.float32)
@@ -189,7 +189,7 @@ def test_from_class_static():
     plain D = A @ B)."""
     from quack.cute_dsl_utils import get_device_capacity
     from quack.gemm import GemmDefaultSm100
-    from quack.gemm_epilogue import epilogue_from_class
+    from quack.epilogue.frontend import epilogue_from_class
 
     # quack capability, not torch's: QUACK_ARCH overrides (e.g. the CI sm120
     # legs) dispatch non-SM100 classes on SM100 hardware.

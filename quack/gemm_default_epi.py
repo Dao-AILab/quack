@@ -6,8 +6,8 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
 
 from quack.cute_dsl_utils import mlir_namedtuple
-from quack.epi_composable import ComposableEpiMixin
-from quack.epi_ops import Scalar, RowVecLoad, ColVecLoad
+from quack.epilogue.mixin import ComposableEpiMixin
+from quack.epilogue.ops import Scalar, RowVecLoad, ColVecLoad
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100

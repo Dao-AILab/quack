@@ -52,6 +52,46 @@ def test_varlen_namedtuple_tvm_ffi(N):
     torch.testing.assert_close(out, cu_seqlens)
 
 
+@cute.kernel
+def _mask_to_int(mOut: cute.Tensor, mMask: cute.Tensor):
+    tidx, _, _ = cute.arch.thread_idx()
+    if tidx < mOut.shape[0]:
+        mOut[tidx] = 1 if mMask[tidx] else 0
+
+
+@cute.jit
+def mask_to_int(mOut: cute.Tensor, mMask: cute.Tensor):
+    assert mMask.element_type == cutlass.Boolean
+    _mask_to_int(mOut, mMask).launch(grid=(1, 1, 1), block=(128, 1, 1))
+
+
+def test_boolean_fake_tensor_tvm_ffi():
+    """Boolean fake tensors compile (regression: Boolean.width == 1 bit made
+    assumed_align = divisibility * width // 8 == 0) and run with real bool tensors."""
+    n = cute.sym_int()
+    out_fake = fake_tensor(cute.Int32, (n,), divisibility=4)
+    mask_fake = fake_tensor(cutlass.Boolean, (n,), divisibility=4)
+    compiled = cute.compile(mask_to_int, out_fake, mask_fake, options="--enable-tvm-ffi")
+
+    torch.manual_seed(0)
+    mask = torch.rand(64, device="cuda") > 0.5
+    out = torch.empty(64, dtype=torch.int32, device="cuda")
+    compiled(out, mask)
+    torch.testing.assert_close(out, mask.to(torch.int32))
+
+
+def test_sub_byte_fake_tensor_alignment():
+    """Sub-byte dtypes divide down to bytes (int4 div=32 -> 16B) and floor to
+    at least 1: bool never claims more than the always-safe 1 byte, since
+    callers pick divisibility for wide dtypes' vectorization and a sliced bool
+    mask can sit at any byte offset."""
+    n = cute.sym_int()
+    assert fake_tensor(cutlass.Int4, (n,), divisibility=32)._assumed_align == 16
+    assert fake_tensor(cutlass.Float4E2M1FN, (n,), divisibility=32)._assumed_align == 16
+    assert fake_tensor(cutlass.Boolean, (n,), divisibility=4)._assumed_align == 1
+    assert fake_tensor(cutlass.Boolean, (n,), divisibility=1)._assumed_align == 1
+
+
 def test_varlen_construction():
     """Smoke test that VarlenArguments NamedTuple has the right interface."""
     # Default construction (all None)

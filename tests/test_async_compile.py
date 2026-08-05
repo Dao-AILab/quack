@@ -294,3 +294,34 @@ def test_oom_retry_compile_pending_defers_not_warns(tmp_path):
     assert "1 passed" in out, out
     assert "PluggyTeardownRaisedWarning" not in out, out
     assert "1 test deferrals" in out, out
+
+
+def test_gpu_blind_device_attr_shim():
+    """GPU-blind workers must answer the DSL's one trace-time driver query
+    (max smem per SM, needed when a launch sets min_blocks_per_mp > 1) from
+    the static arch table — cuDeviceGetAttribute raises NOT_INITIALIZED with
+    CUDA_VISIBLE_DEVICES="" and would fail every occupancy-bound kernel key
+    (e.g. the W4 small-N decode configs) over to in-process compiles."""
+    code = textwrap.dedent(
+        """
+        import os
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        os.environ["CUTE_DSL_ARCH"] = "sm_90a"
+        from quack.cache.async_compile import _install_gpu_blind_device_attrs
+
+        _install_gpu_blind_device_attrs()
+        from cutlass.base_dsl.runtime import cuda as cuda_helpers
+
+        attr = (
+            cuda_helpers.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+        )
+        # sm_90 SM total: the DSL's per-CTA capacity + the 1 KiB reserved slice
+        assert cuda_helpers.get_device_attribute(attr) == 233472
+        print("shim-ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0 and "shim-ok" in result.stdout, result.stderr

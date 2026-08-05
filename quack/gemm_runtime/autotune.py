@@ -34,8 +34,11 @@ swap-at-trace for element-mode sink-less mods; ``dynamic_scheduler=True``
 forces dynamic-persistent scheduling on every candidate (matching the old
 per-variant tuned wrappers); blockscaled SFA/SFB sweeps the
 _blockscaled_ok-pruned space; ``concat_layout`` enters the tuner key (the
-old per-variant tuners aliased concat/non-concat winners). Not supported
-(yet): split_k.
+old per-variant tuners aliased concat/non-concat winners); A-operand
+transforms tune through it too (the handle's semantic digest keys the tuner,
+``transform_a.config_ok`` + geometry validation prune the space, and
+runtime-operand bundles are rebuilt per config so their strip views bake the
+candidate tiles). Not supported (yet): split_k.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ import torch
 
 from quack.autotuner import AutotuneConfig, Autotuner
 from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm_config import config_supports, get_all_configs
+from quack.gemm_config import blockscaled_config_ok, config_supports, get_all_configs
 
 __all__ = ["tuned_mod_gemm", "sink_arg_shapes", "TunedModGemm"]
 
@@ -88,6 +91,19 @@ def _gemm_mn(A, B, b_kn):
     return m, n
 
 
+def _lead(A, A_idx, m_gemm):
+    """(batch?, m) lead shape matching EpiMod._lead_shape (m_gemm already
+    accounts for gather)."""
+    return (A.shape[0], m_gemm) if A.ndim == 3 else (m_gemm,)
+
+
+def _sink_slice(buf, shape):
+    """The leading `shape` view of a worst-case sink buffer."""
+    if tuple(buf.shape) == tuple(shape):
+        return buf
+    return buf[tuple(slice(0, s) for s in shape)]
+
+
 def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
     """Worst-case (over the tuning sweep) buffer shapes for the mod's reduce
     sinks, keyed by sink name. Allocate these f32 and pass them in epi_args;
@@ -95,32 +111,32 @@ def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda"):
     cfgs = _config_space(mod, torch.device(device))
     min_tile_n = min(c.tile_n for c in cfgs)
     min_tile_m = min(c.tile_m for c in cfgs)
+    lead = (m,) if l is None else (l, m)
     shapes = {}
     for name, op in mod.sinks.items():
-        if not hasattr(op, "dim"):
+        alloc = getattr(op, "sink_alloc_shape", None)
+        if alloc is None:
             continue
-        inner = (m, _cdiv(n_gemm, min_tile_n)) if op.dim == 0 else (_cdiv(m, min_tile_m), n_gemm)
-        shapes[name] = inner if l is None else (l, *inner)
+        # cdiv is monotone in the tile size, so the min tiles give the sweep's
+        # worst case (config-independent sinks ignore the tiles).
+        shapes[name] = alloc(lead, n_gemm, min_tile_m, min_tile_n)
     return shapes
 
 
-def _slice_sinks(mod, epi_args, config, m_gemm, n_gemm):
+def _slice_sinks(mod, epi_args, config, lead, n_gemm):
     views = {}
     for name, op in mod.sinks.items():
-        dim = getattr(op, "dim", None)
-        if dim is None or name not in epi_args:
+        alloc = getattr(op, "sink_alloc_shape", None)
+        if alloc is None or name not in epi_args:
             continue
-        buf = epi_args[name]
-        if dim == 0:
-            views[name] = buf[..., : _cdiv(n_gemm, config.tile_n)]
-        else:
-            views[name] = buf[..., : _cdiv(m_gemm, config.tile_m), :]
+        views[name] = _sink_slice(epi_args[name], alloc(lead, n_gemm, config.tile_m, config.tile_n))
     return views
 
 
-def _prune_for_mod(mod, configs, named_args, **kwargs):
+def _prune_for_mod(mod, transform_a, configs, named_args, **kwargs):
     kwargs = named_args | kwargs
     A, B = kwargs["A"], kwargs["B"]
+    n_full = transform_a.padded_n(B) if transform_a is not None else None
     cap = get_device_capacity(A.device)[0]
     A_idx = kwargs.get("A_idx")
     m_gemm, n_gemm = _gemm_mn(A, B, kwargs.get("b_kn", False))
@@ -139,18 +155,12 @@ def _prune_for_mod(mod, configs, named_args, **kwargs):
             continue
         if not config_supports(c, gather_A=A_idx is not None, varlen_m=varlen_m):
             continue
-        if blockscaled and not (
-            # Mirrors prune_invalid_gemm_configs._blockscaled_ok (SM100
-            # tcgen05 MMA constraints; SF tmem is 64-N granular).
-            c.device_capacity in (10, 11)
-            and not c.swap_ab
-            and c.tile_k is None
-            and c.tile_m in (128, 256)
-            and c.tile_n % 64 == 0
-            and 64 <= c.tile_n <= 256
-            and c.cluster_m <= 4
-            and c.cluster_n <= 4
-        ):
+        if transform_a is not None:
+            if not transform_a.config_ok(c):
+                continue
+            if n_full is not None and n_full % c.tile_m:
+                continue  # blob tiles kernel-M in whole CTA tiles
+        if blockscaled and not blockscaled_config_ok(c):
             continue
         if c.swap_ab and (
             not b_kn_call or varlen_or_gather or has_concat or mod.mode != "element" or mod.sinks
@@ -163,21 +173,25 @@ def _prune_for_mod(mod, configs, named_args, **kwargs):
                 continue
         ok = True
         for name, op in mod.sinks.items():
-            if getattr(op, "check_oob", True) is False and n_gemm % c.tile_n:
-                ok = False
-            dim = getattr(op, "dim", None)
+            if getattr(op, "check_oob", True) is False:
+                ragged = n_gemm % c.tile_n if getattr(op, "dim", 0) == 0 else m_gemm % c.tile_m
+                if ragged:
+                    ok = False
             buf = kwargs.get(name)
-            if dim == 0 and buf is not None and buf.shape[-1] < _cdiv(n_gemm, c.tile_n):
-                ok = False  # caller's partial buffer too small for this tile_N
-            if dim == 1 and buf is not None and buf.shape[-2] < _cdiv(m_gemm, c.tile_m):
-                ok = False
+            alloc = getattr(op, "sink_alloc_shape", None)
+            if buf is not None and alloc is not None:
+                need = alloc(_lead(A, A_idx, m_gemm), n_gemm, c.tile_m, c.tile_n)
+                if any(b < s for b, s in zip(buf.shape, need)):
+                    ok = False  # caller's partial buffer too small for this tiling
         if ok:
             survivors.append(conf)
     return survivors
 
 
-def _make_tuned_fn(mod, epi_names):
-    sink_dims = {n: op.dim for n, op in mod.sinks.items() if hasattr(op, "dim")}
+def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
+    sink_allocs = {
+        n: op.sink_alloc_shape for n, op in mod.sinks.items() if hasattr(op, "sink_alloc_shape")
+    }
 
     def fn(
         A=None,
@@ -194,21 +208,24 @@ def _make_tuned_fn(mod, epi_names):
         bs_format_a=None,
         bs_format_b=None,
         concat_layout=None,
+        transform_digest=None,  # keyed; the mod itself is a closure capture
+        transform_sf=None,
         config=None,
-        **epi_flat,
+        **epi_flat,  # epi args by name + transform operands as ta__<name>
     ):
         c = config
         m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
+        if transform_a is not None and transform_a.padded_n(B) is not None:
+            n_gemm = transform_a.padded_n(B)  # B is the repacked blob
         if A_idx is not None:
             m_gemm = A_idx.shape[0]
+        lead = _lead(A, A_idx, m_gemm)
         epi_args = {}
         for name in epi_names:
             v = epi_flat[name]
-            dim = sink_dims.get(name)
-            if dim == 0 and isinstance(v, torch.Tensor):
-                v = v[..., : _cdiv(n_gemm, c.tile_n)]
-            elif dim == 1 and isinstance(v, torch.Tensor):
-                v = v[..., : _cdiv(m_gemm, c.tile_m), :]
+            alloc = sink_allocs.get(name)
+            if alloc is not None and isinstance(v, torch.Tensor):
+                v = _sink_slice(v, alloc(lead, n_gemm, c.tile_m, c.tile_n))
             epi_args[name] = v
         dyn = c.is_dynamic_persistent or dynamic_scheduler
         # SM90 dynamic-persistent scheduling consumes a semaphore; a fresh
@@ -221,8 +238,16 @@ def _make_tuned_fn(mod, epi_names):
         if c.swap_ab and not b_kn:
             B_pass, bkn_pass = B.mT, True  # swap_ab requires B given (k, n)
         try:
+            A_pass = A
+            if transform_a is not None and transform_a.needs_operands:
+                # per-config bundle: the strip views bake this config's tiles
+                # (a geometry mismatch with the caller's strips raises here —
+                # pre-compile — and benches as inf)
+                A_pass = transform_a.bundle(
+                    A, {n: epi_flat[f"ta__{n}"] for n in ta_names}, c.tile_m, c.tile_k
+                )
             return mod.gemm(
-                A,
+                A_pass,
                 B_pass,
                 D,
                 C,
@@ -245,6 +270,8 @@ def _make_tuned_fn(mod, epi_names):
                 concat_layout=concat_layout,
                 b_kn=b_kn,
                 swap_ab=c.swap_ab,
+                transform_a=transform_a,
+                transform_sf=transform_sf,
             )
         except (ValueError, TypeError, AssertionError) as e:
             # The bench loop only maps RuntimeError/MemoryError to an inf
@@ -273,6 +300,9 @@ def _make_tuned_fn(mod, epi_names):
     params.append(inspect.Parameter("b_kn", kw, default=False))
     params.append(inspect.Parameter("dynamic_scheduler", kw, default=False))
     params.append(inspect.Parameter("concat_layout", kw, default=None))
+    params.append(inspect.Parameter("transform_digest", kw, default=None))
+    params.append(inspect.Parameter("transform_sf", kw, default=None))
+    params.extend(inspect.Parameter(f"ta__{n}", kw, default=None) for n in ta_names)
     params.extend(inspect.Parameter(n, kw, default=None) for n in epi_names)
     fn.__signature__ = inspect.Signature(params)
     return fn
@@ -281,12 +311,19 @@ def _make_tuned_fn(mod, epi_names):
 _MOD_TUNERS: dict = {}
 
 
-def _get_tuner(mod, epi_names, has_c, device):
-    key = (mod.semantic_digest, epi_names, has_c, get_device_capacity(device)[0])
+def _get_tuner(mod, epi_names, has_c, device, transform_a=None, ta_names=()):
+    key = (
+        mod.semantic_digest,
+        epi_names,
+        has_c,
+        get_device_capacity(device)[0],
+        getattr(transform_a, "semantic_digest", None),
+        ta_names,
+    )
     tuner = _MOD_TUNERS.get(key)
     if tuner is None:
         tuner = Autotuner(
-            _make_tuned_fn(mod, epi_names),
+            _make_tuned_fn(mod, epi_names, transform_a, ta_names),
             key=[
                 "mod_digest",
                 "b_kn",
@@ -294,9 +331,10 @@ def _get_tuner(mod, epi_names, has_c, device):
                 "concat_layout",
                 "bs_format_a",
                 "bs_format_b",
+                "transform_digest",
             ],
             configs=[AutotuneConfig(config=c) for c in _config_space(mod, device)],
-            prune_configs_by={"early_config_prune": partial(_prune_for_mod, mod)},
+            prune_configs_by={"early_config_prune": partial(_prune_for_mod, mod, transform_a)},
             cache_results=True,
         )
         _MOD_TUNERS[key] = tuner
@@ -320,14 +358,27 @@ def tuned_mod_gemm(
     bs_format_a=None,
     bs_format_b=None,
     concat_layout=None,
+    # A-operand transform: the handle keys the tuner (semantic digest);
+    # layout-owning transforms pass B as the repacked blob (+ transform_sf),
+    # runtime-operand transforms pass RAW operand tensors (bundles are built
+    # per config inside the sweep — their strip views bake the tiles).
+    transform_a=None,
+    transform_sf=None,
+    transform_operands=None,
 ):
     """Autotuned ``mod.gemm``: sweep the arch's config space on the first call
     per (mod, tensor metadata), then run the winner (warm calls replay through
     mod.gemm's own plan cache). Reduce-sink buffers in ``epi_args`` must be
     allocated at the sweep's worst case — see ``sink_arg_shapes``. Returns
     TunedModGemm(plan, config, sinks) with the winning config's sink views."""
+    if transform_a is not None:
+        from quack.operand_transform.host import as_transform_mod
+
+        transform_a = as_transform_mod(transform_a)
     epi_names = tuple(sorted(epi_args))
-    tuner = _get_tuner(mod, epi_names, C is not None, A.device)
+    ta_names = tuple(sorted(transform_operands)) if transform_operands else ()
+    assert not any(f"ta__{n}" in epi_args for n in ta_names)
+    tuner = _get_tuner(mod, epi_names, C is not None, A.device, transform_a, ta_names)
     plan = tuner(
         A=A,
         B=B,
@@ -343,10 +394,17 @@ def tuned_mod_gemm(
         bs_format_a=bs_format_a,
         bs_format_b=bs_format_b,
         concat_layout=concat_layout,
+        transform_digest=getattr(transform_a, "semantic_digest", None),
+        transform_sf=transform_sf,
+        **{f"ta__{k}": v for k, v in (transform_operands or {}).items()},
         **epi_args,
     )
     best = tuner.best_config.kwargs["config"]
     m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
+    if transform_a is not None and transform_a.padded_n(B) is not None:
+        n_gemm = transform_a.padded_n(B)
     if A_idx is not None:
         m_gemm = A_idx.shape[0]
-    return TunedModGemm(plan, best, _slice_sinks(mod, epi_args, best, m_gemm, n_gemm))
+    return TunedModGemm(
+        plan, best, _slice_sinks(mod, epi_args, best, _lead(A, A_idx, m_gemm), n_gemm)
+    )

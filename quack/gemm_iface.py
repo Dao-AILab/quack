@@ -264,7 +264,7 @@ def make_iface_plan(
     sem_dynamic = sem_fn(dynamic_scheduler, capacity, device, True) is not None
 
     if spec.warm_slots is not None:
-        from quack.gemm_host import run_gemm_epi_plan
+        from quack.gemm_runtime.host import run_gemm_epi_plan
 
         code_of = dict(codes)
         a_n, b_n, d_n, c_n = spec.warm_slots

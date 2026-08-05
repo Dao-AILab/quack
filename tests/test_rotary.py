@@ -272,8 +272,21 @@ def test_rotary_emb_inplace_backward_no_copy(use_compile):
 
     assert out.data_ptr() == x.data_ptr()
     torch.testing.assert_close(out, out_pt, atol=1e-2, rtol=1e-3)
-    assert_one_cuda_kernel_no_memcpy(prof)
-    assert dx.data_ptr() == grad.data_ptr()
+    if use_compile:
+        # The bwd op declares its mutation (Tensor(a!)) so graph transforms see
+        # real dataflow edges — the old ordered-effect route hid the in-place
+        # rotation from reorder passes, which silently corrupted training when
+        # comm-overlap scheduling moved consumers across it. The cost: when the
+        # mutated tensor is a GRAPH INPUT (the tangent here, compiled
+        # standalone), functionalization materializes one clone, and dx no
+        # longer aliases grad. Inside a larger compiled region the grad is an
+        # intermediate and no clone is emitted.
+        names = cuda_event_names(prof)
+        if names:
+            assert len([n for n in names if not n.startswith("Memcpy")]) <= 2, names
+    else:
+        assert_one_cuda_kernel_no_memcpy(prof)
+        assert dx.data_ptr() == grad.data_ptr()
     torch.testing.assert_close(dx, x_pt.grad, atol=1e-2, rtol=1e-3)
 
 
@@ -734,8 +747,20 @@ def test_rotary_emb_qkv_inplace_kernel_count(use_compile):
     ) as prof:
         (dqkv,) = torch.autograd.grad(out, qkv, grad)
         torch.cuda.synchronize()
-    assert_one_cuda_kernel_no_memcpy(prof)
-    assert dqkv.data_ptr() == grad.data_ptr()
+    if use_compile:
+        # bwd mutation is schema-declared (Tensor(a!)): compiled standalone,
+        # the tangent is a graph input, so functionalization materializes one
+        # clone and dqkv no longer aliases grad (inside a larger region the
+        # grad is an intermediate and stays clone-free). Declared dataflow is
+        # what keeps graph transforms from reordering across the in-place
+        # rotation (hidden ordered-effect mutation corrupted training under
+        # comm-overlap scheduling).
+        names = cuda_event_names(prof)
+        if names:
+            assert len([n for n in names if not n.startswith("Memcpy")]) <= 2, names
+    else:
+        assert_one_cuda_kernel_no_memcpy(prof)
+        assert dqkv.data_ptr() == grad.data_ptr()
     out_pt.backward(grad_pt)
     torch.testing.assert_close(dqkv, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 
@@ -796,8 +821,20 @@ def test_rotary_emb_qkv_packed_reshape_backward_no_copy(use_compile):
     ) as prof:
         (dqkv,) = torch.autograd.grad(out, qkv, grad)
         torch.cuda.synchronize()
-    assert_one_cuda_kernel_no_memcpy(prof)
-    assert dqkv.data_ptr() == grad.data_ptr()
+    if use_compile:
+        # bwd mutation is schema-declared (Tensor(a!)): compiled standalone,
+        # the tangent is a graph input, so functionalization materializes one
+        # clone and dqkv no longer aliases grad (inside a larger region the
+        # grad is an intermediate and stays clone-free). Declared dataflow is
+        # what keeps graph transforms from reordering across the in-place
+        # rotation (hidden ordered-effect mutation corrupted training under
+        # comm-overlap scheduling).
+        names = cuda_event_names(prof)
+        if names:
+            assert len([n for n in names if not n.startswith("Memcpy")]) <= 2, names
+    else:
+        assert_one_cuda_kernel_no_memcpy(prof)
+        assert dqkv.data_ptr() == grad.data_ptr()
     out_pt.backward(grad_pt)
     torch.testing.assert_close(dqkv, qkv_pt.grad, atol=1e-2, rtol=1e-3)
 

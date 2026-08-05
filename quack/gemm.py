@@ -223,7 +223,7 @@ class _GemmPlan(NamedTuple):
     """
 
     compiled_fn: object
-    is_sm100_family: bool  # SM100/110 use 2-CTA MMA and take trailing (SFA, SFB) args
+    is_sm100_family: bool  # SM100/110 use 2-CTA MMA
     use_d_as_c: bool  # SM8x lowers add_to_output to C = D
     alpha_mode: int
     beta_mode: int
@@ -749,11 +749,8 @@ def _build_gemm_plan(
         )
     if split_k > 1 and device_capacity[0] not in [9, 10, 11, 12]:
         raise ValueError("split_k > 1 requires SM90, SM100, SM110, or SM120")
-    if device_capacity[0] == 12 and A.dtype.itemsize == 1:
-        # SM120 GEMM is warp-level MmaF16BF16Op, which only accepts fp16/bf16 operands
-        # (see quack/gemm_sm120.py). Guard here so fp8 inputs fail with a clear message
-        # instead of a cryptic OpError deep inside MMA-atom construction.
-        raise ValueError("SM120 GEMM does not support fp8 (8-bit) inputs; use fp16/bf16")
+    # SM120 fp8 rides MmaFP8Op (m16n8k32); k-major-only for fp8 operands is
+    # enforced by the shared dtype/layout validation below, same as SM90.
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
     if is_dynamic_persistent and device_capacity[0] <= 9:
