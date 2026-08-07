@@ -541,7 +541,10 @@ class GemmBase:
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         epi_tile: cute.Tile,
-        tRS_gWs: cute.Tensor,
+        tiled_copy_r2s: cute.TiledCopy,
+        tRS_sWs: cute.Tensor,
+        copy_ws: Callable,
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: Optional[cutlass.pipeline.PipelineState],
         epi_producer_state: Optional[cutlass.pipeline.PipelineState],
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
@@ -554,20 +557,17 @@ class GemmBase:
         into the symmetric workspace, run no epi ops (EVT/C/aux belong to the
         reducer warps). Unlike split-K's layout-free f32 stripes, the partial is
         stored in the workspace dtype (default d_dtype; f32 for exact partials)
-        at real (m, n) addresses — the cross-rank multimem contract — as plain
-        register-direct stores: generic-proxy stores need no
-        TMA drain, so ordering is just the epi-group barrier below plus the
-        signal's release. tRS_gWs is the r2s-fragment-order workspace partition of
-        this tile with the epi-subtile modes trailing; the padded workspace absorbs
-        edge and phantom tiles, so every subtile takes the vectorized copy (no
-        coords, no limits).
+        at real (m, n) addresses — the cross-rank multimem contract — through the
+        epilogue's TMA store idiom (register-direct stores measured ~11% slower
+        at comm-bound shapes: the trickle feeding the reducer loses its
+        async-store overlap). Stage cycling restarts at 0 each tile: the
+        per-tile producer_tail below empties the ring, so no cross-tile counter.
 
         The tile signal is the sibling of split-K's sem release: +1 on every
-        rank's copy of flag[tile_id] (multimem red.release), after the barrier
-        orders all epi threads' stores. Flags self-reset at consumption (the
-        last consumer stores 0), so every launch starts from zeroed flags;
-        in_bounds skips fully-OOB CTA halves, whose coord would alias the next
-        column's flag.
+        rank's copy of flag[tile_id] (multimem red.release), after this tile's
+        TMA stores drain. Flags self-reset at consumption (the last consumer
+        stores 0), so every launch starts from zeroed flags; in_bounds skips
+        fully-OOB CTA halves, whose coord would alias the next column's flag.
 
         Runs where epi_fn would (once per tile, on the local finalizing entity —
         under local split-K the load_acc_subtile it receives is the
@@ -586,14 +586,19 @@ class GemmBase:
         for epi_idx in cutlass.range_constexpr(cute.size(epi_tile_shape)):
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
             load_acc_subtile(tRS_rD, epi_coord)
-            tRS_rWs = cute.make_rmem_tensor(tRS_rD.layout.shape, tRS_gWs.element_type)
-            tRS_rWs.store(tRS_rD.load().to(tRS_gWs.element_type))
-            # Direct store measures ~1-3% slower than a TMA-pipelined commit
-            # (lost async-store overlap) but frees the sD smem and needs no drain.
-            cute.autovec_copy(tRS_rWs, tRS_gWs[None, None, None, epi_coord[0], epi_coord[1]])
-        # All epi threads' stores ordered before the elected signal thread's release.
-        epilogue_barrier.arrive_and_wait()
+            if is_tma_warp:
+                epi_store_pipeline.producer_acquire()
+            epilogue_barrier.arrive_and_wait()
+            epi_buffer = epi_idx % self.epi_stage
+            copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sWs[None, None, None, epi_buffer])
+            cute.arch.fence_view_async_shared()
+            epilogue_barrier.arrive_and_wait()
+            if is_tma_warp:
+                copy_ws(src_idx=epi_buffer, dst_idx=epi_coord)
+                epi_store_pipeline.producer_commit()
+        # cutlass order: drain this tile's TMA stores, then release the flag.
         if is_tma_warp:
+            epi_store_pipeline.producer_tail()
             if in_bounds:
                 with cute.arch.elect_one():
                     multimem_red_add1(
@@ -797,6 +802,10 @@ class GemmBase:
         # reducer passes slab_m explicitly: it is unrecoverable from the padded
         # workspace shape.
         tiled_copy_r2s: Optional[cute.TiledCopy] = None,
+        # Producer TMA commit pair (copy_D's sibling; passed directly — the epi_fn
+        # closure is opaque, like epi_store_pipeline above)
+        tRS_sWs: Optional[cute.Tensor] = None,
+        copy_ws: Optional[Callable] = None,
         epi_reduce_args: Optional[EpiReduceArguments] = None,
         slab_m: Optional[Int32] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
@@ -823,9 +832,8 @@ class GemmBase:
         nesting through epilogue_split_k makes local split-K compose (the
         committed partial is the rank's completed local sum). Like its sibling
         builds ws_ptr/split_k_sem, this wrapper owns the flag protocol on both
-        sides: the M-major CTA-tile flag indexing, the producer's commit
-        addressing (fragment-order partition of this tile of the partials
-        workspace), and the reducer's spin + epoch counters. Without
+        sides: the M-major CTA-tile flag indexing, the producer's TMA commit
+        binding, and the reducer's wait + consume/reset. Without
         epi_reduce_mode this is a pure passthrough (world of 1 is a trivial rank
         split)."""
         if const_expr(self.epi_reduce_mode is None):
@@ -845,11 +853,12 @@ class GemmBase:
             )
         cta_m, cta_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
         if const_expr(is_producer):
-            assert tiled_copy_r2s is not None and epi_reduce_args is not None, (
-                "producer needs tiled_copy_r2s and epi_reduce_args"
-            )
-            # This rank's workspace view (real pointers; the padded shape absorbs
-            # edge tiles and phantom CTA halves, so stores are unpredicated).
+            assert (
+                tiled_copy_r2s is not None
+                and tRS_sWs is not None
+                and copy_ws is not None
+                and epi_reduce_args is not None
+            ), "producer needs the ws commit pair, tiled_copy_r2s and epi_reduce_args"
             ws = epi_reduce_args.workspace
             # Flag contract: M-major CTA-tile linear id, derived identically by the
             # reducer branch below; the grid extents come from the workspace shape
@@ -864,13 +873,6 @@ class GemmBase:
                 + cta_tiles_m * (tile_coord_mnkl[1] + cta_tiles_n * tile_coord_mnkl[3])
             )
             in_bounds = tile_coord_mnkl[0] < cta_tiles_m
-            # Fragment-order workspace partition of this tile at real (m, n)
-            # coords, epi-subtile modes trailing — the direct store target.
-            ws_l = ws[None, None, tile_coord_mnkl[3]]
-            tile_mn = (tile_coord_mnkl[0], tile_coord_mnkl[1])
-            gWs = cute.local_tile(ws_l, self.cta_tile_shape_mnk[:2], tile_mn)
-            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-            tRS_gWs = thr_copy_r2s.partition_D(cute.flat_divide(gWs, epi_tile))
 
             # The rank's partial commit replaces the epilogue closure as the finalize
             # action; load_acc_subtile stays the one argument left unbound.
@@ -878,7 +880,10 @@ class GemmBase:
                 self.split_rank_partial_commit,
                 tRS_rD=tRS_rD,
                 epi_tile=epi_tile,
-                tRS_gWs=tRS_gWs,
+                tiled_copy_r2s=tiled_copy_r2s,
+                tRS_sWs=tRS_sWs,
+                copy_ws=copy_ws,
+                epi_store_pipeline=epi_store_pipeline,
                 epi_read_state=epi_read_state,
                 epi_producer_state=epi_producer_state,
                 epilogue_barrier=epilogue_barrier,

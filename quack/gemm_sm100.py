@@ -576,7 +576,8 @@ class GemmSm100(GemmTmaBase):
             self.b_smem_dtype,
             self.sf_dtype,
             self.sf_vec_size,
-            self.d_dtype,
+            # epi staging dtype: ws-dtype partials under epi_reduce
+            self.ws_dtype if self.epi_reduce_mode is not None else self.d_dtype,
             self.c_dtype,
             self.d_layout,
             self.c_layout,
@@ -620,8 +621,10 @@ class GemmSm100(GemmTmaBase):
         )
         self.epi_smem_layout_staged = None
         if const_expr(self.d_dtype is not None):
+            # stages D; ws-dtype partials under epi_reduce (D never stages then)
+            staging_dtype = self.ws_dtype if self.epi_reduce_mode is not None else self.d_dtype
             self.epi_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.d_dtype, self.d_layout, self.epi_tile, self.epi_stage
+                staging_dtype, self.d_layout, self.epi_tile, self.epi_stage
             )
         self.epi_c_smem_layout_staged = None
         if const_expr(self.c_dtype is not None):
@@ -803,6 +806,10 @@ class GemmSm100(GemmTmaBase):
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
 
+        # ws dtype rides the tensor, like d_dtype from mD
+        self.ws_dtype = None
+        if const_expr(self.epi_reduce_mode is not None):
+            self.ws_dtype = epi_reduce_args.workspace.element_type
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
 
@@ -986,6 +993,16 @@ class GemmSm100(GemmTmaBase):
             varlen_m,
         )
 
+        tma_atom_ws, tma_tensor_ws = None, None
+        if const_expr(self.epi_reduce_mode is not None):
+            # producer TMA store target: padded symmetric workspace at real (m, n)
+            tma_atom_ws, tma_tensor_ws = self._make_tma_epi_atoms_and_tensors(
+                epi_reduce_args.workspace,
+                self.epi_smem_layout_staged,
+                self.epi_tile,
+                op_type="store",
+            )
+
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         if const_expr(self.epi_reduce_mode is not None):
             assert not self.epi_needs_acc_prepass, (
@@ -1068,9 +1085,19 @@ class GemmSm100(GemmTmaBase):
             ]
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
+            # D and ws staging are mutually exclusive: under epi_reduce the
+            # producer TMA-stores ws partials and D never stages.
             sD: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
+                    self.d_dtype if self.d_dtype is not None else Int32,
+                    epi_smem_size if self.epi_reduce_mode is None else 0,
+                ],
+                self.buffer_align_bytes,
+            ]
+            sWs: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.ws_dtype if self.ws_dtype is not None else Int32,
+                    epi_smem_size if self.epi_reduce_mode is not None else 0,
                 ],
                 self.buffer_align_bytes,
             ]
@@ -1123,6 +1150,8 @@ class GemmSm100(GemmTmaBase):
             tma_tensor_d if const_expr(self.epi_reduce_mode is None) else mD,
             tma_atom_c,
             tma_tensor_c,
+            tma_atom_ws,
+            tma_tensor_ws,
             epilogue_params,
             varlen_params,
             self.cluster_layout_vmnk,
@@ -1165,6 +1194,9 @@ class GemmSm100(GemmTmaBase):
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
+        # Producer store pair under epi_reduce; mutually exclusive with tma_atom_d
+        tma_atom_ws: Optional[cute.CopyAtom],
+        mWs_mnl: Optional[cute.Tensor],
         epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_vmnk: cute.Layout,
@@ -1215,6 +1247,7 @@ class GemmSm100(GemmTmaBase):
                 tma_atom_sfb,
                 tma_atom_d,
                 tma_atom_c,
+                tma_atom_ws,
             ):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
@@ -1298,8 +1331,11 @@ class GemmSm100(GemmTmaBase):
                     (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms, self.ab_stage)
                 ),
             )
-        sD = None
-        if const_expr(has_D):
+        sD = sWs = None
+        if const_expr(self.epi_reduce_mode is not None):
+            # (EPI_TILE_M, EPI_TILE_N, STAGE), ws dtype
+            sWs = storage.sWs.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
+        elif const_expr(has_D):
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
         sC = None
@@ -1972,9 +2008,15 @@ class GemmSm100(GemmTmaBase):
             )
 
             tTR_rD = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
-            tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
-                tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
-            )
+            tRS_sD = tRS_sWs = None
+            if const_expr(self.epi_reduce_mode is not None):
+                tiled_copy_r2s, tRS_rD, tRS_sWs = self.epilog_smem_store_and_partition(
+                    tiled_copy_t2r, self.d_layout, self.ws_dtype, tTR_rD, sWs, epi_tidx
+                )
+            else:
+                tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
+                    tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
+                )
             tRS_rC, tSR_rC, tSR_sC = None, None, None
             tiled_copy_s2r = None
             # Under epi_reduce, C belongs to its warps (sC is epi_reduce_tile-shaped: partitioning it
@@ -2019,8 +2061,8 @@ class GemmSm100(GemmTmaBase):
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 copy_D = None
-                # epi_reduce: no D TMA atom — the producer commits to the comm
-                # workspace inside epilogue_split_rank instead.
+                # epi_reduce: no D TMA — the producer TMA-stores ws partials via
+                # copy_ws inside split_rank_partial_commit.
                 if const_expr(has_D and self.epi_reduce_mode is None):
                     # Staged split-K: D is the f32 partials workspace, whose batch mode is the
                     # combined (l * split_k + split) index from the scheduler.
@@ -2033,6 +2075,17 @@ class GemmSm100(GemmTmaBase):
                         self.cta_tile_shape_mnk[:2],
                         epi_tile,
                         sD,
+                        tile_coord_mnkl,
+                    )
+
+                copy_ws = None
+                if const_expr(self.epi_reduce_mode is not None):
+                    copy_ws, _, _ = self.epilog_gmem_copy_and_partition(
+                        tma_atom_ws,
+                        varlen_manager.offset_batch_epi(mWs_mnl, batch_idx),
+                        self.cta_tile_shape_mnk[:2],
+                        epi_tile,
+                        sWs,
                         tile_coord_mnkl,
                     )
 
@@ -2113,6 +2166,8 @@ class GemmSm100(GemmTmaBase):
                     epi_tidx,
                     is_tma_warp,
                     tiled_copy_r2s=tiled_copy_r2s,
+                    tRS_sWs=tRS_sWs,
+                    copy_ws=copy_ws,
                     epi_reduce_args=epi_reduce_args,
                 )
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
