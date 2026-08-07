@@ -161,8 +161,8 @@ def _run_gemm_epi_reduce(
     # bit-exact asserts below only hold for split_k == 1 and SERIAL.
     bitwise_repeatable = split_k == 1 or sk_mode == SplitKMode.SERIAL
 
-    # r2r: relaunch reuses tile_flags/sync_barrier in place (stale-flag bugs
-    # are invisible to a single launch); identical inputs must be bit-identical.
+    # r2r: relaunch reuses tile_flags (incl. exit-slot tail) in place (stale-flag
+    # bugs are invisible to a single launch); identical inputs must be bit-identical.
     runs = []
     for _ in range(2):
         launch()

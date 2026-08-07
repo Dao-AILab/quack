@@ -1230,11 +1230,9 @@ class GemmSm100(GemmTmaBase):
         # exit barrier); flags/counters/workspace stay in the bundle for
         # epilogue_split_rank. mD_mc is the all_reduce broadcast view (None under
         # reduce_scatter, whose commit targets the plain kernel mD).
-        mD_mc = ws_mc = sync_barrier = sync_barrier_mc = None
+        mD_mc = ws_mc = None
         if const_expr(epi_reduce_args is not None):
             mD_mc, ws_mc = epi_reduce_args.mD_mc, epi_reduce_args.workspace_mc
-            sync_barrier = epi_reduce_args.sync_barrier
-            sync_barrier_mc = epi_reduce_args.sync_barrier_mc
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -2382,20 +2380,25 @@ class GemmSm100(GemmTmaBase):
                 # reads); this spin-lock exit barrier provides the cross-launch sync.
                 if warp_idx == self.epi_reduce_warp_ids[0]:
                     with cute.arch.elect_one():
-                        exit_slot = epi_reduce_exit_slot(epi_reduce_sched_params)
+                        # Exit slots live in the flag tail (hot allocation; one per
+                        # resident CTA past the tile-flag grid).
+                        cta_tiles_m = ws_mc.shape[0] // self.cta_tile_shape_mnk[0] - 1
+                        cta_tiles_n = ws_mc.shape[1] // self.cta_tile_shape_mnk[1]
+                        exit_base = cta_tiles_m * cta_tiles_n * ws_mc.shape[2]
+                        exit_slot = exit_base + epi_reduce_exit_slot(epi_reduce_sched_params)
                         # sys scope only for AR (peer broadcasts must have landed in
                         # local D); RS commits locally — gpu suffices, sys costs ~3 us.
                         exit_scope = (
                             "gpu" if self.epi_reduce_mode == "reduce_scatter" else "sys"
                         )
                         utils.distributed.multimem_red_add1(
-                            lock_ptr=sync_barrier_mc.iterator + exit_slot,
+                            lock_ptr=epi_reduce_args.tile_flags_mc.iterator + exit_slot,
                             scope=exit_scope,
                             order="release",
                         )
                         # ≥-wait + add-consume (not CAS==): a fast rank's next-invocation +1
                         # banks instead of wedging, so back-to-back calls need no entry fence.
-                        exit_flag = sync_barrier.iterator + exit_slot
+                        exit_flag = epi_reduce_args.tile_flags.iterator + exit_slot
                         utils.distributed.spin_lock_ld_lt_relaxed_wait(
                             lock_ptr=exit_flag,
                             expected_val=self.num_ranks,

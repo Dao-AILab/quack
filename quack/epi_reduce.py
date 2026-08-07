@@ -34,9 +34,9 @@ from quack.fast_math import FastDivmod
 
 @mlir_namedtuple
 class EpiReduceArguments(NamedTuple):
-    """Comm-side tensors for epi_reduce_mode. tile_flags/counters are sized to one
-    problem shape (the tile->slot mapping); sync_barrier is per resident epi-reduce
-    CTA slot, with num_sms allocation remaining a safe upper bound."""
+    """Comm-side tensors for epi_reduce_mode. tile_flags are sized to one problem
+    shape (the tile->slot mapping) plus a num_sms exit-slot tail (one per resident
+    CTA, cross-launch exit barrier)."""
 
     mD_mc: Optional[cute.Tensor] = None  # multicast view of symmetric D — all_reduce only
     # Partials workspace (any multimem-reducible dtype, default d_dtype),
@@ -47,8 +47,6 @@ class EpiReduceArguments(NamedTuple):
     # producer -> consumer, ceil(M/cta_M) * ceil(N/cta_N) * L entries
     tile_flags: Optional[cute.Tensor] = None
     tile_flags_mc: Optional[cute.Tensor] = None
-    sync_barrier: Optional[cute.Tensor] = None  # exit barrier, one slot per resident CTA
-    sync_barrier_mc: Optional[cute.Tensor] = None
 
 
 def epi_reduce_workspace_shape(m, n, cta_m, cta_n):
@@ -126,11 +124,10 @@ def validate_epi_reduce_args(
         )
     n_tiles = (n + tile_N - 1) // tile_N
     ntiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
-    if era.tile_flags.numel() < ntiles or era.tile_flags_mc.numel() < ntiles:
-        raise ValueError(f"epi_reduce_args.tile_flags needs >= {ntiles} entries")
     num_sms = torch.cuda.get_device_properties(D.device).multi_processor_count
-    if era.sync_barrier.numel() < num_sms or era.sync_barrier_mc.numel() < num_sms:
-        raise ValueError(f"epi_reduce_args.sync_barrier needs >= {num_sms} entries")
+    # tile flags + exit-slot tail (one per resident CTA)
+    if era.tile_flags.numel() < ntiles + num_sms or era.tile_flags_mc.numel() < ntiles + num_sms:
+        raise ValueError(f"epi_reduce_args.tile_flags needs >= {ntiles} + {num_sms} entries")
 
 
 # ---- reducer tile scheduler ----

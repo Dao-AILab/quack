@@ -42,14 +42,12 @@ def make_epi_reduce_args(
     n_tiles = (n + tile_N - 1) // tile_N
     num_tiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    tile_flags, tile_flags_mc = make_symm_mem_flags(num_tiles)
-    sync_barrier, sync_barrier_mc = make_symm_mem_flags(num_sms)
+    # exit-barrier slots live in the flag tail (hot allocation, one per resident CTA)
+    tile_flags, tile_flags_mc = make_symm_mem_flags(num_tiles + num_sms)
     return d, EpiReduceArguments(
         mD_mc=mD_mc,
         workspace=workspace,
         workspace_mc=workspace_mc,
         tile_flags=tile_flags,
         tile_flags_mc=tile_flags_mc,
-        sync_barrier=sync_barrier,
-        sync_barrier_mc=sync_barrier_mc,
     )
