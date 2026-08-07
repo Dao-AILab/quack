@@ -2383,10 +2383,14 @@ class GemmSm100(GemmTmaBase):
                 if warp_idx == self.epi_reduce_warp_ids[0]:
                     with cute.arch.elect_one():
                         exit_slot = epi_reduce_exit_slot(epi_reduce_sched_params)
-                        # Release flag with sys scope
+                        # sys scope only for AR (peer broadcasts must have landed in
+                        # local D); RS commits locally — gpu suffices, sys costs ~3 us.
+                        exit_scope = (
+                            "gpu" if self.epi_reduce_mode == "reduce_scatter" else "sys"
+                        )
                         utils.distributed.multimem_red_add1(
                             lock_ptr=sync_barrier_mc.iterator + exit_slot,
-                            scope="sys",
+                            scope=exit_scope,
                             order="release",
                         )
                         # ≥-wait + add-consume (not CAS==): a fast rank's next-invocation +1
@@ -2395,10 +2399,13 @@ class GemmSm100(GemmTmaBase):
                         utils.distributed.spin_lock_ld_lt_relaxed_wait(
                             lock_ptr=exit_flag,
                             expected_val=self.num_ranks,
-                            scope="sys",
+                            scope=exit_scope,
                         )
                         cute.arch.atomic_add(
-                            exit_flag.llvm_ptr, Int32(-self.num_ranks), sem="relaxed", scope="sys"
+                            exit_flag.llvm_ptr,
+                            Int32(-self.num_ranks),
+                            sem="relaxed",
+                            scope=exit_scope,
                         )
 
     @cute.jit
