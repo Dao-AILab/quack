@@ -186,7 +186,7 @@ def _install_gpu_blind_device_attrs() -> None:
     attribute keeps the original driver path (fails in the worker, consumer
     falls back, as designed)."""
     from cutlass.base_dsl.runtime import cuda as cuda_helpers
-    from cutlass.utils.smem_allocator import SMEM_CAPACITY_MAP
+    from cutlass.utils import get_smem_capacity_in_bytes
 
     smem_attr = cuda_helpers.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
     orig = cuda_helpers.get_device_attribute
@@ -194,7 +194,10 @@ def _install_gpu_blind_device_attrs() -> None:
     def get_device_attribute(attribute, device_id: int = 0):
         if attribute == smem_attr:
             sm = os.environ.get("CUTE_DSL_ARCH", "").removesuffix("a")
-            capacity = SMEM_CAPACITY_MAP.get(sm)
+            try:
+                capacity = get_smem_capacity_in_bytes(sm)
+            except ValueError:
+                capacity = None  # arch unset or off the table: keep the driver path
             if capacity is not None:
                 return capacity + 1024  # per-CTA capacity + reserved = SM total
         return orig(attribute, device_id)
