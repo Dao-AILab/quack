@@ -276,6 +276,9 @@ class GemmSm100(GemmTmaBase):
         if use_tma_gather:
             assert gather_A, "TMA gather requires gather_A=True"
         if epi_reduce_mode is not None:
+            # Not ported: cutlass's ldmcxstmc_default_inflight_depth — no perf diff vs always 4.
+            # Not ported: _pick_num_comm_warp_for_128b — fixed 4 comm warps, geometry it can't
+            # serve is rejected in validate_epi_reduce_args.
             assert epi_reduce_mode in ("reduce_scatter", "all_reduce"), (
                 f"Unsupported mode: {epi_reduce_mode}"
             )
@@ -2150,11 +2153,12 @@ class GemmSm100(GemmTmaBase):
                 tile_sched = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
                 work_tile = tile_sched.initial_work_tile_info()
 
-                # we want 128bit ld/st for better performance; one copy pass spans
-                # the reduce tile's width so subtiles slice cleanly in fragment space
+                # 128-bit vectors along contiguous n; gcd keeps the thread layout
+                # rectangular for any reduce-tile width / workspace dtype
                 atom_val = 128 // ws_mc.element_type.width
-                atom_thr_n = self.epi_reduce_tile[1] // atom_val
-                atom_thr_m = len(self.epi_reduce_warp_ids) * cute.arch.WARP_SIZE // atom_thr_n
+                total_threads = self.num_epi_reduce_warps * cute.arch.WARP_SIZE
+                atom_thr_n = math.gcd(self.epi_reduce_tile[1] // atom_val, total_threads)
+                atom_thr_m = total_threads // atom_thr_n
                 thr_layout = cute.make_layout((atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1))
                 val_layout = cute.make_layout((1, atom_val), stride=(atom_val, 1))
 
@@ -2248,6 +2252,8 @@ class GemmSm100(GemmTmaBase):
                         load_reduce_subtile = partial(
                             multimem_reduce_subtile,
                             frgWs_mc,
+                            row_limit=row_limit,
+                            subtile_rows=self.epi_reduce_tile[0],
                         )
                         commit_fn = (
                             commit_subtile_broadcast

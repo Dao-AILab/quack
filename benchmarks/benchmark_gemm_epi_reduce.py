@@ -22,7 +22,7 @@ import cutlass
 import cutlass.torch as cutlass_torch
 
 from quack.bench.bench_utils_dist import do_bench_all
-from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
+from quack.dist_utils import init_distributed, clean_distributed
 from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm
@@ -96,7 +96,7 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def run(args):
-    torchrun_init_nvshmem()
+    init_distributed()
     rank, world_size = dist.get_rank(), dist.get_world_size()
     assert world_size > 1, "launch with torchrun --nproc_per_node > 1"
     sm_major = get_device_capacity(torch.device("cuda"))[0]
@@ -225,9 +225,7 @@ def run(args):
         print(f"  (quack speedup vs cuBLAS+NCCL: {t_base / t_quack:.2f}x)")
 
     dist.barrier()
-    # make_symmetric_tensor / make_barrier_flags registered their frees via on_finalize;
-    # this runs them (reverse order), then nvshmem.core.finalize() + destroy_process_group().
-    torchrun_finalize_nvshmem()
+    clean_distributed()
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 its own — gemm_sm100's kernel binds each piece into the shared GemmBase machinery.
 Sections below: host contract / reducer tile scheduler / cross-launch exit barrier /
 multimem reduce + store. The split-rank protocol itself (flag contract, producer
-partial commit, reducer spin + epoch counters) lives in gemm_base's
+partial commit, reducer wait + consume/reset) lives in gemm_base's
 epilogue_split_rank / split_rank_partial_commit, the cross-rank siblings of the
 split-K pair.
 
@@ -49,8 +49,6 @@ class EpiReduceArguments(NamedTuple):
     tile_flags_mc: Optional[cute.Tensor] = None
     sync_barrier: Optional[cute.Tensor] = None  # exit barrier, one slot per resident CTA
     sync_barrier_mc: Optional[cute.Tensor] = None
-    # consumer-private epoch bases, slab_tiles_m * ceil(N/cta_N) * L entries
-    consumer_counters: Optional[cute.Tensor] = None
 
 
 def epi_reduce_workspace_shape(m, n, cta_m, cta_n):
@@ -109,6 +107,15 @@ def validate_epi_reduce_args(
     ws_vec = 16 // era.workspace.element_size()
     if n % ws_vec:
         raise ValueError(f"epi_reduce_mode: n ({n}) must be divisible by {ws_vec} (workspace vectors)")
+    # Fixed 4 comm warps (128 threads): the per-rank tile slice must spread evenly
+    # across them in whole 128 b ld_reduce atoms. Future fix: vary the warp count
+    # per cutlass's _pick_num_comm_warp_for_128b.
+    slab_elements = cta_m * tile_N // num_ranks
+    if slab_elements % 128 or (slab_elements // 128) % ws_vec:
+        raise ValueError(
+            f"comm warps (128 threads) can't cover the per-rank tile slice "
+            f"({cta_m}/{num_ranks} x {tile_N} {era.workspace.dtype}) in 128 b atoms"
+        )
     if mode == "reduce_scatter":
         if era.mD_mc is not None:
             raise ValueError("reduce_scatter commits to plain local D: mD_mc must be None")
@@ -124,9 +131,6 @@ def validate_epi_reduce_args(
     num_sms = torch.cuda.get_device_properties(D.device).multi_processor_count
     if era.sync_barrier.numel() < num_sms or era.sync_barrier_mc.numel() < num_sms:
         raise ValueError(f"epi_reduce_args.sync_barrier needs >= {num_sms} entries")
-    slab_tiles = ((m // num_ranks + cta_m - 1) // cta_m) * n_tiles * l
-    if era.consumer_counters.numel() < slab_tiles:
-        raise ValueError(f"epi_reduce_args.consumer_counters needs >= {slab_tiles} entries")
 
 
 # ---- reducer tile scheduler ----
@@ -214,27 +218,36 @@ def multimem_reduce_subtile(
     epi_coord: cute.Coord,
     # load_acc_subtile signature compat (acc prepass); a multimem load has nothing to release.
     no_release: cutlass.Constexpr[bool] = False,
+    row_limit: Optional[Int32] = None,
+    subtile_rows: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     """Reduce this subtile's workspace partials across all ranks into tRS_rD via
     multimem ld_reduce; passed to epilogue() as load_acc_subtile by the reducer
-    warps. Unpredicated: the padded workspace keeps every access in-allocation;
-    rows/cols past the slab or N edge carry garbage that the commit skips and epi
-    ops predicate away (slab-framed limits)."""
-    _atom, chunk, sub_loop_n = tRS_rD.shape
-    ld_reduce = multimem_ld_reduce_128b(frgWs_mc.element_type)
-    tmp_results = cute.make_rmem_tensor((4, chunk, sub_loop_n), cutlass.Int32)
-    for ii in cutlass.range_constexpr(chunk):
-        i = epi_coord[0] * chunk + ii
-        for jj in cutlass.range_constexpr(sub_loop_n):
-            j = epi_coord[1] * sub_loop_n + jj
-            mc_ptr = frgWs_mc[None, i, j].iterator
-            x, y, z, w = ld_reduce(mc_ptr)
-            tmp_results[0, ii, jj] = x
-            tmp_results[1, ii, jj] = y
-            tmp_results[2, ii, jj] = z
-            tmp_results[3, ii, jj] = w
-    tmp_rD = cute.recast_tensor(tmp_results, frgWs_mc.element_type)
-    tRS_rD.store(tmp_rD.load().to(tRS_rD.element_type))
+    warps. Within a live subtile the loads are unpredicated (the padded workspace
+    keeps every access in-allocation; edge garbage is skipped by the commit and
+    predicated away by epi ops). Subtiles wholly past the slab tail
+    (epi_coord[0] * subtile_rows >= row_limit) have nothing to store, so skip
+    their ld_reduce traffic too — at small M only 1-2 subtiles are live."""
+    # Dead-subtile traffic is serial multimem round trips: 0.041 vs 0.035 ms, AR M=64 TP=2.
+    in_slab = cutlass.Boolean(True)
+    if const_expr(row_limit is not None):
+        in_slab = epi_coord[0] * subtile_rows < row_limit
+    if in_slab:
+        _atom, chunk, sub_loop_n = tRS_rD.shape
+        ld_reduce = multimem_ld_reduce_128b(frgWs_mc.element_type)
+        tmp_results = cute.make_rmem_tensor((4, chunk, sub_loop_n), cutlass.Int32)
+        for ii in cutlass.range_constexpr(chunk):
+            i = epi_coord[0] * chunk + ii
+            for jj in cutlass.range_constexpr(sub_loop_n):
+                j = epi_coord[1] * sub_loop_n + jj
+                mc_ptr = frgWs_mc[None, i, j].iterator
+                x, y, z, w = ld_reduce(mc_ptr)
+                tmp_results[0, ii, jj] = x
+                tmp_results[1, ii, jj] = y
+                tmp_results[2, ii, jj] = z
+                tmp_results[3, ii, jj] = w
+        tmp_rD = cute.recast_tensor(tmp_results, frgWs_mc.element_type)
+        tRS_rD.store(tmp_rD.load().to(tRS_rD.element_type))
 
 
 def _subtile_to_dtype(tRS_rD, dtype):

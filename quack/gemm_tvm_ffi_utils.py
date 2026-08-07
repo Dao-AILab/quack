@@ -311,7 +311,6 @@ def make_fake_epi_reduce_args(d_dtype, mode, ws_dtype):
         tile_flags_mc=flags(),
         sync_barrier=flags(),
         sync_barrier_mc=flags(),
-        consumer_counters=flags(),
     )
 
 

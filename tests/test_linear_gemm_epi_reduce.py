@@ -54,18 +54,13 @@ def _dist_setup(m, k, world_size):
 
 
 def _make_comm(mode, m, n, l, tile_m, tile_n, cluster_m, num_ranks):
-    """D output + padded partials workspace + flags/barriers/counters; torch handles only."""
+    """D output + padded partials workspace + flags/barriers; torch handles only."""
     from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
 
     d_arg, epi_reduce_args = make_epi_reduce_args(
         mode, torch.bfloat16, m, n, l, tile_m, tile_n, cluster_m, num_ranks
     )
-    return (
-        d_arg,
-        epi_reduce_args,
-        epi_reduce_args.tile_flags,
-        epi_reduce_args.consumer_counters,
-    )
+    return d_arg, epi_reduce_args
 
 
 def _make_ab(m, n, k_local, l, k, rank):
@@ -102,11 +97,11 @@ def _run_gemm_act_reduce(
 ):
     import torch.distributed as dist
 
-    from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
+    from quack.dist_utils import init_distributed, clean_distributed
     from quack.epilogues import linear_act_mod
     from quack.gemm_config import SplitKMode
 
-    torchrun_init_nvshmem()
+    init_distributed()
     rank, world_size = dist.get_rank(), dist.get_world_size()
     assert world_size > 1, "launch with torchrun --nproc_per_node > 1"
     _dist_setup(m, k, world_size)
@@ -118,7 +113,7 @@ def _run_gemm_act_reduce(
     m_per_rank = m // world_size
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
-    d_arg, epi_reduce_args, tf_torch, counters_torch = _make_comm(
+    d_arg, epi_reduce_args = _make_comm(
         epi_reduce_mode, m, n, l, tile_m, tile_n, cluster_m, world_size
     )
     # Aux is slab-local under epi_reduce (epilogue coords are m/TP-shaped).
@@ -172,7 +167,7 @@ def _run_gemm_act_reduce(
     # bit-exact asserts below only hold for split_k == 1 and SERIAL.
     bitwise_repeatable = split_k == 1 or sk_mode == SplitKMode.SERIAL
 
-    # r2r: relaunch reuses flags/counters in place; D and aux must be bit-identical.
+    # r2r: relaunch reuses flags in place; D and aux must be bit-identical.
     runs, aux_runs = [], []
     for _ in range(2):
         launch()
@@ -207,17 +202,8 @@ def _run_gemm_act_reduce(
             assert torch.equal(out, expected), f"mutation loop iter {it}: stale or raced value"
     dist.barrier()
 
-    # Flag wrap (see test_gemm_epi_reduce.py): relaunch across the int32 boundary.
-    wrap_seed = torch.iinfo(torch.int32).max - world_size
-    tf_torch.fill_(wrap_seed)
-    counters_torch.fill_(wrap_seed)
-    dist.barrier()
-    for it in range(3):
-        launch()
-        torch.cuda.synchronize()
-        if bitwise_repeatable:
-            assert torch.equal(out, runs[1]), f"flag-wrap launch {it}: D mismatch"
-            assert torch.equal(aux_out, aux_runs[1]), f"flag-wrap launch {it}: aux mismatch"
+    # Flags self-reset in-kernel: the relaunch loops above are the reuse test;
+    # no int32 wrap is reachable.
     dist.barrier()
 
     # quack convention: fp32 ref is ground truth; kernel error < 2x same-dtype ref error.
@@ -263,16 +249,16 @@ def _run_gemm_act_reduce(
         print("Ref check PASSED")
 
     dist.barrier()
-    torchrun_finalize_nvshmem()
+    clean_distributed()
 
 
 def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=False):
     import torch.distributed as dist
 
-    from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
+    from quack.dist_utils import init_distributed, clean_distributed
     from quack.epilogues import sq_reduce_mod
 
-    torchrun_init_nvshmem()
+    init_distributed()
     rank, world_size = dist.get_rank(), dist.get_world_size()
     assert world_size > 1, "launch with torchrun --nproc_per_node > 1"
     _dist_setup(m, k, world_size)
@@ -285,8 +271,8 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
     n_tiles = (n + tile_n - 1) // tile_n
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
-    d_torch_gpu, epi_reduce_args, tf_torch, counters_torch = _make_comm(
-        m, n, l, tile_m, tile_n, cluster_m, world_size
+    d_torch_gpu, epi_reduce_args = _make_comm(
+        epi_reduce_mode, m, n, l, tile_m, tile_n, cluster_m, world_size
     )
     d_arg = d_torch_gpu.permute(2, 0, 1)
     # Per-N-tile sq partials, slab-local under epi_reduce; norm_weight is common
@@ -351,16 +337,8 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
         assert torch.equal(colvec_gpu, sq_runs[1]), f"mutation loop iter {it}: sq partials"
     dist.barrier()
 
-    # Flag wrap (see test_gemm_epi_reduce.py): relaunch across the int32 boundary.
-    wrap_seed = torch.iinfo(torch.int32).max - world_size
-    tf_torch.fill_(wrap_seed)
-    counters_torch.fill_(wrap_seed)
-    dist.barrier()
-    for it in range(3):
-        launch()
-        torch.cuda.synchronize()
-        assert torch.equal(out, runs[1]), f"flag-wrap launch {it}: D mismatch"
-        assert torch.equal(colvec_gpu, sq_runs[1]), f"flag-wrap launch {it}: sq mismatch"
+    # Flags self-reset in-kernel: the relaunch loops above are the reuse test;
+    # no int32 wrap is reachable.
     dist.barrier()
 
     # quack convention: fp32 reference = ground truth; kernel error < 2x bf16-impl error.
@@ -411,7 +389,7 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
         print("Ref check PASSED")
 
     dist.barrier()
-    torchrun_finalize_nvshmem()
+    clean_distributed()
 
 
 @pytest.mark.parametrize("world_size", WORLD_SIZES, ids=lambda w: f"world{w}")

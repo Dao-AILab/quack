@@ -55,12 +55,12 @@ def _run_gemm_epi_reduce(
     import cutlass.torch as cutlass_torch
 
     from quack.cute_dsl_utils import get_device_capacity
-    from quack.dist_utils import torchrun_init_nvshmem, torchrun_finalize_nvshmem
+    from quack.dist_utils import init_distributed, clean_distributed
     from quack.distributed.gemm_epi_reduce import make_epi_reduce_args
     from quack.gemm import gemm
     from quack.gemm_config import SplitKMode
 
-    torchrun_init_nvshmem()
+    init_distributed()
     rank, world_size = dist.get_rank(), dist.get_world_size()
     assert world_size > 1, "launch with torchrun --nproc_per_node > 1"
     sm_major = get_device_capacity(torch.device("cuda"))[0]
@@ -134,7 +134,6 @@ def _run_gemm_epi_reduce(
         epi_reduce_mode, torch_d, m, n, l, tile_m, tile_n, cluster_m, world_size, ws_dtype=torch_ws
     )
     tf_torch = epi_reduce_args.tile_flags
-    counters_torch = epi_reduce_args.consumer_counters
 
     sk_mode = SplitKMode.SERIAL if split_k_mode == "serial" else SplitKMode.PARALLEL
     launch = lambda: gemm(
@@ -162,7 +161,7 @@ def _run_gemm_epi_reduce(
     # bit-exact asserts below only hold for split_k == 1 and SERIAL.
     bitwise_repeatable = split_k == 1 or sk_mode == SplitKMode.SERIAL
 
-    # r2r: relaunch reuses tile_flags/sync_barrier/counters in place (stale-flag bugs
+    # r2r: relaunch reuses tile_flags/sync_barrier in place (stale-flag bugs
     # are invisible to a single launch); identical inputs must be bit-identical.
     runs = []
     for _ in range(2):
@@ -189,17 +188,8 @@ def _run_gemm_epi_reduce(
             assert torch.equal(out, expected), f"mutation loop iter {it}: stale or raced value"
     dist.barrier()
 
-    # Flag wrap: flags/counters are monotonic (never reset), so int32 wrap is reachable;
-    # seed just below the wrap and relaunch across it (A is restored, output = run 1).
-    wrap_seed = torch.iinfo(torch.int32).max - world_size
-    tf_torch.fill_(wrap_seed)
-    counters_torch.fill_(wrap_seed)
-    dist.barrier()
-    for it in range(3):
-        launch()
-        torch.cuda.synchronize()
-        if bitwise_repeatable:
-            assert torch.equal(out, runs[1]), f"flag-wrap launch {it}: mismatch"
+    # Flags self-reset in-kernel: the relaunch loops above are the reuse test;
+    # no int32 wrap is reachable.
     dist.barrier()
 
     # quack convention: fp32 ref is ground truth; kernel error < 2x same-dtype ref error.
@@ -234,7 +224,7 @@ def _run_gemm_epi_reduce(
         print("Ref check PASSED")
 
     dist.barrier()
-    torchrun_finalize_nvshmem()
+    clean_distributed()
 
 
 def _launch_test(world_size, m, n, k, l, ab_dtype, d_dtype, mode, split_k=1, split_k_mode="serial"):

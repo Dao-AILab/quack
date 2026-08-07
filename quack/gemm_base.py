@@ -16,7 +16,7 @@ from cutlass.utils import LayoutEnum
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 import quack.utils as utils
-from cutlass.utils.distributed import multimem_red_add1
+from cutlass.utils.distributed import multimem_red_add1, spin_lock_ld_lt_relaxed_wait
 
 from quack.cute_dsl_utils import ParamsBase
 from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
@@ -564,9 +564,10 @@ class GemmBase:
 
         The tile signal is the sibling of split-K's sem release: +1 on every
         rank's copy of flag[tile_id] (multimem red.release), after the barrier
-        orders all epi threads' stores. Flags are monotonic — never reset —
-        and consumers epoch-track via consumer_counters; in_bounds skips
-        fully-OOB CTA halves, whose coord would alias the next column's flag.
+        orders all epi threads' stores. Flags self-reset at consumption (the
+        last consumer stores 0), so every launch starts from zeroed flags;
+        in_bounds skips fully-OOB CTA halves, whose coord would alias the next
+        column's flag.
 
         Runs where epi_fn would (once per tile, on the local finalizing entity —
         under local split-K the load_acc_subtile it receives is the
@@ -926,34 +927,38 @@ class GemmBase:
             g_row0 = slab_row0 + row0
             prod_m0 = g_row0 // cta_m
             prod_m1 = (g_row0 + rows_here - 1) // cta_m
-            slab_linear = m_tile + slab_tiles_m * (n_tile + n_tiles_total * batch)
             flag_base = cta_tiles_m_total * (n_tile + n_tiles_total * batch)
 
-            # Passed as args: DSL control flow can't close over outer variables.
-            def spin_flag(flag, base, num_ranks):
-                # Wrap-safe: compare the difference, never absolute values.
-                # (nanosleep backoff on retries was tried: perf-neutral.)
-                res = base
-                while res - base < num_ranks:
-                    res = cute.arch.load(flag.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
-
-            # One counter per consumer tile: each producer signal is +1, so every
-            # flag grows by exactly num_ranks per launch and both checks share one
-            # baseline. Never reset flags: PDL overlaps launches, so the next
-            # launch's +1 can land before a store-0 reset (erased signal = hang),
-            # and a twice-visited flag would over-drain under per-visit
-            # subtraction. Counters are single-writer; int32 wrap harmless
-            # (differences only).
+            # Wait >= world, then consume: +1, and whoever brings the flag to
+            # world + consumers resets it. A flag has 2 consumers on this rank
+            # only when the slab anchor is cta_m-misaligned and both neighbors
+            # exist; both have finished waiting before the reset fires. Safe
+            # under PDL: the next launch's producer release sits behind its
+            # griddepcontrol-gated loads, so it cannot land before this reset.
             if tidx == 0:
-                counter = epi_reduce_args.consumer_counters.iterator + slab_linear
-                base = cute.arch.load(counter.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
+                misaligned = slab_row0 % cta_m != 0
                 flags = epi_reduce_args.tile_flags
-                spin_flag(flags.iterator + prod_m0 + flag_base, base, self.num_ranks)
-                if prod_m1 != prod_m0:
-                    spin_flag(flags.iterator + prod_m1 + flag_base, base, self.num_ranks)
-                cute.arch.atomic_add(
-                    counter.llvm_ptr, Int32(self.num_ranks), sem="relaxed", scope="gpu"
+                f0 = flags.iterator + flag_base + prod_m0
+                spin_lock_ld_lt_relaxed_wait(
+                    lock_ptr=f0, expected_val=self.num_ranks, scope="gpu"
                 )
+                cons0 = Int32(1)
+                if misaligned and m_tile > 0:
+                    cons0 = Int32(2)
+                r0 = cute.arch.atomic_add(f0.llvm_ptr, Int32(1), sem="relaxed", scope="gpu")
+                if r0 == self.num_ranks + cons0 - 1:
+                    cute.arch.store(f0.llvm_ptr, Int32(0), sem="relaxed", scope="gpu")
+                if prod_m1 != prod_m0:
+                    f1 = flags.iterator + flag_base + prod_m1
+                    spin_lock_ld_lt_relaxed_wait(
+                        lock_ptr=f1, expected_val=self.num_ranks, scope="gpu"
+                    )
+                    cons1 = Int32(1)
+                    if m_tile + 1 < slab_tiles_m:
+                        cons1 = Int32(2)
+                    r1 = cute.arch.atomic_add(f1.llvm_ptr, Int32(1), sem="relaxed", scope="gpu")
+                    if r1 == self.num_ranks + cons1 - 1:
+                        cute.arch.store(f1.llvm_ptr, Int32(0), sem="relaxed", scope="gpu")
             epilogue_barrier.arrive_and_wait()
             return epi_fn(load_acc_subtile)
 

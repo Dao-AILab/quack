@@ -1,22 +1,18 @@
 """Distributed helpers for the fused reduce-scatter / all-reduce GEMM path
-(epi_reduce_mode): nvshmem + torch.distributed setup, symmetric / multicast tensor
-allocation, the barrier flags the kernel's comm layer reads, and the multimem
-intrinsic dispatch its reduce uses. These are the runtime contract for calling
-GemmSm100(epi_reduce_mode=...), not benchmarking helpers.
-
-nvshmem / cuda.core imports are lazy: this module is imported from the kernel
-layer (epi_reduce), which must not require nvshmem at import time.
+(epi_reduce_mode): torch.distributed setup, symmetric / multicast tensor
+allocation via torch symm_mem, the barrier flags the kernel's comm layer reads,
+and the multimem intrinsic dispatch its reduce uses. These are the runtime
+contract for calling GemmSm100(epi_reduce_mode=...), not benchmarking helpers.
 """
 
+import math
 import os
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
 import cutlass
 import cutlass.utils as utils
-from cutlass.cute.runtime import from_dlpack
 
 
 def multimem_ld_reduce_128b(dtype):
@@ -34,75 +30,61 @@ def multimem_ld_reduce_128b(dtype):
     raise NotImplementedError(f"multimem_ld_reduce_128b: unsupported dtype {dtype}")
 
 
-def torchrun_init_nvshmem(dist_initialized=False):
-    import nvshmem.core
-    from cuda.core.experimental import Device
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dev = Device(local_rank)
-    dev.set_current()
-    if not dist_initialized:
-        dist.init_process_group(backend="cpu:gloo,cuda:nccl")
-    num_ranks = dist.get_world_size()
-    uid = nvshmem.core.get_unique_id(empty=(local_rank != 0))
-    uid_bytes = uid._data.view(np.uint8).copy()
-    uid_tensor = torch.from_numpy(uid_bytes).cuda()
-    dist.broadcast(uid_tensor, src=0)
-    dist.barrier()
-    uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
-    nvshmem.core.init(
-        device=dev, uid=uid, rank=local_rank, nranks=num_ranks, initializer_method="uid"
-    )
+def init_distributed():
+    """torchrun NCCL setup (idempotent), matching the cutlass distributed
+    examples' init_distributed. Returns (global_rank, world_size, device)."""
+    if not dist.is_initialized():
+        local_rank = int(os.environ["LOCAL_RANK"])
+        global_rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+        dist.init_process_group(
+            backend="nccl", world_size=world_size, rank=global_rank, device_id=device
+        )
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", global_rank))
+    device = torch.device("cuda", local_rank)
+    return global_rank, world_size, device
 
 
-# Cleanup callbacks run (in reverse) by torchrun_finalize_nvshmem, so factories that allocate
-# symmetric memory internally (barrier flags, multicast views) don't leak into finalize errors.
-_finalizers = []
+def clean_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
-def on_finalize(fn):
-    _finalizers.append(fn)
+def _wrap_device_ptr(ptr, shape, torch_dtype):
+    """CUDA-typed non-owning view of a raw device pointer (e.g. a symm_mem
+    multicast VA) on the current device; the symm_mem handle owns the memory."""
+    dev = torch.device("cuda", torch.cuda.current_device())
+    nbytes = math.prod(shape) * torch_dtype.itemsize
+    storage = torch._C._construct_storage_from_data_pointer(ptr, dev, nbytes)
+    return torch.empty(0, dtype=torch_dtype, device=dev).set_(storage).view(shape)
 
 
-def torchrun_finalize_nvshmem():
-    import nvshmem.core
+def make_symm_mem_tensor(shape, torch_dtype, permute):
+    """Uninitialized symmetric tensor plus its multicast view via torch symm_mem.
 
-    for fn in reversed(_finalizers):
-        try:
-            fn()
-        except Exception:
-            pass  # tolerate already-freed tensors
-    _finalizers.clear()
-    nvshmem.core.finalize()
-    dist.destroy_process_group()
+    No host staging — an output or workspace buffer needs no initial contents.
+    shape is in allocation (row-major) order and permute applies to both returns,
+    so shape=(l, m, n) with permute=(1, 2, 0) gives kernel-order (m, n, l)
+    n-major views. torch owns the allocation — no explicit free."""
+    import torch.distributed._symmetric_memory as symm_mem
 
-
-def make_symmetric_tensor(shape, torch_dtype, permute):
-    """Uninitialized symmetric tensor plus its multicast and peer views (torch handles).
-
-    No host staging — an output or workspace buffer needs no initial contents. shape is
-    in allocation (row-major) order and permute applies the same view to all three
-    returns, so shape=(l, m, n) with permute=(1, 2, 0) gives kernel-order (m, n, l)
-    n-major views. The allocation self-registers its free via on_finalize."""
-    import nvshmem.core
-
-    base = nvshmem.core.tensor(tuple(shape), dtype=torch_dtype)
-    base_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, base)
-    on_finalize(lambda: (nvshmem.core.free_tensor(base_mc), nvshmem.core.free_tensor(base)))
-    peers = [
-        nvshmem.core.get_peer_tensor(base, r).permute(permute) for r in range(dist.get_world_size())
-    ]
-    return base.permute(permute), base_mc.permute(permute), peers
+    base = symm_mem.empty(tuple(shape), dtype=torch_dtype, device="cuda")
+    hdl = symm_mem.rendezvous(base, group=dist.group.WORLD)
+    mc = _wrap_device_ptr(hdl.multicast_ptr, tuple(base.shape), base.dtype)
+    return base.permute(permute), mc.permute(permute)
 
 
-def make_barrier_flags(num_flags):
-    import nvshmem.core
+def make_symm_mem_flags(num_flags):
+    """Zero-filled symmetric int32 flag array + multicast view via torch symm_mem.
+    Each rank zero-fills its own copy before the (collective) rendezvous."""
+    import torch.distributed._symmetric_memory as symm_mem
 
-    bf_torch = nvshmem.core.tensor((num_flags,), dtype=torch.int32)
-    bf_torch.fill_(0)
-    bf_torch_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, bf_torch)
-    bf = from_dlpack(bf_torch).mark_layout_dynamic()
-    bf_mc = from_dlpack(bf_torch_mc).mark_layout_dynamic()
-    on_finalize(lambda: (nvshmem.core.free_tensor(bf_torch_mc), nvshmem.core.free_tensor(bf_torch)))
-    return bf_torch, bf_torch_mc, bf, bf_mc
+    flags = symm_mem.empty((num_flags,), dtype=torch.int32, device="cuda")
+    flags.fill_(0)
+    hdl = symm_mem.rendezvous(flags, group=dist.group.WORLD)
+    flags_mc = _wrap_device_ptr(hdl.multicast_ptr, (num_flags,), flags.dtype)
+    return flags, flags_mc
