@@ -554,7 +554,14 @@ class GemmSm100(GemmTmaBase):
         # slower on both counts (18-35%, RS TP=2), warp scatter dominant.
         self.epi_reduce_tile = None
         if const_expr(self.epi_reduce_mode is not None):
-            self.epi_reduce_tile = (32, self.cta_tile_shape_mnk[1])
+            # Rows track the per-rank slab share so small-M slabs aren't over-read,
+            # capped at 32 (register budget), floored at the copy layout's thread rows.
+            cta_n = self.cta_tile_shape_mnk[1]
+            atom_val = 128 // self.d_dtype.width
+            total_threads = 4 * cute.arch.WARP_SIZE
+            atom_thr_m = total_threads // math.gcd(cta_n // atom_val, total_threads)
+            rows = min(32, max(atom_thr_m, self.cta_tile_shape_mnk[0] // self.num_ranks))
+            self.epi_reduce_tile = (rows, cta_n)
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         prefetch_A_idx = (
