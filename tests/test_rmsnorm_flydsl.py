@@ -151,15 +151,23 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
 
     compile_calls = 0
     compile_original = fly_rmsnorm.flyc.compile
+    validate_calls = 0
+    validate_original = fly_rmsnorm._validate_arch
 
     def count_compile(*args, **kwargs):
         nonlocal compile_calls
         compile_calls += 1
         return compile_original(*args, **kwargs)
 
+    def count_validate(device):
+        nonlocal validate_calls
+        validate_calls += 1
+        return validate_original(device)
+
     fly_rmsnorm._FWD_CACHE.clear()
     fly_rmsnorm._COMPILED_CALLABLES.clear()
     monkeypatch.setattr(fly_rmsnorm.flyc, "compile", count_compile)
+    monkeypatch.setattr(fly_rmsnorm, "_validate_arch", count_validate)
     compile_context = [("gfx950", "context-a")]
     monkeypatch.setattr(fly_rmsnorm, "_compile_context", lambda _device: compile_context[0])
 
@@ -173,6 +181,7 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
         _assert_close(out, expected, x.dtype)
 
     assert compile_calls == 1
+    assert validate_calls == 1
     assert len(fly_rmsnorm._FWD_CACHE) == 1
 
     compile_context[0] = ("gfx950", "context-b")
@@ -180,6 +189,7 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
     weight = torch.randn(n, device=_DEVICE, dtype=torch.float16)
     fly_rmsnorm.rmsnorm_fwd(x, weight)
     assert compile_calls == 2
+    assert validate_calls == 2
     assert len(fly_rmsnorm._FWD_CACHE) == 2
 
 
@@ -205,6 +215,26 @@ def test_unaligned_padded_rows_are_copied_before_vector_access():
     assert packed.data_ptr() != x.data_ptr()
 
     weight = torch.randn(n, device=_DEVICE, dtype=torch.float16)
+    out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
+    expected, _, _ = _reference(x, weight)
+    _assert_close(out, expected, x.dtype)
+
+
+def test_misaligned_contiguous_storage_offsets_force_allocation():
+    n = 192
+    x_storage = torch.randn(2 * n + 1, device=_DEVICE, dtype=torch.float16)
+    weight_storage = torch.randn(n + 1, device=_DEVICE, dtype=torch.float16)
+    x = x_storage[1:].view(2, n)
+    weight = weight_storage[1:]
+    assert x.is_contiguous() and weight.is_contiguous()
+    assert x.data_ptr() % 16 == weight.data_ptr() % 16 == 2
+
+    packed_x = fly_rmsnorm._packed_rows(x)
+    packed_weight = fly_rmsnorm._packed_rows(weight)
+    assert packed_x.data_ptr() != x.data_ptr()
+    assert packed_weight.data_ptr() != weight.data_ptr()
+    assert packed_x.data_ptr() % 16 == packed_weight.data_ptr() % 16 == 0
+
     out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
     expected, _, _ = _reference(x, weight)
     _assert_close(out, expected, x.dtype)

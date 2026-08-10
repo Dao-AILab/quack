@@ -825,15 +825,15 @@ def _compile_context(device: torch.device) -> tuple:
     index = device.index if device.index is not None else torch.cuda.current_device()
     return (
         index,
-        _validate_arch(device),
         *(os.environ.get(name, "") for name in _COMPILE_ENV_VARS),
     )
 
 
-def _build_cached(key: tuple):
+def _build_cached(key: tuple, device: torch.device):
     with _BUILD_LOCK:
         launcher = _FWD_CACHE.get(key)
         if launcher is None:
+            _validate_arch(device)
             launcher = _build_rmsnorm_module(
                 key[1],
                 key[2],
@@ -900,7 +900,7 @@ def _launch_rmsnorm_fwd(
     with torch.cuda.device(x.device):
         launcher = _FWD_CACHE.get(key)
         if launcher is None:
-            launcher = _build_cached(key)
+            launcher = _build_cached(key, x.device)
         _run_compiled(
             launcher,
             x,
@@ -1058,7 +1058,9 @@ def _rows_are_disjoint_and_packed(tensor: torch.Tensor) -> bool:
 def _packed_rows(tensor: torch.Tensor) -> torch.Tensor:
     """Preserve safe row padding and copy only incompatible layouts."""
     tensor = _unambiguous_layout(tensor)
-    return tensor if _rows_are_disjoint_and_packed(tensor) else tensor.contiguous()
+    if _rows_are_disjoint_and_packed(tensor):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
 
 
 def _empty_placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
