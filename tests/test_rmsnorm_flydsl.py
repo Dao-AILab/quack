@@ -165,7 +165,6 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
         return validate_original(device)
 
     fly_rmsnorm._FWD_CACHE.clear()
-    fly_rmsnorm._COMPILED_CALLABLES.clear()
     monkeypatch.setattr(fly_rmsnorm.flyc, "compile", count_compile)
     monkeypatch.setattr(fly_rmsnorm, "_validate_arch", count_validate)
     compile_context = [("gfx950", "context-a")]

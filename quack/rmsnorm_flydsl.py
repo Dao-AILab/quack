@@ -11,7 +11,6 @@ import math
 import numbers
 import os
 import threading
-import weakref
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -41,112 +40,71 @@ _COMPILE_ENV_VARS = (
     "FLYDSL_GPU_ARCH",
     "HSA_OVERRIDE_GFX_VERSION",
 )
+_DTYPE_SPECS = {
+    torch.float16: (fx.Float16, 16),
+    torch.bfloat16: (fx.BFloat16, 16),
+    torch.float32: (fx.Float32, 32),
+}
 
 _BUILD_LOCK = threading.RLock()
-_COMPILED_LOCK = threading.Lock()
-_COMPILED_CALLABLES: dict[int, tuple[weakref.ReferenceType, object]] = {}
-_FWD_CACHE: dict[tuple, object] = {}
+_FWD_CACHE: dict[tuple, flyc.CompiledFunction] = {}
 _DEVICE_ARCH_CACHE: dict[int, str] = {}
 _EMPTY_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
-def _cached_callable(executable):
-    key = id(executable)
-    with _COMPILED_LOCK:
-        entry = _COMPILED_CALLABLES.get(key)
-        if entry is not None and entry[0]() is executable:
-            return entry[1]
-    return None
+def _dtype_spec(dtype: torch.dtype):
+    """Translate a public torch dtype to its FlyDSL scalar type and bit width."""
+    try:
+        return _DTYPE_SPECS[dtype]
+    except KeyError:
+        raise TypeError(f"unsupported dtype: {dtype}") from None
 
 
-def _cache_callable(executable, compiled) -> None:
-    key = id(executable)
-
-    def remove(reference):
-        with _COMPILED_LOCK:
-            entry = _COMPILED_CALLABLES.get(key)
-            if entry is not None and entry[0] is reference:
-                del _COMPILED_CALLABLES[key]
-
-    reference = weakref.ref(executable, remove)
-    with _COMPILED_LOCK:
-        _COMPILED_CALLABLES[key] = (reference, compiled)
-
-
-def _run_compiled(executable, *args) -> None:
-    """Compile and launch once, then reuse FlyDSL's compiled callable."""
-    compiled = _cached_callable(executable)
-    if compiled is not None:
-        compiled(*args)
-        return
-    with _BUILD_LOCK:
-        compiled = _cached_callable(executable)
-        if compiled is None:
-            # flyc.compile performs the first launch as part of compilation.
-            compiled = flyc.compile(executable, *args)
-            _cache_callable(executable, compiled)
-            return
-    compiled(*args)
-
-
-def _dtype_to_elem_type(dtype_str: str):
-    if dtype_str == "f32":
-        return fx.Float32
-    if dtype_str == "f16":
-        return fx.Float16
-    if dtype_str == "bf16":
-        return fx.BFloat16
-    raise ValueError(f"unsupported dtype: {dtype_str!r}")
-
-
-def _dtype_to_elem_bits(dtype_str: str) -> int:
-    if dtype_str == "f32":
-        return 32
-    if dtype_str in ("f16", "bf16"):
-        return 16
-    raise ValueError(f"unsupported dtype: {dtype_str!r}")
-
-
-def _dtype_to_str(dtype: torch.dtype) -> str:
-    if dtype == torch.float16:
-        return "f16"
-    if dtype == torch.bfloat16:
-        return "bf16"
-    if dtype == torch.float32:
-        return "f32"
-    raise TypeError(f"unsupported dtype: {dtype}")
-
-
+# Generic ROCm/FlyDSL transaction helpers. They stay local in this first kernel
+# so the PR is self-contained; a later kernel can move them into shared code
+# without changing their contracts.
 def _buffer_copy_atom(access_bits: int, elem_bits: int):
+    """Build one legal MUBUF copy atom.
+
+    ``access_bits`` is the hardware transaction width while ``elem_bits`` tells
+    FlyDSL how that transaction is represented in registers.
+    """
     if access_bits not in (8, 16, 32, 64, 128):
         raise ValueError(f"no buffer copy for a {access_bits}-bit access")
     return fx.make_copy_atom(fx.rocdl.BufferCopy(access_bits, 0), elem_bits)
 
 
-def _vector_access_plan(vecsize: int, dtype_width: int) -> tuple[int, int]:
+def _split_vector_for_dtype(vecsize: int, dtype_width: int) -> tuple[int, int]:
+    """Split one logical activation vector into 128-bit-or-smaller accesses.
+
+    Optional operands can have a wider dtype than the activation, so the same
+    element span may require multiple MUBUF transactions. Returns
+    ``(transaction_count, elements_per_transaction)``.
+    """
     accesses = max(1, (vecsize * dtype_width) // ACCESS_BITS)
     return accesses, vecsize // accesses
 
 
-def _row_records(elem_bits: int, n: int, valid):
-    records = n * (elem_bits // 8)
+def _row_descriptor_bytes(elem_bits: int, n: int, valid):
+    """Return the row-scoped buffer bound, or zero for an invalid grid row."""
+    row_bytes = n * (elem_bits // 8)
     if valid is None:
-        return records
-    return valid.select(fx.Int32(records), fx.Int32(0))
+        return row_bytes
+    return valid.select(fx.Int32(row_bytes), fx.Int32(0))
 
 
 def _row_buffer(tensor, row, elem_bits: int, n: int, valid=None):
     """Create a row-scoped descriptor so padded row pitches stay valid."""
     return fx.rocdl.make_buffer_tensor(
         fx.slice(tensor, (row, None)),
-        num_records_bytes=_row_records(elem_bits, n, valid),
+        num_records_bytes=_row_descriptor_bytes(elem_bits, n, valid),
     )
 
 
 def _row_head_buffer(tensor, row, head, elem_bits: int, n: int, valid=None):
     return fx.rocdl.make_buffer_tensor(
         fx.slice(tensor, (row, head, None)),
-        num_records_bytes=_row_records(elem_bits, n, valid),
+        num_records_bytes=_row_descriptor_bytes(elem_bits, n, valid),
     )
 
 
@@ -218,7 +176,7 @@ def _load_dtype_vec(
     vecsize,
 ):
     """Load one activation-width span, splitting wider operand storage."""
-    accesses, per_access = _vector_access_plan(vecsize, dtype_width)
+    accesses, per_access = _split_vector_for_dtype(vecsize, dtype_width)
     if const_expr(accesses <= 1):
         return _load_vec(
             copy_atom,
@@ -255,7 +213,7 @@ def _store_dtype_vec(
     index,
     vecsize,
 ):
-    accesses, per_access = _vector_access_plan(vecsize, dtype_width)
+    accesses, per_access = _split_vector_for_dtype(vecsize, dtype_width)
     if const_expr(accesses <= 1):
         _store_vec(copy_atom, vecsize, elem_dtype, value, divided_tensor, index)
         return
@@ -271,8 +229,8 @@ def _store_dtype_vec(
         )
 
 
-def _to_store_dtype(dtype_str: str, elem_dtype, value):
-    if const_expr(dtype_str == "f32"):
+def _to_store_dtype(is_float32: bool, elem_dtype, value):
+    if const_expr(is_float32):
         return value
     # gfx950 provides the packed fp32-to-bf16 conversion used by vector stores.
     return value.to(elem_dtype)
@@ -280,13 +238,13 @@ def _to_store_dtype(dtype_str: str, elem_dtype, value):
 
 def _build_rmsnorm_module(
     n: int,
-    input_dtype_str: str,
-    output_dtype_str: str,
+    input_torch_dtype: torch.dtype,
+    output_torch_dtype: torch.dtype,
     *,
-    weight_dtype_str: str,
-    bias_dtype_str: str,
-    residual_dtype_str: str,
-    residual_out_dtype_str: str,
+    weight_torch_dtype: torch.dtype,
+    bias_torch_dtype: torch.dtype,
+    residual_torch_dtype: torch.dtype,
+    residual_out_torch_dtype: torch.dtype,
     has_weight: bool,
     has_bias: bool,
     has_residual: bool,
@@ -296,13 +254,20 @@ def _build_rmsnorm_module(
     num_heads: int,
     apply_weight_offset: bool,
 ):
-    """Build one feature-specialized analytical forward launcher."""
-    input_bits = _dtype_to_elem_bits(input_dtype_str)
-    output_bits = _dtype_to_elem_bits(output_dtype_str)
-    weight_bits = _dtype_to_elem_bits(weight_dtype_str)
-    bias_bits = _dtype_to_elem_bits(bias_dtype_str)
-    residual_bits = _dtype_to_elem_bits(residual_dtype_str)
-    residual_out_bits = _dtype_to_elem_bits(residual_out_dtype_str)
+    """Build one feature-specialized analytical forward launcher.
+
+    Public ``torch.dtype`` values are resolved here, before FlyDSL traces the
+    nested kernel; device code captures only FlyDSL scalar types, bit widths,
+    and booleans.
+    """
+    input_dtype, input_bits = _dtype_spec(input_torch_dtype)
+    output_dtype, output_bits = _dtype_spec(output_torch_dtype)
+    weight_dtype, weight_bits = _dtype_spec(weight_torch_dtype)
+    bias_dtype, bias_bits = _dtype_spec(bias_torch_dtype)
+    residual_dtype, residual_bits = _dtype_spec(residual_torch_dtype)
+    residual_out_dtype, residual_out_bits = _dtype_spec(residual_out_torch_dtype)
+    output_is_float32 = output_torch_dtype == torch.float32
+    residual_out_is_float32 = residual_out_torch_dtype == torch.float32
 
     config = RmsNormFwdConfig.for_forward(n, input_bits)
     threads_per_row = config.num_threads
@@ -319,12 +284,12 @@ def _build_rmsnorm_module(
     red_slots = max(1, threads_per_row // WAVE_SIZE)
     shared_storage = _make_reduction_storage(red_slots)
 
-    _, input_per_access = _vector_access_plan(vecsize, input_bits)
-    _, output_per_access = _vector_access_plan(vecsize, output_bits)
-    _, weight_per_access = _vector_access_plan(vecsize, weight_bits)
-    _, bias_per_access = _vector_access_plan(vecsize, bias_bits)
-    _, residual_per_access = _vector_access_plan(vecsize, residual_bits)
-    _, residual_out_per_access = _vector_access_plan(vecsize, residual_out_bits)
+    _, input_per_access = _split_vector_for_dtype(vecsize, input_bits)
+    _, output_per_access = _split_vector_for_dtype(vecsize, output_bits)
+    _, weight_per_access = _split_vector_for_dtype(vecsize, weight_bits)
+    _, bias_per_access = _split_vector_for_dtype(vecsize, bias_bits)
+    _, residual_per_access = _split_vector_for_dtype(vecsize, residual_bits)
+    _, residual_out_per_access = _split_vector_for_dtype(vecsize, residual_out_bits)
 
     @flyc.kernel(**({} if block_threads <= 256 else {"known_block_size": [block_threads, 1, 1]}))
     def rmsnorm_kernel(
@@ -351,12 +316,6 @@ def _build_rmsnorm_module(
         row = program // fx.Int32(num_heads) if per_head else program
         head = program % fx.Int32(num_heads) if per_head else fx.Int32(0)
 
-        input_dtype = _dtype_to_elem_type(input_dtype_str)
-        output_dtype = _dtype_to_elem_type(output_dtype_str)
-        weight_dtype = _dtype_to_elem_type(weight_dtype_str)
-        bias_dtype = _dtype_to_elem_type(bias_dtype_str)
-        residual_dtype = _dtype_to_elem_type(residual_dtype_str)
-        residual_out_dtype = _dtype_to_elem_type(residual_out_dtype_str)
         fast_math = arith.FastMathFlags.fast
 
         storage = fx.SharedAllocator().allocate(shared_storage).peek()
@@ -467,7 +426,7 @@ def _build_rmsnorm_module(
                         residual_out_copy,
                         residual_out_dtype,
                         residual_out_bits,
-                        _to_store_dtype(residual_out_dtype_str, residual_out_dtype, value),
+                        _to_store_dtype(residual_out_is_float32, residual_out_dtype, value),
                         residual_out_div,
                         index,
                         vecsize,
@@ -501,7 +460,7 @@ def _build_rmsnorm_module(
                             residual_out_copy,
                             residual_out_dtype,
                             residual_out_bits,
-                            _to_store_dtype(residual_out_dtype_str, residual_out_dtype, value),
+                            _to_store_dtype(residual_out_is_float32, residual_out_dtype, value),
                             residual_out_div,
                             index,
                             vecsize,
@@ -538,7 +497,7 @@ def _build_rmsnorm_module(
                     )
                 if const_expr(store_residual):
                     stored = _to_store_dtype(
-                        residual_out_dtype_str,
+                        residual_out_is_float32,
                         residual_out_dtype,
                         value,
                     )
@@ -627,7 +586,7 @@ def _build_rmsnorm_module(
                     output_copy,
                     output_dtype,
                     output_bits,
-                    _to_store_dtype(output_dtype_str, output_dtype, result),
+                    _to_store_dtype(output_is_float32, output_dtype, result),
                     output_div,
                     index,
                     vecsize,
@@ -680,7 +639,7 @@ def _build_rmsnorm_module(
                         output_copy,
                         output_dtype,
                         output_bits,
-                        _to_store_dtype(output_dtype_str, output_dtype, result),
+                        _to_store_dtype(output_is_float32, output_dtype, result),
                         output_div,
                         index,
                         vecsize,
@@ -719,7 +678,7 @@ def _build_rmsnorm_module(
                         safe_index,
                         vecsize,
                     )
-                output_value = _to_store_dtype(output_dtype_str, output_dtype, result)
+                output_value = _to_store_dtype(output_is_float32, output_dtype, result)
                 if const_expr(partial):
                     if in_row:
                         _store_dtype_vec(
@@ -829,30 +788,34 @@ def _compile_context(device: torch.device) -> tuple:
     )
 
 
-def _build_cached(key: tuple, device: torch.device):
+def _compile_forward(key: tuple, device: torch.device, args: tuple):
+    """Build once and retain FlyDSL's public fast callable for this specialization."""
     with _BUILD_LOCK:
-        launcher = _FWD_CACHE.get(key)
-        if launcher is None:
-            _validate_arch(device)
-            launcher = _build_rmsnorm_module(
-                key[1],
-                key[2],
-                key[3],
-                weight_dtype_str=key[4],
-                bias_dtype_str=key[5],
-                residual_dtype_str=key[6],
-                residual_out_dtype_str=key[7],
-                has_weight=key[8],
-                has_bias=key[9],
-                has_residual=key[10],
-                store_residual=key[11],
-                store_rstd=key[12],
-                per_head=key[13],
-                num_heads=key[14],
-                apply_weight_offset=key[15],
-            )
-            _FWD_CACHE[key] = launcher
-    return launcher
+        compiled = _FWD_CACHE.get(key)
+        if compiled is not None:
+            return compiled, False
+        _validate_arch(device)
+        launcher = _build_rmsnorm_module(
+            key[1],
+            key[2],
+            key[3],
+            weight_torch_dtype=key[4],
+            bias_torch_dtype=key[5],
+            residual_torch_dtype=key[6],
+            residual_out_torch_dtype=key[7],
+            has_weight=key[8],
+            has_bias=key[9],
+            has_residual=key[10],
+            store_residual=key[11],
+            store_rstd=key[12],
+            per_head=key[13],
+            num_heads=key[14],
+            apply_weight_offset=key[15],
+        )
+        # flyc.compile returns a CompiledFunction and performs its first launch.
+        compiled = flyc.compile(launcher, *args)
+        _FWD_CACHE[key] = compiled
+        return compiled, True
 
 
 def _current_raw_stream(device: torch.device) -> int:
@@ -882,12 +845,12 @@ def _launch_rmsnorm_fwd(
     key = (
         _compile_context(x.device),
         n,
-        _dtype_to_str(x.dtype),
-        _dtype_to_str(out.dtype),
-        _dtype_to_str(weight.dtype),
-        _dtype_to_str(bias.dtype),
-        _dtype_to_str(residual.dtype),
-        _dtype_to_str(residual_out.dtype),
+        x.dtype,
+        out.dtype,
+        weight.dtype,
+        bias.dtype,
+        residual.dtype,
+        residual_out.dtype,
         has_weight,
         has_bias,
         has_residual,
@@ -897,24 +860,27 @@ def _launch_rmsnorm_fwd(
         num_heads,
         weight_offset != 0.0,
     )
+    args = (
+        x,
+        weight,
+        bias,
+        residual,
+        out,
+        residual_out,
+        rstd,
+        m,
+        eps,
+        weight_offset,
+        _current_raw_stream(x.device),
+    )
     with torch.cuda.device(x.device):
-        launcher = _FWD_CACHE.get(key)
-        if launcher is None:
-            launcher = _build_cached(key, x.device)
-        _run_compiled(
-            launcher,
-            x,
-            weight,
-            bias,
-            residual,
-            out,
-            residual_out,
-            rstd,
-            m,
-            eps,
-            weight_offset,
-            _current_raw_stream(x.device),
-        )
+        compiled = _FWD_CACHE.get(key)
+        if compiled is not None:
+            compiled(*args)
+            return
+        compiled, launched = _compile_forward(key, x.device, args)
+        if not launched:
+            compiled(*args)
 
 
 def _validate_inputs(
