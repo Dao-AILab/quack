@@ -9,6 +9,7 @@
 
 import math
 import numbers
+import os
 import threading
 import weakref
 
@@ -23,7 +24,6 @@ from flydsl.runtime.device import get_rocm_arch
 from quack.rmsnorm_flydsl_config import (
     ACCESS_BITS,
     MAX_N,
-    N_ALIGNMENT,
     WAVE_SIZE,
     RmsNormFwdConfig,
 )
@@ -35,6 +35,12 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_ARCHES = frozenset({"gfx950"})
 _MAX_ROWS = 2**31 - 1
 _MAX_RSTD_ROWS = (2**32 - 1) // 4
+_COMPILE_ENV_VARS = (
+    "FLYDSL_COMPILE_BACKEND",
+    "ARCH",
+    "FLYDSL_GPU_ARCH",
+    "HSA_OVERRIDE_GFX_VERSION",
+)
 
 _BUILD_LOCK = threading.RLock()
 _COMPILED_LOCK = threading.Lock()
@@ -815,11 +821,19 @@ def _validate_arch(device: torch.device) -> str:
     return actual
 
 
-def _build_cached(key: tuple, device: torch.device):
+def _compile_context(device: torch.device) -> tuple:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return (
+        index,
+        _validate_arch(device),
+        *(os.environ.get(name, "") for name in _COMPILE_ENV_VARS),
+    )
+
+
+def _build_cached(key: tuple):
     with _BUILD_LOCK:
         launcher = _FWD_CACHE.get(key)
         if launcher is None:
-            _validate_arch(device)
             launcher = _build_rmsnorm_module(
                 key[1],
                 key[2],
@@ -866,7 +880,7 @@ def _launch_rmsnorm_fwd(
 ) -> None:
     m, n = x.shape[0], x.shape[-1]
     key = (
-        x.device.index,
+        _compile_context(x.device),
         n,
         _dtype_to_str(x.dtype),
         _dtype_to_str(out.dtype),
@@ -886,7 +900,7 @@ def _launch_rmsnorm_fwd(
     with torch.cuda.device(x.device):
         launcher = _FWD_CACHE.get(key)
         if launcher is None:
-            launcher = _build_cached(key, x.device)
+            launcher = _build_cached(key)
         _run_compiled(
             launcher,
             x,
@@ -941,8 +955,6 @@ def _validate_inputs(
 
     if not 1 <= n <= MAX_N:
         raise ValueError(f"x normalized dimension must be between 1 and {MAX_N}, got {n}")
-    if n % N_ALIGNMENT:
-        raise ValueError(f"x normalized dimension must be a multiple of {N_ALIGNMENT}, got {n}")
     for name, tensor in (("weight", weight), ("bias", bias)):
         if tensor is not None and tuple(tensor.shape) != parameter_shape:
             raise ValueError(f"{name} shape must be {parameter_shape}, got {tuple(tensor.shape)}")
@@ -953,6 +965,9 @@ def _validate_inputs(
 
     if x.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(f"x dtype must be float16, bfloat16, or float32, got {x.dtype}")
+    alignment = ACCESS_BITS // (x.element_size() * 8)
+    if n % alignment:
+        raise ValueError(f"x normalized dimension must be a multiple of {alignment}, got {n}")
     for name, tensor in (("weight", weight), ("bias", bias), ("residual", residual)):
         if tensor is not None and tensor.dtype not in _SUPPORTED_DTYPES:
             raise TypeError(
@@ -1025,10 +1040,15 @@ def _unambiguous_layout(tensor: torch.Tensor) -> torch.Tensor:
 def _rows_are_disjoint_and_packed(tensor: torch.Tensor) -> bool:
     if tensor.stride(-1) != 1:
         return False
+    access_bytes = ACCESS_BITS // 8
+    if tensor.data_ptr() % access_bytes:
+        return False
     span = tensor.shape[-1]
     for stride, size in sorted(
         zip(tensor.stride()[:-1], tensor.shape[:-1]), key=lambda axis: axis[0]
     ):
+        if size > 1 and (stride * tensor.element_size()) % access_bytes:
+            return False
         if stride < span:
             return False
         span = stride * (size - 1) + span

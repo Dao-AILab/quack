@@ -12,7 +12,6 @@ TARGET_BLOCK_THREADS = 256
 MAX_WIDE_ROW_THREADS = 1024
 REGISTER_CACHE_ELEMS = 32
 MAX_N = 262144
-N_ALIGNMENT = ACCESS_BITS // 16
 
 
 def _next_power_of_two(value: int) -> int:
@@ -76,7 +75,6 @@ def rows_per_block(config: RmsNormFwdConfig) -> int:
 __all__ = [
     "ACCESS_BITS",
     "MAX_N",
-    "N_ALIGNMENT",
     "WAVE_SIZE",
     "RmsNormFwdConfig",
     "rows_per_block",

@@ -5,6 +5,17 @@ import os
 import torch
 
 _IS_ROCM = torch.version.hip is not None
+_CUTE_ONLY_EXPORTS = frozenset({"RoundingMode", "cross_entropy", "rmsnorm", "softmax"})
+
+
+def __getattr__(name):
+    if _IS_ROCM and name in _CUTE_ONLY_EXPORTS:
+        raise ImportError(
+            f"quack.{name} requires the CUDA/CuTe backend; "
+            "use quack.rmsnorm_flydsl.rmsnorm_fwd for the ROCm forward kernel"
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # CuTe and FlyDSL bundle incompatible MLIR runtimes. Keep the package bootstrap
 # CuTe-free on ROCm so optional FlyDSL modules can be imported safely.

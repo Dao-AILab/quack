@@ -202,6 +202,13 @@ def pytest_configure(config):
     if jobs is not None:
         import os as _os
 
+        import torch
+
+        if torch.version.hip is not None:
+            raise pytest.UsageError(
+                "--async-compile is unavailable on ROCm because it loads the incompatible "
+                "CuTe MLIR runtime"
+            )
         worker = _os.environ.get("PYTEST_XDIST_WORKER")
         is_xdist_master = worker is None and getattr(config.option, "numprocesses", None)
         if not is_xdist_master:
@@ -228,7 +235,9 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     """Tear down the compile pool and undo any pytest-internal patches."""
-    if config.getoption("--async-compile", default=None) is None:
+    import torch
+
+    if config.getoption("--async-compile", default=None) is None or torch.version.hip is not None:
         _restore_getfuncargnames_cache()
         return
 
@@ -283,6 +292,8 @@ def _defer_if_compile_pending(item, outcome, force_pass: bool) -> bool:
     must not run the test body. Setup-phase compiles are rare, so the
     longrepr cost is negligible there.
     """
+    if item.config.getoption("--async-compile", default=None) is None:
+        return False
     if outcome.excinfo is None:
         return False
     from quack.cache.async_compile import CompilePending
