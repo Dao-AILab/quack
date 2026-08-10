@@ -63,26 +63,9 @@ def _dtype_spec(dtype: torch.dtype):
 # Generic ROCm/FlyDSL transaction helpers. They stay local in this first kernel
 # so the PR is self-contained; a later kernel can move them into shared code
 # without changing their contracts.
-def _buffer_copy_atom(access_bits: int, elem_bits: int):
-    """Build one legal MUBUF copy atom.
-
-    ``access_bits`` is the hardware transaction width while ``elem_bits`` tells
-    FlyDSL how that transaction is represented in registers.
-    """
-    if access_bits not in (8, 16, 32, 64, 128):
-        raise ValueError(f"no buffer copy for a {access_bits}-bit access")
-    return fx.make_copy_atom(fx.rocdl.BufferCopy(access_bits, 0), elem_bits)
-
-
-def _split_vector_for_dtype(vecsize: int, dtype_width: int) -> tuple[int, int]:
-    """Split one logical activation vector into 128-bit-or-smaller accesses.
-
-    Optional operands can have a wider dtype than the activation, so the same
-    element span may require multiple MUBUF transactions. Returns
-    ``(transaction_count, elements_per_transaction)``.
-    """
-    accesses = max(1, (vecsize * dtype_width) // ACCESS_BITS)
-    return accesses, vecsize // accesses
+def _elements_per_buffer_copy(vecsize: int, elem_bits: int) -> int:
+    """Elements handled by each at-most-128-bit copy of a logical vector."""
+    return min(vecsize, ACCESS_BITS // elem_bits)
 
 
 def _row_descriptor_bytes(elem_bits: int, n: int, valid):
@@ -176,8 +159,9 @@ def _load_dtype_vec(
     vecsize,
 ):
     """Load one activation-width span, splitting wider operand storage."""
-    accesses, per_access = _split_vector_for_dtype(vecsize, dtype_width)
-    if const_expr(accesses <= 1):
+    elements_per_copy = _elements_per_buffer_copy(vecsize, dtype_width)
+    copy_count = vecsize // elements_per_copy
+    if const_expr(copy_count <= 1):
         return _load_vec(
             copy_atom,
             vecsize,
@@ -186,15 +170,15 @@ def _load_dtype_vec(
             index,
         ).to(fx.Float32)
     elements = []
-    for part in range(accesses):
+    for part in range(copy_count):
         chunk = _load_vec(
             copy_atom,
-            per_access,
+            elements_per_copy,
             elem_dtype,
             divided_tensor,
-            index * accesses + part,
+            index * copy_count + part,
         )
-        elements.extend(chunk[lane] for lane in range(per_access))
+        elements.extend(chunk[lane] for lane in range(elements_per_copy))
     return fx.Vector.from_elements(elements, fx.Float32)
 
 
@@ -213,19 +197,20 @@ def _store_dtype_vec(
     index,
     vecsize,
 ):
-    accesses, per_access = _split_vector_for_dtype(vecsize, dtype_width)
-    if const_expr(accesses <= 1):
+    elements_per_copy = _elements_per_buffer_copy(vecsize, dtype_width)
+    copy_count = vecsize // elements_per_copy
+    if const_expr(copy_count <= 1):
         _store_vec(copy_atom, vecsize, elem_dtype, value, divided_tensor, index)
         return
-    for part in range(accesses):
-        lanes = list(range(part * per_access, (part + 1) * per_access))
+    for part in range(copy_count):
+        lanes = list(range(part * elements_per_copy, (part + 1) * elements_per_copy))
         _store_vec(
             copy_atom,
-            per_access,
+            elements_per_copy,
             elem_dtype,
             value.shuffle(value, lanes),
             divided_tensor,
-            index * accesses + part,
+            index * copy_count + part,
         )
 
 
@@ -284,12 +269,12 @@ def _build_rmsnorm_module(
     red_slots = max(1, threads_per_row // WAVE_SIZE)
     shared_storage = _make_reduction_storage(red_slots)
 
-    _, input_per_access = _split_vector_for_dtype(vecsize, input_bits)
-    _, output_per_access = _split_vector_for_dtype(vecsize, output_bits)
-    _, weight_per_access = _split_vector_for_dtype(vecsize, weight_bits)
-    _, bias_per_access = _split_vector_for_dtype(vecsize, bias_bits)
-    _, residual_per_access = _split_vector_for_dtype(vecsize, residual_bits)
-    _, residual_out_per_access = _split_vector_for_dtype(vecsize, residual_out_bits)
+    input_copy_width = _elements_per_buffer_copy(vecsize, input_bits)
+    output_copy_width = _elements_per_buffer_copy(vecsize, output_bits)
+    weight_copy_width = _elements_per_buffer_copy(vecsize, weight_bits)
+    bias_copy_width = _elements_per_buffer_copy(vecsize, bias_bits)
+    residual_copy_width = _elements_per_buffer_copy(vecsize, residual_bits)
+    residual_out_copy_width = _elements_per_buffer_copy(vecsize, residual_out_bits)
 
     @flyc.kernel(**({} if block_threads <= 256 else {"known_block_size": [block_threads, 1, 1]}))
     def rmsnorm_kernel(
@@ -351,45 +336,62 @@ def _build_rmsnorm_module(
             gpu.barrier()
             return fx.memref_load(reduction, 0)
 
-        def row_div(tensor, elem_bits, per_access):
+        def row_div(tensor, elem_bits, copy_width):
             buffer = (
                 _row_head_buffer(tensor, row, head, elem_bits, n, in_grid)
                 if per_head
                 else _row_buffer(tensor, row, elem_bits, n, in_grid)
             )
-            return fx.logical_divide(buffer, fx.make_layout(per_access, 1))
+            return fx.logical_divide(buffer, fx.make_layout(copy_width, 1))
 
-        def parameter_div(tensor, elem_bits, per_access):
+        def parameter_div(tensor, elem_bits, copy_width):
             buffer = (
                 _row_buffer(tensor, head, elem_bits, n)
                 if per_head
                 else fx.rocdl.make_buffer_tensor(tensor)
             )
-            return fx.logical_divide(buffer, fx.make_layout(per_access, 1))
+            return fx.logical_divide(buffer, fx.make_layout(copy_width, 1))
 
-        input_div = row_div(input_tensor, input_bits, input_per_access)
-        output_div = row_div(output_tensor, output_bits, output_per_access)
-        input_copy = _buffer_copy_atom(input_per_access * input_bits, input_bits)
-        output_copy = _buffer_copy_atom(output_per_access * output_bits, output_bits)
+        input_div = row_div(input_tensor, input_bits, input_copy_width)
+        output_div = row_div(output_tensor, output_bits, output_copy_width)
+        # Copy widths above guarantee each FlyDSL MUBUF transaction is <= 128 bits.
+        input_copy = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(input_copy_width * input_bits, 0), input_bits
+        )
+        output_copy = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(output_copy_width * output_bits, 0), output_bits
+        )
         if const_expr(has_residual):
-            residual_div = row_div(residual_tensor, residual_bits, residual_per_access)
-            residual_copy = _buffer_copy_atom(residual_per_access * residual_bits, residual_bits)
+            residual_div = row_div(residual_tensor, residual_bits, residual_copy_width)
+            residual_copy = fx.make_copy_atom(
+                fx.rocdl.BufferCopy(residual_copy_width * residual_bits, 0),
+                residual_bits,
+            )
         if const_expr(store_residual):
             residual_out_div = row_div(
                 residual_out_tensor,
                 residual_out_bits,
-                residual_out_per_access,
+                residual_out_copy_width,
             )
-            residual_out_copy = _buffer_copy_atom(
-                residual_out_per_access * residual_out_bits,
+            residual_out_copy = fx.make_copy_atom(
+                fx.rocdl.BufferCopy(
+                    residual_out_copy_width * residual_out_bits,
+                    0,
+                ),
                 residual_out_bits,
             )
         if const_expr(has_weight):
-            weight_div = parameter_div(weight_tensor, weight_bits, weight_per_access)
-            weight_copy = _buffer_copy_atom(weight_per_access * weight_bits, weight_bits)
+            weight_div = parameter_div(weight_tensor, weight_bits, weight_copy_width)
+            weight_copy = fx.make_copy_atom(
+                fx.rocdl.BufferCopy(weight_copy_width * weight_bits, 0),
+                weight_bits,
+            )
         if const_expr(has_bias):
-            bias_div = parameter_div(bias_tensor, bias_bits, bias_per_access)
-            bias_copy = _buffer_copy_atom(bias_per_access * bias_bits, bias_bits)
+            bias_div = parameter_div(bias_tensor, bias_bits, bias_copy_width)
+            bias_copy = fx.make_copy_atom(
+                fx.rocdl.BufferCopy(bias_copy_width * bias_bits, 0),
+                bias_bits,
+            )
         if const_expr(store_rstd):
             rstd_buffer = fx.rocdl.make_buffer_tensor(
                 rstd_tensor,
