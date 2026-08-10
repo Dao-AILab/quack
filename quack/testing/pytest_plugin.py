@@ -228,7 +228,11 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     """Tear down the compile pool and undo any pytest-internal patches."""
-    from quack.cache.async_compile import get_active_pool, deactivate
+    if config.getoption("--async-compile", default=None) is None:
+        _restore_getfuncargnames_cache()
+        return
+
+    from quack.cache.async_compile import deactivate, get_active_pool
 
     pool = get_active_pool()
     if pool is not None:

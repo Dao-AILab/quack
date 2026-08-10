@@ -44,6 +44,23 @@ pip install 'quack-kernels[jax]'
 from quack import rmsnorm, softmax, cross_entropy
 ```
 
+### ROCm / FlyDSL RMSNorm forward
+
+The experimental gfx950 forward kernel is available through an explicit import
+and does not load CuTe:
+
+```bash
+pip install -e '.[flydsl,bench]'
+
+python benchmarks/benchmark_rmsnorm_flydsl.py --M 32768 --N 1024
+```
+
+```python
+from quack.rmsnorm_flydsl import rmsnorm_fwd
+
+out, residual_out, rstd = rmsnorm_fwd(x, weight)
+```
+
 JAX bindings are also available for some kernels (see [docs/jax.md](docs/jax.md)):
 
 ```
