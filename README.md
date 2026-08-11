@@ -46,20 +46,26 @@ from quack import rmsnorm, softmax, cross_entropy
 
 ### ROCm / FlyDSL RMSNorm forward
 
-The experimental gfx950 forward kernel is available through an explicit import
-and does not load CuTe:
+`rmsnorm_fwd` is backend-dispatched: the CuTe kernel on CUDA, the experimental
+gfx950 FlyDSL kernel on ROCm. Importing it loads only the backend for the device
+you are on, so the call is the same either way.
 
 ```bash
 pip install -e '.[flydsl,bench]'
 
-python benchmarks/benchmark_rmsnorm_flydsl.py --M 32768 --N 1024
+python benchmarks/benchmark_rmsnorm.py --M 32768 --N 1024
 ```
 
 ```python
-from quack.rmsnorm_flydsl import rmsnorm_fwd
+from quack import rmsnorm_fwd
 
 out, residual_out, rstd = rmsnorm_fwd(x, weight)
 ```
+
+The benchmark lists whichever backends are installed as providers, so the same
+command compares FlyDSL against `torch.compile` on ROCm and quack (CuTe),
+`torch.compile` and cuDNN on CUDA. `--backward` is CuTe-only; there is no FlyDSL
+backward kernel yet.
 
 JAX bindings are also available for some kernels (see [docs/jax.md](docs/jax.md)):
 
