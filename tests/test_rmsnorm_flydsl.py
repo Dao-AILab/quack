@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Tri Dao.
 
 import importlib.util
+import logging
 import sys
 
 import pytest
@@ -294,6 +295,69 @@ def test_cuda_graph_capture_replays_correctly(n):
         graph.replay()
         torch.cuda.synchronize()
         _assert_close(captured_out, _reference(x, weight)[0], x.dtype)
+
+
+@pytest.mark.skipif(_CAN_RUN and torch.cuda.device_count() < 2, reason="needs two visible devices")
+def test_same_specialization_runs_on_a_second_device():
+    # FlyDSL caches compiled artifacts on the JitFunction by argument signature
+    # alone, so a launcher shared across GPUs hands the second one a module
+    # loaded into the first one's context: hipErrorInvalidDevice at launch.
+    n = 1024
+    for index in range(2):
+        device = torch.device("cuda", index)
+        x = torch.randn(8, n, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(n, device=device, dtype=torch.float32)
+        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
+        torch.cuda.synchronize(device)
+        _assert_close(out, _reference(x, weight)[0], x.dtype)
+
+
+def test_compiled_path_rejects_the_same_scalars_as_eager():
+    n = 256
+    x = torch.randn(4, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+
+    # The custom-op dispatcher coerces arguments to the schema's types, so
+    # validating inside the op would let torch.compile accept eps=True as 1.0,
+    # store_rstd=1 as True, and weight_offset=True as a silent (weight + 1).
+    for kwargs, exc in (
+        ({"eps": True}, TypeError),
+        ({"eps": "1e-6"}, TypeError),
+        ({"store_rstd": 1}, TypeError),
+        ({"weight_offset": True}, TypeError),
+    ):
+        with pytest.raises(exc):
+            fly_rmsnorm.rmsnorm_fwd(x, weight, **kwargs)
+
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            lambda a, b, kw=kwargs: fly_rmsnorm.rmsnorm_fwd(a, b, **kw), dynamic=False
+        )
+        with pytest.raises(exc):
+            compiled(x, weight)
+
+
+def test_reduce_overhead_does_not_skip_cudagraphs(caplog):
+    n = 1024
+    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+
+    def block(x, w):
+        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, w, eps=1e-6)
+        return out * 2.0
+
+    torch._dynamo.reset()
+    with caplog.at_level(logging.WARNING):
+        compiled = torch.compile(block, mode="reduce-overhead", dynamic=False)
+        for _ in range(3):
+            got = compiled(x, weight)
+        torch.cuda.synchronize()
+
+    _assert_close(got, _reference(x, weight)[0] * 2.0, x.dtype)
+    # A mutating op earns "skipping cudagraphs due to mutated inputs"; the
+    # functional one must not, or the region is never captured.
+    skips = [r.getMessage() for r in caplog.records if "skipping cudagraphs" in r.getMessage()]
+    assert not skips, skips
 
 
 def test_unaligned_padded_rows_are_copied_before_vector_access():

@@ -2,17 +2,21 @@
 
 """Generic host plumbing shared by every FlyDSL kernel in quack.
 
-Nothing here knows about a particular kernel: architecture validation, the
-specialization cache and its lock, stream and dtype translation, and the row
-layout rules the ROCm buffer descriptors depend on. A kernel module supplies
-its own cache key type and its own builder.
+Nothing here knows about a particular kernel: architecture validation, launch
+dispatch, stream and dtype translation, and the row layout rules the ROCm
+buffer descriptors depend on.
 
-This is the FlyDSL sibling of :mod:`quack.cache.jit`, which cannot be reused:
-that module's disk half is CuTe-specific (``.o`` export plus a tvm_ffi
-``load_module``) and it imports cutlass, so it will not load on ROCm. FlyDSL
-already persists compiled artifacts itself under ``~/.flydsl/cache``, so the
-only cache this module owns is the in-process one that turns a ~33 ms disk-cache
-hydration into a ~20 us call.
+Caching is split, and a kernel module needs to know which half it owns. The
+launcher for a specialization is the kernel module's business -- rmsnorm keeps
+one per shape and dtype behind a ``functools.cache``. Its *compiled* form is
+this module's, because that part is bound to a device context: ``run_compiled``
+keys it by device ordinal, and reusing one device's handle on another fails the
+launch. Neither half is serialized against concurrent builders, and FlyDSL's
+own on-disk cache under ``~/.flydsl/cache`` sits below both.
+
+This is a sibling of :mod:`quack.cache.jit` rather than a reuse of it: that
+module's disk half is CuTe-specific (``.o`` export plus a tvm_ffi
+``load_module``) and it imports cutlass, so it will not load on ROCm.
 """
 
 import flydsl.compiler as flyc
@@ -168,18 +172,20 @@ def run_compiled(exe, device: torch.device, args: tuple, *, supported: frozenset
     """Dispatch a launcher, compiling it on this process's first use.
 
     Follows aiter's ``_run_compiled``: the ``CompiledFunction`` is stashed on
-    the launcher object, which a ``@functools.cache`` over the builder has
-    already keyed by specialization, so there is no second dictionary here.
-    ``flyc.compile`` both compiles and performs the first launch, so the miss
-    branch must not call the result again.
+    the launcher, and ``flyc.compile`` both compiles and performs the first
+    launch, so the miss branch must not call the result again.
 
-    Two consequences of that shape are deliberate. Nothing serializes a cold
-    key, so concurrent threads can each build it -- FlyDSL's per-key file lock
-    still makes only one of them run the MLIR pipeline, and either artifact is
-    valid. And the compiled kernel is keyed by shape and dtype alone, so it is
-    reused across devices and across a mid-process change to ARCH or
-    FLYDSL_GPU_ARCH; validate_arch runs on the miss and would reject the first
-    such build, not a later reuse.
+    One artifact per launcher is only correct because the caller keys its
+    launchers by device as well as by specialization. FlyDSL caches compiled
+    artifacts on the JitFunction by argument signature alone, so a launcher
+    shared across GPUs would hand the second one a module loaded into the
+    first one's context and the launch would fail with hipErrorInvalidDevice.
+
+    One consequence of the shape is deliberate: nothing serializes a cold key,
+    so concurrent threads can each build it. FlyDSL's per-key file lock still
+    makes only one of them run the MLIR pipeline, and either artifact is valid.
+    A mid-process change to ARCH or FLYDSL_GPU_ARCH is likewise not detected
+    once an artifact exists; validate_arch runs per launcher on the miss.
     """
     with torch.cuda.device(device):
         cf = getattr(exe, "_cf", None)

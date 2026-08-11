@@ -48,6 +48,7 @@ _IS_ROCM = torch.version.hip is not None
 
 @functools.cache
 def _compiled_forward(
+    device_index: int,
     n: int,
     input_dtype: torch.dtype,
     output_dtype: torch.dtype,
@@ -69,6 +70,14 @@ def _compiled_forward(
     The arguments are the cache key, so a parameter added here without a
     matching argument at the call site is a TypeError rather than a silently
     shared kernel.
+
+    ``device_index`` is part of that key even though the module it builds
+    closes over no device. FlyDSL caches compiled artifacts on the JitFunction
+    itself, keyed by argument signature and not by device, so sharing one
+    launcher across two GPUs hands the second one a module loaded into the
+    first one's context and the launch fails with hipErrorInvalidDevice. A
+    launcher per device gives each its own FlyDSL cache; the MLIR work is done
+    once and reloaded from ~/.flydsl/cache for the rest.
     """
     return _build_rmsnorm_module(
         n,
@@ -733,9 +742,13 @@ def _launch_rmsnorm_fwd(
     num_heads: int,
 ) -> None:
     m, n = x.shape[0], x.shape[-1]
-    # Positional, not keyword: matching fifteen keywords through lru_cache costs
+    device_index = x.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    # Positional, not keyword: matching sixteen keywords through lru_cache costs
     # ~0.4us per launch on gfx950, against a ~20us host path at small M.
     exe = _compiled_forward(
+        device_index,
         n,
         x.dtype,
         out.dtype,
@@ -841,9 +854,36 @@ def _validate_inputs(
                 f"x and {name} must be on the same device, got {device}/{tensor.device}"
             )
 
-    # float is the only type worth a fast path; numbers.Real is an ABC, so its
-    # isinstance goes through __instancecheck__ and costs far more than the
-    # concrete check that answers the common case.
+    if weight is None and weight_offset != 0.0:
+        raise ValueError("weight_offset requires an explicit weight")
+
+    m = x.numel() // (num_heads * n)
+    normalized_rows = m * num_heads
+    if normalized_rows > _MAX_ROWS:
+        raise ValueError(
+            f"x has {normalized_rows} normalized rows, but the kernel addresses at most {_MAX_ROWS}"
+        )
+    if store_rstd and normalized_rows > _MAX_RSTD_ROWS:
+        raise ValueError(
+            f"rstd has {normalized_rows} rows, but its buffer descriptor addresses at most "
+            f"{_MAX_RSTD_ROWS}"
+        )
+    return m, n, num_heads, per_head, eps, weight_offset
+
+
+def _validate_scalars(eps, store_rstd, weight_offset):
+    """Check the Python scalars before anything can coerce them.
+
+    These have to run outside the custom op: the dispatcher converts arguments
+    to the schema's types on the way in, so `eps=True` reaches the body as 1.0
+    and `store_rstd=1` as True. Validating inside would accept under
+    torch.compile what eager rejects, and `weight_offset=True` would silently
+    scale by (weight + 1).
+
+    float is the only type worth a fast path; numbers.Real is an ABC, so its
+    isinstance goes through __instancecheck__ and costs far more than the
+    concrete check that answers the common case.
+    """
     if type(eps) is not float:
         if isinstance(eps, bool) or not isinstance(eps, numbers.Real):
             raise TypeError(f"eps must be a real number, got {type(eps).__name__}")
@@ -860,21 +900,7 @@ def _validate_inputs(
         weight_offset = float(weight_offset)
     if not -math.inf < weight_offset < math.inf:
         raise ValueError(f"weight_offset must be finite, got {weight_offset}")
-    if weight is None and weight_offset != 0.0:
-        raise ValueError("weight_offset requires an explicit weight")
-
-    m = x.numel() // (num_heads * n)
-    normalized_rows = m * num_heads
-    if normalized_rows > _MAX_ROWS:
-        raise ValueError(
-            f"x has {normalized_rows} normalized rows, but the kernel addresses at most {_MAX_ROWS}"
-        )
-    if store_rstd and normalized_rows > _MAX_RSTD_ROWS:
-        raise ValueError(
-            f"rstd has {normalized_rows} rows, but its buffer descriptor addresses at most "
-            f"{_MAX_RSTD_ROWS}"
-        )
-    return m, n, num_heads, per_head, eps, weight_offset
+    return eps, weight_offset
 
 
 def _output_dtypes(x, residual, out_dtype, residual_dtype):
@@ -1041,6 +1067,7 @@ def rmsnorm_fwd(
     None unless requested -- are made here, because an op may return neither one
     of its inputs nor a None.
     """
+    eps, weight_offset = _validate_scalars(eps, store_rstd, weight_offset)
     if torch.compiler.is_compiling():
         # This branch runs once per trace, not per call, so resolving the
         # dtypes again here is free and keeps one definition of the predicate.
