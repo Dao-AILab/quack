@@ -39,7 +39,13 @@ from quack.rmsnorm_config import (
 
 # Re-exported: the pure-torch references live in a backend-neutral module so
 # ROCm can import them without the CuTe stack.
-from quack.rmsnorm_ref import rmsnorm_bwd_ref, rmsnorm_ref  # noqa: F401
+from quack.rmsnorm_torch import (  # noqa: F401
+    layernorm_mean_ref,
+    layernorm_ref,
+    layernorm_rstd_ref,
+    rmsnorm_bwd_ref,
+    rmsnorm_ref,
+)
 from cutlass.base_dsl.enums import Arch
 
 
@@ -1808,20 +1814,3 @@ def layernorm_bwd(
         dw = torch.zeros_like(weight)
         db = torch.zeros_like(weight) if has_bias else None
     return dx, dw, db
-
-
-def layernorm_ref(x: Tensor, w: Tensor, eps: float = 1e-6) -> Tensor:
-    """Reference implementation for LayerNorm."""
-    x_f32 = x.float()
-    return torch.nn.functional.layer_norm(x_f32, w.shape, w, None, eps).to(x.dtype)
-
-
-def layernorm_rstd_ref(x: torch.Tensor, eps: float = 1e-6):
-    x_f32 = x.float()
-    mean = x_f32.mean(dim=-1, keepdim=True)
-    var = ((x_f32 - mean) ** 2).mean(dim=-1)
-    return 1.0 / torch.sqrt(var + eps)
-
-
-def layernorm_mean_ref(x: torch.Tensor) -> torch.Tensor:
-    return x.float().mean(dim=-1)
