@@ -217,6 +217,85 @@ def test_launch_follows_the_callers_stream():
     _assert_close(out, expected, x.dtype)
 
 
+def test_custom_op_schema_and_fake_agree():
+    n = 256
+    x = torch.randn(4, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+    residual = torch.randn_like(x)
+    # opcheck compares the fake against the real op's shapes and dtypes, and
+    # checks the schema declares no aliasing or mutation the op does not do.
+    # (x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset)
+    for args in (
+        (x, weight, None, None, None, None, 1e-6, False, 0.0),
+        (x, weight, None, residual, None, None, 1e-6, True, 0.0),
+        (x, weight, None, None, torch.float32, torch.float32, 1e-6, False, 0.0),
+    ):
+        torch.library.opcheck(fly_rmsnorm._rmsnorm_fwd_op, args)
+
+
+def test_compiles_into_one_graph_without_breaks():
+    n = 1024
+    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+
+    def block(x, w):
+        h = torch.nn.functional.silu(x)
+        out, _, _ = fly_rmsnorm.rmsnorm_fwd(h, w, eps=1e-6)
+        return out * 2.0
+
+    torch._dynamo.reset()
+    explanation = torch._dynamo.explain(block)(x, weight)
+    # Without the registered op Dynamo traces into FlyDSL's own @flyc.jit and
+    # breaks inside it, which both fragments the region and, on a cold
+    # specialization, raises "@kernel can only be called inside @jit function".
+    assert explanation.graph_break_count == 0, explanation.break_reasons
+    assert explanation.graph_count == 1
+
+    torch._dynamo.reset()
+    compiled = torch.compile(block, dynamic=False)
+    expected = _reference(torch.nn.functional.silu(x), weight)[0] * 2.0
+    _assert_close(compiled(x, weight), expected, x.dtype)
+
+
+def test_compiles_a_specialization_never_seen_in_eager():
+    # The pre-op failure only reproduced when flyc.compile ran inside Dynamo's
+    # trace, so this shape must not be warmed first.
+    n = 1024 + 128
+    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(lambda a, b: fly_rmsnorm.rmsnorm_fwd(a, b, eps=1e-6)[0], dynamic=False)
+    _assert_close(compiled(x, weight), _reference(x, weight)[0], x.dtype)
+
+
+@pytest.mark.parametrize("n", [256, 4096, 65536])
+def test_cuda_graph_capture_replays_correctly(n):
+    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+    call = lambda: fly_rmsnorm.rmsnorm_fwd(x, weight, eps=1e-6)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out, _, _ = call()
+
+    # A graph writes to the buffers it captured, so refill the input in place
+    # and read the captured output; a stale or empty graph fails here.
+    for _ in range(3):
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_close(captured_out, _reference(x, weight)[0], x.dtype)
+
+
 def test_unaligned_padded_rows_are_copied_before_vector_access():
     n = 192
     storage = torch.randn(4, 196, device=_DEVICE, dtype=torch.float16)

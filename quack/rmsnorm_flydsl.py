@@ -877,29 +877,8 @@ def _validate_inputs(
     return m, n, num_heads, per_head, eps, weight_offset
 
 
-def rmsnorm_fwd(
-    x: torch.Tensor,
-    weight: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
-    residual: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-    residual_dtype: torch.dtype | None = None,
-    eps: float = 1e-6,
-    store_rstd: bool = False,
-    weight_offset: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Run eager RMSNorm over the last dimension and return CuTe-compatible outputs."""
-    m, n, num_heads, per_head, eps, weight_offset = _validate_inputs(
-        x,
-        weight,
-        bias,
-        residual,
-        out_dtype,
-        residual_dtype,
-        eps,
-        store_rstd,
-        weight_offset,
-    )
+def _output_dtypes(x, residual, out_dtype, residual_dtype):
+    """Resolve the two output dtypes and whether the residual sum is stored."""
     output_dtype = x.dtype if out_dtype is None else out_dtype
     residual_out_dtype = (
         residual_dtype
@@ -909,16 +888,39 @@ def rmsnorm_fwd(
     store_residual = residual is not None or (
         residual_dtype is not None and residual_dtype != x.dtype
     )
+    return output_dtype, residual_out_dtype, store_residual
+
+
+def _absent(x, dtype):
+    """Stand-in for an output this call does not produce.
+
+    A custom op has fixed arity and its fake has to predict shapes exactly, so
+    "no rstd" cannot be None here. The caller drops these; they never escape.
+    """
+    return torch.empty(0, device=x.device, dtype=dtype)
+
+
+def _rmsnorm_fwd_core(
+    x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
+):
+    """Shared body. Absent outputs come back as None, not as a sentinel tensor:
+    materializing two empty CUDA tensors costs 2.1us, which is an eighth of this
+    kernel's whole host path, and only the op boundary actually needs them."""
+    m, n, num_heads, per_head, eps, weight_offset = _validate_inputs(
+        x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
+    )
+    output_dtype, residual_out_dtype, store_residual = _output_dtypes(
+        x, residual, out_dtype, residual_dtype
+    )
 
     if m == 0:
-        out = torch.empty(x.shape, device=x.device, dtype=output_dtype)
-        residual_out = (
-            torch.empty(x.shape, device=x.device, dtype=residual_out_dtype) if store_residual else x
+        return (
+            torch.empty(x.shape, device=x.device, dtype=output_dtype),
+            torch.empty(x.shape, device=x.device, dtype=residual_out_dtype)
+            if store_residual
+            else None,
+            torch.empty(x.shape[:-1], device=x.device, dtype=torch.float32) if store_rstd else None,
         )
-        rstd = (
-            torch.empty(x.shape[:-1], device=x.device, dtype=torch.float32) if store_rstd else None
-        )
-        return out, residual_out, rstd
 
     last_shape = (num_heads, n) if per_head else (n,)
     x_flat = packed_rows(x.reshape(-1, *last_shape))
@@ -961,7 +963,94 @@ def rmsnorm_fwd(
         num_heads=num_heads,
     )
 
-    out = out_flat.reshape(x.shape)
-    residual_out = residual_out_flat.reshape(x.shape) if store_residual else x
-    rstd = rstd_flat.reshape(x.shape[:-1]) if store_rstd else None
-    return out, residual_out, rstd
+    return (
+        out_flat.reshape(x.shape),
+        residual_out_flat.reshape(x.shape) if store_residual else None,
+        rstd_flat.reshape(x.shape[:-1]) if store_rstd else None,
+    )
+
+
+def _rmsnorm_fwd_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    out_dtype: torch.dtype | None,
+    residual_dtype: torch.dtype | None,
+    eps: float,
+    store_rstd: bool,
+    weight_offset: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Functional, not mutating: inductor skips cudagraphs for a region whose op
+    writes into buffers it did not allocate, and letting the surrounding region
+    be captured is the whole reason to register this."""
+    out, residual_out, rstd = _rmsnorm_fwd_core(
+        x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
+    )
+    _, residual_out_dtype, _ = _output_dtypes(x, residual, out_dtype, residual_dtype)
+    return (
+        out,
+        residual_out if residual_out is not None else _absent(x, residual_out_dtype),
+        rstd if rstd is not None else _absent(x, torch.float32),
+    )
+
+
+_rmsnorm_fwd_op = torch.library.custom_op(
+    "quack::flydsl_rmsnorm_fwd",
+    _rmsnorm_fwd_impl,
+    mutates_args=(),
+    device_types="cuda",
+)
+
+
+@_rmsnorm_fwd_op.register_fake
+def _(x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset):
+    # Shapes only: running the body here would pay a FlyDSL compile at trace
+    # time, and would reject shape/dtype combinations the kernel means to.
+    output_dtype, residual_out_dtype, store_residual = _output_dtypes(
+        x, residual, out_dtype, residual_dtype
+    )
+    return (
+        torch.empty(x.shape, device=x.device, dtype=output_dtype),
+        torch.empty(x.shape, device=x.device, dtype=residual_out_dtype)
+        if store_residual
+        else _absent(x, residual_out_dtype),
+        torch.empty(x.shape[:-1], device=x.device, dtype=torch.float32)
+        if store_rstd
+        else _absent(x, torch.float32),
+    )
+
+
+def rmsnorm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
+    eps: float = 1e-6,
+    store_rstd: bool = False,
+    weight_offset: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Run eager RMSNorm over the last dimension and return CuTe-compatible outputs.
+
+    Only routes through the registered op while Dynamo is watching: the
+    torch.library boundary buys an opaque graph node, and in eager there is
+    nobody to give it to. The two aliasing decisions the CuTe-compatible
+    contract asks for -- residual_out is x when nothing was accumulated, rstd is
+    None unless requested -- are made here, because an op may return neither one
+    of its inputs nor a None.
+    """
+    if torch.compiler.is_compiling():
+        out, residual_out, rstd = _rmsnorm_fwd_op(
+            x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
+        )
+        store_residual = residual is not None or (
+            residual_dtype is not None and residual_dtype != x.dtype
+        )
+        return out, (residual_out if store_residual else x), (rstd if store_rstd else None)
+
+    out, residual_out, rstd = _rmsnorm_fwd_core(
+        x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
+    )
+    return out, (residual_out if residual_out is not None else x), rstd
