@@ -71,19 +71,11 @@ def _bwd_providers():
     return [("quack", "quack"), ("torch_compile", "torch.compile")]
 
 
-def _weight_dtype(dtype_name: str, weight_dtype_name: str) -> torch.dtype:
-    if weight_dtype_name == "same":
-        return DTYPE_MAP[dtype_name]
-    return DTYPE_MAP[weight_dtype_name]
-
-
 def make_fwd_benchmark(
-    dtype_name: str, residual_dtype_name: Optional[str], weight_dtype_name: str, x_vals=None
+    dtype_name: str, residual_dtype_name: Optional[str], x_vals=None
 ) -> Benchmark:
     line_vals, line_names = zip(*_fwd_providers())
-    suffix = dtype_name + f"-w-{weight_dtype_name}"
-    if residual_dtype_name:
-        suffix += f"-res-{residual_dtype_name}"
+    suffix = dtype_name + (f"-res-{residual_dtype_name}" if residual_dtype_name else "")
     return Benchmark(
         x_names=["M", "N"],
         x_vals=x_vals if x_vals is not None else MN_PAIRS,
@@ -91,11 +83,7 @@ def make_fwd_benchmark(
         line_vals=list(line_vals),
         line_names=list(line_names),
         plot_name=f"rmsnorm-fwd-{suffix}",
-        args={
-            "dtype_name": dtype_name,
-            "residual_dtype_name": residual_dtype_name,
-            "weight_dtype_name": weight_dtype_name,
-        },
+        args={"dtype_name": dtype_name, "residual_dtype_name": residual_dtype_name},
         xlabel="(M, N)",
         ylabel="GB/s",
     )
@@ -172,13 +160,15 @@ def rmsnorm_cudnn_setup(M, N, dtype):
     return run
 
 
-def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name, weight_dtype_name):
+def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     dtype = DTYPE_MAP[dtype_name]
     residual_dtype = DTYPE_MAP[residual_dtype_name] if residual_dtype_name else None
     eps = 1e-6
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
-    w = torch.randn(N, device="cuda", dtype=_weight_dtype(dtype_name, weight_dtype_name))
+    # Both backends accept fp16/bf16/fp32 weight; the ladder fixes fp32 (master
+    # weight) so fwd and bwd report the same configuration.
+    w = torch.randn(N, device="cuda", dtype=torch.float32)
     residual = (
         torch.randn(M, N, device="cuda", dtype=residual_dtype)
         if residual_dtype is not None
@@ -274,12 +264,6 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark rmsnorm fwd / bwd")
     parser.add_argument("--dtype", default="bfloat16", choices=list(DTYPE_MAP))
     parser.add_argument("--residual_dtype", default=None, choices=[None, *DTYPE_MAP])
-    parser.add_argument(
-        "--weight_dtype",
-        default="float32",
-        choices=["same", *DTYPE_MAP],
-        help="Weight dtype; 'same' follows --dtype. Forward only.",
-    )
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--M", type=int, default=None, help="Bench a single M (requires --N)")
     parser.add_argument("--N", type=int, default=None, help="Bench a single N (requires --M)")
@@ -299,9 +283,9 @@ def main():
             rmsnorm_bwd_runner
         )
     else:
-        bench = perf_report(
-            make_fwd_benchmark(args.dtype, args.residual_dtype, args.weight_dtype, x_vals)
-        )(rmsnorm_fwd_runner)
+        bench = perf_report(make_fwd_benchmark(args.dtype, args.residual_dtype, x_vals))(
+            rmsnorm_fwd_runner
+        )
 
     run_and_print(bench, save_path=args.save_path)
 
