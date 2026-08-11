@@ -1042,15 +1042,18 @@ def rmsnorm_fwd(
     of its inputs nor a None.
     """
     if torch.compiler.is_compiling():
+        # This branch runs once per trace, not per call, so resolving the
+        # dtypes again here is free and keeps one definition of the predicate.
         out, residual_out, rstd = _rmsnorm_fwd_op(
             x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
         )
-        store_residual = residual is not None or (
-            residual_dtype is not None and residual_dtype != x.dtype
+        _, _, store_residual = _output_dtypes(x, residual, out_dtype, residual_dtype)
+        if not store_residual:
+            residual_out = None
+        if not store_rstd:
+            rstd = None
+    else:
+        out, residual_out, rstd = _rmsnorm_fwd_core(
+            x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
         )
-        return out, (residual_out if store_residual else x), (rstd if store_rstd else None)
-
-    out, residual_out, rstd = _rmsnorm_fwd_core(
-        x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
-    )
-    return out, (residual_out if residual_out is not None else x), rstd
+    return out, (x if residual_out is None else residual_out), rstd
