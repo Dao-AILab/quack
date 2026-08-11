@@ -7,9 +7,9 @@
 
 """Direct eager RMSNorm forward for ROCm gfx950 using FlyDSL."""
 
+import functools
 import math
 import numbers
-from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -22,12 +22,11 @@ from quack.flydsl_runtime import (
     SUPPORTED_DTYPES as _SUPPORTED_DTYPES,
 )
 from quack.flydsl_runtime import (
-    SpecializationCache,
-    compile_context,
     current_raw_stream,
     dtype_spec,
     empty_placeholder,
     packed_rows,
+    run_compiled,
 )
 from quack.rmsnorm_flydsl_config import (
     ACCESS_BITS,
@@ -47,32 +46,47 @@ _MAX_RSTD_ROWS = (2**32 - 1) // 4
 _IS_ROCM = torch.version.hip is not None
 
 
-class _ForwardKey(NamedTuple):
-    """Everything one compiled forward specialization is allowed to depend on.
+@functools.cache
+def _compiled_forward(
+    n: int,
+    input_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    bias_dtype: torch.dtype,
+    residual_dtype: torch.dtype,
+    residual_out_dtype: torch.dtype,
+    has_weight: bool,
+    has_bias: bool,
+    has_residual: bool,
+    store_residual: bool,
+    store_rstd: bool,
+    per_head: bool,
+    num_heads: int,
+    apply_weight_offset: bool,
+):
+    """Memoize one feature-specialized launcher per set of build parameters.
 
-    Field order is irrelevant to correctness: the builder reads members by
-    name, so inserting a field can never silently feed the wrong argument.
+    The arguments are the cache key, so a parameter added here without a
+    matching argument at the call site is a TypeError rather than a silently
+    shared kernel.
     """
-
-    context: tuple
-    n: int
-    input_dtype: torch.dtype
-    output_dtype: torch.dtype
-    weight_dtype: torch.dtype
-    bias_dtype: torch.dtype
-    residual_dtype: torch.dtype
-    residual_out_dtype: torch.dtype
-    has_weight: bool
-    has_bias: bool
-    has_residual: bool
-    store_residual: bool
-    store_rstd: bool
-    per_head: bool
-    num_heads: int
-    apply_weight_offset: bool
-
-
-_FWD_CACHE = SpecializationCache("RMSNorm", _SUPPORTED_ARCHES)
+    return _build_rmsnorm_module(
+        n,
+        input_dtype,
+        output_dtype,
+        weight_torch_dtype=weight_dtype,
+        bias_torch_dtype=bias_dtype,
+        residual_torch_dtype=residual_dtype,
+        residual_out_torch_dtype=residual_out_dtype,
+        has_weight=has_weight,
+        has_bias=has_bias,
+        has_residual=has_residual,
+        store_residual=store_residual,
+        store_rstd=store_rstd,
+        per_head=per_head,
+        num_heads=num_heads,
+        apply_weight_offset=apply_weight_offset,
+    )
 
 
 def _elements_per_buffer_copy(vecsize: int, elem_bits: int) -> int:
@@ -699,26 +713,6 @@ def _build_rmsnorm_module(
     return launch_rmsnorm
 
 
-def _build_for(key: _ForwardKey):
-    return _build_rmsnorm_module(
-        key.n,
-        key.input_dtype,
-        key.output_dtype,
-        weight_torch_dtype=key.weight_dtype,
-        bias_torch_dtype=key.bias_dtype,
-        residual_torch_dtype=key.residual_dtype,
-        residual_out_torch_dtype=key.residual_out_dtype,
-        has_weight=key.has_weight,
-        has_bias=key.has_bias,
-        has_residual=key.has_residual,
-        store_residual=key.store_residual,
-        store_rstd=key.store_rstd,
-        per_head=key.per_head,
-        num_heads=key.num_heads,
-        apply_weight_offset=key.apply_weight_offset,
-    )
-
-
 def _launch_rmsnorm_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -739,10 +733,9 @@ def _launch_rmsnorm_fwd(
     num_heads: int,
 ) -> None:
     m, n = x.shape[0], x.shape[-1]
-    # Positional, not keyword: matching sixteen keywords measured ~0.4us per
-    # launch on gfx950, against a ~23us host path at small M.
-    key = _ForwardKey(
-        compile_context(x.device),
+    # Positional, not keyword: matching fifteen keywords through lru_cache costs
+    # ~0.4us per launch on gfx950, against a ~20us host path at small M.
+    exe = _compiled_forward(
         n,
         x.dtype,
         out.dtype,
@@ -772,7 +765,7 @@ def _launch_rmsnorm_fwd(
         weight_offset,
         current_raw_stream(x.device),
     )
-    _FWD_CACHE.launch(key, x.device, _build_for, args)
+    run_compiled(exe, x.device, args, supported=_SUPPORTED_ARCHES, kernel="RMSNorm")
 
 
 def _validate_inputs(

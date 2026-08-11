@@ -15,9 +15,6 @@ only cache this module owns is the in-process one that turns a ~33 ms disk-cache
 hydration into a ~20 us call.
 """
 
-import os
-import threading
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -26,13 +23,12 @@ from flydsl.runtime.device import get_rocm_arch
 __all__ = [
     "ACCESS_BITS",
     "SUPPORTED_DTYPES",
-    "SpecializationCache",
-    "compile_context",
     "current_raw_stream",
     "dtype_spec",
     "empty_placeholder",
     "packed_rows",
     "rows_are_disjoint_and_packed",
+    "run_compiled",
     "unambiguous_layout",
     "validate_arch",
 ]
@@ -42,15 +38,6 @@ __all__ = [
 ACCESS_BITS = 128
 
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-
-# Anything that can change what FlyDSL compiles for must invalidate the
-# specialization cache, since the jit cache key cannot see these.
-COMPILE_ENV_VARS = (
-    "FLYDSL_COMPILE_BACKEND",
-    "ARCH",
-    "FLYDSL_GPU_ARCH",
-    "HSA_OVERRIDE_GFX_VERSION",
-)
 
 _DTYPE_SPECS = {
     torch.float16: (fx.Float16, 16),
@@ -115,14 +102,6 @@ def validate_arch(device: torch.device, supported: frozenset, kernel: str) -> st
     return actual
 
 
-def compile_context(device: torch.device) -> tuple:
-    """The part of a cache key that is about the target, not the arguments."""
-    return (
-        _device_index(device),
-        *(os.environ.get(name, "") for name in COMPILE_ENV_VARS),
-    )
-
-
 # torch.cuda.current_stream() allocates a Stream wrapper per call, ~1.6us of a
 # ~21us host path. Inductor's generated code binds the same raw accessor.
 _get_raw_stream = torch._C._cuda_getCurrentRawStream
@@ -183,50 +162,27 @@ def packed_rows(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone(memory_format=torch.contiguous_format)
 
 
-class SpecializationCache:
-    """One compiled FlyDSL launcher per specialization key, for this process.
+def run_compiled(exe, device: torch.device, args: tuple, *, supported: frozenset, kernel: str):
+    """Dispatch a launcher, compiling it on this process's first use.
 
-    Reads take no lock; a miss serializes on the build lock and re-checks, so
-    concurrent callers on a new key compile once rather than racing. FlyDSL's
-    own on-disk cache sits underneath and survives the process.
+    Follows aiter's ``_run_compiled``: the ``CompiledFunction`` is stashed on
+    the launcher object, which a ``@functools.cache`` over the builder has
+    already keyed by specialization, so there is no second dictionary here.
+    ``flyc.compile`` both compiles and performs the first launch, so the miss
+    branch must not call the result again.
+
+    Two consequences of that shape are deliberate. Nothing serializes a cold
+    key, so concurrent threads can each build it -- FlyDSL's per-key file lock
+    still makes only one of them run the MLIR pipeline, and either artifact is
+    valid. And the compiled kernel is keyed by shape and dtype alone, so it is
+    reused across devices and across a mid-process change to ARCH or
+    FLYDSL_GPU_ARCH; validate_arch runs on the miss and would reject the first
+    such build, not a later reuse.
     """
-
-    __slots__ = ("_entries", "_kernel", "_lock", "_supported")
-
-    def __init__(self, kernel: str, supported: frozenset):
-        self._entries: dict = {}
-        self._lock = threading.RLock()
-        self._kernel = kernel
-        self._supported = supported
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-    def __contains__(self, key) -> bool:
-        return key in self._entries
-
-    def clear(self) -> None:
-        self._entries.clear()
-
-    def launch(self, key, device: torch.device, build, args: tuple) -> None:
-        """Run this specialization, compiling it first if this process has not.
-
-        ``build(key)`` is called only on a miss and must return the ``@flyc.jit``
-        launcher for ``key``; it is taken as a plain function rather than a
-        closure so a warm call allocates nothing. Architecture validation is
-        deferred to the same miss, so a hit pays only the dict lookup.
-        """
-        with torch.cuda.device(device):
-            compiled = self._entries.get(key)
-            if compiled is not None:
-                compiled(*args)
-                return
-            with self._lock:
-                compiled = self._entries.get(key)
-                if compiled is None:
-                    validate_arch(device, self._supported, self._kernel)
-                    # flyc.compile returns a CompiledFunction and performs its
-                    # first launch, so a fresh compile must not be called again.
-                    self._entries[key] = flyc.compile(build(key), *args)
-                    return
-            compiled(*args)
+    with torch.cuda.device(device):
+        cf = getattr(exe, "_cf", None)
+        if cf is not None:
+            cf(*args)
+            return
+        validate_arch(device, supported, kernel)
+        exe._cf = flyc.compile(exe, *args)

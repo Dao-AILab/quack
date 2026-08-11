@@ -165,13 +165,10 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
         validate_calls += 1
         return validate_original(*args, **kwargs)
 
-    fly_rmsnorm._FWD_CACHE.clear()
+    fly_rmsnorm._compiled_forward.cache_clear()
     monkeypatch.setattr(fly_rmsnorm.flyc, "compile", count_compile)
-    # SpecializationCache resolves validate_arch from its own module globals;
-    # compile_context is bound into the kernel module by its from-import.
+    # run_compiled resolves validate_arch from its own module's globals.
     monkeypatch.setattr(fly_runtime, "validate_arch", count_validate)
-    compile_context = [("gfx950", "context-a")]
-    monkeypatch.setattr(fly_rmsnorm, "compile_context", lambda _device: compile_context[0])
 
     for m, padding in ((3, 8), (11, 16)):
         storage = torch.randn(m, n + padding, device=_DEVICE, dtype=torch.float16)
@@ -182,28 +179,20 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
         expected, _, _ = _reference(x, weight)
         _assert_close(out, expected, x.dtype)
 
+    # Same specialization, different row padding and row count: one build, one
+    # compile, one architecture check.
     assert compile_calls == 1
     assert validate_calls == 1
-    assert len(fly_rmsnorm._FWD_CACHE) == 1
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 1
 
-    compile_context[0] = ("gfx950", "context-b")
-    x = torch.randn(3, n, device=_DEVICE, dtype=torch.float16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float16)
+    # A different normalized dimension is a different specialization.
+    wide = 2 * n
+    x = torch.randn(3, wide, device=_DEVICE, dtype=torch.float16)
+    weight = torch.randn(wide, device=_DEVICE, dtype=torch.float16)
     fly_rmsnorm.rmsnorm_fwd(x, weight)
     assert compile_calls == 2
     assert validate_calls == 2
-    assert len(fly_rmsnorm._FWD_CACHE) == 2
-
-
-def test_compile_context_tracks_target_environment(monkeypatch):
-    monkeypatch.setattr(fly_runtime, "validate_arch", lambda *_args, **_kwargs: "gfx950")
-    monkeypatch.delenv("ARCH", raising=False)
-    first = fly_rmsnorm.compile_context(_DEVICE)
-
-    monkeypatch.setenv("ARCH", "gfx950:context-change")
-    second = fly_rmsnorm.compile_context(_DEVICE)
-
-    assert second != first
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 2
 
 
 def test_launch_follows_the_callers_stream():
