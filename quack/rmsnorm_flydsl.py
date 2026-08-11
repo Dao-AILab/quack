@@ -9,8 +9,6 @@
 
 import math
 import numbers
-import os
-import threading
 from typing import NamedTuple
 
 import flydsl.compiler as flyc
@@ -19,8 +17,18 @@ import torch
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp
-from flydsl.runtime.device import get_rocm_arch
 
+from quack.flydsl_runtime import (
+    SUPPORTED_DTYPES as _SUPPORTED_DTYPES,
+)
+from quack.flydsl_runtime import (
+    SpecializationCache,
+    compile_context,
+    current_raw_stream,
+    dtype_spec,
+    empty_placeholder,
+    packed_rows,
+)
 from quack.rmsnorm_flydsl_config import (
     ACCESS_BITS,
     MAX_N,
@@ -31,21 +39,10 @@ from quack.rmsnorm_flydsl_config import rows_per_block as _rows_per_block
 
 __all__ = ["rmsnorm_fwd"]
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_ARCHES = frozenset({"gfx950"})
 _MAX_ROWS = 2**31 - 1
+# rstd's buffer descriptor carries a 32-bit num_records over fp32 elements.
 _MAX_RSTD_ROWS = (2**32 - 1) // 4
-_COMPILE_ENV_VARS = (
-    "FLYDSL_COMPILE_BACKEND",
-    "ARCH",
-    "FLYDSL_GPU_ARCH",
-    "HSA_OVERRIDE_GFX_VERSION",
-)
-_DTYPE_SPECS = {
-    torch.float16: (fx.Float16, 16),
-    torch.bfloat16: (fx.BFloat16, 16),
-    torch.float32: (fx.Float32, 32),
-}
 
 
 class _ForwardKey(NamedTuple):
@@ -73,23 +70,9 @@ class _ForwardKey(NamedTuple):
     apply_weight_offset: bool
 
 
-_BUILD_LOCK = threading.RLock()
-_FWD_CACHE: dict[_ForwardKey, flyc.CompiledFunction] = {}
-_DEVICE_ARCH_CACHE: dict[int, str] = {}
-_EMPTY_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_FWD_CACHE = SpecializationCache("RMSNorm", _SUPPORTED_ARCHES)
 
 
-def _dtype_spec(dtype: torch.dtype):
-    """Translate a public torch dtype to its FlyDSL scalar type and bit width."""
-    try:
-        return _DTYPE_SPECS[dtype]
-    except KeyError:
-        raise TypeError(f"unsupported dtype: {dtype}") from None
-
-
-# Generic ROCm/FlyDSL transaction helpers. They stay local in this first kernel
-# so the PR is self-contained; a later kernel can move them into shared code
-# without changing their contracts.
 def _elements_per_buffer_copy(vecsize: int, elem_bits: int) -> int:
     """Elements handled by each at-most-128-bit copy of a logical vector."""
     return min(vecsize, ACCESS_BITS // elem_bits)
@@ -272,12 +255,12 @@ def _build_rmsnorm_module(
     nested kernel; device code captures only FlyDSL scalar types, bit widths,
     and booleans.
     """
-    input_dtype, input_bits = _dtype_spec(input_torch_dtype)
-    output_dtype, output_bits = _dtype_spec(output_torch_dtype)
-    weight_dtype, weight_bits = _dtype_spec(weight_torch_dtype)
-    bias_dtype, bias_bits = _dtype_spec(bias_torch_dtype)
-    residual_dtype, residual_bits = _dtype_spec(residual_torch_dtype)
-    residual_out_dtype, residual_out_bits = _dtype_spec(residual_out_torch_dtype)
+    input_dtype, input_bits = dtype_spec(input_torch_dtype)
+    output_dtype, output_bits = dtype_spec(output_torch_dtype)
+    weight_dtype, weight_bits = dtype_spec(weight_torch_dtype)
+    bias_dtype, bias_bits = dtype_spec(bias_torch_dtype)
+    residual_dtype, residual_bits = dtype_spec(residual_torch_dtype)
+    residual_out_dtype, residual_out_bits = dtype_spec(residual_out_torch_dtype)
     output_is_float32 = output_torch_dtype == torch.float32
     residual_out_is_float32 = residual_out_torch_dtype == torch.float32
 
@@ -714,92 +697,24 @@ def _build_rmsnorm_module(
     return launch_rmsnorm
 
 
-def _normalize_arch(arch: str) -> str:
-    arch = str(arch).split(":", 1)[0]
-    if arch.startswith("gfx"):
-        return arch
-    parts = arch.split(".")
-    if len(parts) == 3 and all(part.isdigit() for part in parts):
-        return f"gfx{parts[0]}{parts[1]}{parts[2]}"
-    return arch
-
-
-def _validate_arch(device: torch.device) -> str:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    actual = _DEVICE_ARCH_CACHE.get(index)
-    if actual is None:
-        actual = _normalize_arch(torch.cuda.get_device_properties(index).gcnArchName)
-        if actual not in _SUPPORTED_ARCHES:
-            supported = ", ".join(sorted(_SUPPORTED_ARCHES))
-            raise ValueError(f"FlyDSL RMSNorm supports {supported}; cuda:{index} is {actual}")
-        _DEVICE_ARCH_CACHE[index] = actual
-
-    target = flyc.get_backend().target
-    compile_arch = _normalize_arch(target.arch)
-    if target.backend != "rocm":
-        raise RuntimeError(
-            f"FlyDSL RMSNorm requires FlyDSL's ROCm backend, but it targets {target.backend!r}"
-        )
-    if compile_arch != actual:
-        raise ValueError(
-            f"cuda:{index} is {actual}, but FlyDSL compiles for {compile_arch}; "
-            "set ARCH and FLYDSL_GPU_ARCH to the device architecture"
-        )
-    runtime_arch = _normalize_arch(get_rocm_arch())
-    if runtime_arch != actual:
-        raise ValueError(
-            f"cuda:{index} is {actual}, but FlyDSL runtime helpers use {runtime_arch}; "
-            "set FLYDSL_GPU_ARCH or HSA_OVERRIDE_GFX_VERSION to the device architecture"
-        )
-    return actual
-
-
-def _compile_context(device: torch.device) -> tuple:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return (
-        index,
-        *(os.environ.get(name, "") for name in _COMPILE_ENV_VARS),
+def _build_for(key: _ForwardKey):
+    return _build_rmsnorm_module(
+        key.n,
+        key.input_dtype,
+        key.output_dtype,
+        weight_torch_dtype=key.weight_dtype,
+        bias_torch_dtype=key.bias_dtype,
+        residual_torch_dtype=key.residual_dtype,
+        residual_out_torch_dtype=key.residual_out_dtype,
+        has_weight=key.has_weight,
+        has_bias=key.has_bias,
+        has_residual=key.has_residual,
+        store_residual=key.store_residual,
+        store_rstd=key.store_rstd,
+        per_head=key.per_head,
+        num_heads=key.num_heads,
+        apply_weight_offset=key.apply_weight_offset,
     )
-
-
-def _compile_forward(key: _ForwardKey, device: torch.device, args: tuple):
-    """Build once and retain FlyDSL's public fast callable for this specialization."""
-    with _BUILD_LOCK:
-        compiled = _FWD_CACHE.get(key)
-        if compiled is not None:
-            return compiled, False
-        _validate_arch(device)
-        launcher = _build_rmsnorm_module(
-            key.n,
-            key.input_dtype,
-            key.output_dtype,
-            weight_torch_dtype=key.weight_dtype,
-            bias_torch_dtype=key.bias_dtype,
-            residual_torch_dtype=key.residual_dtype,
-            residual_out_torch_dtype=key.residual_out_dtype,
-            has_weight=key.has_weight,
-            has_bias=key.has_bias,
-            has_residual=key.has_residual,
-            store_residual=key.store_residual,
-            store_rstd=key.store_rstd,
-            per_head=key.per_head,
-            num_heads=key.num_heads,
-            apply_weight_offset=key.apply_weight_offset,
-        )
-        # flyc.compile returns a CompiledFunction and performs its first launch.
-        compiled = flyc.compile(launcher, *args)
-        _FWD_CACHE[key] = compiled
-        return compiled, True
-
-
-# torch.cuda.current_stream() allocates a Stream wrapper per call, ~1.6us of a
-# ~23us host path here. Inductor's generated code binds the same raw accessor.
-_get_raw_stream = torch._C._cuda_getCurrentRawStream
-
-
-def _current_raw_stream(device: torch.device) -> int:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return _get_raw_stream(index)
 
 
 def _launch_rmsnorm_fwd(
@@ -825,7 +740,7 @@ def _launch_rmsnorm_fwd(
     # Positional, not keyword: matching sixteen keywords measured ~0.4us per
     # launch on gfx950, against a ~23us host path at small M.
     key = _ForwardKey(
-        _compile_context(x.device),
+        compile_context(x.device),
         n,
         x.dtype,
         out.dtype,
@@ -853,16 +768,9 @@ def _launch_rmsnorm_fwd(
         m,
         eps,
         weight_offset,
-        _current_raw_stream(x.device),
+        current_raw_stream(x.device),
     )
-    with torch.cuda.device(x.device):
-        compiled = _FWD_CACHE.get(key)
-        if compiled is not None:
-            compiled(*args)
-            return
-        compiled, launched = _compile_forward(key, x.device, args)
-        if not launched:
-            compiled(*args)
+    _FWD_CACHE.launch(key, x.device, _build_for, args)
 
 
 def _validate_inputs(
@@ -970,56 +878,6 @@ def _validate_inputs(
     return m, n, num_heads, per_head, eps, weight_offset
 
 
-def _unambiguous_layout(tensor: torch.Tensor) -> torch.Tensor:
-    """Ensure FlyDSL identifies the last dimension as the unit-stride row."""
-    row = tensor.dim() - 1
-    offenders = [
-        axis for axis in range(row) if tensor.shape[axis] == 1 and tensor.stride(axis) == 1
-    ]
-    if not offenders:
-        return tensor
-    for axis in reversed(offenders):
-        tensor = tensor.squeeze(axis)
-    for axis in offenders:
-        tensor = tensor.unsqueeze(axis)
-    return tensor
-
-
-def _rows_are_disjoint_and_packed(tensor: torch.Tensor) -> bool:
-    if tensor.stride(-1) != 1:
-        return False
-    access_bytes = ACCESS_BITS // 8
-    if tensor.data_ptr() % access_bytes:
-        return False
-    span = tensor.shape[-1]
-    for stride, size in sorted(
-        zip(tensor.stride()[:-1], tensor.shape[:-1]), key=lambda axis: axis[0]
-    ):
-        if size > 1 and (stride * tensor.element_size()) % access_bytes:
-            return False
-        if stride < span:
-            return False
-        span = stride * (size - 1) + span
-    return True
-
-
-def _packed_rows(tensor: torch.Tensor) -> torch.Tensor:
-    """Preserve safe row padding and copy only incompatible layouts."""
-    tensor = _unambiguous_layout(tensor)
-    if _rows_are_disjoint_and_packed(tensor):
-        return tensor
-    return tensor.clone(memory_format=torch.contiguous_format)
-
-
-def _empty_placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (device, dtype)
-    tensor = _EMPTY_CACHE.get(key)
-    if tensor is None:
-        tensor = torch.empty(0, device=device, dtype=dtype)
-        _EMPTY_CACHE[key] = tensor
-    return tensor
-
-
 def rmsnorm_fwd(
     x: torch.Tensor,
     weight: torch.Tensor | None = None,
@@ -1064,27 +922,25 @@ def rmsnorm_fwd(
         return out, residual_out, rstd
 
     last_shape = (num_heads, n) if per_head else (n,)
-    x_flat = _packed_rows(x.reshape(-1, *last_shape))
-    weight_arg = (
-        _packed_rows(weight) if weight is not None else _empty_placeholder(x.device, x.dtype)
-    )
-    bias_arg = _packed_rows(bias) if bias is not None else _empty_placeholder(x.device, x.dtype)
+    x_flat = packed_rows(x.reshape(-1, *last_shape))
+    weight_arg = packed_rows(weight) if weight is not None else empty_placeholder(x.device, x.dtype)
+    bias_arg = packed_rows(bias) if bias is not None else empty_placeholder(x.device, x.dtype)
     residual_arg = (
-        _packed_rows(residual.reshape(-1, *last_shape))
+        packed_rows(residual.reshape(-1, *last_shape))
         if residual is not None
-        else _empty_placeholder(x.device, x.dtype)
+        else empty_placeholder(x.device, x.dtype)
     )
 
     out_flat = torch.empty(x_flat.shape, device=x.device, dtype=output_dtype)
     residual_out_flat = (
         torch.empty(x_flat.shape, device=x.device, dtype=residual_out_dtype)
         if store_residual
-        else _empty_placeholder(x.device, residual_out_dtype)
+        else empty_placeholder(x.device, residual_out_dtype)
     )
     rstd_flat = (
         torch.empty(m * num_heads, device=x.device, dtype=torch.float32)
         if store_rstd
-        else _empty_placeholder(x.device, torch.float32)
+        else empty_placeholder(x.device, torch.float32)
     )
 
     _launch_rmsnorm_fwd(

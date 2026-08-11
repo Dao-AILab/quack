@@ -29,6 +29,7 @@ else:
 pytestmark = pytest.mark.skipif(not _CAN_RUN, reason=_SKIP_REASON)
 
 if _CAN_RUN:
+    import quack.flydsl_runtime as fly_runtime
     import quack.rmsnorm_flydsl as fly_rmsnorm
     from quack.rmsnorm_flydsl_config import WAVE_SIZE, RmsNormFwdConfig, rows_per_block
 
@@ -152,23 +153,25 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
     compile_calls = 0
     compile_original = fly_rmsnorm.flyc.compile
     validate_calls = 0
-    validate_original = fly_rmsnorm._validate_arch
+    validate_original = fly_runtime.validate_arch
 
     def count_compile(*args, **kwargs):
         nonlocal compile_calls
         compile_calls += 1
         return compile_original(*args, **kwargs)
 
-    def count_validate(device):
+    def count_validate(*args, **kwargs):
         nonlocal validate_calls
         validate_calls += 1
-        return validate_original(device)
+        return validate_original(*args, **kwargs)
 
     fly_rmsnorm._FWD_CACHE.clear()
     monkeypatch.setattr(fly_rmsnorm.flyc, "compile", count_compile)
-    monkeypatch.setattr(fly_rmsnorm, "_validate_arch", count_validate)
+    # SpecializationCache resolves validate_arch from its own module globals;
+    # compile_context is bound into the kernel module by its from-import.
+    monkeypatch.setattr(fly_runtime, "validate_arch", count_validate)
     compile_context = [("gfx950", "context-a")]
-    monkeypatch.setattr(fly_rmsnorm, "_compile_context", lambda _device: compile_context[0])
+    monkeypatch.setattr(fly_rmsnorm, "compile_context", lambda _device: compile_context[0])
 
     for m, padding in ((3, 8), (11, 16)):
         storage = torch.randn(m, n + padding, device=_DEVICE, dtype=torch.float16)
@@ -193,12 +196,12 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
 
 
 def test_compile_context_tracks_target_environment(monkeypatch):
-    monkeypatch.setattr(fly_rmsnorm, "_validate_arch", lambda _device: "gfx950")
+    monkeypatch.setattr(fly_runtime, "validate_arch", lambda *_args, **_kwargs: "gfx950")
     monkeypatch.delenv("ARCH", raising=False)
-    first = fly_rmsnorm._compile_context(_DEVICE)
+    first = fly_rmsnorm.compile_context(_DEVICE)
 
     monkeypatch.setenv("ARCH", "gfx950:context-change")
-    second = fly_rmsnorm._compile_context(_DEVICE)
+    second = fly_rmsnorm.compile_context(_DEVICE)
 
     assert second != first
 
@@ -210,18 +213,18 @@ def test_launch_follows_the_callers_stream():
     expected, _, _ = _reference(x, weight)
 
     default_stream = torch.cuda.current_stream(_DEVICE)
-    assert fly_rmsnorm._current_raw_stream(_DEVICE) == default_stream.cuda_stream
-    assert fly_rmsnorm._current_raw_stream(torch.device("cuda")) == default_stream.cuda_stream
+    assert fly_rmsnorm.current_raw_stream(_DEVICE) == default_stream.cuda_stream
+    assert fly_rmsnorm.current_raw_stream(torch.device("cuda")) == default_stream.cuda_stream
 
     # A raw stream accessor that ignored the ambient context would silently
     # place every launch on the default stream, racing the caller's ordering.
     side = torch.cuda.Stream(device=_DEVICE)
     with torch.cuda.stream(side):
-        assert fly_rmsnorm._current_raw_stream(_DEVICE) == side.cuda_stream
+        assert fly_rmsnorm.current_raw_stream(_DEVICE) == side.cuda_stream
         out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
     side.synchronize()
 
-    assert fly_rmsnorm._current_raw_stream(_DEVICE) == default_stream.cuda_stream
+    assert fly_rmsnorm.current_raw_stream(_DEVICE) == default_stream.cuda_stream
     _assert_close(out, expected, x.dtype)
 
 
@@ -231,7 +234,7 @@ def test_unaligned_padded_rows_are_copied_before_vector_access():
     x = storage[:, :n]
     assert (x.stride(0) * x.element_size()) % 16 == 8
 
-    packed = fly_rmsnorm._packed_rows(x)
+    packed = fly_rmsnorm.packed_rows(x)
     assert packed.is_contiguous()
     assert packed.data_ptr() != x.data_ptr()
 
@@ -250,8 +253,8 @@ def test_misaligned_contiguous_storage_offsets_force_allocation():
     assert x.is_contiguous() and weight.is_contiguous()
     assert x.data_ptr() % 16 == weight.data_ptr() % 16 == 2
 
-    packed_x = fly_rmsnorm._packed_rows(x)
-    packed_weight = fly_rmsnorm._packed_rows(weight)
+    packed_x = fly_rmsnorm.packed_rows(x)
+    packed_weight = fly_rmsnorm.packed_rows(weight)
     assert packed_x.data_ptr() != x.data_ptr()
     assert packed_weight.data_ptr() != weight.data_ptr()
     assert packed_x.data_ptr() % 16 == packed_weight.data_ptr() % 16 == 0
