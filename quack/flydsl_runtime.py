@@ -67,7 +67,9 @@ def _normalize_arch(arch: str) -> str:
         return arch
     parts = arch.split(".")
     if len(parts) == 3 and all(part.isdigit() for part in parts):
-        return f"gfx{parts[0]}{parts[1]}{parts[2]}"
+        # HSA_OVERRIDE_GFX_VERSION spells the stepping as one hex digit, so
+        # gfx90a arrives as 9.0.10 and a decimal join would yield gfx9010.
+        return f"gfx{parts[0]}{parts[1]}{int(parts[2]):x}"
     return arch
 
 

@@ -253,6 +253,24 @@ def test_misaligned_contiguous_storage_offsets_force_allocation():
     _assert_close(out, expected, x.dtype)
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    (
+        pytest.param("gfx950:sramecc+:xnack-", "gfx950", id="gcn-arch-name"),
+        pytest.param("9.5.0", "gfx950", id="override-gfx950"),
+        pytest.param("9.0.10", "gfx90a", id="override-gfx90a"),
+        pytest.param("9.0.12", "gfx90c", id="override-gfx90c"),
+        pytest.param("9.4.2", "gfx942", id="override-gfx942"),
+        pytest.param("10.3.0", "gfx1030", id="override-gfx1030"),
+        pytest.param("9.0.x", "9.0.x", id="unparsable"),
+    ),
+)
+def test_normalize_arch_reads_the_stepping_as_hex(raw, expected):
+    # A decimal join turns gfx90a's 9.0.10 override into gfx9010, which makes
+    # validate_arch reject a correctly configured device.
+    assert fly_runtime._normalize_arch(raw) == expected
+
+
 def test_empty_rows_return_without_compiling(monkeypatch):
     x = torch.empty(0, 192, device=_DEVICE, dtype=torch.float16)
     weight = torch.ones(192, device=_DEVICE, dtype=torch.float32)
