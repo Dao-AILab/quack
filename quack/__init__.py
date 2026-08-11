@@ -7,12 +7,26 @@ import torch
 _IS_ROCM = torch.version.hip is not None
 _CUTE_ONLY_EXPORTS = frozenset({"RoundingMode", "cross_entropy", "rmsnorm", "softmax"})
 
+# FlyDSL is a backend of quack's RMSNorm forward, not a separate library: the
+# two implementations take the same arguments and return the same triple, so
+# the caller picks a device, not a backend. Resolved on first attribute access
+# rather than at import so `import quack` does not pull in a backend nobody
+# asked for.
+_FORWARD_BACKENDS = {"rmsnorm_fwd": "quack.rmsnorm_flydsl" if _IS_ROCM else "quack.rmsnorm"}
+
 
 def __getattr__(name):
+    backend = _FORWARD_BACKENDS.get(name)
+    if backend is not None:
+        import importlib
+
+        value = getattr(importlib.import_module(backend), name)
+        globals()[name] = value
+        return value
     if _IS_ROCM and name in _CUTE_ONLY_EXPORTS:
         raise ImportError(
             f"quack.{name} requires the CUDA/CuTe backend; "
-            "use quack.rmsnorm_flydsl.rmsnorm_fwd for the ROCm forward kernel"
+            "quack.rmsnorm_fwd is available on both backends"
         )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -42,7 +56,8 @@ if not _IS_ROCM:
         "RoundingMode",
         "cross_entropy",
         "rmsnorm",
+        "rmsnorm_fwd",
         "softmax",
     ]
 else:
-    __all__ = []
+    __all__ = ["rmsnorm_fwd"]

@@ -8,24 +8,15 @@ import torch  # noqa: E402
 import torch._functorch.config as _functorch_config  # noqa: E402
 from triton.testing import Benchmark, do_bench, perf_report  # noqa: E402
 
+# quack.rmsnorm_fwd is the CuTe kernel on CUDA and the FlyDSL kernel on ROCm.
+from quack import rmsnorm_fwd  # noqa: E402
 from quack.bench.bench_utils import run_and_print  # noqa: E402
+from quack.rmsnorm_ref import rmsnorm_ref  # noqa: E402
 
 # Inductor's donated-buffer optimization is incompatible with retain_graph=True
 # (used so we benchmark only bwd, not fwd+bwd). Disable it for the torch.compile
 # bwd path. Must be set before torch.compile builds the bwd graph.
 _functorch_config.donated_buffer = False
-
-# Every backend is optional so one ladder covers whichever are installed: the
-# CuTe kernels need cuda.bindings (absent on ROCm) and FlyDSL is ROCm-only.
-try:
-    from quack.rmsnorm import rmsnorm, rmsnorm_bwd, rmsnorm_fwd
-except ImportError:
-    rmsnorm = rmsnorm_bwd = rmsnorm_fwd = None
-
-try:
-    from quack.rmsnorm_flydsl import rmsnorm_fwd as flydsl_rmsnorm_fwd
-except ImportError:
-    flydsl_rmsnorm_fwd = None
 
 try:
     import cudnn
@@ -63,50 +54,20 @@ def _bench(fn, **kwargs) -> float:
     return do_bench(fn, warmup=10, rep=100, **kwargs)
 
 
-def _torch_compile_ref(x, w=None, bias=None, residual=None, eps=1e-6, weight_offset=0.0):
-    """Baseline for the torch.compile column.
-
-    Equivalent to ``quack.rmsnorm_ref.rmsnorm_ref`` to within a bf16 ulp, but
-    written with ``rsqrt`` rather than a divide by ``sqrt``: inductor compiles
-    the rsqrt form 6.7-10.9% faster for N >= 8192 on gfx950 (it is slower by
-    6.5% only at N = 1024). The baseline has to be the stronger of two equally
-    valid spellings, or the kernel's reported margin is inflated by the gap.
-    """
-    x_f32 = x.float()
-    if residual is not None:
-        x_f32 = x_f32 + residual.float()
-    rstd = torch.rsqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps)
-    out = x_f32 * rstd
-    if w is not None:
-        out = out * (w.float() + weight_offset)
-    if bias is not None:
-        out = out + bias.float()
-    if residual is None:
-        return out.to(x.dtype)
-    return out.to(x.dtype), x_f32.to(residual.dtype)
-
-
 def _compiled_ref():
     # Dynamo's recompile budget is process-global across benchmark cells.
     torch._dynamo.reset()
-    return torch.compile(_torch_compile_ref, dynamic=False)
+    return torch.compile(rmsnorm_ref, dynamic=False)
 
 
 def _fwd_providers():
-    providers = []
-    if rmsnorm_fwd is not None:
-        providers.append(("quack", "quack"))
-    if flydsl_rmsnorm_fwd is not None:
-        providers.append(("flydsl", "flydsl"))
-    providers.append(("torch_compile", "torch.compile"))
+    providers = [("quack", "quack"), ("torch_compile", "torch.compile")]
     if cudnn is not None:
         providers.append(("cudnn", "cudnn"))
     return providers
 
 
 def _bwd_providers():
-    # No FlyDSL backward kernel yet; the shared setup also builds its reference
-    # graph with the CuTe rmsnorm, so backward requires the CuTe backend.
     return [("quack", "quack"), ("torch_compile", "torch.compile")]
 
 
@@ -228,10 +189,6 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name, weight_d
         fn = lambda: rmsnorm_fwd(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
-    elif provider == "flydsl":
-        fn = lambda: flydsl_rmsnorm_fwd(x, w, residual=residual, eps=eps)
-        ms = _bench(fn)
-        nbytes = _fwd_mem_bytes(x, w, residual)
     elif provider == "torch_compile":
         compiled = _compiled_ref()
         fn = lambda: compiled(x, w, residual=residual, eps=eps)
@@ -250,6 +207,10 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name, weight_d
 
 
 def rmsnorm_bwd_runner(M, N, provider, dtype_name, residual_dtype_name):
+    # CuTe-only: there is no FlyDSL RMSNorm backward, and the shared setup below
+    # builds its reference graph with the CuTe autograd entry point.
+    from quack.rmsnorm import rmsnorm, rmsnorm_bwd
+
     dtype = DTYPE_MAP[dtype_name]
     residual_dtype = DTYPE_MAP[residual_dtype_name] if residual_dtype_name else None
     eps = 1e-6
@@ -328,8 +289,8 @@ def main():
     if (args.M is None) != (args.N is None):
         parser.error("--M and --N must be given together")
     x_vals = [(args.M, args.N)] if args.M is not None else None
-    if args.backward and rmsnorm is None:
-        parser.error("--backward requires the CuTe backend (quack.rmsnorm failed to import)")
+    if args.backward and torch.version.hip is not None:
+        parser.error("--backward is CuTe-only; there is no FlyDSL RMSNorm backward kernel yet")
 
     torch.manual_seed(0)
 
