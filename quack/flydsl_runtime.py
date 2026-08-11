@@ -6,13 +6,15 @@ Nothing here knows about a particular kernel: architecture validation, launch
 dispatch, stream and dtype translation, and the row layout rules the ROCm
 buffer descriptors depend on.
 
-Caching is split, and a kernel module needs to know which half it owns. The
-launcher for a specialization is the kernel module's business -- rmsnorm keeps
-one per shape and dtype behind a ``functools.cache``. Its *compiled* form is
-this module's, because that part is bound to a device context: ``run_compiled``
-keys it by device ordinal, and reusing one device's handle on another fails the
-launch. Neither half is serialized against concurrent builders, and FlyDSL's
-own on-disk cache under ``~/.flydsl/cache`` sits below both.
+Caching is split, and a kernel module needs to know which half it owns.
+``run_compiled`` holds one compiled artifact per launcher and does no keying of
+its own, so **the caller must key its launchers by device** as well as by
+specialization -- rmsnorm passes the device ordinal to its ``functools.cache``d
+builder for exactly that reason. FlyDSL caches artifacts on the JitFunction by
+argument signature alone, so a launcher shared across GPUs hands the second one
+a module loaded into the first one's context and the launch fails with
+hipErrorInvalidDevice. Neither layer is serialized against concurrent builders,
+and FlyDSL's own on-disk cache under ``~/.flydsl/cache`` sits below both.
 
 This is a sibling of :mod:`quack.cache.jit` rather than a reuse of it: that
 module's disk half is CuTe-specific (``.o`` export plus a tvm_ffi
