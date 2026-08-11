@@ -569,6 +569,54 @@ def _build_rmsnorm_module(
             if lane == 0:
                 rstd_div[program] = rrms
 
+        def write_normalized(value, load_index, store_index, guard=None):
+            """Scale one vector by rrms, fold in weight and bias, and store it.
+
+            ``load_index`` is clamped inside the row for a ragged tile while
+            ``store_index`` stays unclamped, because the store is predicated by
+            ``guard`` instead. A ``guard`` of None means the tile is full.
+            """
+            result = value * rrms
+            if const_expr(has_weight):
+                weights = _load_dtype_vec(
+                    weight_copy,
+                    weight_dtype,
+                    weight_bits,
+                    weight_div,
+                    load_index,
+                    vecsize,
+                )
+                if const_expr(apply_weight_offset):
+                    weights = weights + weight_offset
+                result = result * weights
+            if const_expr(has_bias):
+                result = result + _load_dtype_vec(
+                    bias_copy,
+                    bias_dtype,
+                    bias_bits,
+                    bias_div,
+                    load_index,
+                    vecsize,
+                )
+            stored = _to_store_dtype(output_is_float32, output_dtype, result)
+
+            def emit():
+                _store_dtype_vec(
+                    output_copy,
+                    output_dtype,
+                    output_bits,
+                    stored,
+                    output_div,
+                    store_index,
+                    vecsize,
+                )
+
+            if const_expr(guard is None):
+                emit()
+            else:
+                if guard:
+                    emit()
+
         if const_expr(reload_from_gmem):
             for tile_i in range(wide_full_tiles):
                 index = lane + tile_i * threads_per_row
@@ -589,37 +637,7 @@ def _build_rmsnorm_module(
                         index,
                         vecsize,
                     )
-                result = value * rrms
-                if const_expr(has_weight):
-                    weights = _load_dtype_vec(
-                        weight_copy,
-                        weight_dtype,
-                        weight_bits,
-                        weight_div,
-                        index,
-                        vecsize,
-                    )
-                    if const_expr(apply_weight_offset):
-                        weights = weights + weight_offset
-                    result = result * weights
-                if const_expr(has_bias):
-                    result = result + _load_dtype_vec(
-                        bias_copy,
-                        bias_dtype,
-                        bias_bits,
-                        bias_div,
-                        index,
-                        vecsize,
-                    )
-                _store_dtype_vec(
-                    output_copy,
-                    output_dtype,
-                    output_bits,
-                    _to_store_dtype(output_is_float32, output_dtype, result),
-                    output_div,
-                    index,
-                    vecsize,
-                )
+                write_normalized(value, index, index)
             if const_expr(wide_tail_vecs > 0):
                 index = lane + wide_full_tiles * threads_per_row
                 in_row = lane < wide_tail_vecs
@@ -641,43 +659,13 @@ def _build_rmsnorm_module(
                         safe_index,
                         vecsize,
                     )
-                result = value * rrms
-                if const_expr(has_weight):
-                    weights = _load_dtype_vec(
-                        weight_copy,
-                        weight_dtype,
-                        weight_bits,
-                        weight_div,
-                        safe_index,
-                        vecsize,
-                    )
-                    if const_expr(apply_weight_offset):
-                        weights = weights + weight_offset
-                    result = result * weights
-                if const_expr(has_bias):
-                    result = result + _load_dtype_vec(
-                        bias_copy,
-                        bias_dtype,
-                        bias_bits,
-                        bias_div,
-                        safe_index,
-                        vecsize,
-                    )
-                if in_row:
-                    _store_dtype_vec(
-                        output_copy,
-                        output_dtype,
-                        output_bits,
-                        _to_store_dtype(output_is_float32, output_dtype, result),
-                        output_div,
-                        index,
-                        vecsize,
-                    )
+                write_normalized(value, safe_index, index, in_row)
         else:
             for tile_i in range_constexpr(config.num_tiles):
                 partial = config.needs_predicate and tile_i == last_tile
                 index = lane + tile_i * threads_per_row
                 safe_index = index
+                in_row = None
                 if const_expr(partial):
                     in_row = index < num_vecs
                     safe_index = in_row.select(index, 0)
@@ -685,50 +673,7 @@ def _build_rmsnorm_module(
                     value = row_values[tile_i]
                 else:
                     value = native_row_values[tile_i].to(fx.Float32)
-                result = value * rrms
-                if const_expr(has_weight):
-                    weights = _load_dtype_vec(
-                        weight_copy,
-                        weight_dtype,
-                        weight_bits,
-                        weight_div,
-                        safe_index,
-                        vecsize,
-                    )
-                    if const_expr(apply_weight_offset):
-                        weights = weights + weight_offset
-                    result = result * weights
-                if const_expr(has_bias):
-                    result = result + _load_dtype_vec(
-                        bias_copy,
-                        bias_dtype,
-                        bias_bits,
-                        bias_div,
-                        safe_index,
-                        vecsize,
-                    )
-                output_value = _to_store_dtype(output_is_float32, output_dtype, result)
-                if const_expr(partial):
-                    if in_row:
-                        _store_dtype_vec(
-                            output_copy,
-                            output_dtype,
-                            output_bits,
-                            output_value,
-                            output_div,
-                            index,
-                            vecsize,
-                        )
-                else:
-                    _store_dtype_vec(
-                        output_copy,
-                        output_dtype,
-                        output_bits,
-                        output_value,
-                        output_div,
-                        index,
-                        vecsize,
-                    )
+                write_normalized(value, safe_index, index, in_row)
 
     @flyc.jit
     def launch_rmsnorm(
