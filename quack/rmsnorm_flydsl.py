@@ -173,7 +173,7 @@ def _shuffle_reduce_add(value, lanes: int, shuffle_width, fast_math):
 
 def _load_vec(copy_atom, vec_width, elem_dtype, divided_tensor, index):
     register = fx.make_rmem_tensor(vec_width, elem_dtype)
-    fx.copy_atom_call(copy_atom, fx.slice(divided_tensor, (None, index)), register)
+    fx.copy(copy_atom, fx.slice(divided_tensor, (None, index)), register)
     return fx.memref_load_vec(register)
 
 
@@ -212,7 +212,7 @@ def _load_dtype_vec(
 def _store_vec(copy_atom, vec_width, elem_dtype, value, divided_tensor, index):
     register = fx.make_rmem_tensor(vec_width, elem_dtype)
     fx.memref_store_vec(value, register)
-    fx.copy_atom_call(copy_atom, register, fx.slice(divided_tensor, (None, index)))
+    fx.copy(copy_atom, register, fx.slice(divided_tensor, (None, index)))
 
 
 def _store_dtype_vec(
