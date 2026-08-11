@@ -76,6 +76,7 @@ def _assert_close(actual, expected, input_dtype):
         pytest.param(3, 192, torch.float16, torch.float16, id="padded-fp16"),
         pytest.param(5, 760, torch.bfloat16, torch.float32, id="predicated-mixed-weight"),
         pytest.param(2, 4096, torch.bfloat16, None, id="cross-wave"),
+        pytest.param(2, 8192, torch.bfloat16, torch.float32, id="doubled-thread-geometry"),
         pytest.param(1, 65536, torch.bfloat16, torch.float32, id="wide-reload"),
         pytest.param(1, 65544, torch.bfloat16, torch.float32, id="wide-predicated-reload"),
     ],
@@ -97,6 +98,12 @@ def test_plain_forward(m, n, dtype, weight_dtype):
     if n == 4096:
         config = RmsNormFwdConfig.for_forward(n, x.element_size() * 8)
         assert config.num_threads > WAVE_SIZE
+    if n == 8192:
+        # Pin the branch, not the geometry: no other row lands between the
+        # small-block and max-block thread counts while still register-cached.
+        config = RmsNormFwdConfig.for_forward(n, x.element_size() * 8)
+        assert 256 < config.num_threads < 1024
+        assert not config.reload_from_gmem
     if n >= 65536:
         config = RmsNormFwdConfig.for_forward(n, x.element_size() * 8)
         assert config.reload_from_gmem
@@ -337,8 +344,9 @@ def test_compiled_path_rejects_the_same_scalars_as_eager():
             compiled(x, weight)
 
 
-def test_reduce_overhead_does_not_skip_cudagraphs(caplog):
+def test_reduce_overhead_replays_the_graph_instead_of_relaunching(monkeypatch, caplog):
     n = 1024
+    calls = 8
     x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
 
@@ -346,16 +354,42 @@ def test_reduce_overhead_does_not_skip_cudagraphs(caplog):
         out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, w, eps=1e-6)
         return out * 2.0
 
-    torch._dynamo.reset()
-    with caplog.at_level(logging.WARNING):
-        compiled = torch.compile(block, mode="reduce-overhead", dynamic=False)
-        for _ in range(3):
+    executions = 0
+    core = fly_rmsnorm._rmsnorm_fwd_core
+
+    def counting_core(*args, **kwargs):
+        nonlocal executions
+        executions += 1
+        return core(*args, **kwargs)
+
+    monkeypatch.setattr(fly_rmsnorm, "_rmsnorm_fwd_core", counting_core)
+
+    # Replay is the only way the host body can stop running while the output
+    # stays correct, so count launches rather than trust a log line: a globally
+    # disabled cudagraph, an unsupported environment or a reworded warning all
+    # leave the message absent while the region silently relaunches every call.
+    def run(**compile_kwargs):
+        nonlocal executions
+        torch._dynamo.reset()
+        executions = 0
+        compiled = torch.compile(block, dynamic=False, **compile_kwargs)
+        for _ in range(calls):
             got = compiled(x, weight)
         torch.cuda.synchronize()
+        _assert_close(got, _reference(x, weight)[0] * 2.0, x.dtype)
+        return executions
 
-    _assert_close(got, _reference(x, weight)[0] * 2.0, x.dtype)
-    # A mutating op earns "skipping cudagraphs due to mutated inputs"; the
-    # functional one must not, or the region is never captured.
+    with caplog.at_level(logging.WARNING):
+        captured = run(mode="reduce-overhead")
+    relaunched = run()
+
+    # The default mode pins the counter to a launch, so a captured run that
+    # stops short of it is replaying and not just dodging instrumentation.
+    assert relaunched == calls, relaunched
+    assert captured < calls, captured
+
+    # A mutating op also earns "skipping cudagraphs due to mutated inputs"; the
+    # functional one must not, so keep the message as a diagnostic.
     skips = [r.getMessage() for r in caplog.records if "skipping cudagraphs" in r.getMessage()]
     assert not skips, skips
 
