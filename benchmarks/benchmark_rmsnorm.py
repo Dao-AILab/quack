@@ -9,12 +9,23 @@ import torch._functorch.config as _functorch_config  # noqa: E402
 from triton.testing import Benchmark, do_bench, perf_report  # noqa: E402
 
 from quack.bench.bench_utils import run_and_print  # noqa: E402
-from quack.rmsnorm import rmsnorm, rmsnorm_bwd, rmsnorm_fwd, rmsnorm_ref  # noqa: E402
 
 # Inductor's donated-buffer optimization is incompatible with retain_graph=True
 # (used so we benchmark only bwd, not fwd+bwd). Disable it for the torch.compile
 # bwd path. Must be set before torch.compile builds the bwd graph.
 _functorch_config.donated_buffer = False
+
+# Every backend is optional so one ladder covers whichever are installed: the
+# CuTe kernels need cuda.bindings (absent on ROCm) and FlyDSL is ROCm-only.
+try:
+    from quack.rmsnorm import rmsnorm, rmsnorm_bwd, rmsnorm_fwd
+except ImportError:
+    rmsnorm = rmsnorm_bwd = rmsnorm_fwd = None
+
+try:
+    from quack.rmsnorm_flydsl import rmsnorm_fwd as flydsl_rmsnorm_fwd
+except ImportError:
+    flydsl_rmsnorm_fwd = None
 
 try:
     import cudnn
@@ -52,22 +63,66 @@ def _bench(fn, **kwargs) -> float:
     return do_bench(fn, warmup=10, rep=100, **kwargs)
 
 
+def _torch_compile_ref(x, w=None, bias=None, residual=None, eps=1e-6, weight_offset=0.0):
+    """Baseline for the torch.compile column.
+
+    Equivalent to ``quack.rmsnorm_ref.rmsnorm_ref`` to within a bf16 ulp, but
+    written with ``rsqrt`` rather than a divide by ``sqrt``: inductor compiles
+    the rsqrt form 6.7-10.9% faster for N >= 8192 on gfx950 (it is slower by
+    6.5% only at N = 1024). The baseline has to be the stronger of two equally
+    valid spellings, or the kernel's reported margin is inflated by the gap.
+    """
+    x_f32 = x.float()
+    if residual is not None:
+        x_f32 = x_f32 + residual.float()
+    rstd = torch.rsqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps)
+    out = x_f32 * rstd
+    if w is not None:
+        out = out * (w.float() + weight_offset)
+    if bias is not None:
+        out = out + bias.float()
+    if residual is None:
+        return out.to(x.dtype)
+    return out.to(x.dtype), x_f32.to(residual.dtype)
+
+
+def _compiled_ref():
+    # Dynamo's recompile budget is process-global across benchmark cells.
+    torch._dynamo.reset()
+    return torch.compile(_torch_compile_ref, dynamic=False)
+
+
 def _fwd_providers():
-    providers = [("quack", "quack"), ("torch_compile", "torch.compile")]
+    providers = []
+    if rmsnorm_fwd is not None:
+        providers.append(("quack", "quack"))
+    if flydsl_rmsnorm_fwd is not None:
+        providers.append(("flydsl", "flydsl"))
+    providers.append(("torch_compile", "torch.compile"))
     if cudnn is not None:
         providers.append(("cudnn", "cudnn"))
     return providers
 
 
 def _bwd_providers():
+    # No FlyDSL backward kernel yet; the shared setup also builds its reference
+    # graph with the CuTe rmsnorm, so backward requires the CuTe backend.
     return [("quack", "quack"), ("torch_compile", "torch.compile")]
 
 
+def _weight_dtype(dtype_name: str, weight_dtype_name: str) -> torch.dtype:
+    if weight_dtype_name == "same":
+        return DTYPE_MAP[dtype_name]
+    return DTYPE_MAP[weight_dtype_name]
+
+
 def make_fwd_benchmark(
-    dtype_name: str, residual_dtype_name: Optional[str], x_vals=None
+    dtype_name: str, residual_dtype_name: Optional[str], weight_dtype_name: str, x_vals=None
 ) -> Benchmark:
     line_vals, line_names = zip(*_fwd_providers())
-    suffix = dtype_name + (f"-res-{residual_dtype_name}" if residual_dtype_name else "")
+    suffix = dtype_name + f"-w-{weight_dtype_name}"
+    if residual_dtype_name:
+        suffix += f"-res-{residual_dtype_name}"
     return Benchmark(
         x_names=["M", "N"],
         x_vals=x_vals if x_vals is not None else MN_PAIRS,
@@ -75,7 +130,11 @@ def make_fwd_benchmark(
         line_vals=list(line_vals),
         line_names=list(line_names),
         plot_name=f"rmsnorm-fwd-{suffix}",
-        args={"dtype_name": dtype_name, "residual_dtype_name": residual_dtype_name},
+        args={
+            "dtype_name": dtype_name,
+            "residual_dtype_name": residual_dtype_name,
+            "weight_dtype_name": weight_dtype_name,
+        },
         xlabel="(M, N)",
         ylabel="GB/s",
     )
@@ -105,7 +164,7 @@ def make_bwd_benchmark(
 
 
 def _fwd_mem_bytes(x: torch.Tensor, w: torch.Tensor, residual: Optional[torch.Tensor]) -> int:
-    nbytes = 2 * x.numel() * x.dtype.itemsize + w.numel() * 4
+    nbytes = 2 * x.numel() * x.dtype.itemsize + w.numel() * w.dtype.itemsize
     if residual is not None:
         nbytes += 2 * residual.numel() * residual.dtype.itemsize
     return nbytes
@@ -152,13 +211,13 @@ def rmsnorm_cudnn_setup(M, N, dtype):
     return run
 
 
-def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
+def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name, weight_dtype_name):
     dtype = DTYPE_MAP[dtype_name]
     residual_dtype = DTYPE_MAP[residual_dtype_name] if residual_dtype_name else None
     eps = 1e-6
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
-    w = torch.randn(N, device="cuda", dtype=torch.float32)
+    w = torch.randn(N, device="cuda", dtype=_weight_dtype(dtype_name, weight_dtype_name))
     residual = (
         torch.randn(M, N, device="cuda", dtype=residual_dtype)
         if residual_dtype is not None
@@ -169,8 +228,12 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
         fn = lambda: rmsnorm_fwd(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
+    elif provider == "flydsl":
+        fn = lambda: flydsl_rmsnorm_fwd(x, w, residual=residual, eps=eps)
+        ms = _bench(fn)
+        nbytes = _fwd_mem_bytes(x, w, residual)
     elif provider == "torch_compile":
-        compiled = torch.compile(rmsnorm_ref)
+        compiled = _compiled_ref()
         fn = lambda: compiled(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
@@ -230,7 +293,7 @@ def rmsnorm_bwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     elif provider == "torch_compile":
         x_ref = x.detach().clone().requires_grad_()
         w_ref = w.detach().clone().requires_grad_()
-        y_ref = torch.compile(rmsnorm_ref)(x_ref, w_ref, eps=eps)
+        y_ref = _compiled_ref()(x_ref, w_ref, eps=eps)
         fn = lambda: torch.autograd.grad(y_ref, [x_ref, w_ref], grad_outputs=dy, retain_graph=True)
         ms = _bench(fn, grad_to_none=(x_ref, w_ref))
         sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 2
@@ -250,6 +313,12 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark rmsnorm fwd / bwd")
     parser.add_argument("--dtype", default="bfloat16", choices=list(DTYPE_MAP))
     parser.add_argument("--residual_dtype", default=None, choices=[None, *DTYPE_MAP])
+    parser.add_argument(
+        "--weight_dtype",
+        default="float32",
+        choices=["same", *DTYPE_MAP],
+        help="Weight dtype; 'same' follows --dtype. Forward only.",
+    )
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--M", type=int, default=None, help="Bench a single M (requires --N)")
     parser.add_argument("--N", type=int, default=None, help="Bench a single N (requires --M)")
@@ -259,6 +328,8 @@ def main():
     if (args.M is None) != (args.N is None):
         parser.error("--M and --N must be given together")
     x_vals = [(args.M, args.N)] if args.M is not None else None
+    if args.backward and rmsnorm is None:
+        parser.error("--backward requires the CuTe backend (quack.rmsnorm failed to import)")
 
     torch.manual_seed(0)
 
@@ -267,9 +338,9 @@ def main():
             rmsnorm_bwd_runner
         )
     else:
-        bench = perf_report(make_fwd_benchmark(args.dtype, args.residual_dtype, x_vals))(
-            rmsnorm_fwd_runner
-        )
+        bench = perf_report(
+            make_fwd_benchmark(args.dtype, args.residual_dtype, args.weight_dtype, x_vals)
+        )(rmsnorm_fwd_runner)
 
     run_and_print(bench, save_path=args.save_path)
 
