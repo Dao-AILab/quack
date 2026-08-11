@@ -203,6 +203,28 @@ def test_compile_context_tracks_target_environment(monkeypatch):
     assert second != first
 
 
+def test_launch_follows_the_callers_stream():
+    n = 4096
+    x = torch.randn(2, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+    expected, _, _ = _reference(x, weight)
+
+    default_stream = torch.cuda.current_stream(_DEVICE)
+    assert fly_rmsnorm._current_raw_stream(_DEVICE) == default_stream.cuda_stream
+    assert fly_rmsnorm._current_raw_stream(torch.device("cuda")) == default_stream.cuda_stream
+
+    # A raw stream accessor that ignored the ambient context would silently
+    # place every launch on the default stream, racing the caller's ordering.
+    side = torch.cuda.Stream(device=_DEVICE)
+    with torch.cuda.stream(side):
+        assert fly_rmsnorm._current_raw_stream(_DEVICE) == side.cuda_stream
+        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
+    side.synchronize()
+
+    assert fly_rmsnorm._current_raw_stream(_DEVICE) == default_stream.cuda_stream
+    _assert_close(out, expected, x.dtype)
+
+
 def test_unaligned_padded_rows_are_copied_before_vector_access():
     n = 192
     storage = torch.randn(4, 196, device=_DEVICE, dtype=torch.float16)

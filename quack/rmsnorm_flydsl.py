@@ -847,8 +847,14 @@ def _compile_forward(key: _ForwardKey, device: torch.device, args: tuple):
         return compiled, True
 
 
+# torch.cuda.current_stream() allocates a Stream wrapper per call, ~1.6us of a
+# ~23us host path here. Inductor's generated code binds the same raw accessor.
+_get_raw_stream = torch._C._cuda_getCurrentRawStream
+
+
 def _current_raw_stream(device: torch.device) -> int:
-    return torch.cuda.current_stream(device).cuda_stream
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _get_raw_stream(index)
 
 
 def _launch_rmsnorm_fwd(
