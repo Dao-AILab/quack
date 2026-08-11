@@ -18,6 +18,14 @@ from quack.rmsnorm_torch import rmsnorm_ref  # noqa: E402
 # bwd path. Must be set before torch.compile builds the bwd graph.
 _functorch_config.donated_buffer = False
 
+# dynamic=False makes every (M, N) a fresh graph, and the recompile budget is
+# per code object, so the ladder's rungs share one. At the default limit of 8,
+# the last rungs stop compiling and silently report eager timings under the
+# torch.compile heading -- a 4-6x understatement of the baseline at the widest
+# rows. Raise it past the rung count instead, as tests/test_rmsnorm.py does.
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
+
 try:
     import cudnn
 except ImportError:
@@ -52,12 +60,6 @@ def _result(num_bytes: int, ms: float) -> dict:
 
 def _bench(fn, **kwargs) -> float:
     return do_bench(fn, warmup=10, rep=100, **kwargs)
-
-
-def _compiled_ref():
-    # Dynamo's recompile budget is process-global across benchmark cells.
-    torch._dynamo.reset()
-    return torch.compile(rmsnorm_ref, dynamic=False)
 
 
 def _fwd_providers():
@@ -180,7 +182,7 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
     elif provider == "torch_compile":
-        compiled = _compiled_ref()
+        compiled = torch.compile(rmsnorm_ref, dynamic=False)
         fn = lambda: compiled(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
@@ -244,7 +246,7 @@ def rmsnorm_bwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     elif provider == "torch_compile":
         x_ref = x.detach().clone().requires_grad_()
         w_ref = w.detach().clone().requires_grad_()
-        y_ref = _compiled_ref()(x_ref, w_ref, eps=eps)
+        y_ref = torch.compile(rmsnorm_ref, dynamic=False)(x_ref, w_ref, eps=eps)
         fn = lambda: torch.autograd.grad(y_ref, [x_ref, w_ref], grad_outputs=dy, retain_graph=True)
         ms = _bench(fn, grad_to_none=(x_ref, w_ref))
         sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 2
