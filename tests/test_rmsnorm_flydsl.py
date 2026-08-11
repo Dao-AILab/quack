@@ -324,3 +324,19 @@ def test_invalid_inputs():
         fly_rmsnorm.rmsnorm_fwd(x, eps=0)
     with pytest.raises(ValueError, match="ROCm device"):
         fly_rmsnorm.rmsnorm_fwd(x.cpu())
+
+    # The scalar checks take a `type(...) is float` fast path, so the branches
+    # that only the slow path can reject need holding down explicitly.
+    weight = torch.empty(16, device=_DEVICE, dtype=torch.float16)
+    with pytest.raises(TypeError, match="eps must be a real number"):
+        fly_rmsnorm.rmsnorm_fwd(x, eps=True)
+    with pytest.raises(TypeError, match="eps must be a real number"):
+        fly_rmsnorm.rmsnorm_fwd(x, eps="1e-6")
+    with pytest.raises(TypeError, match="store_rstd must be a bool"):
+        fly_rmsnorm.rmsnorm_fwd(x, store_rstd=1)
+    with pytest.raises(TypeError, match="weight_offset must be a real number"):
+        fly_rmsnorm.rmsnorm_fwd(x, weight, weight_offset=True)
+    with pytest.raises(ValueError, match="weight_offset must be finite"):
+        fly_rmsnorm.rmsnorm_fwd(x, weight, weight_offset=float("inf"))
+    # An int is not a float but is a Real: still accepted, still converted.
+    fly_rmsnorm.rmsnorm_fwd(x, weight, eps=1, weight_offset=1)

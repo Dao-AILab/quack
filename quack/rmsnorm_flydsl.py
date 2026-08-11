@@ -43,6 +43,8 @@ _SUPPORTED_ARCHES = frozenset({"gfx950"})
 _MAX_ROWS = 2**31 - 1
 # rstd's buffer descriptor carries a 32-bit num_records over fp32 elements.
 _MAX_RSTD_ROWS = (2**32 - 1) // 4
+# Fixed for the life of the process, and read on every validated call.
+_IS_ROCM = torch.version.hip is not None
 
 
 class _ForwardKey(NamedTuple):
@@ -788,7 +790,8 @@ def _validate_inputs(
         raise TypeError(f"x must be a torch.Tensor, got {type(x).__name__}")
     if x.ndim < 1:
         raise ValueError("x must have at least one dimension")
-    for name, tensor in (("weight", weight), ("bias", bias), ("residual", residual)):
+    optional = (("weight", weight), ("bias", bias), ("residual", residual))
+    for name, tensor in optional:
         if tensor is not None and not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor or None, got {type(tensor).__name__}")
 
@@ -824,7 +827,7 @@ def _validate_inputs(
     alignment = ACCESS_BITS // (x.element_size() * 8)
     if n % alignment:
         raise ValueError(f"x normalized dimension must be a multiple of {alignment}, got {n}")
-    for name, tensor in (("weight", weight), ("bias", bias), ("residual", residual)):
+    for name, tensor in optional:
         if tensor is not None and tensor.dtype not in _SUPPORTED_DTYPES:
             raise TypeError(
                 f"{name} dtype must be float16, bfloat16, or float32, got {tensor.dtype}"
@@ -833,32 +836,35 @@ def _validate_inputs(
         if dtype is not None and dtype not in _SUPPORTED_DTYPES:
             raise TypeError(f"{name} must be float16, bfloat16, or float32, got {dtype}")
 
-    for name, tensor in (
-        ("x", x),
-        ("weight", weight),
-        ("bias", bias),
-        ("residual", residual),
-    ):
+    for name, tensor in (("x", x), *optional):
         if tensor is not None and tensor.layout != torch.strided:
             raise ValueError(f"{name} must use torch.strided layout, got {tensor.layout}")
-    if torch.version.hip is None or x.device.type != "cuda":
-        raise ValueError(f"x must be on a ROCm device, got {x.device}")
-    for name, tensor in (("weight", weight), ("bias", bias), ("residual", residual)):
-        if tensor is not None and tensor.device != x.device:
+    device = x.device
+    if not _IS_ROCM or device.type != "cuda":
+        raise ValueError(f"x must be on a ROCm device, got {device}")
+    for name, tensor in optional:
+        if tensor is not None and tensor.device != device:
             raise ValueError(
-                f"x and {name} must be on the same device, got {x.device}/{tensor.device}"
+                f"x and {name} must be on the same device, got {device}/{tensor.device}"
             )
 
-    if isinstance(eps, bool) or not isinstance(eps, numbers.Real):
-        raise TypeError(f"eps must be a real number, got {type(eps).__name__}")
-    eps = float(eps)
+    # float is the only type worth a fast path; numbers.Real is an ABC, so its
+    # isinstance goes through __instancecheck__ and costs far more than the
+    # concrete check that answers the common case.
+    if type(eps) is not float:
+        if isinstance(eps, bool) or not isinstance(eps, numbers.Real):
+            raise TypeError(f"eps must be a real number, got {type(eps).__name__}")
+        eps = float(eps)
     if not 0.0 < eps < math.inf:
         raise ValueError(f"eps must be finite and positive, got {eps}")
-    if not isinstance(store_rstd, bool):
+    if store_rstd is not True and store_rstd is not False:
         raise TypeError(f"store_rstd must be a bool, got {type(store_rstd).__name__}")
-    if isinstance(weight_offset, bool) or not isinstance(weight_offset, numbers.Real):
-        raise TypeError(f"weight_offset must be a real number, got {type(weight_offset).__name__}")
-    weight_offset = float(weight_offset)
+    if type(weight_offset) is not float:
+        if isinstance(weight_offset, bool) or not isinstance(weight_offset, numbers.Real):
+            raise TypeError(
+                f"weight_offset must be a real number, got {type(weight_offset).__name__}"
+            )
+        weight_offset = float(weight_offset)
     if not -math.inf < weight_offset < math.inf:
         raise ValueError(f"weight_offset must be finite, got {weight_offset}")
     if weight is None and weight_offset != 0.0:
