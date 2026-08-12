@@ -2,6 +2,9 @@
 
 """The rmsnorm_fwd forward contract, held against whichever backend this machine has.
 
+This is a temporary forward-contract suite, not complete RMSNorm coverage.
+Backward and other feature tests will follow as those FlyDSL paths are added.
+
 CuTe-DSL and FlyDSL implement the same function -- same arguments, same returned
 triple, same aliasing (residual_out is x when nothing was accumulated, rstd is
 None unless asked for). Most of this file therefore runs on both, and each test
