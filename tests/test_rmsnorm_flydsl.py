@@ -153,6 +153,23 @@ def test_residual_dtype_without_residual_forces_a_fresh_output():
     torch.testing.assert_close(residual_out, combined, atol=0, rtol=0)
 
 
+# One predicated register-cached row and one reloaded row: the offset is folded
+# in the shared epilogue, so a value check on both branches pins the arithmetic
+# that the type checks around weight_offset cannot see.
+@pytest.mark.parametrize("n", [760, 65536])
+def test_weight_offset_scales_by_one_plus_weight(n):
+    x = torch.randn((3, n), device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+
+    out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight, weight_offset=1.0)
+    expected, _, _ = _reference(x, weight + 1.0)
+
+    _assert_close(out, expected, x.dtype)
+    # An ignored offset would leave the plain-weight result, which differs here.
+    plain, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
+    assert not torch.allclose(out, plain, atol=1e-3, rtol=1e-3)
+
+
 def test_padded_rows_reuse_compiled_launcher(monkeypatch):
     n = 192
     config = RmsNormFwdConfig.for_forward(n, 16)
