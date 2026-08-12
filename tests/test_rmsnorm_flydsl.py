@@ -160,6 +160,35 @@ def test_rmsnorm_strided_tensor(use_compile):
     _assert_close(out, expected, x.dtype)
 
 
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("n", [131072, 262144])
+def test_rmsnorm_large_tensor(n, use_compile):
+    """The row counts a real model reaches; every other test here fits in 11 rows."""
+    m, n_chunks = 32 * 1024, 16
+    # x + out must be fully materialized (irreducible); the reference is
+    # computed one m/n_chunks-row chunk at a time, so it never is. Gate on
+    # *free* memory so a partially-occupied GPU skips instead of OOMing.
+    torch.cuda.empty_cache()
+    peak_bytes = 2 * m * n * 2 + 3 * (m // n_chunks) * n * 2
+    free_bytes = torch.cuda.mem_get_info()[0]
+    if peak_bytes > free_bytes * 0.9:
+        pytest.skip(
+            f"Insufficient free VRAM ({free_bytes // 2**30} GiB free,"
+            f" need ~{peak_bytes // 2**30} GiB)"
+        )
+
+    x = torch.randn(m, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+    out, _, _ = _fwd(use_compile)(x, weight)
+
+    # Absolute only, and the counterpart's looser bf16 budget: this kernel is
+    # correctly rounded (measured worst case 0.50 bf16 ULP against fp32), but
+    # one ULP is ~0.8% relative, so the file's rtol=2e-3 is tighter than correct
+    # rounding permits and half a billion elements always reach that tail.
+    for x_c, out_c in zip(x.chunk(n_chunks), out.chunk(n_chunks)):
+        assert (out_c.float() - _reference(x_c, weight)[0]).abs().max() < 1e-1
+
+
 def test_rmsnorm_input_validation():
     x = torch.empty(2, 16, device=_DEVICE, dtype=torch.float16)
 
@@ -167,6 +196,8 @@ def test_rmsnorm_input_validation():
         fly_rmsnorm.rmsnorm_fwd(torch.empty(2, 15, device=_DEVICE, dtype=torch.float16))
     with pytest.raises(ValueError, match="weight shape"):
         fly_rmsnorm.rmsnorm_fwd(x, torch.empty(8, device=_DEVICE))
+    with pytest.raises(TypeError, match="weight dtype"):
+        fly_rmsnorm.rmsnorm_fwd(x, torch.empty(16, device=_DEVICE, dtype=torch.float64))
     with pytest.raises(ValueError, match="residual shape"):
         fly_rmsnorm.rmsnorm_fwd(x, residual=torch.empty(1, 16, device=_DEVICE))
     with pytest.raises(TypeError, match="x dtype"):
@@ -206,6 +237,12 @@ def test_rmsnorm_compile_cache():
     # A different normalized dimension is a different specialization.
     call(3, 8, width=2 * n)
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 2
+
+    # So is a different dtype. This is the only pair in the file that differs
+    # in nothing else, so it is the only thing standing between a dtype dropped
+    # from the key and a launcher built for another element width.
+    call(3, 8, dtype=torch.bfloat16)
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 3
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
