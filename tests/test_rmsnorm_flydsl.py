@@ -1,33 +1,55 @@
 # Copyright (c) 2026, Tri Dao.
 
-"""Forward-only mirror of tests/test_rmsnorm.py for the FlyDSL backend.
+"""The rmsnorm_fwd forward contract, held against whichever backend this machine has.
 
-The two rmsnorm_fwd implementations take the same arguments and return the same
-triple, so a test here carries its CuTe-DSL counterpart's name and does the same
-thing at the same strength. Tests with no counterpart there (backward, autotune,
-prenorm) are absent rather than invented.
+CuTe-DSL and FlyDSL implement the same function -- same arguments, same returned
+triple, same aliasing (residual_out is x when nothing was accumulated, rstd is
+None unless asked for). Most of this file therefore runs on both, and each test
+carries its tests/test_rmsnorm.py counterpart's name. Tests with no counterpart
+there (backward, autotune, prenorm) are absent rather than invented.
+
+Five tests are marked FlyDSL-only. Those are not gaps: three reach into host
+plumbing that has no CuTe analogue (error text, the launcher cache, packed_rows),
+one feeds a 4D input that CuTe's rmsnorm_fwd cannot take, and one is a
+multi-GiB tensor that tests/test_rmsnorm.py:303 already covers on CuTe.
+
+Only the FlyDSL half has ever been executed. There is no ROCm CI leg, and the
+dev box has no CUDA, so the CuTe half is source-derived until the first NVIDIA
+CI run -- see the commit that introduced it for what is most likely to move.
 """
 
 import pytest
 import torch
+from flydsl_env import BACKEND as _BACKEND
 from flydsl_env import CAN_RUN as _CAN_RUN
 from flydsl_env import DEVICE as _DEVICE
+from flydsl_env import IS_FLYDSL as _IS_FLYDSL
 from flydsl_env import SKIP_REASON as _SKIP_REASON
 
 pytestmark = pytest.mark.skipif(not _CAN_RUN, reason=_SKIP_REASON)
+_flydsl_only = pytest.mark.skipif(not _IS_FLYDSL, reason="FlyDSL-specific, no CuTe analogue")
 
 if _CAN_RUN:
+    # Through the package, not the backend module: quack/__init__.py picks the
+    # implementation, and a test that imported one directly would never notice
+    # the picker choosing the other.
+    from quack import rmsnorm_fwd as _rmsnorm_fwd
+if _IS_FLYDSL:
     import quack.rmsnorm_flydsl as fly_rmsnorm
 
 # The use_compile axis recompiles once per specialization, same as test_rmsnorm.py.
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
-_ATOL = {
-    torch.float16: 2e-3,
-    torch.bfloat16: 2e-2,
-    torch.float32: 2e-4,
-}
+# Each backend keeps the budget it earned. CuTe's rsqrt is fastmath, and
+# tests/test_rmsnorm.py:22 has spent bf16 down to 1e-1 for it; the FlyDSL kernel
+# measured 0.50 bf16 ULP against fp32. Sharing the looser pair would silently
+# retire 5x of FlyDSL's precision coverage.
+_ATOL, _RTOL = (
+    ({torch.float16: 2e-3, torch.bfloat16: 2e-2, torch.float32: 2e-4}, 2e-3)
+    if _IS_FLYDSL
+    else ({torch.float16: 1e-2, torch.bfloat16: 1e-1, torch.float32: 1e-4}, 1e-3)
+)
 
 
 @pytest.fixture(autouse=True)
@@ -38,8 +60,8 @@ def _seed():
 def _fwd(use_compile):
     """The `function = torch.compile(rmsnorm) if use_compile else rmsnorm` of test_rmsnorm.py."""
     if not use_compile:
-        return fly_rmsnorm.rmsnorm_fwd
-    return torch.compile(fly_rmsnorm.rmsnorm_fwd, fullgraph=True, dynamic=False)
+        return _rmsnorm_fwd
+    return torch.compile(_rmsnorm_fwd, fullgraph=True, dynamic=False)
 
 
 def _reference(x, weight=None, bias=None, residual=None, eps=1e-6):
@@ -60,8 +82,14 @@ def _assert_close(actual, expected, input_dtype):
         actual,
         expected.to(actual.dtype),
         atol=_ATOL[input_dtype],
-        rtol=2e-3,
+        rtol=_RTOL,
     )
+
+
+def test_rmsnorm_fwd_dispatches_to_the_device_backend():
+    """quack.rmsnorm_fwd must resolve to the backend this device actually runs."""
+    expected = "quack.rmsnorm_flydsl" if _BACKEND == "flydsl" else "quack.rmsnorm"
+    assert _rmsnorm_fwd.__module__ == expected
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
@@ -114,12 +142,16 @@ def test_rmsnorm_weight_offset(n, use_compile):
     assert not torch.allclose(out, plain, atol=1e-3, rtol=1e-3)
 
 
-def test_rmsnorm_compile_2d_then_4d():
-    """One compiled callable must take a 2D input then a 4D one, no dynamo.reset() between.
+def test_rmsnorm_compile_2d_then_3d():
+    """One compiled callable must take a 2D input then a 3D one, no dynamo.reset() between.
 
     Rank is not a shape guard dynamo can specialize away here: the registered op's
     fake impl re-derives every output shape and dtype, so a second rank has to
     retrace it rather than reuse the first trace's answer.
+
+    3D, not the 4D of tests/test_rmsnorm.py:168, because that test goes through
+    rmsnorm(), which flattens leading batch dims at quack/rmsnorm.py:1670 before
+    the kernel sees them. At this level per-head input is (rows, H, D).
     """
     torch._dynamo.reset()
     function = _fwd(use_compile=True)
@@ -132,22 +164,22 @@ def test_rmsnorm_compile_2d_then_4d():
     _assert_close(out, expected, x.dtype)
 
     # Different rank, per-head weight, and two arguments the first trace never saw.
-    shape = (2, 16, 4, 64)
-    x4 = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
+    shape = (32, 4, 64)
+    x3 = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
     weight2 = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
     bias2 = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
-    residual4 = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
-    out4, residual_out4, _ = function(x4, weight2, bias=bias2, residual=residual4)
-    expected4, combined4, _ = _reference(x4, weight2, bias2, residual4)
-    assert out4.shape == shape and residual_out4.shape == shape
-    _assert_close(out4, expected4, x4.dtype)
-    _assert_close(residual_out4, combined4, x4.dtype)
+    residual3 = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
+    out3, residual_out3, _ = function(x3, weight2, bias=bias2, residual=residual3)
+    expected3, combined3, _ = _reference(x3, weight2, bias2, residual3)
+    assert out3.shape == shape and residual_out3.shape == shape
+    _assert_close(out3, expected3, x3.dtype)
+    _assert_close(residual_out3, combined3, x3.dtype)
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_qk(use_compile):
-    """Per-head weight and bias over a 4D input, with a residual and rstd."""
-    shape = (2, 3, 4, 64)
+    """Per-head weight and bias over a 3D input, with a residual and rstd."""
+    shape = (6, 4, 64)
     x = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
     bias = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
@@ -172,6 +204,28 @@ def test_rmsnorm_qk(use_compile):
     _assert_close(rstd, expected_rstd, x.dtype)
 
 
+@_flydsl_only
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_qk_4d(use_compile):
+    """FlyDSL flattens leading batch dims itself, so per-head input may be any rank.
+
+    CuTe's rmsnorm_fwd cannot take this: _compile_rmsnorm_fwd builds a 3D layout
+    descriptor for per-head (quack/rmsnorm.py:454), and rmsnorm() reshapes to it
+    before the call. test_rmsnorm_qk covers the 3D shape both backends share.
+    """
+    shape = (2, 3, 4, 64)
+    x = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
+
+    out, _, rstd = _fwd(use_compile)(x, weight, store_rstd=True)
+    expected, _, expected_rstd = _reference(x, weight)
+
+    assert out.shape == shape and rstd.shape == shape[:-1]
+    _assert_close(out, expected, x.dtype)
+    _assert_close(rstd, expected_rstd, x.dtype)
+
+
+@_flydsl_only
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_strided_tensor(use_compile):
     """A row stride that is not 16B-aligned must be copied before vector access."""
@@ -190,10 +244,16 @@ def test_rmsnorm_strided_tensor(use_compile):
     _assert_close(out, expected, x.dtype)
 
 
+@_flydsl_only
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("n", [131072, 262144])
 def test_rmsnorm_large_tensor(n, use_compile):
-    """The row counts a real model reaches; every other test here fits in 11 rows."""
+    """The row counts a real model reaches; every other test here fits in 11 rows.
+
+    FlyDSL-only for cost, not for capability: ~35 GiB of peak VRAM, and CI runs
+    the whole tests/ tree on six NVIDIA legs where tests/test_rmsnorm.py:303
+    already covers the same m and n on CuTe. Drop the marker to share it.
+    """
     m, n_chunks = 32 * 1024, 16
     # x + out must be fully materialized (irreducible); the reference is
     # computed one m/n_chunks-row chunk at a time, so it never is. Gate on
@@ -219,7 +279,14 @@ def test_rmsnorm_large_tensor(n, use_compile):
         assert (out_c.float() - _reference(x_c, weight)[0]).abs().max() < 1e-1
 
 
+@_flydsl_only
 def test_rmsnorm_input_validation():
+    """FlyDSL rejects before the op. CuTe's counterpart is tests/test_rmsnorm.py:337.
+
+    Not shared: CuTe validates with bare asserts carrying different text, and
+    half of these -- the 128-bit access width, the ROCm device check -- guard
+    constraints that exist only on this backend.
+    """
     x = torch.empty(2, 16, device=_DEVICE, dtype=torch.float16)
 
     with pytest.raises(ValueError, match="multiple of 8"):
@@ -238,8 +305,13 @@ def test_rmsnorm_input_validation():
         fly_rmsnorm.rmsnorm_fwd(x.cpu())
 
 
+@_flydsl_only
 def test_rmsnorm_compile_cache():
-    """One launcher per specialization; row padding and row count are not part of it."""
+    """One launcher per specialization; row padding and row count are not part of it.
+
+    Not shared: this reads FlyDSL's functools.cache directly. CuTe keys a
+    @jit_cache on a different tuple; tests/test_rmsnorm.py:383 checks that one.
+    """
     n = 192
     fly_rmsnorm._compiled_forward.cache_clear()
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 0
@@ -338,7 +410,7 @@ def test_rmsnorm_fwd_empty(store_rstd):
     x = torch.empty(0, n, device=_DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(n, device=_DEVICE, dtype=torch.bfloat16)
 
-    out, residual_out, rstd = fly_rmsnorm.rmsnorm_fwd(x, weight, store_rstd=store_rstd)
+    out, residual_out, rstd = _rmsnorm_fwd(x, weight, store_rstd=store_rstd)
 
     assert out.shape == x.shape and out.numel() == 0
     # No residual passed in: residual_out aliases x (and is empty).
