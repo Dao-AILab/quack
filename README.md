@@ -71,10 +71,10 @@ from quack import rmsnorm_fwd
 out, residual_out, rstd = rmsnorm_fwd(x, weight)
 ```
 
-The benchmark lists whichever backends are installed as providers, so the same
-command compares FlyDSL against `torch.compile` on ROCm and quack (CuTe),
-`torch.compile` and cuDNN on CUDA. `--backward` is CuTe-only; there is no FlyDSL
-backward kernel yet.
+The benchmark uses the QuACK backend selected by the PyTorch build: FlyDSL
+against `torch.compile` on ROCm, and CuTe against `torch.compile` on CUDA (plus
+cuDNN when installed). `--backward` is CuTe-only; there is no FlyDSL backward
+kernel yet.
 
 JAX bindings are also available for some kernels (see [docs/jax.md](docs/jax.md)):
 

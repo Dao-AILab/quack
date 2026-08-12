@@ -24,18 +24,19 @@ ARCH = (
     else None
 )
 
-# BACKEND is what quack.rmsnorm_fwd will resolve to on this machine -- see the
-# _FORWARD_BACKENDS table in quack/__init__.py, which keys off the same build flag.
-if not _HAS_GPU:
-    BACKEND, SKIP_REASON = None, "requires a GPU"
-elif not _IS_ROCM:
-    BACKEND, SKIP_REASON = "cute", ""
-elif importlib.util.find_spec("flydsl") is None:
-    BACKEND, SKIP_REASON = None, "requires flydsl"
-elif ARCH != "gfx950":
-    BACKEND, SKIP_REASON = None, "FlyDSL kernels currently require gfx950"
-else:
-    BACKEND, SKIP_REASON = "flydsl", ""
+# Selection is a build fact; runnability additionally needs a device and, on
+# ROCm, the optional package plus an architecture the kernel implements.
+SELECTED_BACKEND = "flydsl" if _IS_ROCM else "cute"
 
-CAN_RUN = BACKEND is not None
-IS_FLYDSL = BACKEND == "flydsl"
+if not _HAS_GPU:
+    CAN_RUN, SKIP_REASON = False, "requires a GPU"
+elif not _IS_ROCM:
+    CAN_RUN, SKIP_REASON = True, ""
+elif ARCH != "gfx950":
+    CAN_RUN, SKIP_REASON = False, "FlyDSL kernels currently require gfx950"
+elif importlib.util.find_spec("flydsl") is None:
+    CAN_RUN, SKIP_REASON = False, "requires flydsl"
+else:
+    CAN_RUN, SKIP_REASON = True, ""
+
+IS_FLYDSL = CAN_RUN and SELECTED_BACKEND == "flydsl"

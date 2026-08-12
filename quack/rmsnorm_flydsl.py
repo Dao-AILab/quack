@@ -11,9 +11,16 @@ import functools
 import math
 import numbers
 
+import torch
+
+from quack._platform import IS_ROCM_BUILD
+from quack.flydsl_constants import ACCESS_BITS
+
+if not IS_ROCM_BUILD:
+    raise ImportError("quack.rmsnorm_flydsl requires a ROCm PyTorch build")
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp
@@ -22,7 +29,6 @@ from quack.flydsl_runtime import (
     SUPPORTED_DTYPES as _SUPPORTED_DTYPES,
 )
 from quack.flydsl_runtime import (
-    ACCESS_BITS,
     current_raw_stream,
     dtype_spec,
     empty_placeholder,
@@ -41,8 +47,6 @@ _SUPPORTED_ARCHES = frozenset({"gfx950"})
 _MAX_ROWS = 2**31 - 1
 # rstd's buffer descriptor carries a 32-bit num_records over fp32 elements.
 _MAX_RSTD_ROWS = (2**32 - 1) // 4
-# Fixed for the life of the process, and read on every validated call.
-_IS_ROCM = torch.version.hip is not None
 
 
 def _row_records(elem_bits: int, n: int, valid=None):
@@ -495,7 +499,7 @@ def _validate_inputs(
             raise TypeError(f"{name} must be float16, bfloat16, or float32, got {dtype}")
 
     device = x.device
-    if not _IS_ROCM or device.type != "cuda":
+    if device.type != "cuda":
         raise ValueError(f"x must be on a ROCm device, got {device}")
     if x.layout != torch.strided:
         raise ValueError(f"x must use torch.strided layout, got {x.layout}")

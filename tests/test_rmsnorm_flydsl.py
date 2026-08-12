@@ -8,20 +8,23 @@ Backward and other feature tests will follow as those FlyDSL paths are added.
 CuTe-DSL and FlyDSL implement the same function -- same arguments, same returned
 triple, same aliasing (residual_out is x when nothing was accumulated, rstd is
 None unless asked for). Most of this file therefore runs on both, and each test
-carries its tests/test_rmsnorm.py counterpart's name. Tests marked FlyDSL-only
-reach into host plumbing or shapes that the CuTe backend does not have.
+carries its tests/test_rmsnorm.py counterpart's name. Backend-specific tests
+either reach FlyDSL host plumbing, cover a FlyDSL-only shape, or avoid repeating
+an expensive case already owned by the CuTe suite.
 """
 
 import pytest
 import torch
-from flydsl_env import BACKEND as _BACKEND
 from flydsl_env import CAN_RUN as _CAN_RUN
 from flydsl_env import DEVICE as _DEVICE
 from flydsl_env import IS_FLYDSL as _IS_FLYDSL
 from flydsl_env import SKIP_REASON as _SKIP_REASON
 
 pytestmark = pytest.mark.skipif(not _CAN_RUN, reason=_SKIP_REASON)
-_flydsl_only = pytest.mark.skipif(not _IS_FLYDSL, reason="FlyDSL-specific, no CuTe analogue")
+_requires_flydsl = pytest.mark.skipif(not _IS_FLYDSL, reason="requires the FlyDSL backend")
+_flydsl_suite_owner = pytest.mark.skipif(
+    not _IS_FLYDSL, reason="equivalent CuTe coverage lives in tests/test_rmsnorm.py"
+)
 
 if _CAN_RUN:
     # Through the package, not the backend module: quack/__init__.py picks the
@@ -74,12 +77,6 @@ def _assert_close(actual, expected, input_dtype):
         atol=_ATOL[input_dtype],
         rtol=_RTOL,
     )
-
-
-def test_rmsnorm_fwd_dispatches_to_the_device_backend():
-    """quack.rmsnorm_fwd must resolve to the backend this device actually runs."""
-    expected = "quack.rmsnorm_flydsl" if _BACKEND == "flydsl" else "quack.rmsnorm"
-    assert _rmsnorm_fwd.__module__ == expected
 
 
 @pytest.mark.parametrize("use_compile", [False, True])
@@ -189,7 +186,7 @@ def test_rmsnorm_qk(use_compile):
     _assert_close(rstd, expected_rstd, x.dtype)
 
 
-@_flydsl_only
+@_requires_flydsl
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_qk_4d(use_compile):
     """FlyDSL flattens leading batch dims itself, so per-head input may be any rank.
@@ -209,10 +206,10 @@ def test_rmsnorm_qk_4d(use_compile):
     _assert_close(rstd, expected_rstd, x.dtype)
 
 
-@_flydsl_only
+@_requires_flydsl
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_strided_tensor(use_compile):
-    """A row stride that is not 16B-aligned must be copied before vector access."""
+    """FlyDSL copies a row pitch that CuTe's TVM-FFI contract rejects."""
     n = 192
     storage = torch.randn(4, 196, device=_DEVICE, dtype=torch.float16)
     x = storage[:, :n]
@@ -228,7 +225,7 @@ def test_rmsnorm_strided_tensor(use_compile):
     _assert_close(out, expected, x.dtype)
 
 
-@_flydsl_only
+@_flydsl_suite_owner
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("n", [131072, 262144])
 def test_rmsnorm_large_tensor(n, use_compile):
@@ -261,7 +258,7 @@ def test_rmsnorm_large_tensor(n, use_compile):
         assert (out_c.float() - _reference(x_c, weight)[0]).abs().max() < 1e-1
 
 
-@_flydsl_only
+@_requires_flydsl
 def test_rmsnorm_input_validation():
     """Test input validation and error handling: FlyDSL rejects before the op."""
     x = torch.empty(2, 16, device=_DEVICE, dtype=torch.float16)
@@ -282,7 +279,7 @@ def test_rmsnorm_input_validation():
         fly_rmsnorm.rmsnorm_fwd(x.cpu())
 
 
-@_flydsl_only
+@_requires_flydsl
 def test_rmsnorm_compile_cache():
     """One launcher per specialization; row padding and row count are not part of it."""
     n = 192

@@ -21,9 +21,16 @@ module's disk half is CuTe-specific (``.o`` export plus a tvm_ffi
 ``load_module``) and it imports cutlass, so it will not load on ROCm.
 """
 
+import torch
+
+from quack._platform import IS_ROCM_BUILD
+from quack.flydsl_constants import ACCESS_BITS
+
+if not IS_ROCM_BUILD:
+    raise ImportError("quack.flydsl_runtime requires a ROCm PyTorch build")
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl.runtime.device import get_rocm_arch
 
 __all__ = [
@@ -36,10 +43,6 @@ __all__ = [
     "run_compiled",
     "validate_arch",
 ]
-
-# Widest MUBUF transaction, and therefore the alignment every vectorized row
-# access is built around.
-ACCESS_BITS = 128
 
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 

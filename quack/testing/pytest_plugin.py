@@ -202,9 +202,9 @@ def pytest_configure(config):
     if jobs is not None:
         import os as _os
 
-        import torch
+        from quack._platform import IS_ROCM_BUILD
 
-        if torch.version.hip is not None:
+        if IS_ROCM_BUILD:
             raise pytest.UsageError(
                 "--async-compile is unavailable on ROCm because it loads the incompatible "
                 "CuTe MLIR runtime"
@@ -217,6 +217,10 @@ def pytest_configure(config):
 
             n_workers = int(_os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
             pool = activate(max(2, jobs // n_workers))
+            # Record the state instead of asking teardown to reconstruct it
+            # from the option and platform. Set before prewarm so a failed
+            # prewarm still leaves enough information to deactivate the pool.
+            config._quack_async_pool_active = True
             pool.prewarm()  # sidecar import overlaps collection, not the first miss
             if worker is not None:
                 config.pluginmanager.register(_XdistWorkerDefer(pool), "quack-xdist-defer")
@@ -235,9 +239,7 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     """Tear down the compile pool and undo any pytest-internal patches."""
-    import torch
-
-    if config.getoption("--async-compile", default=None) is None or torch.version.hip is not None:
+    if not getattr(config, "_quack_async_pool_active", False):
         _restore_getfuncargnames_cache()
         return
 
@@ -268,6 +270,7 @@ def pytest_unconfigure(config):
             for line in detail:
                 print(line)
         deactivate()
+        config._quack_async_pool_active = False
 
     # Always undo the global monkey-patches we installed. This keeps the
     # process clean for downstream callers (e.g. notebook hosts that
@@ -292,7 +295,7 @@ def _defer_if_compile_pending(item, outcome, force_pass: bool) -> bool:
     must not run the test body. Setup-phase compiles are rare, so the
     longrepr cost is negligible there.
     """
-    if item.config.getoption("--async-compile", default=None) is None:
+    if not getattr(item.config, "_quack_async_pool_active", False):
         return False
     if outcome.excinfo is None:
         return False

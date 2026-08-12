@@ -1,12 +1,10 @@
 import argparse
-from typing import Optional
 
 import torch
 import torch._functorch.config as _functorch_config
 from triton.testing import Benchmark, do_bench, perf_report
 
-# quack.rmsnorm_fwd is the CuTe kernel on CUDA and the FlyDSL kernel on ROCm.
-from quack import rmsnorm_fwd
+from quack._platform import IS_ROCM_BUILD
 from quack.bench.bench_utils import run_and_print
 from quack.rmsnorm_torch import rmsnorm_ref
 
@@ -23,10 +21,12 @@ _functorch_config.donated_buffer = False
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
-try:
-    import cudnn
-except ImportError:
-    cudnn = None
+cudnn = None
+if not IS_ROCM_BUILD:
+    try:
+        import cudnn
+    except ImportError:
+        pass
 
 
 MN_PAIRS = [
@@ -70,9 +70,7 @@ def _bwd_providers():
     return [("quack", "quack"), ("torch_compile", "torch.compile")]
 
 
-def make_fwd_benchmark(
-    dtype_name: str, residual_dtype_name: Optional[str], x_vals=None
-) -> Benchmark:
+def make_fwd_benchmark(dtype_name: str, residual_dtype_name: str | None, x_vals=None) -> Benchmark:
     line_vals, line_names = zip(*_fwd_providers())
     suffix = dtype_name + (f"-res-{residual_dtype_name}" if residual_dtype_name else "")
     return Benchmark(
@@ -88,9 +86,7 @@ def make_fwd_benchmark(
     )
 
 
-def make_bwd_benchmark(
-    dtype_name: str, residual_dtype_name: Optional[str], x_vals=None
-) -> Benchmark:
+def make_bwd_benchmark(dtype_name: str, residual_dtype_name: str | None, x_vals=None) -> Benchmark:
     line_vals, line_names = zip(*_bwd_providers())
     suffix = dtype_name + (f"-res-{residual_dtype_name}" if residual_dtype_name else "")
     if x_vals is None:
@@ -111,7 +107,7 @@ def make_bwd_benchmark(
     )
 
 
-def _fwd_mem_bytes(x: torch.Tensor, w: torch.Tensor, residual: Optional[torch.Tensor]) -> int:
+def _fwd_mem_bytes(x: torch.Tensor, w: torch.Tensor, residual: torch.Tensor | None) -> int:
     nbytes = 2 * x.numel() * x.dtype.itemsize + w.numel() * w.dtype.itemsize
     if residual is not None:
         nbytes += 2 * residual.numel() * residual.dtype.itemsize
@@ -175,6 +171,10 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     )
 
     if provider == "quack":
+        # Resolve only after CLI parsing: FlyDSL is optional, and ROCm
+        # ``--help``/``--backward`` must not import the forward backend.
+        from quack import rmsnorm_fwd
+
         fn = lambda: rmsnorm_fwd(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
@@ -272,7 +272,7 @@ def main():
     if (args.M is None) != (args.N is None):
         parser.error("--M and --N must be given together")
     x_vals = [(args.M, args.N)] if args.M is not None else None
-    if args.backward and torch.version.hip is not None:
+    if args.backward and IS_ROCM_BUILD:
         parser.error("--backward is CuTe-only; there is no FlyDSL RMSNorm backward kernel yet")
 
     torch.manual_seed(0)

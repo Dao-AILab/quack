@@ -2,9 +2,8 @@ __version__ = "0.6.4"
 
 import os
 
-import torch
+from quack._platform import IS_ROCM_BUILD
 
-_IS_ROCM = torch.version.hip is not None
 _CUTE_ONLY_EXPORTS = frozenset({"RoundingMode", "cross_entropy", "rmsnorm", "softmax"})
 
 # FlyDSL is a backend of quack's RMSNorm forward, not a separate library: the
@@ -12,7 +11,7 @@ _CUTE_ONLY_EXPORTS = frozenset({"RoundingMode", "cross_entropy", "rmsnorm", "sof
 # the caller picks a device, not a backend. Resolved on first attribute access
 # rather than at import so `import quack` does not pull in a backend nobody
 # asked for.
-_FORWARD_BACKENDS = {"rmsnorm_fwd": "quack.rmsnorm_flydsl" if _IS_ROCM else "quack.rmsnorm"}
+_FORWARD_BACKENDS = {"rmsnorm_fwd": "quack.rmsnorm_flydsl" if IS_ROCM_BUILD else "quack.rmsnorm"}
 
 
 def __getattr__(name):
@@ -23,7 +22,7 @@ def __getattr__(name):
         value = getattr(importlib.import_module(backend), name)
         globals()[name] = value
         return value
-    if _IS_ROCM and name in _CUTE_ONLY_EXPORTS:
+    if IS_ROCM_BUILD and name in _CUTE_ONLY_EXPORTS:
         raise ImportError(
             f"quack.{name} requires the CUDA/CuTe backend; "
             "quack.rmsnorm_fwd is available on both backends"
@@ -33,7 +32,7 @@ def __getattr__(name):
 
 # CuTe and FlyDSL bundle incompatible MLIR runtimes. Keep the package bootstrap
 # CuTe-free on ROCm so optional FlyDSL modules can be imported safely.
-if not _IS_ROCM:
+if not IS_ROCM_BUILD:
     import quack.dsl as _quack_dsl  # noqa: F401
 
     if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
