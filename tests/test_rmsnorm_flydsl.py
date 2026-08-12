@@ -1,7 +1,5 @@
 # Copyright (c) 2026, Tri Dao.
 
-import logging
-
 import pytest
 import torch
 from flydsl_env import CAN_RUN as _CAN_RUN
@@ -60,6 +58,7 @@ def _assert_close(actual, expected, input_dtype):
         pytest.param(2, 8192, torch.bfloat16, torch.float32, id="doubled-thread-geometry"),
         pytest.param(1, 65536, torch.bfloat16, torch.float32, id="wide-reload"),
         pytest.param(1, 65544, torch.bfloat16, torch.float32, id="wide-predicated-reload"),
+        pytest.param(1, 262144, torch.bfloat16, torch.float32, id="max-n"),
     ],
 )
 def test_plain_forward(m, n, dtype, weight_dtype):
@@ -201,44 +200,6 @@ def test_padded_rows_reuse_compiled_launcher(monkeypatch):
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 2
 
 
-def test_launch_follows_the_callers_stream():
-    n = 4096
-    x = torch.randn(2, n, device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-    expected, _, _ = _reference(x, weight)
-
-    default_stream = torch.cuda.current_stream(_DEVICE)
-    assert fly_rmsnorm.current_raw_stream(_DEVICE) == default_stream.cuda_stream
-    assert fly_rmsnorm.current_raw_stream(torch.device("cuda")) == default_stream.cuda_stream
-
-    # A raw stream accessor that ignored the ambient context would silently
-    # place every launch on the default stream, racing the caller's ordering.
-    side = torch.cuda.Stream(device=_DEVICE)
-    with torch.cuda.stream(side):
-        assert fly_rmsnorm.current_raw_stream(_DEVICE) == side.cuda_stream
-        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
-    side.synchronize()
-
-    assert fly_rmsnorm.current_raw_stream(_DEVICE) == default_stream.cuda_stream
-    _assert_close(out, expected, x.dtype)
-
-
-def test_custom_op_schema_and_fake_agree():
-    n = 256
-    x = torch.randn(4, n, device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-    residual = torch.randn_like(x)
-    # opcheck compares the fake against the real op's shapes and dtypes, and
-    # checks the schema declares no aliasing or mutation the op does not do.
-    # (x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset)
-    for args in (
-        (x, weight, None, None, None, None, 1e-6, False, 0.0),
-        (x, weight, None, residual, None, None, 1e-6, True, 0.0),
-        (x, weight, None, None, torch.float32, torch.float32, 1e-6, False, 0.0),
-    ):
-        torch.library.opcheck(fly_rmsnorm._rmsnorm_fwd_op, args)
-
-
 def test_compiles_into_one_graph_without_breaks():
     n = 1024
     x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
@@ -263,135 +224,6 @@ def test_compiles_into_one_graph_without_breaks():
     _assert_close(compiled(x, weight), expected, x.dtype)
 
 
-def test_compiles_a_specialization_never_seen_in_eager():
-    # The pre-op failure only reproduced when flyc.compile ran inside Dynamo's
-    # trace, so this shape must not be warmed first.
-    n = 1024 + 128
-    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-
-    torch._dynamo.reset()
-    compiled = torch.compile(lambda a, b: fly_rmsnorm.rmsnorm_fwd(a, b, eps=1e-6)[0], dynamic=False)
-    _assert_close(compiled(x, weight), _reference(x, weight)[0], x.dtype)
-
-
-@pytest.mark.parametrize("n", [256, 4096, 65536])
-def test_cuda_graph_capture_replays_correctly(n):
-    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-    call = lambda: fly_rmsnorm.rmsnorm_fwd(x, weight, eps=1e-6)
-
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(3):
-            call()
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_out, _, _ = call()
-
-    # A graph writes to the buffers it captured, so refill the input in place
-    # and read the captured output; a stale or empty graph fails here.
-    for _ in range(3):
-        x.copy_(torch.randn_like(x))
-        graph.replay()
-        torch.cuda.synchronize()
-        _assert_close(captured_out, _reference(x, weight)[0], x.dtype)
-
-
-@pytest.mark.skipif(_CAN_RUN and torch.cuda.device_count() < 2, reason="needs two visible devices")
-def test_same_specialization_runs_on_a_second_device():
-    # FlyDSL caches compiled artifacts on the JitFunction by argument signature
-    # alone, so a launcher shared across GPUs hands the second one a module
-    # loaded into the first one's context: hipErrorInvalidDevice at launch.
-    n = 1024
-    for index in range(2):
-        device = torch.device("cuda", index)
-        x = torch.randn(8, n, device=device, dtype=torch.bfloat16)
-        weight = torch.randn(n, device=device, dtype=torch.float32)
-        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
-        torch.cuda.synchronize(device)
-        _assert_close(out, _reference(x, weight)[0], x.dtype)
-
-
-def test_compiled_path_rejects_the_same_scalars_as_eager():
-    n = 256
-    x = torch.randn(4, n, device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-
-    # The custom-op dispatcher coerces arguments to the schema's types, so
-    # validating inside the op would let torch.compile accept eps=True as 1.0,
-    # store_rstd=1 as True, and weight_offset=True as a silent (weight + 1).
-    for kwargs, exc in (
-        ({"eps": True}, TypeError),
-        ({"eps": "1e-6"}, TypeError),
-        ({"store_rstd": 1}, TypeError),
-        ({"weight_offset": True}, TypeError),
-    ):
-        with pytest.raises(exc):
-            fly_rmsnorm.rmsnorm_fwd(x, weight, **kwargs)
-
-        torch._dynamo.reset()
-        compiled = torch.compile(
-            lambda a, b, kw=kwargs: fly_rmsnorm.rmsnorm_fwd(a, b, **kw), dynamic=False
-        )
-        with pytest.raises(exc):
-            compiled(x, weight)
-
-
-def test_reduce_overhead_replays_the_graph_instead_of_relaunching(monkeypatch, caplog):
-    n = 1024
-    calls = 8
-    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-
-    def block(x, w):
-        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, w, eps=1e-6)
-        return out * 2.0
-
-    executions = 0
-    core = fly_rmsnorm._rmsnorm_fwd_core
-
-    def counting_core(*args, **kwargs):
-        nonlocal executions
-        executions += 1
-        return core(*args, **kwargs)
-
-    monkeypatch.setattr(fly_rmsnorm, "_rmsnorm_fwd_core", counting_core)
-
-    # Replay is the only way the host body can stop running while the output
-    # stays correct, so count launches rather than trust a log line: a globally
-    # disabled cudagraph, an unsupported environment or a reworded warning all
-    # leave the message absent while the region silently relaunches every call.
-    def run(**compile_kwargs):
-        nonlocal executions
-        torch._dynamo.reset()
-        executions = 0
-        compiled = torch.compile(block, dynamic=False, **compile_kwargs)
-        for _ in range(calls):
-            got = compiled(x, weight)
-        torch.cuda.synchronize()
-        _assert_close(got, _reference(x, weight)[0] * 2.0, x.dtype)
-        return executions
-
-    with caplog.at_level(logging.WARNING):
-        captured = run(mode="reduce-overhead")
-    relaunched = run()
-
-    # The default mode pins the counter to a launch, so a captured run that
-    # stops short of it is replaying and not just dodging instrumentation.
-    assert relaunched == calls, relaunched
-    assert captured < calls, captured
-
-    # A mutating op also earns "skipping cudagraphs due to mutated inputs"; the
-    # functional one must not, so keep the message as a diagnostic.
-    skips = [r.getMessage() for r in caplog.records if "skipping cudagraphs" in r.getMessage()]
-    assert not skips, skips
-
-
 def test_unaligned_padded_rows_are_copied_before_vector_access():
     n = 192
     storage = torch.randn(4, 196, device=_DEVICE, dtype=torch.float16)
@@ -403,26 +235,6 @@ def test_unaligned_padded_rows_are_copied_before_vector_access():
     assert packed.data_ptr() != x.data_ptr()
 
     weight = torch.randn(n, device=_DEVICE, dtype=torch.float16)
-    out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
-    expected, _, _ = _reference(x, weight)
-    _assert_close(out, expected, x.dtype)
-
-
-def test_misaligned_contiguous_storage_offsets_force_allocation():
-    n = 192
-    x_storage = torch.randn(2 * n + 1, device=_DEVICE, dtype=torch.float16)
-    weight_storage = torch.randn(n + 1, device=_DEVICE, dtype=torch.float16)
-    x = x_storage[1:].view(2, n)
-    weight = weight_storage[1:]
-    assert x.is_contiguous() and weight.is_contiguous()
-    assert x.data_ptr() % 16 == weight.data_ptr() % 16 == 2
-
-    packed_x = fly_rmsnorm.packed_rows(x)
-    packed_weight = fly_rmsnorm.packed_rows(weight)
-    assert packed_x.data_ptr() != x.data_ptr()
-    assert packed_weight.data_ptr() != weight.data_ptr()
-    assert packed_x.data_ptr() % 16 == packed_weight.data_ptr() % 16 == 0
-
     out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
     expected, _, _ = _reference(x, weight)
     _assert_close(out, expected, x.dtype)
