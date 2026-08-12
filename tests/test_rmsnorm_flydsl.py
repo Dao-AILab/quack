@@ -114,6 +114,36 @@ def test_rmsnorm_weight_offset(n, use_compile):
     assert not torch.allclose(out, plain, atol=1e-3, rtol=1e-3)
 
 
+def test_rmsnorm_compile_2d_then_4d():
+    """One compiled callable must take a 2D input then a 4D one, no dynamo.reset() between.
+
+    Rank is not a shape guard dynamo can specialize away here: the registered op's
+    fake impl re-derives every output shape and dtype, so a second rank has to
+    retrace it rather than reuse the first trace's answer.
+    """
+    torch._dynamo.reset()
+    function = _fwd(use_compile=True)
+
+    x = torch.randn(32, 256, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(256, device=_DEVICE, dtype=torch.float32)
+    out, residual_out, rstd = function(x, weight, eps=1e-5)
+    expected, _, _ = _reference(x, weight, eps=1e-5)
+    assert out.shape == x.shape and residual_out is x and rstd is None
+    _assert_close(out, expected, x.dtype)
+
+    # Different rank, per-head weight, and two arguments the first trace never saw.
+    shape = (2, 16, 4, 64)
+    x4 = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
+    weight2 = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
+    bias2 = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
+    residual4 = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
+    out4, residual_out4, _ = function(x4, weight2, bias=bias2, residual=residual4)
+    expected4, combined4, _ = _reference(x4, weight2, bias2, residual4)
+    assert out4.shape == shape and residual_out4.shape == shape
+    _assert_close(out4, expected4, x4.dtype)
+    _assert_close(residual_out4, combined4, x4.dtype)
+
+
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_rmsnorm_qk(use_compile):
     """Per-head weight and bias over a 4D input, with a residual and rstd."""
