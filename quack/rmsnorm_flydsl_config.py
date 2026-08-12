@@ -1,11 +1,18 @@
 # Copyright (c) 2026, Tri Dao.
 
-"""Pure-Python launch heuristic for the eager FlyDSL RMSNorm forward kernel."""
+"""Launch heuristic for the eager FlyDSL RMSNorm forward kernel.
+
+Plain Python, no DSL: the geometry here is chosen on the host before any
+kernel is built. ACCESS_BITS comes from :mod:`quack.flydsl_runtime` because the
+same width bounds the vector size chosen here and the alignment that module
+enforces on every row pointer; they cannot disagree.
+"""
 
 import math
 from dataclasses import dataclass
 
-ACCESS_BITS = 128
+from quack.flydsl_runtime import ACCESS_BITS
+
 WAVE_SIZE = 64
 MIN_NUM_THREADS = WAVE_SIZE
 TARGET_BLOCK_THREADS = 256
@@ -73,7 +80,6 @@ def _vector_size(n: int, dtype_width: int) -> int:
 
 
 __all__ = [
-    "ACCESS_BITS",
     "MAX_N",
     "WAVE_SIZE",
     "RmsNormFwdConfig",

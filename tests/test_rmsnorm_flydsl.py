@@ -1,7 +1,9 @@
 # Copyright (c) 2026, Tri Dao.
 
+import dataclasses
 import importlib.util
 import logging
+import re
 import sys
 
 import pytest
@@ -447,22 +449,18 @@ def test_misaligned_contiguous_storage_offsets_force_allocation():
     _assert_close(out, expected, x.dtype)
 
 
-@pytest.mark.parametrize(
-    "raw,expected",
-    (
-        pytest.param("gfx950:sramecc+:xnack-", "gfx950", id="gcn-arch-name"),
-        pytest.param("9.5.0", "gfx950", id="override-gfx950"),
-        pytest.param("9.0.10", "gfx90a", id="override-gfx90a"),
-        pytest.param("9.0.12", "gfx90c", id="override-gfx90c"),
-        pytest.param("9.4.2", "gfx942", id="override-gfx942"),
-        pytest.param("10.3.0", "gfx1030", id="override-gfx1030"),
-        pytest.param("9.0.x", "9.0.x", id="unparsable"),
-    ),
-)
-def test_normalize_arch_reads_the_stepping_as_hex(raw, expected):
-    # A decimal join turns gfx90a's 9.0.10 override into gfx9010, which makes
-    # validate_arch reject a correctly configured device.
-    assert fly_runtime._normalize_arch(raw) == expected
+@pytest.mark.parametrize("arch", ("9.5.0", "gfx942"), ids=("dotted", "wrong-gfx"))
+def test_compile_target_that_the_device_never_reports_is_rejected(monkeypatch, arch):
+    # ARCH reaches FlyDSL's ROCDL pipeline as `chip` verbatim, so an override
+    # the device never reports has to fail here. Normalizing "9.5.0" to gfx950
+    # would let it past this check and fail later inside the compiler instead.
+    # get_backend() memoizes one instance per (name, arch), so patching the
+    # instance is what validate_arch reads back.
+    backend = fly_runtime.flyc.get_backend()
+    monkeypatch.setattr(backend, "target", dataclasses.replace(backend.target, arch=arch))
+
+    with pytest.raises(ValueError, match=f"FlyDSL compiles for {re.escape(arch)}"):
+        fly_runtime.validate_arch(_DEVICE, frozenset({_ARCH}), "RMSNorm")
 
 
 def test_empty_rows_return_without_compiling(monkeypatch):

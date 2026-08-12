@@ -22,6 +22,7 @@ from quack.flydsl_runtime import (
     SUPPORTED_DTYPES as _SUPPORTED_DTYPES,
 )
 from quack.flydsl_runtime import (
+    ACCESS_BITS,
     current_raw_stream,
     dtype_spec,
     empty_placeholder,
@@ -29,7 +30,6 @@ from quack.flydsl_runtime import (
     run_compiled,
 )
 from quack.rmsnorm_flydsl_config import (
-    ACCESS_BITS,
     MAX_N,
     WAVE_SIZE,
     RmsNormFwdConfig,

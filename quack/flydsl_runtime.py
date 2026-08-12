@@ -33,9 +33,7 @@ __all__ = [
     "dtype_spec",
     "empty_placeholder",
     "packed_rows",
-    "rows_are_disjoint_and_packed",
     "run_compiled",
-    "unambiguous_layout",
     "validate_arch",
 ]
 
@@ -67,41 +65,34 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
-def _normalize_arch(arch: str) -> str:
-    arch = str(arch).split(":", 1)[0]
-    if arch.startswith("gfx"):
-        return arch
-    parts = arch.split(".")
-    if len(parts) == 3 and all(part.isdigit() for part in parts):
-        # HSA_OVERRIDE_GFX_VERSION spells the stepping as one hex digit, so
-        # gfx90a arrives as 9.0.10 and a decimal join would yield gfx9010.
-        return f"gfx{parts[0]}{parts[1]}{int(parts[2]):x}"
-    return arch
-
-
 def validate_arch(device: torch.device, supported: frozenset, kernel: str) -> str:
-    """Reject a device, a compile target or a runtime that disagree on the arch."""
+    """Reject a device, a compile target or a runtime that disagree on the arch.
+
+    Only gcnArchName is normalized. ARCH is a raw passthrough into FlyDSL's
+    compile target and reaches the ROCDL pipeline as ``chip``, so a value the
+    device never reports has to fail here rather than be massaged into one.
+    """
     index = _device_index(device)
     actual = _DEVICE_ARCH_CACHE.get(index)
     if actual is None:
-        actual = _normalize_arch(torch.cuda.get_device_properties(index).gcnArchName)
+        # ROCm appends feature flags: "gfx950:sramecc+:xnack-".
+        actual = torch.cuda.get_device_properties(index).gcnArchName.split(":", 1)[0]
         if actual not in supported:
             names = ", ".join(sorted(supported))
             raise ValueError(f"FlyDSL {kernel} supports {names}; cuda:{index} is {actual}")
         _DEVICE_ARCH_CACHE[index] = actual
 
     target = flyc.get_backend().target
-    compile_arch = _normalize_arch(target.arch)
     if target.backend != "rocm":
         raise RuntimeError(
             f"FlyDSL {kernel} requires FlyDSL's ROCm backend, but it targets {target.backend!r}"
         )
-    if compile_arch != actual:
+    if target.arch != actual:
         raise ValueError(
-            f"cuda:{index} is {actual}, but FlyDSL compiles for {compile_arch}; "
+            f"cuda:{index} is {actual}, but FlyDSL compiles for {target.arch}; "
             "set ARCH and FLYDSL_GPU_ARCH to the device architecture"
         )
-    runtime_arch = _normalize_arch(get_rocm_arch())
+    runtime_arch = get_rocm_arch()
     if runtime_arch != actual:
         raise ValueError(
             f"cuda:{index} is {actual}, but FlyDSL runtime helpers use {runtime_arch}; "
@@ -129,22 +120,7 @@ def empty_placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return tensor
 
 
-def unambiguous_layout(tensor: torch.Tensor) -> torch.Tensor:
-    """Ensure FlyDSL identifies the last dimension as the unit-stride row."""
-    row = tensor.dim() - 1
-    offenders = [
-        axis for axis in range(row) if tensor.shape[axis] == 1 and tensor.stride(axis) == 1
-    ]
-    if not offenders:
-        return tensor
-    for axis in reversed(offenders):
-        tensor = tensor.squeeze(axis)
-    for axis in offenders:
-        tensor = tensor.unsqueeze(axis)
-    return tensor
-
-
-def rows_are_disjoint_and_packed(tensor: torch.Tensor) -> bool:
+def _rows_are_disjoint_and_packed(tensor: torch.Tensor) -> bool:
     if tensor.stride(-1) != 1:
         return False
     access_bytes = ACCESS_BITS // 8
@@ -164,8 +140,7 @@ def rows_are_disjoint_and_packed(tensor: torch.Tensor) -> bool:
 
 def packed_rows(tensor: torch.Tensor) -> torch.Tensor:
     """Preserve safe row padding and copy only incompatible layouts."""
-    tensor = unambiguous_layout(tensor)
-    if rows_are_disjoint_and_packed(tensor):
+    if _rows_are_disjoint_and_packed(tensor):
         return tensor
     return tensor.clone(memory_format=torch.contiguous_format)
 
