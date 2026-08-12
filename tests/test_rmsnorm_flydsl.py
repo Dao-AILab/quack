@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(not _CAN_RUN, reason=_SKIP_REASON)
 if _CAN_RUN:
     import quack.flydsl_runtime as fly_runtime
     import quack.rmsnorm_flydsl as fly_rmsnorm
-    from quack.rmsnorm_flydsl_config import WAVE_SIZE, RmsNormFwdConfig, rows_per_block
+    from quack.rmsnorm_flydsl_config import WAVE_SIZE, RmsNormFwdConfig
 
 _ATOL = {
     torch.float16: 2e-3,
@@ -173,7 +173,7 @@ def test_weight_offset_scales_by_one_plus_weight(n):
 def test_padded_rows_reuse_compiled_launcher(monkeypatch):
     n = 192
     config = RmsNormFwdConfig.for_forward(n, 16)
-    assert rows_per_block(config) == 8
+    assert config.rows_per_block == 8
 
     compile_calls = 0
     compile_original = fly_rmsnorm.flyc.compile

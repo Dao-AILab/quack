@@ -35,6 +35,13 @@ class RmsNormFwdConfig:
     def reload_from_gmem(self) -> bool:
         return self.num_tiles * self.vecsize > REGISTER_CACHE_ELEMS
 
+    @property
+    def rows_per_block(self) -> int:
+        """Pack short single-pass rows into a 256-thread block."""
+        if self.num_vecs >= MIN_NUM_THREADS:
+            return 1
+        return max(1, TARGET_BLOCK_THREADS // self.num_threads)
+
     @classmethod
     def for_forward(cls, n: int, dtype_width: int) -> "RmsNormFwdConfig":
         """Choose the stable analytical row geometry."""
@@ -65,17 +72,9 @@ def _vector_size(n: int, dtype_width: int) -> int:
     return math.gcd(n, ACCESS_BITS // dtype_width)
 
 
-def rows_per_block(config: RmsNormFwdConfig) -> int:
-    """Pack short single-pass rows into a 256-thread block."""
-    if config.num_vecs >= MIN_NUM_THREADS:
-        return 1
-    return max(1, TARGET_BLOCK_THREADS // config.num_threads)
-
-
 __all__ = [
     "ACCESS_BITS",
     "MAX_N",
     "WAVE_SIZE",
     "RmsNormFwdConfig",
-    "rows_per_block",
 ]
