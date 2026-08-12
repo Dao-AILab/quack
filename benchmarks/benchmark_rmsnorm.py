@@ -1,17 +1,14 @@
 import argparse
-import os
 from typing import Optional
 
-os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
-
-import torch  # noqa: E402
-import torch._functorch.config as _functorch_config  # noqa: E402
-from triton.testing import Benchmark, do_bench, perf_report  # noqa: E402
+import torch
+import torch._functorch.config as _functorch_config
+from triton.testing import Benchmark, do_bench, perf_report
 
 # quack.rmsnorm_fwd is the CuTe kernel on CUDA and the FlyDSL kernel on ROCm.
-from quack import rmsnorm_fwd  # noqa: E402
-from quack.bench.bench_utils import run_and_print  # noqa: E402
-from quack.rmsnorm_torch import rmsnorm_ref  # noqa: E402
+from quack import rmsnorm_fwd
+from quack.bench.bench_utils import run_and_print
+from quack.rmsnorm_torch import rmsnorm_ref
 
 # Inductor's donated-buffer optimization is incompatible with retain_graph=True
 # (used so we benchmark only bwd, not fwd+bwd). Disable it for the torch.compile
