@@ -5,17 +5,8 @@
 CuTe-DSL and FlyDSL implement the same function -- same arguments, same returned
 triple, same aliasing (residual_out is x when nothing was accumulated, rstd is
 None unless asked for). Most of this file therefore runs on both, and each test
-carries its tests/test_rmsnorm.py counterpart's name. Tests with no counterpart
-there (backward, autotune, prenorm) are absent rather than invented.
-
-Five tests are marked FlyDSL-only. Those are not gaps: three reach into host
-plumbing that has no CuTe analogue (error text, the launcher cache, packed_rows),
-one feeds a 4D input that CuTe's rmsnorm_fwd cannot take, and one is a
-multi-GiB tensor that tests/test_rmsnorm.py:303 already covers on CuTe.
-
-Only the FlyDSL half has ever been executed. There is no ROCm CI leg, and the
-dev box has no CUDA, so the CuTe half is source-derived until the first NVIDIA
-CI run -- see the commit that introduced it for what is most likely to move.
+carries its tests/test_rmsnorm.py counterpart's name. Tests marked FlyDSL-only
+reach into host plumbing or shapes that the CuTe backend does not have.
 """
 
 import pytest
@@ -31,20 +22,17 @@ _flydsl_only = pytest.mark.skipif(not _IS_FLYDSL, reason="FlyDSL-specific, no Cu
 
 if _CAN_RUN:
     # Through the package, not the backend module: quack/__init__.py picks the
-    # implementation, and a test that imported one directly would never notice
-    # the picker choosing the other.
+    # implementation, so a direct import would never notice a mis-pick.
     from quack import rmsnorm_fwd as _rmsnorm_fwd
 if _IS_FLYDSL:
     import quack.rmsnorm_flydsl as fly_rmsnorm
 
-# The use_compile axis recompiles once per specialization, same as test_rmsnorm.py.
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
-# Each backend keeps the budget it earned. CuTe's rsqrt is fastmath, and
-# tests/test_rmsnorm.py:22 has spent bf16 down to 1e-1 for it; the FlyDSL kernel
-# measured 0.50 bf16 ULP against fp32. Sharing the looser pair would silently
-# retire 5x of FlyDSL's precision coverage.
+# Each backend keeps its own budget: CuTe's rsqrt is fastmath, which is what
+# spent bf16 down to 1e-1 in test_rmsnorm.py, while the FlyDSL kernel measured
+# 0.50 bf16 ULP against fp32.
 _ATOL, _RTOL = (
     ({torch.float16: 2e-3, torch.bfloat16: 2e-2, torch.float32: 2e-4}, 2e-3)
     if _IS_FLYDSL
@@ -58,7 +46,6 @@ def _seed():
 
 
 def _fwd(use_compile):
-    """The `function = torch.compile(rmsnorm) if use_compile else rmsnorm` of test_rmsnorm.py."""
     if not use_compile:
         return _rmsnorm_fwd
     return torch.compile(_rmsnorm_fwd, fullgraph=True, dynamic=False)
@@ -108,7 +95,7 @@ def test_rmsnorm_fwd_dispatches_to_the_device_backend():
     ],
 )
 def test_rmsnorm_forward(m, n, dtype, weight_dtype, use_compile):
-    """Forward half of test_rmsnorm.py::test_rmsnorm_forward_backward."""
+    """Test RMSNorm forward pass against reference implementation."""
     x = torch.randn(m, n, device=_DEVICE, dtype=dtype)
     weight = (
         torch.randn(n, device=_DEVICE, dtype=weight_dtype) if weight_dtype is not None else None
@@ -123,9 +110,8 @@ def test_rmsnorm_forward(m, n, dtype, weight_dtype, use_compile):
     _assert_close(out, expected, dtype)
 
 
-# One predicated register-cached row and one reloaded row: the offset is folded
-# in the shared epilogue, so a value check on both branches pins the arithmetic
-# that the type checks around weight_offset cannot see.
+# n=760 stays register-cached, n=65536 reloads. The offset is folded into the
+# epilogue both paths share, so each needs its own value check.
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("n", [760, 65536])
 def test_rmsnorm_weight_offset(n, use_compile):
@@ -145,13 +131,9 @@ def test_rmsnorm_weight_offset(n, use_compile):
 def test_rmsnorm_compile_2d_then_3d():
     """One compiled callable must take a 2D input then a 3D one, no dynamo.reset() between.
 
-    Rank is not a shape guard dynamo can specialize away here: the registered op's
-    fake impl re-derives every output shape and dtype, so a second rank has to
-    retrace it rather than reuse the first trace's answer.
-
-    3D, not the 4D of tests/test_rmsnorm.py:168, because that test goes through
-    rmsnorm(), which flattens leading batch dims at quack/rmsnorm.py:1670 before
-    the kernel sees them. At this level per-head input is (rows, H, D).
+    3D, not the 4D of the counterpart: that test calls rmsnorm(), which flattens
+    leading batch dims before the kernel sees them. At this level per-head input
+    is (rows, H, D).
     """
     torch._dynamo.reset()
     function = _fwd(use_compile=True)
@@ -209,9 +191,8 @@ def test_rmsnorm_qk(use_compile):
 def test_rmsnorm_qk_4d(use_compile):
     """FlyDSL flattens leading batch dims itself, so per-head input may be any rank.
 
-    CuTe's rmsnorm_fwd cannot take this: _compile_rmsnorm_fwd builds a 3D layout
-    descriptor for per-head (quack/rmsnorm.py:454), and rmsnorm() reshapes to it
-    before the call. test_rmsnorm_qk covers the 3D shape both backends share.
+    CuTe's rmsnorm_fwd cannot take this: it builds a 3D per-head layout descriptor,
+    and rmsnorm() reshapes to it before the call.
     """
     shape = (2, 3, 4, 64)
     x = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
@@ -250,9 +231,8 @@ def test_rmsnorm_strided_tensor(use_compile):
 def test_rmsnorm_large_tensor(n, use_compile):
     """The row counts a real model reaches; every other test here fits in 11 rows.
 
-    FlyDSL-only for cost, not for capability: ~35 GiB of peak VRAM, and CI runs
-    the whole tests/ tree on six NVIDIA legs where tests/test_rmsnorm.py:303
-    already covers the same m and n on CuTe. Drop the marker to share it.
+    FlyDSL-only for cost, not capability: ~35 GiB of peak VRAM, and the CuTe
+    counterpart already covers the same m and n. Drop the marker to share it.
     """
     m, n_chunks = 32 * 1024, 16
     # x + out must be fully materialized (irreducible); the reference is
@@ -271,22 +251,16 @@ def test_rmsnorm_large_tensor(n, use_compile):
     weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
     out, _, _ = _fwd(use_compile)(x, weight)
 
-    # Absolute only, and the counterpart's looser bf16 budget: this kernel is
-    # correctly rounded (measured worst case 0.50 bf16 ULP against fp32), but
-    # one ULP is ~0.8% relative, so the file's rtol=2e-3 is tighter than correct
-    # rounding permits and half a billion elements always reach that tail.
+    # Absolute only, at the counterpart's looser bf16 budget: one bf16 ULP is
+    # ~0.8% relative, so the file's rtol=2e-3 is tighter than correct rounding
+    # permits, and half a billion elements always reach that tail.
     for x_c, out_c in zip(x.chunk(n_chunks), out.chunk(n_chunks)):
         assert (out_c.float() - _reference(x_c, weight)[0]).abs().max() < 1e-1
 
 
 @_flydsl_only
 def test_rmsnorm_input_validation():
-    """FlyDSL rejects before the op. CuTe's counterpart is tests/test_rmsnorm.py:337.
-
-    Not shared: CuTe validates with bare asserts carrying different text, and
-    half of these -- the 128-bit access width, the ROCm device check -- guard
-    constraints that exist only on this backend.
-    """
+    """Test input validation and error handling: FlyDSL rejects before the op."""
     x = torch.empty(2, 16, device=_DEVICE, dtype=torch.float16)
 
     with pytest.raises(ValueError, match="multiple of 8"):
@@ -307,11 +281,7 @@ def test_rmsnorm_input_validation():
 
 @_flydsl_only
 def test_rmsnorm_compile_cache():
-    """One launcher per specialization; row padding and row count are not part of it.
-
-    Not shared: this reads FlyDSL's functools.cache directly. CuTe keys a
-    @jit_cache on a different tuple; tests/test_rmsnorm.py:383 checks that one.
-    """
+    """One launcher per specialization; row padding and row count are not part of it."""
     n = 192
     fly_rmsnorm._compiled_forward.cache_clear()
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 0
@@ -340,9 +310,8 @@ def test_rmsnorm_compile_cache():
     call(3, 8, width=2 * n)
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 2
 
-    # So is a different dtype. This is the only pair in the file that differs
-    # in nothing else, so it is the only thing standing between a dtype dropped
-    # from the key and a launcher built for another element width.
+    # So is a different dtype: dropped from the key, it would hand back a
+    # launcher built for another element width.
     call(3, 8, dtype=torch.bfloat16)
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 3
 
