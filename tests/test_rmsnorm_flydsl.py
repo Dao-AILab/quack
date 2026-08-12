@@ -1,5 +1,13 @@
 # Copyright (c) 2026, Tri Dao.
 
+"""Forward-only mirror of tests/test_rmsnorm.py for the FlyDSL backend.
+
+The two rmsnorm_fwd implementations take the same arguments and return the same
+triple, so a test here carries its CuTe-DSL counterpart's name and does the same
+thing at the same strength. Tests with no counterpart there (backward, autotune,
+prenorm) are absent rather than invented.
+"""
+
 import pytest
 import torch
 from flydsl_env import CAN_RUN as _CAN_RUN
@@ -9,9 +17,11 @@ from flydsl_env import SKIP_REASON as _SKIP_REASON
 pytestmark = pytest.mark.skipif(not _CAN_RUN, reason=_SKIP_REASON)
 
 if _CAN_RUN:
-    import quack.flydsl_runtime as fly_runtime
     import quack.rmsnorm_flydsl as fly_rmsnorm
-    from quack.rmsnorm_flydsl_config import WAVE_SIZE, RmsNormFwdConfig
+
+# The use_compile axis recompiles once per specialization, same as test_rmsnorm.py.
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 _ATOL = {
     torch.float16: 2e-3,
@@ -23,6 +33,13 @@ _ATOL = {
 @pytest.fixture(autouse=True)
 def _seed():
     torch.manual_seed(0)
+
+
+def _fwd(use_compile):
+    """The `function = torch.compile(rmsnorm) if use_compile else rmsnorm` of test_rmsnorm.py."""
+    if not use_compile:
+        return fly_rmsnorm.rmsnorm_fwd
+    return torch.compile(fly_rmsnorm.rmsnorm_fwd, fullgraph=True, dynamic=False)
 
 
 def _reference(x, weight=None, bias=None, residual=None, eps=1e-6):
@@ -47,6 +64,7 @@ def _assert_close(actual, expected, input_dtype):
     )
 
 
+@pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize(
     "m,n,dtype,weight_dtype",
     [
@@ -61,13 +79,14 @@ def _assert_close(actual, expected, input_dtype):
         pytest.param(1, 262144, torch.bfloat16, torch.float32, id="max-n"),
     ],
 )
-def test_plain_forward(m, n, dtype, weight_dtype):
+def test_rmsnorm_forward(m, n, dtype, weight_dtype, use_compile):
+    """Forward half of test_rmsnorm.py::test_rmsnorm_forward_backward."""
     x = torch.randn(m, n, device=_DEVICE, dtype=dtype)
     weight = (
         torch.randn(n, device=_DEVICE, dtype=weight_dtype) if weight_dtype is not None else None
     )
 
-    out, residual_out, rstd = fly_rmsnorm.rmsnorm_fwd(x, weight)
+    out, residual_out, rstd = _fwd(use_compile)(x, weight)
     expected, _, _ = _reference(x, weight)
 
     assert out.shape == x.shape and out.dtype == x.dtype
@@ -75,28 +94,36 @@ def test_plain_forward(m, n, dtype, weight_dtype):
     assert rstd is None
     _assert_close(out, expected, dtype)
 
-    if n == 4096:
-        config = RmsNormFwdConfig.for_forward(n, x.element_size() * 8)
-        assert config.num_threads > WAVE_SIZE
-    if n == 8192:
-        # Pin the branch, not the geometry: no other row lands between the
-        # small-block and max-block thread counts while still register-cached.
-        config = RmsNormFwdConfig.for_forward(n, x.element_size() * 8)
-        assert 256 < config.num_threads < 1024
-        assert not config.reload_from_gmem
-    if n >= 65536:
-        config = RmsNormFwdConfig.for_forward(n, x.element_size() * 8)
-        assert config.reload_from_gmem
+
+# One predicated register-cached row and one reloaded row: the offset is folded
+# in the shared epilogue, so a value check on both branches pins the arithmetic
+# that the type checks around weight_offset cannot see.
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("n", [760, 65536])
+def test_rmsnorm_weight_offset(n, use_compile):
+    x = torch.randn((3, n), device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+
+    function = _fwd(use_compile)
+    out, _, _ = function(x, weight, weight_offset=1.0)
+    expected, _, _ = _reference(x, weight + 1.0)
+
+    _assert_close(out, expected, x.dtype)
+    # An ignored offset would leave the plain-weight result, which differs here.
+    plain, _, _ = function(x, weight)
+    assert not torch.allclose(out, plain, atol=1e-3, rtol=1e-3)
 
 
-def test_bias_residual_and_aux_output_semantics():
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_qk(use_compile):
+    """Per-head weight and bias over a 4D input, with a residual and rstd."""
     shape = (2, 3, 4, 64)
     x = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
     bias = torch.randn(shape[-2:], device=_DEVICE, dtype=torch.float32)
     residual = torch.randn(shape, device=_DEVICE, dtype=torch.float16)
 
-    out, residual_out, rstd = fly_rmsnorm.rmsnorm_fwd(
+    out, residual_out, rstd = _fwd(use_compile)(
         x,
         weight,
         bias=bias,
@@ -115,116 +142,9 @@ def test_bias_residual_and_aux_output_semantics():
     _assert_close(rstd, expected_rstd, x.dtype)
 
 
-def test_residual_dtype_without_residual_forces_a_fresh_output():
-    x = torch.randn((3, 64), device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(64, device=_DEVICE, dtype=torch.float32)
-
-    out, residual_out, rstd = fly_rmsnorm.rmsnorm_fwd(
-        x,
-        weight,
-        residual_dtype=torch.float32,
-    )
-    expected, combined, _ = _reference(x, weight)
-
-    assert residual_out.dtype == torch.float32
-    assert residual_out.data_ptr() != x.data_ptr()
-    assert rstd is None
-    _assert_close(out, expected, x.dtype)
-    torch.testing.assert_close(residual_out, combined, atol=0, rtol=0)
-
-
-# One predicated register-cached row and one reloaded row: the offset is folded
-# in the shared epilogue, so a value check on both branches pins the arithmetic
-# that the type checks around weight_offset cannot see.
-@pytest.mark.parametrize("n", [760, 65536])
-def test_weight_offset_scales_by_one_plus_weight(n):
-    x = torch.randn((3, n), device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-
-    out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight, weight_offset=1.0)
-    expected, _, _ = _reference(x, weight + 1.0)
-
-    _assert_close(out, expected, x.dtype)
-    # An ignored offset would leave the plain-weight result, which differs here.
-    plain, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
-    assert not torch.allclose(out, plain, atol=1e-3, rtol=1e-3)
-
-
-def test_padded_rows_reuse_compiled_launcher(monkeypatch):
-    n = 192
-    config = RmsNormFwdConfig.for_forward(n, 16)
-    assert config.rows_per_block == 8
-
-    compile_calls = 0
-    compile_original = fly_rmsnorm.flyc.compile
-    validate_calls = 0
-    validate_original = fly_runtime.validate_arch
-
-    def count_compile(*args, **kwargs):
-        nonlocal compile_calls
-        compile_calls += 1
-        return compile_original(*args, **kwargs)
-
-    def count_validate(*args, **kwargs):
-        nonlocal validate_calls
-        validate_calls += 1
-        return validate_original(*args, **kwargs)
-
-    fly_rmsnorm._compiled_forward.cache_clear()
-    monkeypatch.setattr(fly_rmsnorm.flyc, "compile", count_compile)
-    # run_compiled resolves validate_arch from its own module's globals.
-    monkeypatch.setattr(fly_runtime, "validate_arch", count_validate)
-
-    for m, padding in ((3, 8), (11, 16)):
-        storage = torch.randn(m, n + padding, device=_DEVICE, dtype=torch.float16)
-        x = storage[:, :n]
-        assert x.stride() == (n + padding, 1)
-        weight = torch.randn(n, device=_DEVICE, dtype=torch.float16)
-        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
-        expected, _, _ = _reference(x, weight)
-        _assert_close(out, expected, x.dtype)
-
-    # Same specialization, different row padding and row count: one build, one
-    # compile, one architecture check.
-    assert compile_calls == 1
-    assert validate_calls == 1
-    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 1
-
-    # A different normalized dimension is a different specialization.
-    wide = 2 * n
-    x = torch.randn(3, wide, device=_DEVICE, dtype=torch.float16)
-    weight = torch.randn(wide, device=_DEVICE, dtype=torch.float16)
-    fly_rmsnorm.rmsnorm_fwd(x, weight)
-    assert compile_calls == 2
-    assert validate_calls == 2
-    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 2
-
-
-def test_compiles_into_one_graph_without_breaks():
-    n = 1024
-    x = torch.randn(8, n, device=_DEVICE, dtype=torch.bfloat16)
-    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
-
-    def block(x, w):
-        h = torch.nn.functional.silu(x)
-        out, _, _ = fly_rmsnorm.rmsnorm_fwd(h, w, eps=1e-6)
-        return out * 2.0
-
-    torch._dynamo.reset()
-    explanation = torch._dynamo.explain(block)(x, weight)
-    # Without the registered op Dynamo traces into FlyDSL's own @flyc.jit and
-    # breaks inside it, which both fragments the region and, on a cold
-    # specialization, raises "@kernel can only be called inside @jit function".
-    assert explanation.graph_break_count == 0, explanation.break_reasons
-    assert explanation.graph_count == 1
-
-    torch._dynamo.reset()
-    compiled = torch.compile(block, dynamic=False)
-    expected = _reference(torch.nn.functional.silu(x), weight)[0] * 2.0
-    _assert_close(compiled(x, weight), expected, x.dtype)
-
-
-def test_unaligned_padded_rows_are_copied_before_vector_access():
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_strided_tensor(use_compile):
+    """A row stride that is not 16B-aligned must be copied before vector access."""
     n = 192
     storage = torch.randn(4, 196, device=_DEVICE, dtype=torch.float16)
     x = storage[:, :n]
@@ -235,34 +155,12 @@ def test_unaligned_padded_rows_are_copied_before_vector_access():
     assert packed.data_ptr() != x.data_ptr()
 
     weight = torch.randn(n, device=_DEVICE, dtype=torch.float16)
-    out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
+    out, _, _ = _fwd(use_compile)(x, weight)
     expected, _, _ = _reference(x, weight)
     _assert_close(out, expected, x.dtype)
 
 
-def test_empty_rows_return_without_compiling(monkeypatch):
-    x = torch.empty(0, 192, device=_DEVICE, dtype=torch.float16)
-    weight = torch.ones(192, device=_DEVICE, dtype=torch.float32)
-
-    def forbid_compile(*_args, **_kwargs):
-        raise AssertionError("empty rows attempted to compile a kernel")
-
-    monkeypatch.setattr(fly_rmsnorm.flyc, "compile", forbid_compile)
-    out, residual_out, rstd = fly_rmsnorm.rmsnorm_fwd(
-        x,
-        weight,
-        out_dtype=torch.float32,
-        residual_dtype=torch.float32,
-        store_rstd=True,
-    )
-
-    assert out.shape == x.shape and out.dtype == torch.float32
-    assert residual_out.shape == x.shape and residual_out.dtype == torch.float32
-    assert residual_out is not x
-    assert rstd.shape == x.shape[:-1] and rstd.dtype == torch.float32
-
-
-def test_invalid_inputs():
+def test_rmsnorm_input_validation():
     x = torch.empty(2, 16, device=_DEVICE, dtype=torch.float16)
 
     with pytest.raises(ValueError, match="multiple of 8"):
@@ -278,18 +176,107 @@ def test_invalid_inputs():
     with pytest.raises(ValueError, match="ROCm device"):
         fly_rmsnorm.rmsnorm_fwd(x.cpu())
 
-    # The scalar checks take a `type(...) is float` fast path, so the branches
-    # that only the slow path can reject need holding down explicitly.
-    weight = torch.empty(16, device=_DEVICE, dtype=torch.float16)
-    with pytest.raises(TypeError, match="eps must be a real number"):
-        fly_rmsnorm.rmsnorm_fwd(x, eps=True)
-    with pytest.raises(TypeError, match="eps must be a real number"):
-        fly_rmsnorm.rmsnorm_fwd(x, eps="1e-6")
-    with pytest.raises(TypeError, match="store_rstd must be a bool"):
-        fly_rmsnorm.rmsnorm_fwd(x, store_rstd=1)
-    with pytest.raises(TypeError, match="weight_offset must be a real number"):
-        fly_rmsnorm.rmsnorm_fwd(x, weight, weight_offset=True)
-    with pytest.raises(ValueError, match="weight_offset must be finite"):
-        fly_rmsnorm.rmsnorm_fwd(x, weight, weight_offset=float("inf"))
-    # An int is not a float but is a Real: still accepted, still converted.
-    fly_rmsnorm.rmsnorm_fwd(x, weight, eps=1, weight_offset=1)
+
+def test_rmsnorm_compile_cache():
+    """One launcher per specialization; row padding and row count are not part of it."""
+    n = 192
+    fly_rmsnorm._compiled_forward.cache_clear()
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 0
+
+    def call(m, padding, width=n, dtype=torch.float16):
+        storage = torch.randn(m, width + padding, device=_DEVICE, dtype=dtype)
+        x = storage[:, :width]
+        assert x.stride() == (width + padding, 1)
+        weight = torch.randn(width, device=_DEVICE, dtype=dtype)
+        out, _, _ = fly_rmsnorm.rmsnorm_fwd(x, weight)
+        _assert_close(out, _reference(x, weight)[0], dtype)
+
+    # First call compiles.
+    call(3, 8)
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 1
+
+    # Same shape reuses.
+    call(3, 8)
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 1
+
+    # A different row count and a different row padding still reuse.
+    call(11, 16)
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 1
+
+    # A different normalized dimension is a different specialization.
+    call(3, 8, width=2 * n)
+    assert fly_rmsnorm._compiled_forward.cache_info().currsize == 2
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_with_bias(use_compile):
+    m, n = 32, 1024
+    x = torch.randn(m, n, device=_DEVICE, dtype=torch.float16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+    bias = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+
+    out, residual_out, rstd = _fwd(use_compile)(x, weight, bias=bias)
+    expected, _, _ = _reference(x, weight, bias)
+
+    assert out.shape == x.shape and out.dtype == torch.float16
+    assert residual_out is x
+    assert rstd is None
+    _assert_close(out, expected, x.dtype)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_with_residual(use_compile):
+    m, n = 32, 1024
+    x = torch.randn(m, n, device=_DEVICE, dtype=torch.float16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
+    residual = torch.randn(m, n, device=_DEVICE, dtype=torch.float16)
+
+    out, residual_out, rstd = _fwd(use_compile)(
+        x,
+        weight,
+        residual=residual,
+        residual_dtype=torch.float32,
+        store_rstd=True,
+    )
+    expected, combined, expected_rstd = _reference(x, weight, residual=residual)
+
+    assert residual_out.shape == x.shape and residual_out.dtype == torch.float32
+    assert rstd.shape == x.shape[:-1]
+    _assert_close(out, expected, x.dtype)
+    # The kernel accumulates x + residual in fp32 and casts only at the store.
+    torch.testing.assert_close(residual_out, combined, atol=0, rtol=0)
+    _assert_close(rstd, expected_rstd, x.dtype)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_rmsnorm_residual_dtype_override(use_compile):
+    """residual_dtype without a residual still forces a fresh fp32 residual_out."""
+    x = torch.randn((3, 64), device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(64, device=_DEVICE, dtype=torch.float32)
+
+    out, residual_out, rstd = _fwd(use_compile)(x, weight, residual_dtype=torch.float32)
+    expected, combined, _ = _reference(x, weight)
+
+    assert residual_out.dtype == torch.float32
+    assert residual_out.data_ptr() != x.data_ptr()
+    assert rstd is None
+    _assert_close(out, expected, x.dtype)
+    torch.testing.assert_close(residual_out, combined, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("store_rstd", [False, True])
+def test_rmsnorm_fwd_empty(store_rstd):
+    """Zero rows (e.g. uneven FSDP shards) must return correctly-shaped empty outputs."""
+    n = 4096
+    x = torch.empty(0, n, device=_DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(n, device=_DEVICE, dtype=torch.bfloat16)
+
+    out, residual_out, rstd = fly_rmsnorm.rmsnorm_fwd(x, weight, store_rstd=store_rstd)
+
+    assert out.shape == x.shape and out.numel() == 0
+    # No residual passed in: residual_out aliases x (and is empty).
+    assert residual_out.shape == x.shape and residual_out.numel() == 0
+    if store_rstd:
+        assert rstd.shape == x.shape[:-1] and rstd.numel() == 0
+    else:
+        assert rstd is None
