@@ -49,8 +49,7 @@ _DTYPE_SPECS = {
     torch.float32: (fx.Float32, 32),
 }
 
-_DEVICE_ARCH_CACHE: dict[int, str] = {}
-_EMPTY_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+_EMPTY_CACHE: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
 def dtype_spec(dtype: torch.dtype):
@@ -71,16 +70,18 @@ def validate_arch(device: torch.device, supported: frozenset, kernel: str) -> st
     Only gcnArchName is normalized. ARCH is a raw passthrough into FlyDSL's
     compile target and reaches the ROCDL pipeline as ``chip``, so a value the
     device never reports has to fail here rather than be massaged into one.
+
+    Nothing is memoized across calls. ``run_compiled`` only reaches here on a
+    launcher's cold path, and torch already caches the properties object, so a
+    per-device arch cache would buy one string split -- at the price of every
+    caller after the first inheriting the first one's ``supported`` set.
     """
     index = _device_index(device)
-    actual = _DEVICE_ARCH_CACHE.get(index)
-    if actual is None:
-        # ROCm appends feature flags: "gfx950:sramecc+:xnack-".
-        actual = torch.cuda.get_device_properties(index).gcnArchName.split(":", 1)[0]
-        if actual not in supported:
-            names = ", ".join(sorted(supported))
-            raise ValueError(f"FlyDSL {kernel} supports {names}; cuda:{index} is {actual}")
-        _DEVICE_ARCH_CACHE[index] = actual
+    # ROCm appends feature flags: "gfx950:sramecc+:xnack-".
+    actual = torch.cuda.get_device_properties(index).gcnArchName.split(":", 1)[0]
+    if actual not in supported:
+        names = ", ".join(sorted(supported))
+        raise ValueError(f"FlyDSL {kernel} supports {names}; cuda:{index} is {actual}")
 
     target = flyc.get_backend().target
     if target.backend != "rocm":
@@ -111,8 +112,13 @@ def current_raw_stream(device: torch.device) -> int:
 
 
 def empty_placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """A shared zero-element tensor for arguments a specialization ignores."""
-    key = (device, dtype)
+    """A shared zero-element tensor for arguments a specialization ignores.
+
+    Keyed by ordinal, not by the torch.device object: callers pass whatever
+    ``x.device`` gave them, and "cuda" and "cuda:0" hash apart while naming the
+    same GPU.
+    """
+    key = (_device_index(device), dtype)
     tensor = _EMPTY_CACHE.get(key)
     if tensor is None:
         tensor = torch.empty(0, device=device, dtype=dtype)

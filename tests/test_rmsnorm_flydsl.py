@@ -463,6 +463,24 @@ def test_compile_target_that_the_device_never_reports_is_rejected(monkeypatch, a
         fly_runtime.validate_arch(_DEVICE, frozenset({_ARCH}), "RMSNorm")
 
 
+def test_every_caller_gets_its_own_supported_set_checked():
+    # A per-device arch cache that also gated the supported check would let the
+    # second kernel inherit the first one's verdict on this GPU.
+    assert fly_runtime.validate_arch(_DEVICE, frozenset({_ARCH}), "RMSNorm") == _ARCH
+
+    with pytest.raises(ValueError, match=f"supports gfx900; cuda:\\d+ is {_ARCH}"):
+        fly_runtime.validate_arch(_DEVICE, frozenset({"gfx900"}), "Elsewhere")
+
+
+def test_placeholders_are_shared_across_spellings_of_one_device():
+    # Callers hand over whatever x.device gave them, so an unindexed "cuda" and
+    # an explicit "cuda:N" have to land on the same cached tensor.
+    bare = fly_runtime.empty_placeholder(torch.device("cuda"), torch.float32)
+    indexed = fly_runtime.empty_placeholder(_DEVICE, torch.float32)
+    assert bare is indexed
+    assert bare.numel() == 0 and bare.device.index == _DEVICE.index
+
+
 def test_empty_rows_return_without_compiling(monkeypatch):
     x = torch.empty(0, 192, device=_DEVICE, dtype=torch.float16)
     weight = torch.ones(192, device=_DEVICE, dtype=torch.float32)
