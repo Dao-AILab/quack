@@ -439,65 +439,6 @@ def _compiled_forward(
     return launch_rmsnorm
 
 
-def _launch_rmsnorm_fwd(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    residual: torch.Tensor,
-    out: torch.Tensor,
-    residual_out: torch.Tensor,
-    rstd: torch.Tensor,
-    eps: float,
-    weight_offset: float,
-    *,
-    has_weight: bool,
-    has_bias: bool,
-    has_residual: bool,
-    store_residual: bool,
-    store_rstd: bool,
-    per_head: bool,
-    num_heads: int,
-) -> None:
-    m, n = x.shape[0], x.shape[-1]
-    device_index = x.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    # Positional, not keyword: matching sixteen keywords through lru_cache costs
-    # ~0.4us per launch on gfx950, against a ~20us host path at small M.
-    exe = _compiled_forward(
-        device_index,
-        n,
-        x.dtype,
-        out.dtype,
-        weight.dtype,
-        bias.dtype,
-        residual.dtype,
-        residual_out.dtype,
-        has_weight,
-        has_bias,
-        has_residual,
-        store_residual,
-        store_rstd,
-        per_head,
-        num_heads,
-        weight_offset != 0.0,
-    )
-    args = (
-        x,
-        weight,
-        bias,
-        residual,
-        out,
-        residual_out,
-        rstd,
-        m,
-        eps,
-        weight_offset,
-        current_raw_stream(x.device),
-    )
-    run_compiled(exe, x.device, args, supported=_SUPPORTED_ARCHES, kernel="RMSNorm")
-
-
 def _validate_inputs(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -505,10 +446,9 @@ def _validate_inputs(
     residual: torch.Tensor | None,
     out_dtype: torch.dtype | None,
     residual_dtype: torch.dtype | None,
-    eps: float,
     store_rstd: bool,
     weight_offset: float,
-) -> tuple[int, int, int, bool, float, float]:
+) -> tuple[int, int, int, bool]:
     if not isinstance(x, torch.Tensor):
         raise TypeError(f"x must be a torch.Tensor, got {type(x).__name__}")
     if x.ndim < 1:
@@ -550,23 +490,25 @@ def _validate_inputs(
     alignment = ACCESS_BITS // (x.element_size() * 8)
     if n % alignment:
         raise ValueError(f"x normalized dimension must be a multiple of {alignment}, got {n}")
-    for name, tensor in optional:
-        if tensor is not None and tensor.dtype not in _SUPPORTED_DTYPES:
-            raise TypeError(
-                f"{name} dtype must be float16, bfloat16, or float32, got {tensor.dtype}"
-            )
     for name, dtype in (("out_dtype", out_dtype), ("residual_dtype", residual_dtype)):
         if dtype is not None and dtype not in _SUPPORTED_DTYPES:
             raise TypeError(f"{name} must be float16, bfloat16, or float32, got {dtype}")
 
-    for name, tensor in (("x", x), *optional):
-        if tensor is not None and tensor.layout != torch.strided:
-            raise ValueError(f"{name} must use torch.strided layout, got {tensor.layout}")
     device = x.device
     if not _IS_ROCM or device.type != "cuda":
         raise ValueError(f"x must be on a ROCm device, got {device}")
+    if x.layout != torch.strided:
+        raise ValueError(f"x must use torch.strided layout, got {x.layout}")
     for name, tensor in optional:
-        if tensor is not None and tensor.device != device:
+        if tensor is None:
+            continue
+        if tensor.dtype not in _SUPPORTED_DTYPES:
+            raise TypeError(
+                f"{name} dtype must be float16, bfloat16, or float32, got {tensor.dtype}"
+            )
+        if tensor.layout != torch.strided:
+            raise ValueError(f"{name} must use torch.strided layout, got {tensor.layout}")
+        if tensor.device != device:
             raise ValueError(
                 f"x and {name} must be on the same device, got {device}/{tensor.device}"
             )
@@ -585,7 +527,7 @@ def _validate_inputs(
             f"rstd has {normalized_rows} rows, but its buffer descriptor addresses at most "
             f"{_MAX_RSTD_ROWS}"
         )
-    return m, n, num_heads, per_head, eps, weight_offset
+    return m, n, num_heads, per_head
 
 
 def _validate_scalars(eps, store_rstd, weight_offset):
@@ -649,8 +591,8 @@ def _rmsnorm_fwd_core(
     """Shared body. Absent outputs come back as None, not as a sentinel tensor:
     materializing two empty CUDA tensors costs 2.1us, which is an eighth of this
     kernel's whole host path, and only the op boundary actually needs them."""
-    m, n, num_heads, per_head, eps, weight_offset = _validate_inputs(
-        x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
+    m, n, num_heads, per_head = _validate_inputs(
+        x, weight, bias, residual, out_dtype, residual_dtype, store_rstd, weight_offset
     )
     output_dtype, residual_out_dtype, store_residual = _output_dtypes(
         x, residual, out_dtype, residual_dtype
@@ -687,7 +629,30 @@ def _rmsnorm_fwd_core(
         else empty_placeholder(x.device, torch.float32)
     )
 
-    _launch_rmsnorm_fwd(
+    device_index = x.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    # Positional, not keyword: matching sixteen keywords through lru_cache costs
+    # ~0.4us per launch on gfx950, against a ~20us host path at small M.
+    exe = _compiled_forward(
+        device_index,
+        n,
+        x_flat.dtype,
+        output_dtype,
+        weight_arg.dtype,
+        bias_arg.dtype,
+        residual_arg.dtype,
+        residual_out_dtype,
+        weight is not None,
+        bias is not None,
+        residual is not None,
+        store_residual,
+        store_rstd,
+        per_head,
+        num_heads,
+        weight_offset != 0.0,
+    )
+    args = (
         x_flat,
         weight_arg,
         bias_arg,
@@ -695,16 +660,12 @@ def _rmsnorm_fwd_core(
         out_flat,
         residual_out_flat,
         rstd_flat,
+        m,
         eps,
         weight_offset,
-        has_weight=weight is not None,
-        has_bias=bias is not None,
-        has_residual=residual is not None,
-        store_residual=store_residual,
-        store_rstd=store_rstd,
-        per_head=per_head,
-        num_heads=num_heads,
+        current_raw_stream(x.device),
     )
+    run_compiled(exe, x.device, args, supported=_SUPPORTED_ARCHES, kernel="RMSNorm")
 
     return (
         out_flat.reshape(x.shape),

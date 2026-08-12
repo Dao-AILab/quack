@@ -178,10 +178,8 @@ def run_compiled(exe, device: torch.device, args: tuple, *, supported: frozenset
     launch, so the miss branch must not call the result again.
 
     One artifact per launcher is only correct because the caller keys its
-    launchers by device as well as by specialization. FlyDSL caches compiled
-    artifacts on the JitFunction by argument signature alone, so a launcher
-    shared across GPUs would hand the second one a module loaded into the
-    first one's context and the launch would fail with hipErrorInvalidDevice.
+    launchers by device as well as by specialization; see this module's
+    docstring for what goes wrong when it does not.
 
     One consequence of the shape is deliberate: nothing serializes a cold key,
     so concurrent threads can each build it. FlyDSL's per-key file lock still
