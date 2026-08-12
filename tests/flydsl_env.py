@@ -1,9 +1,11 @@
 # Copyright (c) 2026, Tri Dao.
 
-"""Environment gate shared by the FlyDSL test modules.
+"""Environment gate for the FlyDSL test modules.
 
-Not a conftest fixture: each module needs these at import time to build its own
+Not a conftest fixture: a module needs these at import time to build its own
 ``pytestmark`` and to guard the ``quack.*`` imports, which pull in flydsl.
+test_rmsnorm_flydsl.py is the only importer today; it stays a module so the
+next FlyDSL kernel does not re-derive the gate.
 """
 
 import importlib.util
