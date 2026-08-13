@@ -58,49 +58,18 @@ def _row_records(elem_bits: int, n: int, valid=None):
     return valid.select(fx.Int32(row_bytes), fx.Int32(0))
 
 
-# Raw upstream-MLIR ROCDL builders, unstable under FlyDSL's api_stability.md §2.4
-# (re-exported through fx.rocdl but absent from its __all__). fx.gpu.shuffle_xor
-# below is the stable path; these are taken for speed, keeping the intra-wave
-# reduction out of LDS so only cross-wave rows touch shared memory.
-def _dpp_shuffle_xor(value, offset: int):
-    raw = value.ir_value()
-    result_type = raw.type
-    if offset == 8:
-        peer = fx.rocdl.update_dpp(result_type, raw, raw, 0x118, 0xF, 0xC, False)
-        peer = fx.rocdl.update_dpp(result_type, peer, raw, 0x108, 0xF, 0x3, False)
-    elif offset == 4:
-        peer = fx.rocdl.update_dpp(result_type, raw, raw, 0x114, 0xF, 0xA, False)
-        peer = fx.rocdl.update_dpp(result_type, peer, raw, 0x104, 0xF, 0x5, False)
-    elif offset == 2:
-        peer = fx.rocdl.update_dpp(result_type, raw, raw, 0x4E, 0xF, 0xF, False)
-    elif offset == 1:
-        peer = fx.rocdl.update_dpp(result_type, raw, raw, 0xB1, 0xF, 0xF, False)
-    else:
-        raise ValueError(f"unsupported DPP XOR offset: {offset}")
-    return fx.Float32(peer)
-
-
-def _ds_swizzle_xor(value, offset: int):
-    bits = value.bitcast(fx.Uint32)
-    peer = fx.rocdl.ds_swizzle(
-        bits.ir_value().type,
-        bits.ir_value(),
-        fx.Int32((offset << 10) | 0x1F).ir_value(),
-    )
-    return fx.Uint32(peer).bitcast(fx.Float32)
-
-
 def _shuffle_reduce_add(value, lanes: int):
+    """Butterfly-sum a row's partials across ``lanes`` lanes of a wave.
+
+    Hand-written DPP and ds_swizzle used to cover offsets <= 16 here. Measured
+    at parity on gfx950 bf16 (N=256..16384, interleaved A/B), so they only bought
+    a raw upstream-MLIR dependency -- unstable under FlyDSL's api_stability.md
+    §2.4 -- and are gone. Re-measure before reaching for them again.
+    """
     result = value
     for shift_exp in range_constexpr(int(math.log2(lanes))):
         offset = lanes // (2 << shift_exp)
-        if lanes in (32, 64) and offset <= 8:
-            peer = _dpp_shuffle_xor(result, offset)
-        elif lanes in (32, 64) and offset == 16:
-            peer = _ds_swizzle_xor(result, offset)
-        else:
-            peer = fx.gpu.shuffle_xor(result, offset, fx.Int32(lanes))
-        result = result + peer
+        result = result + fx.gpu.shuffle_xor(result, offset, fx.Int32(lanes))
     return result
 
 
