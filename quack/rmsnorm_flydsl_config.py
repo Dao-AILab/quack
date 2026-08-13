@@ -2,10 +2,9 @@
 
 """Launch heuristic for the eager FlyDSL RMSNorm forward kernel.
 
-Plain Python, no DSL: the geometry here is chosen on the host before any
-kernel is built. ``MAX_ACCESS_BITS`` comes from a dependency-free leaf because
-the same ceiling bounds both the vector size chosen here and every runtime row
-access; the two layers cannot disagree.
+Plain Python, no DSL: the geometry is chosen on the host before any kernel is
+built. ``MAX_ACCESS_BITS`` comes from a dependency-free leaf so the vector size
+here and every runtime row access share one ceiling.
 """
 
 import math

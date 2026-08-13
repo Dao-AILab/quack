@@ -1,24 +1,18 @@
 # Copyright (c) 2026, Tri Dao.
 
-"""Generic host plumbing shared by every FlyDSL kernel in quack.
+"""Generic host plumbing shared by every FlyDSL kernel: arch validation, launch
+dispatch, stream and dtype translation, ROCm buffer-descriptor row rules.
 
-Nothing here knows about a particular kernel: architecture validation, launch
-dispatch, stream and dtype translation, and the row layout rules the ROCm
-buffer descriptors depend on.
+``run_compiled`` holds one artifact per launcher and keys nothing itself, so
+**the caller must key its launchers by device** as well as by specialization.
+FlyDSL keys artifacts on the JitFunction by argument signature alone, so a
+launcher shared across GPUs hands the second one a module loaded into the
+first one's context: hipErrorInvalidDevice. FlyDSL's own on-disk cache under
+``~/.flydsl/cache`` sits below both.
 
-Caching is split, and a kernel module needs to know which half it owns.
-``run_compiled`` holds one compiled artifact per launcher and does no keying of
-its own, so **the caller must key its launchers by device** as well as by
-specialization -- rmsnorm passes the device ordinal to its ``functools.cache``d
-builder for exactly that reason. FlyDSL caches artifacts on the JitFunction by
-argument signature alone, so a launcher shared across GPUs hands the second one
-a module loaded into the first one's context and the launch fails with
-hipErrorInvalidDevice. Neither layer is serialized against concurrent builders,
-and FlyDSL's own on-disk cache under ``~/.flydsl/cache`` sits below both.
-
-This is a sibling of :mod:`quack.cache.jit` rather than a reuse of it: that
-module's disk half is CuTe-specific (``.o`` export plus a tvm_ffi
-``load_module``) and it imports cutlass, so it will not load on ROCm.
+A sibling of :mod:`quack.cache.jit`, not a reuse: that module's disk half is
+CuTe-specific (``.o`` export plus tvm_ffi ``load_module``) and imports cutlass,
+so it will not load on ROCm.
 """
 
 import torch
@@ -70,14 +64,9 @@ def _device_index(device: torch.device) -> int:
 def validate_arch(device: torch.device, supported: frozenset, kernel: str) -> str:
     """Reject a device, a compile target or a runtime that disagree on the arch.
 
-    Only gcnArchName is normalized. ARCH is a raw passthrough into FlyDSL's
-    compile target and reaches the ROCDL pipeline as ``chip``, so a value the
-    device never reports has to fail here rather than be massaged into one.
-
-    Nothing is memoized across calls. ``run_compiled`` only reaches here on a
-    launcher's cold path, and torch already caches the properties object, so a
-    per-device arch cache would buy one string split -- at the price of every
-    caller after the first inheriting the first one's ``supported`` set.
+    Only gcnArchName is normalized: ARCH passes through to FlyDSL's compile
+    target and reaches the ROCDL pipeline as ``chip``, so a value the device
+    never reports has to fail here rather than be massaged into one.
     """
     index = _device_index(device)
     # ROCm appends feature flags: "gfx950:sramecc+:xnack-".
@@ -117,9 +106,7 @@ def current_raw_stream(device: torch.device) -> int:
 def empty_placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """A shared zero-element tensor for arguments a specialization ignores.
 
-    Keyed by ordinal, not by the torch.device object: callers pass whatever
-    ``x.device`` gave them, and "cuda" and "cuda:0" hash apart while naming the
-    same GPU.
+    Keyed by ordinal, not torch.device: "cuda" and "cuda:0" hash apart.
     """
     key = (_device_index(device), dtype)
     tensor = _EMPTY_CACHE.get(key)
@@ -157,19 +144,13 @@ def packed_rows(tensor: torch.Tensor) -> torch.Tensor:
 def run_compiled(exe, device: torch.device, args: tuple, *, supported: frozenset, kernel: str):
     """Dispatch a launcher, compiling it on this process's first use.
 
-    Follows aiter's ``_run_compiled``: the ``CompiledFunction`` is stashed on
-    the launcher, and ``flyc.compile`` both compiles and performs the first
-    launch, so the miss branch must not call the result again.
+    Follows aiter's ``_run_compiled``: the ``CompiledFunction`` is stashed on the
+    launcher, and ``flyc.compile`` both compiles and performs the first launch,
+    so the miss branch must not call the result again.
 
-    One artifact per launcher is only correct because the caller keys its
-    launchers by device as well as by specialization; see this module's
-    docstring for what goes wrong when it does not.
-
-    One consequence of the shape is deliberate: nothing serializes a cold key,
-    so concurrent threads can each build it. FlyDSL's per-key file lock still
-    makes only one of them run the MLIR pipeline, and either artifact is valid.
-    A mid-process change to ARCH or FLYDSL_GPU_ARCH is likewise not detected
-    once an artifact exists; validate_arch runs per launcher on the miss.
+    Nothing serializes a cold key; FlyDSL's per-key file lock still runs the MLIR
+    pipeline once and either artifact is valid. validate_arch runs on the miss
+    only, so a mid-process ARCH change goes undetected once an artifact exists.
     """
     with torch.cuda.device(device):
         cf = getattr(exe, "_cf", None)

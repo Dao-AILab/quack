@@ -50,15 +50,15 @@ _MAX_RSTD_ROWS = (2**32 - 1) // 4
 
 
 def _row_records(elem_bits: int, n: int, valid=None):
-    """Return the row-scoped buffer bound, or zero for an invalid grid row."""
+    """Row-scoped buffer bound; zero for an invalid grid row."""
     row_bytes = n * (elem_bits // 8)
     if valid is None:
         return row_bytes
     return valid.select(fx.Int32(row_bytes), fx.Int32(0))
 
 
-# FlyDSL has no stable wrapper for these two ROCDL operations. They keep the
-# intra-wave reduction out of LDS; only cross-wave rows use shared memory.
+# Raw ROCDL, since FlyDSL has no wrapper: these keep the intra-wave reduction out
+# of LDS, so only cross-wave rows touch shared memory.
 def _dpp_shuffle_xor(value, offset: int):
     raw = value.ir_value()
     result_type = raw.type
@@ -102,7 +102,7 @@ def _shuffle_reduce_add(value, lanes: int):
 
 
 def _load_native(access, index):
-    """Load one buffer copy, still in the operand's own dtype."""
+    """One buffer copy, still in the operand's own dtype."""
     atom, dtype, width, _, div = access
     register = fx.make_rmem_tensor(width, dtype)
     fx.copy(atom, fx.slice(div, (None, index)), register)
@@ -117,7 +117,7 @@ def _copy_out(access, value, index):
 
 
 def _load(access, index):
-    """Load one activation-width span as fp32, joining wider operand storage."""
+    """One activation-width span as fp32, joining wider operand storage."""
     _, _, width, copies, _ = access
     if const_expr(copies == 1):
         return _load_native(access, index).to(fx.Float32)
@@ -129,7 +129,7 @@ def _load(access, index):
 
 
 def _store(access, value, index):
-    """Convert one activation-width span to the operand dtype and store it."""
+    """One activation-width span, converted to the operand dtype and stored."""
     _, dtype, width, copies, _ = access
     if const_expr(dtype is not fx.Float32):
         # gfx950 provides the packed fp32-to-bf16 conversion used by vector stores.
@@ -163,15 +163,9 @@ def _compiled_forward(
 ):
     """Build and memoize one feature-specialized forward launcher.
 
-    The arguments are the cache key, so a parameter added here without a
-    matching argument at the call site is a TypeError rather than a silently
-    shared kernel. ``device_index`` is part of that key even though the module
-    closes over no device; :mod:`quack.flydsl_runtime` explains why the caller
-    owns per-device keying.
-
-    Public ``torch.dtype`` values are resolved here, before FlyDSL traces the
-    nested kernel; device code captures only FlyDSL scalar types, bit widths,
-    and booleans.
+    Arguments are the cache key. ``device_index`` is in it because FlyDSL keys
+    artifacts by argument signature alone (see :mod:`quack.flydsl_runtime`).
+    torch dtypes resolve here, so device code captures only FlyDSL types.
     """
     input_dtype, input_bits = dtype_spec(input_torch_dtype)
     output_dtype, output_bits = dtype_spec(output_torch_dtype)
@@ -198,8 +192,7 @@ def _compiled_forward(
     class SharedStorage:
         s_red: fx.Array[fx.Float32, red_slots, 16]
 
-    # An input span is always one copy, which is what lets the register-cached
-    # pass below keep a tile in the input dtype.
+    # An input span is always one copy, so a cached tile stays in the input dtype.
     assert vecsize * input_bits <= MAX_ACCESS_BITS
 
     @flyc.kernel(**({} if block_threads <= 256 else {"known_block_size": [block_threads, 1, 1]}))
@@ -258,12 +251,10 @@ def _compiled_forward(
             return fx.memref_load(reduction, 0)
 
         def access(buffer, dtype, bits):
-            """Everything one operand needs: copy atom, element type, elements
-            per copy, copies per vector, and the divided view they index.
-
-            The copy width caps every MUBUF transaction at
-            ``MAX_ACCESS_BITS``, so an operand stored wider than the input takes
-            more than one copy. Narrower spans emit narrower transactions.
+            """Copy atom, element type, elements per copy, copies per vector,
+            and the divided view they index. ``MAX_ACCESS_BITS`` caps each MUBUF
+            transaction -- narrower spans emit narrower ones -- so an operand
+            wider than the input takes >1 copy.
             """
             width = min(vecsize, MAX_ACCESS_BITS // bits)
             return (
@@ -312,11 +303,10 @@ def _compiled_forward(
             )
             rstd_div = fx.logical_divide(rstd_buffer, fx.make_layout(1, 1))
 
-        # One driver owns the tile geometry for both passes. It hands the body
-        # the load index (clamped into the row), the unclamped store index, the
-        # store guard (None for a full tile) and the tile ordinal. Plain
-        # ``range`` is a runtime loop only inside the traced kernel, so keeping
-        # this nested is what bounds code size and VGPRs on wide rows.
+        # One tile-geometry driver for both passes: body(clamped load index,
+        # unclamped store index, store guard (None if full tile), tile ordinal).
+        # Nested so plain ``range`` traces as a runtime loop, bounding code size
+        # and VGPRs on wide rows.
         def sweep(body, reduce=False):
             total = fx.Float32(0.0)
             if const_expr(reload_from_gmem):
@@ -352,11 +342,10 @@ def _compiled_forward(
                     action()
 
         def row_span(index):
-            """This row's span at ``index``, summed with the residual if fused.
+            """This row's span at ``index``, plus the residual if fused.
 
-            Without a residual the span stays in the input dtype, which halves
-            the registers a cached tile costs; ``widen`` folds the conversion
-            into every consumer instead.
+            Without a residual it stays in the input dtype, halving a cached
+            tile's registers; ``widen`` folds the conversion into consumers.
             """
             value = _load_native(inp, index)
             if const_expr(has_residual):
@@ -533,17 +522,12 @@ def _validate_inputs(
 
 
 def _validate_scalars(eps, store_rstd, weight_offset):
-    """Check the Python scalars before anything can coerce them.
+    """Check the Python scalars before the dispatcher can coerce them.
 
-    These have to run outside the custom op: the dispatcher converts arguments
-    to the schema's types on the way in, so `eps=True` reaches the body as 1.0
-    and `store_rstd=1` as True. Validating inside would accept under
-    torch.compile what eager rejects, and `weight_offset=True` would silently
-    scale by (weight + 1).
-
-    float is the only type worth a fast path; numbers.Real is an ABC, so its
-    isinstance goes through __instancecheck__ and costs far more than the
-    concrete check that answers the common case.
+    Outside the custom op, since the dispatcher casts to the schema's types:
+    `eps=True` would reach the body as 1.0 and `store_rstd=1` as True, so
+    torch.compile would accept what eager rejects. The `type(x) is float` fast
+    paths skip numbers.Real's __instancecheck__ on the common case.
     """
     if type(eps) is not float:
         if isinstance(eps, bool) or not isinstance(eps, numbers.Real):
@@ -579,20 +563,16 @@ def _output_dtypes(x, residual, out_dtype, residual_dtype):
 
 
 def _absent(x, dtype):
-    """Stand-in for an output this call does not produce.
-
-    A custom op has fixed arity and its fake has to predict shapes exactly, so
-    "no rstd" cannot be None here. The caller drops these; they never escape.
-    """
+    """Stand-in for an output this call does not produce: a custom op has fixed
+    arity and its fake must predict shapes, so "no rstd" cannot be None here."""
     return torch.empty(0, device=x.device, dtype=dtype)
 
 
 def _rmsnorm_fwd_core(
     x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
 ):
-    """Shared body. Absent outputs come back as None, not as a sentinel tensor:
-    materializing two empty CUDA tensors costs 2.1us, which is an eighth of this
-    kernel's whole host path, and only the op boundary actually needs them."""
+    """Shared body; absent outputs are None, not sentinel tensors. Two empty CUDA
+    tensors cost 2.1us, an eighth of the host path, and only the op needs them."""
     m, n, num_heads, per_head = _validate_inputs(
         x, weight, bias, residual, out_dtype, residual_dtype, store_rstd, weight_offset
     )
@@ -688,8 +668,7 @@ def _rmsnorm_fwd_impl(
     weight_offset: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional, not mutating: inductor skips cudagraphs for a region whose op
-    writes into buffers it did not allocate, and letting the surrounding region
-    be captured is the whole reason to register this."""
+    writes into buffers it did not allocate."""
     out, residual_out, rstd = _rmsnorm_fwd_core(
         x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
     )
@@ -740,17 +719,13 @@ def rmsnorm_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run eager RMSNorm over the last dimension and return CuTe-compatible outputs.
 
-    Only routes through the registered op while Dynamo is watching: the
-    torch.library boundary buys an opaque graph node, and in eager there is
-    nobody to give it to. The two aliasing decisions the CuTe-compatible
-    contract asks for -- residual_out is x when nothing was accumulated, rstd is
-    None unless requested -- are made here, because an op may return neither one
-    of its inputs nor a None.
+    Routes through the registered op only under Dynamo, for the opaque graph
+    node. The CuTe aliasing -- residual_out is x when nothing was accumulated,
+    rstd is None unless requested -- is applied here, since an op may return
+    neither one of its inputs nor a None.
     """
     eps, weight_offset = _validate_scalars(eps, store_rstd, weight_offset)
     if torch.compiler.is_compiling():
-        # This branch runs once per trace, not per call, so resolving the
-        # dtypes again here is free and keeps one definition of the predicate.
         out, residual_out, rstd = _rmsnorm_fwd_op(
             x, weight, bias, residual, out_dtype, residual_dtype, eps, store_rstd, weight_offset
         )

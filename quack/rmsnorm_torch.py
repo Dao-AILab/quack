@@ -2,12 +2,9 @@
 
 """Pure-PyTorch references for the RMSNorm/LayerNorm family, shared by every backend.
 
-These live outside ``quack.rmsnorm`` so ROCm can reach them: that module pulls
-in the CuTe stack and fails to import without ``cuda.bindings``, while the
-FlyDSL backend and the shared benchmark need the same reference to compare
-against. Keeping a single copy is what stops the two backends from drifting
-onto subtly different baselines. ``quack.rmsnorm`` re-exports every name here,
-so existing importers are unaffected.
+Outside ``quack.rmsnorm`` so ROCm can reach them without the CuTe stack, and so
+both backends measure against one baseline. ``quack.rmsnorm`` re-exports every
+name here, so existing importers are unaffected.
 """
 
 import torch
@@ -23,10 +20,8 @@ __all__ = [
 
 
 def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6, weight_offset=0.0):
-    # rsqrt, not a divide by sqrt: equivalent to within an ulp, but rstd is
-    # what the kernels actually compute and return, and what rmsnorm_bwd_ref
-    # consumes -- naming it here keeps the reference's dataflow aligned with
-    # the kernel's.
+    # rsqrt, not a divide by sqrt: same to within an ulp, but rstd is what the
+    # kernels return and what rmsnorm_bwd_ref consumes.
     x_f32 = x.float()
     if residual is not None:
         residual_f32 = residual.float()

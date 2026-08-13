@@ -2,15 +2,13 @@
 
 """The rmsnorm_fwd forward contract, held against whichever backend this machine has.
 
-This is a temporary forward-contract suite, not complete RMSNorm coverage.
-Backward and other feature tests will follow as those FlyDSL paths are added.
+CuTe-DSL and FlyDSL implement the same function -- same arguments, same triple,
+same aliasing (residual_out is x when nothing was accumulated, rstd is None
+unless asked for) -- so most tests run on both and carry their
+tests/test_rmsnorm.py counterpart's name. The backend-specific ones reach FlyDSL
+host plumbing, cover a FlyDSL-only shape, or skip a case the CuTe suite owns.
 
-CuTe-DSL and FlyDSL implement the same function -- same arguments, same returned
-triple, same aliasing (residual_out is x when nothing was accumulated, rstd is
-None unless asked for). Most of this file therefore runs on both, and each test
-carries its tests/test_rmsnorm.py counterpart's name. Backend-specific tests
-either reach FlyDSL host plumbing, cover a FlyDSL-only shape, or avoid repeating
-an expensive case already owned by the CuTe suite.
+Forward only; backward follows as those FlyDSL paths are added.
 """
 
 import pytest
@@ -27,8 +25,7 @@ _flydsl_suite_owner = pytest.mark.skipif(
 )
 
 if _CAN_RUN:
-    # Through the package, not the backend module: quack/__init__.py picks the
-    # implementation, so a direct import would never notice a mis-pick.
+    # Through the package: a direct backend import would not notice a mis-pick.
     from quack import rmsnorm_fwd as _rmsnorm_fwd
 if _IS_FLYDSL:
     import quack.rmsnorm_flydsl as fly_rmsnorm
@@ -36,9 +33,8 @@ if _IS_FLYDSL:
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
-# Each backend keeps its own budget: CuTe's rsqrt is fastmath, which is what
-# spent bf16 down to 1e-1 in test_rmsnorm.py, while the FlyDSL kernel measured
-# 0.50 bf16 ULP against fp32.
+# Each backend keeps its own budget: CuTe's fastmath rsqrt is what spent bf16 down
+# to 1e-1 in test_rmsnorm.py, while the FlyDSL kernel measured 0.50 bf16 ULP.
 _ATOL, _RTOL = (
     ({torch.float16: 2e-3, torch.bfloat16: 2e-2, torch.float32: 2e-4}, 2e-3)
     if _IS_FLYDSL
@@ -131,9 +127,8 @@ def test_rmsnorm_weight_offset(n, use_compile):
 def test_rmsnorm_compile_2d_then_3d():
     """One compiled callable must take a 2D input then a 3D one, no dynamo.reset() between.
 
-    3D, not the 4D of the counterpart: that test calls rmsnorm(), which flattens
-    leading batch dims before the kernel sees them. At this level per-head input
-    is (rows, H, D).
+    3D, not the counterpart's 4D: that test calls rmsnorm(), which flattens leading
+    batch dims first. At this level per-head input is (rows, H, D).
     """
     torch._dynamo.reset()
     function = _fwd(use_compile=True)
@@ -191,8 +186,8 @@ def test_rmsnorm_qk(use_compile):
 def test_rmsnorm_qk_4d(use_compile):
     """FlyDSL flattens leading batch dims itself, so per-head input may be any rank.
 
-    CuTe's rmsnorm_fwd cannot take this: it builds a 3D per-head layout descriptor,
-    and rmsnorm() reshapes to it before the call.
+    CuTe's rmsnorm_fwd builds a 3D per-head layout descriptor and relies on
+    rmsnorm() reshaping to it first, so it cannot take this.
     """
     shape = (2, 3, 4, 64)
     x = torch.randn(shape, device=_DEVICE, dtype=torch.bfloat16)
@@ -235,9 +230,8 @@ def test_rmsnorm_large_tensor(n, use_compile):
     counterpart already covers the same m and n. Drop the marker to share it.
     """
     m, n_chunks = 32 * 1024, 16
-    # x + out must be fully materialized (irreducible); the reference is
-    # computed one m/n_chunks-row chunk at a time, so it never is. Gate on
-    # *free* memory so a partially-occupied GPU skips instead of OOMing.
+    # x + out are irreducible; the reference is chunked. Gate on *free* memory so
+    # a partially-occupied GPU skips instead of OOMing.
     torch.cuda.empty_cache()
     peak_bytes = 2 * m * n * 2 + 3 * (m // n_chunks) * n * 2
     free_bytes = torch.cuda.mem_get_info()[0]
@@ -251,9 +245,8 @@ def test_rmsnorm_large_tensor(n, use_compile):
     weight = torch.randn(n, device=_DEVICE, dtype=torch.float32)
     out, _, _ = _fwd(use_compile)(x, weight)
 
-    # Absolute only, at the counterpart's looser bf16 budget: one bf16 ULP is
-    # ~0.8% relative, so the file's rtol=2e-3 is tighter than correct rounding
-    # permits, and half a billion elements always reach that tail.
+    # Absolute only, at the counterpart's looser bf16 budget: one bf16 ULP is ~0.8%
+    # relative, so the file's rtol=2e-3 is tighter than correct rounding permits.
     for x_c, out_c in zip(x.chunk(n_chunks), out.chunk(n_chunks)):
         assert (out_c.float() - _reference(x_c, weight)[0]).abs().max() < 1e-1
 
@@ -310,8 +303,8 @@ def test_rmsnorm_compile_cache():
     call(3, 8, width=2 * n)
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 2
 
-    # So is a different dtype: dropped from the key, it would hand back a
-    # launcher built for another element width.
+    # So is a different dtype: dropped from the key, it would hand back a launcher
+    # built for another element width.
     call(3, 8, dtype=torch.bfloat16)
     assert fly_rmsnorm._compiled_forward.cache_info().currsize == 3
 

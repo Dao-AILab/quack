@@ -3,10 +3,8 @@
 """Which rmsnorm_fwd backend this machine can test, decided at import time.
 
 Not a conftest fixture: the test module needs the verdict before ``pytestmark``
-and before it picks which quack module to import.
-
-Nothing here imports quack or cutlass. ``torch.version.hip`` already separates
-the two builds, and importing cutlass on ROCm loads an MLIR runtime that is
+and before it picks a quack module to import. Imports neither quack nor cutlass
+-- ``torch.version.hip`` separates the builds, and cutlass loads an MLIR runtime
 incompatible with FlyDSL's.
 """
 
@@ -24,8 +22,8 @@ ARCH = (
     else None
 )
 
-# Selection is a build fact; runnability additionally needs a device and, on
-# ROCm, the optional package plus an architecture the kernel implements.
+# Selection is a build fact; running also needs a device and, on ROCm, gfx950
+# plus the optional package.
 SELECTED_BACKEND = "flydsl" if _IS_ROCM else "cute"
 
 if not _HAS_GPU:

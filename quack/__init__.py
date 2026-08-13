@@ -6,11 +6,9 @@ from quack._platform import IS_ROCM_BUILD
 
 _CUTE_ONLY_EXPORTS = frozenset({"RoundingMode", "cross_entropy", "rmsnorm", "softmax"})
 
-# FlyDSL is a backend of quack's RMSNorm forward, not a separate library: the
-# two implementations take the same arguments and return the same triple, so
-# the caller picks a device, not a backend. Resolved on first attribute access
-# rather than at import so `import quack` does not pull in a backend nobody
-# asked for.
+# Both RMSNorm forward backends take the same arguments and return the same
+# triple, so the caller picks a device, not a backend. Resolved on first
+# attribute access so `import quack` pulls in neither DSL by itself.
 _FORWARD_BACKENDS = {"rmsnorm_fwd": "quack.rmsnorm_flydsl" if IS_ROCM_BUILD else "quack.rmsnorm"}
 
 

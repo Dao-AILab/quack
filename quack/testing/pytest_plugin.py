@@ -217,9 +217,7 @@ def pytest_configure(config):
 
             n_workers = int(_os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
             pool = activate(max(2, jobs // n_workers))
-            # Record the state instead of asking teardown to reconstruct it
-            # from the option and platform. Set before prewarm so a failed
-            # prewarm still leaves enough information to deactivate the pool.
+            # Set before prewarm so a failed prewarm still tears the pool down.
             config._quack_async_pool_active = True
             pool.prewarm()  # sidecar import overlaps collection, not the first miss
             if worker is not None:
