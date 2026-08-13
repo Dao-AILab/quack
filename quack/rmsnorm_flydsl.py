@@ -21,7 +21,7 @@ if not IS_ROCM_BUILD:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp
 
@@ -87,7 +87,7 @@ def _ds_swizzle_xor(value, offset: int):
     return fx.Uint32(peer).bitcast(fx.Float32)
 
 
-def _shuffle_reduce_add(value, lanes: int, fast_math):
+def _shuffle_reduce_add(value, lanes: int):
     result = value
     for shift_exp in range_constexpr(int(math.log2(lanes))):
         offset = lanes // (2 << shift_exp)
@@ -97,8 +97,7 @@ def _shuffle_reduce_add(value, lanes: int, fast_math):
             peer = _ds_swizzle_xor(result, offset)
         else:
             peer = fx.gpu.shuffle_xor(result, offset, fx.Int32(lanes))
-        with fx.arith.fastmath(fast_math):
-            result = result + peer
+        result = result + peer
     return result
 
 
@@ -228,14 +227,12 @@ def _compiled_forward(
         row = program // fx.Int32(num_heads) if per_head else program
         head = program % fx.Int32(num_heads) if per_head else fx.Int32(0)
 
-        fast_math = arith.FastMathFlags.fast
-
         if const_expr(red_slots > 1):
             storage = fx.SharedAllocator().allocate(SharedStorage).peek()
             reduction = storage.s_red.view(fx.make_layout(red_slots, 1))
 
         def group_reduce_add(value):
-            return _shuffle_reduce_add(value, reduce_lanes, fast_math)
+            return _shuffle_reduce_add(value, reduce_lanes)
 
         def row_reduce_add(value):
             """Sum one row's partials: in-wave shuffles, then LDS across waves."""
@@ -379,7 +376,7 @@ def _compiled_forward(
                 guarded(guard, lambda: _store(res_out, wide, store_index))
             if const_expr(not reload_from_gmem):
                 cached.append(value)
-            contribution = (wide * wide).reduce(ReductionOp.ADD, fastmath=fast_math)
+            contribution = (wide * wide).reduce(ReductionOp.ADD)
             if const_expr(guard is None):
                 return contribution
             return guard.select(contribution, fx.Float32(0.0))
@@ -398,7 +395,7 @@ def _compiled_forward(
             guarded(guard, lambda: _store(out, result, store_index))
 
         sum_sq = row_reduce_add(sweep(accumulate, reduce=True))
-        rrms = fmath.rsqrt(sum_sq / float(n) + eps, fastmath=fast_math)
+        rrms = fmath.rsqrt(sum_sq / float(n) + eps)
         if const_expr(store_rstd):  # noqa: SIM102 - compile-time guard
             if lane == 0:
                 rstd_div[program] = rrms
@@ -440,7 +437,7 @@ def _compiled_forward(
             stream=stream,
         )
 
-    return launch_rmsnorm
+    return flyc.compile[{"fastmath": "fast"}](launch_rmsnorm)
 
 
 def _validate_inputs(
