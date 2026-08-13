@@ -3,9 +3,12 @@
 """Which rmsnorm_fwd backend this machine can test, decided at import time.
 
 Not a conftest fixture: the test module needs the verdict before ``pytestmark``
-and before it picks a quack module to import. Imports neither quack nor cutlass
--- ``torch.version.hip`` separates the builds, and cutlass loads an MLIR runtime
-incompatible with FlyDSL's.
+and before it picks a quack module to import.
+
+Recomputes ``torch.version.hip`` instead of importing :data:`IS_ROCM_BUILD`,
+because reaching ``quack._platform`` executes ``quack/__init__.py``, which on
+CUDA pulls in the whole CuTe stack -- a skip verdict must not depend on the
+stack under test importing cleanly.
 """
 
 import importlib.util

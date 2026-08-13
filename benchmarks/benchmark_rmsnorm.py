@@ -1,4 +1,5 @@
 import argparse
+from typing import Optional
 
 import torch
 import torch._functorch.config as _functorch_config
@@ -70,7 +71,9 @@ def _bwd_providers():
     return [("quack", "quack"), ("torch_compile", "torch.compile")]
 
 
-def make_fwd_benchmark(dtype_name: str, residual_dtype_name: str | None, x_vals=None) -> Benchmark:
+def make_fwd_benchmark(
+    dtype_name: str, residual_dtype_name: Optional[str], x_vals=None
+) -> Benchmark:
     line_vals, line_names = zip(*_fwd_providers())
     suffix = dtype_name + (f"-res-{residual_dtype_name}" if residual_dtype_name else "")
     return Benchmark(
@@ -86,7 +89,9 @@ def make_fwd_benchmark(dtype_name: str, residual_dtype_name: str | None, x_vals=
     )
 
 
-def make_bwd_benchmark(dtype_name: str, residual_dtype_name: str | None, x_vals=None) -> Benchmark:
+def make_bwd_benchmark(
+    dtype_name: str, residual_dtype_name: Optional[str], x_vals=None
+) -> Benchmark:
     line_vals, line_names = zip(*_bwd_providers())
     suffix = dtype_name + (f"-res-{residual_dtype_name}" if residual_dtype_name else "")
     if x_vals is None:
@@ -107,7 +112,7 @@ def make_bwd_benchmark(dtype_name: str, residual_dtype_name: str | None, x_vals=
     )
 
 
-def _fwd_mem_bytes(x: torch.Tensor, w: torch.Tensor, residual: torch.Tensor | None) -> int:
+def _fwd_mem_bytes(x: torch.Tensor, w: torch.Tensor, residual: Optional[torch.Tensor]) -> int:
     nbytes = 2 * x.numel() * x.dtype.itemsize + w.numel() * w.dtype.itemsize
     if residual is not None:
         nbytes += 2 * residual.numel() * residual.dtype.itemsize
@@ -161,7 +166,6 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     eps = 1e-6
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
-    # fp32 (master) weight, so fwd and bwd report the same configuration.
     w = torch.randn(N, device="cuda", dtype=torch.float32)
     residual = (
         torch.randn(M, N, device="cuda", dtype=residual_dtype)

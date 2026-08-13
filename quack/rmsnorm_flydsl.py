@@ -59,13 +59,7 @@ def _row_records(elem_bits: int, n: int, valid=None):
 
 
 def _shuffle_reduce_add(value, lanes: int):
-    """Butterfly-sum a row's partials across ``lanes`` lanes of a wave.
-
-    Hand-written DPP and ds_swizzle used to cover offsets <= 16 here. Measured
-    at parity on gfx950 bf16 (N=256..16384, interleaved A/B), so they only bought
-    a raw upstream-MLIR dependency -- unstable under FlyDSL's api_stability.md
-    §2.4 -- and are gone. Re-measure before reaching for them again.
-    """
+    """Butterfly-sum a row's partials across ``lanes`` lanes of a wave."""
     result = value
     for shift_exp in range_constexpr(int(math.log2(lanes))):
         offset = lanes // (2 << shift_exp)
