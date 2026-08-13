@@ -14,7 +14,7 @@ import numbers
 import torch
 
 from quack._platform import IS_ROCM_BUILD
-from quack.flydsl_constants import ACCESS_BITS
+from quack.flydsl_constants import MAX_ACCESS_BITS
 
 if not IS_ROCM_BUILD:
     raise ImportError("quack.rmsnorm_flydsl requires a ROCm PyTorch build")
@@ -200,7 +200,7 @@ def _compiled_forward(
 
     # An input span is always one copy, which is what lets the register-cached
     # pass below keep a tile in the input dtype.
-    assert vecsize * input_bits <= ACCESS_BITS
+    assert vecsize * input_bits <= MAX_ACCESS_BITS
 
     @flyc.kernel(**({} if block_threads <= 256 else {"known_block_size": [block_threads, 1, 1]}))
     def rmsnorm_kernel(
@@ -261,10 +261,11 @@ def _compiled_forward(
             """Everything one operand needs: copy atom, element type, elements
             per copy, copies per vector, and the divided view they index.
 
-            The copy width caps every MUBUF transaction at 128 bits, so an
-            operand stored wider than the input takes more than one copy.
+            The copy width caps every MUBUF transaction at
+            ``MAX_ACCESS_BITS``, so an operand stored wider than the input takes
+            more than one copy. Narrower spans emit narrower transactions.
             """
-            width = min(vecsize, ACCESS_BITS // bits)
+            width = min(vecsize, MAX_ACCESS_BITS // bits)
             return (
                 fx.make_copy_atom(fx.rocdl.BufferCopy(width * bits, 0), bits),
                 dtype,
@@ -488,7 +489,7 @@ def _validate_inputs(
 
     if x.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(f"x dtype must be float16, bfloat16, or float32, got {x.dtype}")
-    alignment = ACCESS_BITS // (x.element_size() * 8)
+    alignment = MAX_ACCESS_BITS // (x.element_size() * 8)
     if n % alignment:
         raise ValueError(f"x normalized dimension must be a multiple of {alignment}, got {n}")
     for name, dtype in (("out_dtype", out_dtype), ("residual_dtype", residual_dtype)):

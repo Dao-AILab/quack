@@ -13,11 +13,13 @@ from quack.rmsnorm_torch import rmsnorm_ref
 # bwd path. Must be set before torch.compile builds the bwd graph.
 _functorch_config.donated_buffer = False
 
-# dynamic=False makes every (M, N) a fresh graph, and the recompile budget is
-# per code object, so the ladder's rungs share one. At the default limit of 8,
-# the last rungs stop compiling and silently report eager timings under the
-# torch.compile heading -- a 4-6x understatement of the baseline at the widest
-# rows. Raise it past the rung count instead, as tests/test_rmsnorm.py does.
+# Keep N static: after the first recompile, automatic dynamic shapes generalize
+# the reduction dimension and Inductor drops its persistent-reduction schedule.
+# ``dynamic=False`` therefore gives every (M, N) a fresh graph. The recompile
+# budget is per code object, so the ladder's rungs share one; at the default
+# limit of 8, the last rungs silently report eager timings under the
+# torch.compile heading. Raise it past the rung count, as tests/test_rmsnorm.py
+# does.
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 

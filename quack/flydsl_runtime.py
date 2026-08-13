@@ -24,7 +24,7 @@ module's disk half is CuTe-specific (``.o`` export plus a tvm_ffi
 import torch
 
 from quack._platform import IS_ROCM_BUILD
-from quack.flydsl_constants import ACCESS_BITS
+from quack.flydsl_constants import MAX_ACCESS_BITS
 
 if not IS_ROCM_BUILD:
     raise ImportError("quack.flydsl_runtime requires a ROCm PyTorch build")
@@ -34,7 +34,7 @@ import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 
 __all__ = [
-    "ACCESS_BITS",
+    "MAX_ACCESS_BITS",
     "SUPPORTED_DTYPES",
     "current_raw_stream",
     "dtype_spec",
@@ -132,7 +132,7 @@ def empty_placeholder(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 def _rows_are_disjoint_and_packed(tensor: torch.Tensor) -> bool:
     if tensor.stride(-1) != 1:
         return False
-    access_bytes = ACCESS_BITS // 8
+    access_bytes = MAX_ACCESS_BITS // 8
     if tensor.data_ptr() % access_bytes:
         return False
     span = tensor.shape[-1]

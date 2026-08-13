@@ -3,15 +3,15 @@
 """Launch heuristic for the eager FlyDSL RMSNorm forward kernel.
 
 Plain Python, no DSL: the geometry here is chosen on the host before any
-kernel is built. ``ACCESS_BITS`` comes from a dependency-free leaf because the
-same width bounds both the vector size chosen here and every runtime row access;
-the two layers cannot disagree.
+kernel is built. ``MAX_ACCESS_BITS`` comes from a dependency-free leaf because
+the same ceiling bounds both the vector size chosen here and every runtime row
+access; the two layers cannot disagree.
 """
 
 import math
 from dataclasses import dataclass
 
-from quack.flydsl_constants import ACCESS_BITS
+from quack.flydsl_constants import MAX_ACCESS_BITS
 
 WAVE_SIZE = 64
 MIN_NUM_THREADS = WAVE_SIZE
@@ -76,7 +76,7 @@ class RmsNormFwdConfig:
 def _vector_size(n: int, dtype_width: int) -> int:
     if dtype_width not in (16, 32):
         raise ValueError(f"unsupported element width: {dtype_width} bits")
-    return math.gcd(n, ACCESS_BITS // dtype_width)
+    return math.gcd(n, MAX_ACCESS_BITS // dtype_width)
 
 
 __all__ = [
