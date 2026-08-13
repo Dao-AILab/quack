@@ -273,6 +273,26 @@ def test_rmsnorm_input_validation():
 
 
 @_requires_flydsl
+def test_rmsnorm_rejects_compile_only(monkeypatch):
+    """COMPILE_ONLY must not return output buffers that no kernel wrote."""
+    x = torch.randn(2, 320, device=_DEVICE, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("COMPILE_ONLY", "1")
+    with pytest.raises(RuntimeError, match="unset COMPILE_ONLY"):
+        fly_rmsnorm.rmsnorm_fwd(x)
+
+    # A rejected cold call must not poison the launcher, and a warmed launcher
+    # must not bypass the same public-API guard.
+    monkeypatch.delenv("COMPILE_ONLY")
+    out, _, _ = fly_rmsnorm.rmsnorm_fwd(x)
+    _assert_close(out, _reference(x)[0], x.dtype)
+
+    monkeypatch.setenv("COMPILE_ONLY", "true")
+    with pytest.raises(RuntimeError, match="unset COMPILE_ONLY"):
+        fly_rmsnorm.rmsnorm_fwd(x)
+
+
+@_requires_flydsl
 def test_rmsnorm_compile_cache():
     """One launcher per specialization; row padding and row count are not part of it."""
     n = 192

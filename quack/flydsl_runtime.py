@@ -15,6 +15,8 @@ CuTe-specific (``.o`` export plus tvm_ffi ``load_module``) and imports cutlass,
 so it will not load on ROCm.
 """
 
+import os
+
 import torch
 
 from quack._platform import IS_ROCM_BUILD
@@ -152,7 +154,7 @@ class Launcher:
     load cheaper than the ``getattr`` default it replaces.
     """
 
-    __slots__ = ("jit_fn", "cf")
+    __slots__ = ("cf", "jit_fn")
 
     def __init__(self, jit_fn):
         self.jit_fn = jit_fn
@@ -172,6 +174,11 @@ def run_compiled(
     pipeline once and either artifact is valid. validate_arch runs on the miss
     only, so a mid-process ARCH change goes undetected once an artifact exists.
     """
+    if os.environ.get("COMPILE_ONLY", "").lower() in ("1", "true", "yes", "on"):
+        raise RuntimeError(
+            f"FlyDSL {kernel} cannot execute with COMPILE_ONLY enabled because it skips "
+            "kernel launches; unset COMPILE_ONLY"
+        )
     with torch.cuda.device(device):
         if launcher.cf is not None:
             launcher.cf(*args)
