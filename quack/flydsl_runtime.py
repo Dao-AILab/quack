@@ -3,12 +3,12 @@
 """Generic host plumbing shared by every FlyDSL kernel: arch validation, launch
 dispatch, stream and dtype translation, ROCm buffer-descriptor row rules.
 
-``run_compiled`` holds one artifact per launcher and keys nothing itself, so
-**the caller must key its launchers by device** as well as by specialization.
-FlyDSL keys artifacts on the JitFunction by argument signature alone, so a
-launcher shared across GPUs hands the second one a module loaded into the
-first one's context: hipErrorInvalidDevice. FlyDSL's own on-disk cache under
-``~/.flydsl/cache`` sits below both.
+A ``Launcher`` holds one artifact and keys nothing itself, so **the caller must
+key its launchers by device** as well as by specialization. FlyDSL keys
+artifacts on the JitFunction by argument signature alone, so a launcher shared
+across GPUs hands the second one a module loaded into the first one's context:
+hipErrorInvalidDevice. FlyDSL's own on-disk cache under ``~/.flydsl/cache``
+sits below both.
 
 A sibling of :mod:`quack.cache.jit`, not a reuse: that module's disk half is
 CuTe-specific (``.o`` export plus tvm_ffi ``load_module``) and imports cutlass,
@@ -30,6 +30,7 @@ from flydsl.runtime.device import get_rocm_arch
 __all__ = [
     "MAX_ACCESS_BITS",
     "SUPPORTED_DTYPES",
+    "Launcher",
     "current_raw_stream",
     "dtype_spec",
     "empty_placeholder",
@@ -141,7 +142,26 @@ def packed_rows(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone(memory_format=torch.contiguous_format)
 
 
-def run_compiled(exe, device: torch.device, args: tuple, *, supported: frozenset, kernel: str):
+class Launcher:
+    """A FlyDSL entry point plus the ``CompiledFunction`` its first launch builds.
+
+    The artifact is held here rather than attached to the ``JitFunction``: that
+    object's underscore namespace belongs to FlyDSL (api_stability.md §2), it has
+    no ``__slots__`` to catch a collision, and FlyDSL's own ``_mem_cache`` already
+    keys artifacts by argument signature. ``__slots__`` also makes the hot-path
+    load cheaper than the ``getattr`` default it replaces.
+    """
+
+    __slots__ = ("jit_fn", "cf")
+
+    def __init__(self, jit_fn):
+        self.jit_fn = jit_fn
+        self.cf = None
+
+
+def run_compiled(
+    launcher: Launcher, device: torch.device, args: tuple, *, supported: frozenset, kernel: str
+):
     """Dispatch a launcher, compiling it on this process's first use.
 
     Follows aiter's ``_run_compiled``: the ``CompiledFunction`` is stashed on the
@@ -153,9 +173,8 @@ def run_compiled(exe, device: torch.device, args: tuple, *, supported: frozenset
     only, so a mid-process ARCH change goes undetected once an artifact exists.
     """
     with torch.cuda.device(device):
-        cf = getattr(exe, "_cf", None)
-        if cf is not None:
-            cf(*args)
+        if launcher.cf is not None:
+            launcher.cf(*args)
             return
         validate_arch(device, supported, kernel)
-        exe._cf = flyc.compile(exe, *args)
+        launcher.cf = flyc.compile(launcher.jit_fn, *args)

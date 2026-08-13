@@ -29,6 +29,7 @@ from quack.flydsl_runtime import (
     SUPPORTED_DTYPES as _SUPPORTED_DTYPES,
 )
 from quack.flydsl_runtime import (
+    Launcher,
     current_raw_stream,
     dtype_spec,
     empty_placeholder,
@@ -57,8 +58,10 @@ def _row_records(elem_bits: int, n: int, valid=None):
     return valid.select(fx.Int32(row_bytes), fx.Int32(0))
 
 
-# Raw ROCDL, since FlyDSL has no wrapper: these keep the intra-wave reduction out
-# of LDS, so only cross-wave rows touch shared memory.
+# Raw upstream-MLIR ROCDL builders, unstable under FlyDSL's api_stability.md §2.4
+# (re-exported through fx.rocdl but absent from its __all__). fx.gpu.shuffle_xor
+# below is the stable path; these are taken for speed, keeping the intra-wave
+# reduction out of LDS so only cross-wave rows touch shared memory.
 def _dpp_shuffle_xor(value, offset: int):
     raw = value.ir_value()
     result_type = raw.type
@@ -427,7 +430,7 @@ def _compiled_forward(
             stream=stream,
         )
 
-    return flyc.compile[{"fastmath": "fast"}](launch_rmsnorm)
+    return Launcher(flyc.compile[{"fastmath": "fast"}](launch_rmsnorm))
 
 
 def _validate_inputs(
@@ -616,7 +619,7 @@ def _rmsnorm_fwd_core(
         device_index = torch.cuda.current_device()
     # Positional, not keyword: matching sixteen keywords through lru_cache costs
     # ~0.4us per launch on gfx950, against a ~20us host path at small M.
-    exe = _compiled_forward(
+    launcher = _compiled_forward(
         device_index,
         n,
         x_flat.dtype,
@@ -647,7 +650,7 @@ def _rmsnorm_fwd_core(
         weight_offset,
         current_raw_stream(x.device),
     )
-    run_compiled(exe, x.device, args, supported=_SUPPORTED_ARCHES, kernel="RMSNorm")
+    run_compiled(launcher, x.device, args, supported=_SUPPORTED_ARCHES, kernel="RMSNorm")
 
     return (
         out_flat.reshape(x.shape),
