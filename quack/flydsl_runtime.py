@@ -174,14 +174,14 @@ def run_compiled(
     pipeline once and either artifact is valid. validate_arch runs on the miss
     only, so a mid-process ARCH change goes undetected once an artifact exists.
     """
-    if os.environ.get("COMPILE_ONLY", "").lower() in ("1", "true", "yes", "on"):
-        raise RuntimeError(
-            f"FlyDSL {kernel} cannot execute with COMPILE_ONLY enabled because it skips "
-            "kernel launches; unset COMPILE_ONLY"
-        )
     with torch.cuda.device(device):
         if launcher.cf is not None:
             launcher.cf(*args)
             return
+        # Quack has no compile-only API. FlyDSL checks this generic environment
+        # variable only on its JitFunction path, where it would suppress the
+        # mandatory first launch; compiled-callable hits do not consult it.
+        if os.environ.get("COMPILE_ONLY", "").lower() in ("1", "true", "yes", "on"):
+            raise RuntimeError(f"COMPILE_ONLY is unsupported by eager FlyDSL {kernel}")
         validate_arch(device, supported, kernel)
         launcher.cf = flyc.compile(launcher.jit_fn, *args)
