@@ -188,7 +188,12 @@ from quack.gemm_runtime.identity import (
     module_locator,
     register_local_epi_mod,
 )
-from quack.gemm_config import SplitKMode, blockscaled_default_config, default_config
+from quack.gemm_config import (
+    SplitKMode,
+    blockscaled_default_config,
+    cta_tile_shape_m,
+    default_config,
+)
 from quack.gemm_tvm_ffi_utils import tensor_key
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
@@ -304,20 +309,27 @@ class EpiMod:
     ):
         self.fn = fn
         # ``outputs`` entries are names or TileStore instances (per-op config:
-        # rounding, predicate); a bare name gets a default TileStore.
+        # rounding, predicate, quantize codec); a bare name gets a default
+        # TileStore.
         self.output_ops = {}
         out_names = []
+        quant_ops = []
         for out in outputs:
             if isinstance(out, TileStore):
                 out_names.append(out.name)
                 self.output_ops[out.name] = out
+                if out.quant is not None:
+                    quant_ops.append(out.quant)
             else:
                 out_names.append(out)
         self.outputs = tuple(out_names)
         # ``extra_ops``: ops the driver consumes that the fn never sees (e.g.
         # Scalar("sr_seed") feeding stochastic-rounding stores). Their values
-        # travel through epi_args under the op name.
-        self.extra_ops = tuple(extra_ops)
+        # travel through epi_args under the op name. An output's quantize
+        # codec (TileStore(quant=...)) is exactly such an op — lift it here so
+        # its SF tensor arg, params, and begin/end lifecycle ride the standard
+        # op plumbing.
+        self.extra_ops = tuple(extra_ops) + tuple(quant_ops)
         self.ops = dict(ops or {})  # explicit EpiOp pins: {operand_name: EpiOp instance}
         # Sink-port ops by output name; ``reduces`` is kept as sugar for the
         # common VecReduce case, ``outs`` is the general form (any fn_port ==
@@ -864,12 +876,22 @@ class EpiMod:
         for out_name in self.outputs:
             if out_name not in epi_args:
                 raise ValueError(f"missing epilogue output buffer '{out_name}'")
+            import torch
+
+            aux = epi_args[out_name]
             out_n = n_gemm // 2 if paired_acc else n_gemm
-            _require_shape(out_name, epi_args[out_name], _tile_shape(batch, m, out_n, varlen_m))
+            if aux.dtype == torch.float4_e2m1fn_x2:
+                out_n //= 2  # fp4 values are stored packed, two per byte
+            _require_shape(out_name, aux, _tile_shape(batch, m, out_n, varlen_m))
             if paired_acc:
-                aux = epi_args[out_name]
-                if aux.element_size() != 2:
-                    raise TypeError("acc_pair auxiliary output must have a 16-bit dtype")
+                # fp8/fp4 gated aux = quantized postact (SM100-only; the
+                # TileStore op asserts the arch at trace time).
+                if aux.element_size() != 2 and aux.dtype not in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                    torch.float4_e2m1fn_x2,
+                ):
+                    raise TypeError("acc_pair auxiliary output must be 16-bit (or fp8/fp4)")
                 if aux.stride(-1) != 1 or (D is not None and D.stride(-1) != 1):
                     raise ValueError("acc_pair auxiliary output and D must be N-major")
         # Swap-at-trace relabels pinned vec pins into KERNEL coordinates: a
@@ -931,6 +953,12 @@ class EpiMod:
             epi_values[name] = epi_args[name]
         for out_name in self.outputs:
             epi_values[out_name] = epi_args[out_name]
+        # Sink partials are per-CTA-tile along the reduce dim: under the SM100
+        # 2-CTA MMA (even cluster_M) each CTA of the pair owns half the M tile,
+        # so M-tile-unit buffers count in cta_tile_M, not tile_M.
+        cta_tile_M = cta_tile_shape_m(
+            tile_M, cluster_M, get_device_capacity(A.device)[0], blockscaled
+        )
         for sink_name in self.sinks:
             if sink_name not in epi_args:
                 raise ValueError(f"missing sink output buffer '{sink_name}'")
@@ -947,11 +975,24 @@ class EpiMod:
                     varlen_m=varlen_m,
                     epi_args=epi_args,
                 )
+            if varlen_m and getattr(op, "dim", 0) == 1 and getattr(op, "combine", "add") != "add":
+                # Zero-filled OOB rows (the varlen ragged-load contract) are
+                # the identity for add only; a segment-max finalize would also
+                # break graph-safety.
+                raise ValueError(
+                    f"sink '{sink_name}': combine={op.combine!r} M-fold reduces are not "
+                    "supported under varlen_m"
+                )
             alloc = getattr(op, "sink_alloc_shape", None)
             if alloc is not None:
                 lead_k = (m,) if varlen_m or batch is None else (batch, m)
+                num_seqs_k = (
+                    cu_seqlens_m.shape[0] - 1 if varlen_m and getattr(op, "dim", 0) == 1 else None
+                )
                 _require_shape(
-                    sink_name, epi_args[sink_name], alloc(lead_k, n_gemm, tile_M, tile_N)
+                    sink_name,
+                    epi_args[sink_name],
+                    alloc(lead_k, n_gemm, cta_tile_M, tile_N, num_seqs=num_seqs_k),
                 )
             if getattr(op, "check_oob", True) is False:
                 # The reduce dim must be tile-divisible: dim 0 (colvec) reduces
@@ -963,10 +1004,10 @@ class EpiMod:
                             f"sink '{sink_name}': check_oob=False requires N divisible by "
                             f"tile_N (N={n_gemm}, tile_N={tile_N})"
                         )
-                elif varlen_m or m % tile_M:
+                elif varlen_m or m % cta_tile_M:
                     raise ValueError(
-                        f"sink '{sink_name}': check_oob=False requires M divisible by tile_M "
-                        f"and no varlen_m (M={m}, tile_M={tile_M})"
+                        f"sink '{sink_name}': check_oob=False requires M divisible by the "
+                        f"per-CTA tile and no varlen_m (M={m}, cta_tile_M={cta_tile_M})"
                     )
             epi_values[sink_name] = epi_args[sink_name]
         for op in self.extra_ops:
@@ -1145,10 +1186,11 @@ class EpiMod:
                 out[name] = torch.empty((*lead, n_store), dtype=dt, device=A.device)
         return out
 
-    def _alloc_sinks(self, epi_args, lead, n, config, device):
+    def _alloc_sinks(self, epi_args, lead, n, config, device, blockscaled=False, num_seqs=None):
         """Reduce partials are config-shaped scratch, not outputs: allocated
         per call (stream-safe, graph-pool friendly). A caller-provided buffer
-        (same name in operands) is used as-is and returned raw."""
+        (same name in operands) is used as-is and returned raw. ``num_seqs``
+        (varlen_m only): dim==1 partials are per-sequence tile-prefix rows."""
         import torch
 
         bufs = {}
@@ -1158,9 +1200,32 @@ class EpiMod:
             # NOTE: for full-vector sinks (ColVecSelect), rows the kernel
             # never writes (out-of-range select indices) stay uninitialized —
             # callers who care pass the buffer.
-            shape = op.sink_alloc_shape(lead, n, config.tile_m, config.tile_n)
+            cta_tile_m = cta_tile_shape_m(
+                config.tile_m, config.cluster_m, config.device_capacity, blockscaled
+            )
+            shape = op.sink_alloc_shape(
+                lead,
+                n,
+                cta_tile_m,
+                config.tile_n,
+                num_seqs=num_seqs if getattr(op, "dim", 0) == 1 else None,
+            )
             bufs[name] = epi_args[name] = torch.empty(shape, dtype=torch.float32, device=device)
         return bufs
+
+    def _finalize_sink(self, name, buf, cu_seqlens_m, plan):
+        """Fold a sink's partial buffer to the user-visible value. Under
+        varlen_m, M-fold (dim==1) sinks use per-sequence segment finalization
+        (rows grouped by the cu_tiles_m prefix, -> (num_seqs, n)); everything
+        else keeps the op's plain host_finalize."""
+        op = self.sinks[name]
+        tile_m = getattr(plan, "cu_tiles_tile_m", None)
+        if cu_seqlens_m is not None and tile_m is not None:
+            finalize_varlen = getattr(op, "host_finalize_varlen", None)
+            if finalize_varlen is not None:
+                return finalize_varlen(buf, cu_seqlens_m, tile_m)
+        finalize = getattr(op, "host_finalize", None)
+        return finalize(buf) if finalize is not None else buf
 
     def _iface_execute(self, config, dynamic_scheduler, ctx, _launch=True):
         import torch
@@ -1170,13 +1235,22 @@ class EpiMod:
         epi_args = dict(ctx["operands"])
         for name in self.outputs:
             epi_args[name] = ctx["out"][name]
-        sink_bufs = self._alloc_sinks(epi_args, ctx["lead"], ctx["n"], config, A.device)
+        blockscaled = ctx.get("SFA") is not None
+        cu_seqlens_m_ctx = ctx.get("cu_seqlens_m")
+        sink_bufs = self._alloc_sinks(
+            epi_args,
+            ctx["lead"],
+            ctx["n"],
+            config,
+            A.device,
+            blockscaled,
+            num_seqs=None if cu_seqlens_m_ctx is None else cu_seqlens_m_ctx.shape[0] - 1,
+        )
         semaphore = (
             torch.zeros(1, dtype=torch.int32, device=A.device)
             if dyn and get_device_capacity(A.device)[0] == 9
             else None
         )
-        blockscaled = ctx.get("SFA") is not None
         A_bundle = ctx.get("A_bundle")  # runtime-operand transform: A crosses bundled
         plan = self.gemm(
             A if A_bundle is None else A_bundle,
@@ -1414,8 +1488,7 @@ class EpiMod:
                 )
                 result = dict(outs) if store_d else {kk: v for kk, v in outs.items() if kk != "D"}
                 for name, buf in sink_bufs.items():
-                    finalize = getattr(self.sinks[name], "host_finalize", None)
-                    result[name] = finalize(buf) if finalize is not None else buf
+                    result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan)
                 return result
 
         varlen_m = cu_seqlens_m is not None
@@ -1449,11 +1522,14 @@ class EpiMod:
                 # sink_arg_shapes walks the full config space — cache the
                 # worst-case shapes per metadata (it's on the warm path).
                 l = lead[0] if len(lead) == 2 else None
-                shape_key = (lead[-1], n, l, str(A.device))
+                num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
+                shape_key = (lead[-1], n, l, str(A.device), num_seqs)
                 cache = self.__dict__.setdefault("_sink_shape_cache", {})
                 shapes = cache.get(shape_key)
                 if shapes is None:
-                    shapes = sink_arg_shapes(self, lead[-1], n, l=l, device=A.device)
+                    shapes = sink_arg_shapes(
+                        self, lead[-1], n, l=l, device=A.device, num_seqs=num_seqs
+                    )
                     cache[shape_key] = shapes
                 for name, shape in shapes.items():
                     if epi_args.get(name) is None:
@@ -1542,8 +1618,7 @@ class EpiMod:
             )
         result = dict(out) if store_d else {k: v for k, v in out.items() if k != "D"}
         for name, buf in sink_bufs.items():
-            finalize = getattr(self.sinks[name], "host_finalize", None)
-            result[name] = finalize(buf) if finalize is not None else buf
+            result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan_used)
         return result
 
     def plan(

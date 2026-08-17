@@ -28,12 +28,16 @@ from quack.gemm_tvm_ffi_utils import (
     get_dtypes,
     make_scheduler_args,
     make_fake_scheduler_args,
+    make_fake_gemm_tensors,
+    make_fake_sf_tensor,
     compile_gemm_kernel,
+    resolve_blockscaled_formats,
     tensor_key,
     scalar_mode,
     scalar_arg,
     plan_scheduler_args,
     launch_gemm,
+    validate_blockscaled_sf,
 )
 from quack.cache import jit_cache
 from quack.tile_scheduler import TriangularTileScheduler
@@ -113,6 +117,11 @@ def _compile_gemm_symmetric(
     beta_mode,
     device_capacity,
     batched=True,
+    sf_dtype=None,  # blockscaled scale-factor dtype (cutlass), None for dense
+    sf_vec_size=None,
+    sf_batched=True,
+    a_mma_dtype=None,  # blockscaled MMA element types (see compile_gemm_kernel)
+    b_mma_dtype=None,
 ):
     sm_to_cls = {
         8: GemmSymmetricSm80,
@@ -122,23 +131,26 @@ def _compile_gemm_symmetric(
         12: GemmSymmetricSm120,
     }
     GemmCls = sm_to_cls[device_capacity[0]]
-    # Symmetric GEMM: m == n, so reuse the same sym_int for shape checking
-    m, k = cute.sym_int(), cute.sym_int()
-    l = cute.sym_int() if batched else None
-    a_leading = 1 if a_major == "k" else 0
-    b_leading = 1 if b_major == "k" else 0
-    d_leading = 1 if d_major == "n" else 0
-    c_leading = 1 if c_major == "n" else 0
-    div_a, div_b = div_for_dtype(a_dtype), div_for_dtype(b_dtype)
-    div_d, div_c = div_for_dtype(d_dtype), div_for_dtype(c_dtype) if c_dtype else 1
-    mA = fake_batched(a_dtype, m, k, l, a_leading, div_a)
-    mB = fake_batched(b_dtype, m, k, l, b_leading, div_b)
-    mD = fake_batched(d_dtype, m, m, l, d_leading, div_d)
-    mC = fake_batched(c_dtype, m, m, l, c_leading, div_c)
+    # Symmetric B is operand-shaped (m, k) like A, never (K, N): no b_kn.
+    # Squareness (m == n) is asserted host-side in _build_gemm_symmetric_plan.
+    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        batched=batched,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
+    )
     # PostAct = D.mT, so it has the opposite major from D (m↔n swapped)
-    div_pa = div_for_dtype(postact_dtype)
     postact_leading = 1 if postact_major == "n" else 0
-    mAuxOut = fake_batched(postact_dtype, m, m, l, postact_leading, div_pa)
+    mAuxOut = fake_batched(
+        postact_dtype, m, m, l if batched else None, postact_leading, div_for_dtype(postact_dtype)
+    )
 
     def fake_scalar(mode):
         if mode == 0:
@@ -154,9 +166,11 @@ def _compile_gemm_symmetric(
         beta=fake_scalar(beta_mode),
     )
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l
+        (is_dynamic_persistent and device_capacity[0] == 9), False, l if batched else None
     )
     varlen_args = None
+    mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
+    mSFB = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -174,6 +188,11 @@ def _compile_gemm_symmetric(
         epi_args,
         scheduler_args,
         varlen_args,
+        mSFA=mSFA,
+        mSFB=mSFB,
+        sf_vec_size=sf_vec_size,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
     )
 
 
@@ -215,6 +234,12 @@ def gemm_symmetric(
     max_swizzle_size: int = 8,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    SFA: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) blocked scale factors, or 5-D if 2D A
+    SFB: Optional[Tensor] = None,  # (l, rm, rk, 32, 4, 4) — B is operand-shaped (m, k)
+    # BlockScaledFormat names for A / B (independent); required when SFA/SFB are
+    # passed (see quack.gemm.gemm).
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
 ) -> _GemmSymmetricPlan:
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
@@ -239,6 +264,10 @@ def gemm_symmetric(
         max_swizzle_size,
         alpha_mode,
         beta_mode,
+        tensor_key(SFA),
+        tensor_key(SFB),
+        bs_format_a,
+        bs_format_b,
     )
     plan = _gemm_symmetric_plan_cache.get(key)
     if plan is None:
@@ -259,10 +288,23 @@ def gemm_symmetric(
             max_swizzle_size=max_swizzle_size,
             alpha_mode=alpha_mode,
             beta_mode=beta_mode,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
         )
         _gemm_symmetric_plan_cache[key] = plan
     run_gemm_symmetric_plan(
-        plan, A, B, D, C, tile_count_semaphore=tile_count_semaphore, alpha=alpha, beta=beta
+        plan,
+        A,
+        B,
+        D,
+        C,
+        tile_count_semaphore=tile_count_semaphore,
+        alpha=alpha,
+        beta=beta,
+        SFA=SFA,
+        SFB=SFB,
     )
     return plan
 
@@ -277,6 +319,8 @@ def run_gemm_symmetric_plan(
     tile_count_semaphore: Optional[Tensor] = None,
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
     The tensors must match the metadata the plan was built from."""
@@ -290,7 +334,7 @@ def run_gemm_symmetric_plan(
         sr_seed=None,
     )
     scheduler_args = plan_scheduler_args(plan, tile_count_semaphore)
-    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, None)
+    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, None, SFA, SFB)
 
 
 def _build_gemm_symmetric_plan(
@@ -311,6 +355,10 @@ def _build_gemm_symmetric_plan(
     max_swizzle_size,
     alpha_mode,
     beta_mode,
+    SFA=None,
+    SFB=None,
+    bs_format_a=None,
+    bs_format_b=None,
 ) -> _GemmSymmetricPlan:
     PostAct = D.mT
     a_major, b_major, d_major, c_major = get_majors(A, B, D, C)
@@ -323,9 +371,24 @@ def _build_gemm_symmetric_plan(
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
+    # The compiled fakes share no m/n sym, so squareness is enforced here.
+    assert A.shape[-2] == B.shape[-2] == D.shape[-2] == D.shape[-1], (
+        "gemm_symmetric requires square output: A (m, k), B (m, k), D (m, m)"
+    )
+    sf_dtype = sf_vec_size = a_mma_dtype = b_mma_dtype = None
+    sf_batched = True
+    if SFA is not None:
+        assert tile_K is None, "blockscaled GEMM derives tile_K from the MMA instruction"
+        fmt_a, fmt_b = resolve_blockscaled_formats(bs_format_a, bs_format_b)
+        a_mma_dtype = fmt_a.to_cutlass_dtype()
+        b_mma_dtype = fmt_b.to_cutlass_dtype()
+        sf_dtype, sf_vec_size = validate_blockscaled_sf(
+            A, B, SFA, SFB, device_capacity, fmt_a=fmt_a, fmt_b=fmt_b
+        )
+        sf_batched = SFA.ndim == 6
     batched = A.ndim == 3
     if not batched:
-        # Dense 2D (unbatched) operands: trace-time batch append, see gemm_act.
+        # Dense 2D (unbatched) operands: trace-time batch append, see quack.gemm.
         # No b_kn here — symmetric B is operand-shaped (m, k) like A, never (K, N).
         assert B.ndim == 2 and D.ndim == 2 and (C is None or C.ndim == 2), (
             "2D (unbatched) A requires 2D B, D, and C"
@@ -360,6 +423,11 @@ def _build_gemm_symmetric_plan(
         beta_mode,
         device_capacity,
         batched=batched,
+        sf_dtype=sf_dtype,
+        sf_vec_size=sf_vec_size,
+        sf_batched=sf_batched,
+        a_mma_dtype=a_mma_dtype,
+        b_mma_dtype=b_mma_dtype,
     )
 
     cluster_size = cluster_M * cluster_N

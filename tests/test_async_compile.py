@@ -223,6 +223,72 @@ def test_warm_session_with_flag_submits_nothing(tmp_path):
     assert "0 test deferrals" in out, out
 
 
+_WEDGED_POOL_CONFTEST_SRC = textwrap.dedent(
+    """
+    pytest_plugins = ["quack.testing.pytest_plugin"]
+
+
+    def pytest_configure(config):
+        # Simulate a wedged pool: submissions succeed but poll never resolves
+        # — exactly what a hung pool worker (still holding the per-key flock)
+        # looks like to every waiter. Shrink the drain wedge deadline so the
+        # escape path runs quickly.
+        from quack.cache import async_compile as ac
+        from quack.testing import pytest_plugin as tp
+
+        tp._XdistWorkerDefer._WEDGE_TIMEOUT_S = 2.0
+        ac.CompilePool.poll = lambda self, sha: ("pending", None)
+    """
+)
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="end-to-end defer needs a GPU"
+)
+def test_xdist_drain_escapes_wedged_pool(tmp_path):
+    """A sha that polls "pending" forever must not deadlock the final drain.
+
+    Regression (Aug 2026, run 31081200282): pool compiles froze mid-job and
+    every xdist worker's end-of-session drain skipped its still-pending items
+    forever — ``_drain_ready`` never called ``_attempt`` on a pending sha, so
+    the wedge escape's attempts bump never took effect and the CI leg died at
+    ``timeout-minutes: 30``. With the fix, the wedge deadline forces the
+    remaining items through in-process; without it, this inner session hangs
+    (the outer ``timeout=`` converts that into a failure).
+    """
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    # Unusual N values so the keys are cold in the throwaway cache dir.
+    (suite / "test_wedged.py").write_text(_INNER_TEST_SRC.format(N_A=2752, N_B=3264))
+    (suite / "conftest.py").write_text(_WEDGED_POOL_CONFTEST_SRC)
+
+    env = dict(os.environ)
+    env["QUACK_CACHE_DIR"] = str(tmp_path / "cache")
+    env.pop("PYTEST_XDIST_WORKER", None)  # the inner master must not be a worker
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(suite),
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--async-compile=4",
+            "-n",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+        cwd=str(suite),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, f"inner pytest failed:\n{out}"
+    assert "2 passed" in out, out
+
+
 @pytest.mark.skipif(
     not __import__("torch").cuda.is_available(), reason="end-to-end defer needs a GPU"
 )
@@ -325,3 +391,48 @@ def test_gpu_blind_device_attr_shim():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0 and "shim-ok" in result.stdout, result.stderr
+
+
+def test_pool_arch_pin_survives_early_dsl_construction():
+    """The worker's ptxas target must land on a DSL singleton that was built
+    BEFORE the pool's env pinning ran.
+
+    Regression (cutlass-dsl 4.6.2 CI image): importing
+    ``quack.cache._pool_preload`` executes the parent packages first, and
+    ``quack/__init__`` pulls in cutlass — constructing the DSL env manager
+    before ``CUTE_DSL_ARCH`` is set. 4.6.2 snapshots the env var at
+    construction (4.6.0 read it lazily), so env pinning alone left the
+    singleton unlatched; a GPU-blind worker's first ``.arch`` read then fell
+    back to ``detect_gpu_arch()``'s sm_100a default, and every pool ``.o``
+    on the B300 runner (sm_103a) failed to load with
+    cudaErrorNoKernelImageForDevice — which the 4.6.2 runtime escalated into
+    a permanent spinlock hang on the process's next launch. The explicit
+    ``_pin_dsl_arch`` re-latch in ``_pool_initializer`` / ``_pool_preload``
+    is what this test protects.
+    """
+    code = textwrap.dedent(
+        """
+        import os
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        os.environ.pop("CUTE_DSL_ARCH", None)
+        # Simulate the parent-package import chain: cutlass (and the DSL
+        # env-manager singleton) come up with no CUTE_DSL_ARCH in sight.
+        import quack.cache  # noqa: F401
+
+        # The pool's env pinning + re-latch, as _pool_initializer runs them.
+        from quack.cache.async_compile import _pool_initializer
+
+        _pool_initializer("90", "sm_90a")
+
+        from cutlass.cutlass_dsl import CuTeDSL
+
+        arch = CuTeDSL._get_dsl().envar.arch
+        assert arch == "sm_90a", f"worker would compile for {arch}, not sm_90a"
+        print("arch-pin-ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0 and "arch-pin-ok" in result.stdout, result.stderr

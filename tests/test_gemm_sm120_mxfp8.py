@@ -38,7 +38,14 @@ from quack.gemm_interface import (
 )
 
 _ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
-requires_sm120 = pytest.mark.skipif(_ARCH != 12, reason="SM120 blockscaled warp-MMA path")
+# get_device_capacity honors the QUACK_ARCH proxy override, but the blockscaled
+# mma kinds exist on sm_120/121 silicon only and ptxas always targets the
+# physical GPU — so the H100 QUACK_ARCH=120 CI legs must skip these.
+_PHYSICAL_ARCH = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+requires_sm120 = pytest.mark.skipif(
+    _ARCH != 12 or _PHYSICAL_ARCH != 12,
+    reason="SM120 blockscaled warp-MMA path (needs sm_120/121 silicon, no proxy)",
+)
 
 
 def _quantized_operands(fmt, m, n, k, batched=False, seed=0):
@@ -431,6 +438,26 @@ def test_sm120_b_n_major_tiles(tile_mn, pingpong):
     W = B.mT  # undo the .mT from _quantized_operands
     out = _gemm_with_config(A, _n_major_b(W), config=config)
     assert torch.equal(out, out_kmaj), f"tile={tile_mn} pingpong={pingpong}: n-major != k-major"
+
+
+@requires_sm120
+def test_sm120_b_n_major_quant_out():
+    """N-major fp8 B under the widened 32-column warp run (vec-32 mxfp8 SFD
+    output widens mma_n_warp_run to 32): the generalized _nmajor_b_tiled_copy
+    issues two 16-column atom invocations per warp and _retile_b splits the
+    fragment's np mode into (in-atom pair, repetition) — the quantized values
+    and SF bytes must be bit-identical to the k-major B run."""
+    m, n, k = 256, 320, 512
+    A = _mixed_operand("mxfp8_e4m3", m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
+    out_kmaj = gemm(A, W.mT, out_dtype="mxfp8_e4m3", tuned=False)
+    out = gemm(A, _n_major_b(W), out_dtype="mxfp8_e4m3", tuned=False)
+    assert torch.equal(out.qdata.view(torch.uint8), out_kmaj.qdata.view(torch.uint8)), (
+        "n-major quantized values != k-major"
+    )
+    assert torch.equal(out.scale.view(torch.uint8), out_kmaj.scale.view(torch.uint8)), (
+        "n-major SF bytes != k-major"
+    )
 
 
 @requires_sm120

@@ -17,10 +17,12 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Float16, Boolean, const_expr
+from cutlass.experimental import primitives as prims
 from cutlass.utils import LayoutEnum, SmemPartition
 
 
 from quack import layout_utils
+from quack import pipeline_checks
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm, reinterpret_packed_fp6
 from quack.gemm_config import SplitKMode
 from quack.operand_transform.transform import TransformAOperand
@@ -75,6 +77,34 @@ class GemmSm90(GemmTmaBase):
     This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Hopper GPUs with persistent tile scheduling and warp specialization.
 
+    Warp roles and pipeline schedule (arrive counts validated by quack.pipeline_checks
+    at construction):
+
+    Roles per CTA: mma_warp_groups warpgroups (128 threads each) running WGMMA + epilogue
+    (cooperative: all on one tile; pingpong: two warpgroups alternate tiles), plus one
+    producer warpgroup containing the AB-load warp (or 4 cp.async warps when gather_A),
+    the C-load warp, and the scheduler warp.
+
+    Pipelines (producer role -> consumer role):
+      ab       TmaAsync: AB-load -> MMA warpgroups.  full: TMA tx bytes (+cp.async lane
+               arrives when gather_A); empty: 1 arrive per mma warp, delivered to every
+               CTA in this CTA's A/B-multicast peer set.
+      sched    Async:    scheduler -> mma + load warps. full: armed as tx barrier by the
+               producer; empty: 1 arrive per consumer warp, every CTA routed to CTA 0
+               (pingpong halves the participating mma warps unless varlen_k).
+      epi (C)  TmaAsync: C-load -> epilogue warps.   full: TMA tx; empty: 1 arrive per
+               epi warp (elected lane).
+      epi_store TmaStore: epilogue TMA-store completion pacing (bulk-group, no mbarrier).
+
+    Per-role timeline (steady state):
+      scheduler: [per tile]  sched.acquire -> produce next tile slot (arms tx)
+      AB-load:   [per tile]  sched slot read -> sched.release
+                 [per k]     ab.acquire (wait empty + arm tx) -> TMA A,B (+cp.async A if
+                 gather_A, committed via cp.async.mbarrier.arrive)
+      MMA wg:    [per k]     ab full wait -> wgmma -> ab.release (per warp, to mcast peers)
+                 [tile end]  epilogue: per subtile: epi wait (if C) -> regs -> smem ->
+                 epi_store.acquire -> TMA store -> epi.release
+
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
     :param tile_shape_mnk: Shape of the CTA tile. Pass (M, N) to default K to
@@ -109,6 +139,13 @@ class GemmSm90(GemmTmaBase):
     """
 
     arch = 90
+    # Base (pre-refinement) C-load stage depth in _compute_stages: SM90's TMA
+    # epilogue dispatch policy StagesC = min(EpiTiles, 4). SM120 overrides to
+    # 2 (its CUTLASS builder uses StagesC = StagesD = min(EpiTiles, 2) — the
+    # 100 KB smem budget can't afford 4 upfront C stages without dropping an
+    # AB stage); the leftover refinement below still deepens C when smem is
+    # free.
+    epi_c_stage_base = 4
     EpilogueArguments = GemmTmaBase.EpilogueArguments
     EpilogueParams = GemmTmaBase.EpilogueParams
 
@@ -615,6 +652,10 @@ class GemmSm90(GemmTmaBase):
         assert (varlen_args.mAIdx is not None) == self.gather_A
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
+        # Stash for epilogue ops (epi_to_underlying_arguments runs later and
+        # SFD needs the varlen mode to shape its logical scale layout).
+        self.varlen_m = varlen_m
+        self.varlen_k = varlen_k
 
         self._setup_attributes(epilogue_args)
 
@@ -630,6 +671,7 @@ class GemmSm90(GemmTmaBase):
                     varlen_k,
                     a_internal_type=self.a_tma_internal_dtype,
                     b_internal_type=self.b_tma_internal_dtype,
+                    varlen_m_zero_fill=varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args),
                 )
             )
         else:
@@ -995,7 +1037,7 @@ class GemmSm90(GemmTmaBase):
             ):
                 # PDL: wait for prior kernel before any TMA loads (matches cutlass C++ sm90 mainloop producer)
                 if const_expr(self.use_pdl):
-                    cute.arch.griddepcontrol_wait()
+                    prims.griddepcontrol(prims.GridDepAction.WAIT)
                 # block_copy's lowering wants the coordinate held fixed by the
                 # multicast mask: A is same-M across N peers, while B is
                 # same-N across M peers. Degenerate cluster dimensions are
@@ -1447,7 +1489,7 @@ class GemmSm90(GemmTmaBase):
 
             # PDL: hint next kernel to launch (matches cutlass C++ sm90 consumer)
             if const_expr(self.use_pdl):
-                cute.arch.griddepcontrol_launch_dependents()
+                prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
 
             # Wait for D store complete
             if const_expr(not self.pingpong):
@@ -1802,6 +1844,24 @@ class GemmSm90(GemmTmaBase):
         # (((2,2,2),1), MMA_M / epi_M, MMA_N / epi_N, (epi_M, epi_N))
         return tiled_copy_r2s.retile(tRS_rAcc)
 
+    def epi_r2s_pair_xor(self) -> bool:
+        # 32-bit D with n-major layout: the wgmma acc pairs are contiguous in
+        # smem and both the SW128 (epi_tile_n % 32 == 0) and SW64
+        # (epi_tile_n == 16, i.e. tile_n % 32 == 16 like 112/176) swizzle
+        # atoms make STS.64 uniformly 2-way bank conflicted; the pair-XOR
+        # STS.32 split is conflict-free under both (ncu-verified, no spills).
+        # epi_tile_n == 8 (SW32) is not verified, keep the default store.
+        # Gated off when C is present: the fp32-C epilogue sits exactly at the
+        # setmaxnreg cap and the split's few extra registers spill to local
+        # (measured ~150MB STL, a net loss; same for a mirrored LDS split).
+        return (
+            self.d_dtype is not None
+            and self.d_dtype.width == 32
+            and (self.d_layout is None or self.d_layout.is_n_major_c())
+            and self.epi_tile[1] % 16 == 0
+            and self.c_dtype is None
+        )
+
     def epilog_smem_copy_atom(self, tiled_mma: cute.TiledMma) -> cute.TiledCopy:
         copy_atom_C = cute.make_copy_atom(
             warp.StMatrix8x8x16bOp(
@@ -1878,10 +1938,22 @@ class GemmSm90(GemmTmaBase):
         # Each warp will contribute 1 to the arrive count
         # If pingpong and varlen_k, then all 8 mma warps will participate in the scheduler barrier
         # at each round. If pingpong and not varlen_k, then only 4 mma warp will participate.
-        consumer_arrive_cnt = (
-            (self.mma_warp_groups if not (self.pingpong and not varlen_k) else 1) * 4
-            + self.num_ab_load_warps
-        ) * cluster_size
+        sched_consumer_warps_per_cta = (
+            self.mma_warp_groups if not (self.pingpong and not varlen_k) else 1
+        ) * 4 + self.num_ab_load_warps
+        consumer_arrive_cnt = sched_consumer_warps_per_cta * cluster_size
+        # One arrive per consumer warp (elected lane); consumer_mask=0 routes every CTA
+        # in the cluster to CTA 0's barrier. per_warp is bound to elect_one_release below.
+        elect_one_release = True
+        pipeline_checks.check_arrive_count(
+            "sm90 sched_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(
+                sched_consumer_warps_per_cta, per_warp=elect_one_release, ctas_routed=cluster_size
+            ),
+            warps_per_cta=sched_consumer_warps_per_cta,
+            cluster_size=cluster_size,
+        )
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1894,7 +1966,7 @@ class GemmSm90(GemmTmaBase):
             defer_sync=True,
             # One arrive per consumer warp (consumer_arrive_cnt counts warps): syncwarp
             # so every lane's slot read is complete, then one elected lane signals.
-            elect_one_release=True,
+            elect_one_release=elect_one_release,
         )
 
     @classmethod
@@ -1931,7 +2003,19 @@ class GemmSm90(GemmTmaBase):
         :rtype: Tuple[int, int]
         """
 
-        epi_stage = 4 if epi_tile[1] <= 16 else 2
+        # Stage split mirrors CUTLASS's sm90 TMA epilogue dispatch policy
+        # (sm90_get_tma_dispatch_policy): StagesD = min(EpiTiles, 2),
+        # StagesC = min(EpiTiles, 4). C loads are latency-critical
+        # (consumer_wait sits on the epilogue's serial path; at epi_c_stage=2
+        # it measured ~15% of warp time on C-heavy epilogues like dgated at
+        # 65536x2048x768), while D stores are fire-and-forget through the TMA
+        # store pipeline and L2 absorbs them (producer_acquire waits measured
+        # near-zero even at epi_stage=2). Narrow epi tiles keep the deeper
+        # 4-stage D (per-stage bytes are small).
+        epi_tiles = (cta_tile_shape_mnk[0] * cta_tile_shape_mnk[1]) // cute.size(
+            cute.shape(epi_tile)
+        )
+        epi_stage = min(epi_tiles, 4 if epi_tile[1] <= 16 else 2)
         epi_smem_bytes = cls.epi_smem_bytes(
             epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
         )
@@ -1941,7 +2025,7 @@ class GemmSm90(GemmTmaBase):
         epi_bytes_per_stage = d_bytes_per_stage + epi_smem_bytes.d_stage
         epi_bytes = epi_smem_bytes.unstaged + epi_bytes_per_stage * epi_stage
         epi_c_stage = (
-            0 if c_dtype is None and not has_tile_load else (4 if epi_tile[1] <= 16 else 2)
+            0 if c_dtype is None and not has_tile_load else min(epi_tiles, cls.epi_c_stage_base)
         )
         if c_dtype is not None:
             epi_bytes += epi_tile_elems * c_dtype.width // 8 * epi_c_stage
@@ -1982,11 +2066,23 @@ class GemmSm90(GemmTmaBase):
         )
         ab_stage = remaining_bytes // ab_bytes_per_stage
 
-        # Refine epilogue stages:
-        # Calculate remaining smem after allocating for A/B stages and reserved bytes
-        # Add remaining unused smem to epilogue
+        # Refine epilogue stages with the smem left below one more A/B stage,
+        # C first (one extra C stage measured ~2.6% on dgated at
+        # 65536x2048x768, leftover-to-D never won an interleaved A/B), capped
+        # at min(5, epi_tiles) — the epilogue only prefetches C within the
+        # current tile, so deeper than epi_tiles is dead smem. The rest goes
+        # to D stages.
+        leftover = remaining_bytes - ab_bytes_per_stage * ab_stage
+        c_bytes_per_stage = (
+            epi_tile_elems * c_dtype.width // 8 if c_dtype is not None else 0
+        ) + epi_smem_bytes.c_stage
+        if epi_c_stage > 0 and c_bytes_per_stage > 0:
+            add = min(leftover // c_bytes_per_stage, min(5, epi_tiles) - epi_c_stage)
+            if add > 0:
+                epi_c_stage += add
+                leftover -= add * c_bytes_per_stage
         if epi_bytes_per_stage > 0:
-            epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // epi_bytes_per_stage
+            epi_stage += leftover // epi_bytes_per_stage
         return ab_stage, epi_stage, epi_c_stage
 
     @staticmethod

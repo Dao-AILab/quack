@@ -16,6 +16,8 @@ bf16 loss parity — FLOOR clips block maxima in (448, 512)·2^e, which hurts
 especially on gradient tensors. The FP4 quantizers remain FLOOR-only.
 """
 
+import inspect
+
 import torch
 
 F8E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
@@ -452,8 +454,25 @@ def to_nvfp4(x: torch.Tensor, block_size: int = 16, per_tensor_scale=None):
 # the per-wrapper torch.compile kwarg, NOT `torch._dynamo.config.recompile_limit
 # = 64`: config assignments are thread-local, and backward-pass shapes compile
 # on the autograd worker thread, which would still see the default 8.
+#
+# The per-wrapper `recompile_limit=` kwarg only exists on torch >= 2.13. Older
+# torch must stay importable: on Blackwell with r575 (CUDA 12.9) drivers,
+# torch >= 2.13 pins a triton whose ptxas emits CUDA 13.1 cubins the driver
+# cannot load (gh-182), so torch 2.11/2.12 is the working combination there.
+# On those versions fall back to raising the process-global dynamo limit
+# (named cache_size_limit before the recompile_limit rename) — the thread-local
+# config semantics arrived alongside the per-wrapper kwarg, so the global
+# assignment is visible to autograd-thread compiles there.
 # ---------------------------------------------------------------------------
-_COMPILE_KW = dict(dynamic=False, recompile_limit=64)
+if "recompile_limit" in inspect.signature(torch.compile).parameters:
+    _COMPILE_KW = dict(dynamic=False, recompile_limit=64)
+else:
+    _COMPILE_KW = dict(dynamic=False)
+    _dynamo_cfg = torch._dynamo.config
+    _limit_name = (
+        "recompile_limit" if hasattr(_dynamo_cfg, "recompile_limit") else "cache_size_limit"
+    )
+    setattr(_dynamo_cfg, _limit_name, max(getattr(_dynamo_cfg, _limit_name), 64))
 
 to_mx_compiled = torch.compile(to_mx, **_COMPILE_KW)
 to_mx_e5m2_compiled = torch.compile(to_mx_e5m2, **_COMPILE_KW)

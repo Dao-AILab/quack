@@ -25,10 +25,16 @@ import subprocess
 # (e.g. rmsnorm_config._detect_arch_major) consult QUACK_ARCH via
 # get_device_capacity and would otherwise initialize CUDA — which both makes
 # the forkserver's context leak into children and trips torch's forked-child
-# guard — and the DSL latches its ptxas target (CUTE_DSL_ARCH or detection)
-# at the cutlass import below; the per-worker env set in _pool_initializer
-# runs after the fork, too late to change it. nvidia-smi queries the
-# capability without creating a CUDA context.
+# guard. nvidia-smi queries the capability without creating a CUDA context.
+#
+# NOTE: by the time this module body runs, its parent packages (``quack``,
+# ``quack.cache``) have already been imported — and ``quack/__init__`` pulls
+# in cutlass, so the DSL's env manager is constructed before these env vars
+# exist. cutlass-dsl >= 4.6.2 snapshots CUTE_DSL_ARCH at that construction,
+# so the pinning here is NOT enough for the ptxas target: the explicit
+# ``_pin_dsl_arch`` re-latch at the bottom of this module is what actually
+# lands it. The env vars still matter for everything that reads them lazily
+# (QUACK_ARCH dispatch, the gpu-blind smem-capacity shim).
 #
 # The two overrides are pinned independently: QUACK_ARCH (dispatch) is
 # respected if the caller set it (the CI proxy legs), while CUTE_DSL_ARCH
@@ -56,3 +62,12 @@ except Exception:
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import quack.cache  # noqa: F401, E402  (pulls torch, cutlass.cute, tvm_ffi)
+
+# Re-latch the ptxas target on the already-constructed DSL singleton (see the
+# NOTE above): forked workers inherit the latched value. Without this, a
+# GPU-blind worker under cutlass-dsl >= 4.6.2 defaults to sm_100a and every
+# pool .o fails to load with cudaErrorNoKernelImageForDevice — which the
+# 4.6.2 runtime then escalates into a spinlock hang on the next launch.
+from quack.cache.async_compile import _pin_dsl_arch  # noqa: E402
+
+_pin_dsl_arch(os.environ.get("CUTE_DSL_ARCH"))

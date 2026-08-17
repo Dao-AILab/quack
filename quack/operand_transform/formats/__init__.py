@@ -182,7 +182,9 @@ class Int4(DecodeFormat):
 
     def prepare(self, q, sf):
         q, sf = _pad_n128(q, sf)
-        return U.repack_int4_weight(q), U.repack_int4_sf(sf, q.shape[1] * 2, group=self.group)
+        # blob word order tracks the decode branch: s2f6 hw-cvt on Blackwell
+        blob = U.repack_int4_weight(q, s2f6=U.use_s2f6_int_cvt())
+        return blob, U.repack_int4_sf(sf, q.shape[1] * 2, group=self.group)
 
 
 class Int4Awq(DecodeFormat):
@@ -193,7 +195,12 @@ class Int4Awq(DecodeFormat):
     and HMUL2 issues at ~2x the rate of the HFMA2 it replaced (which
     occupied both fma-pipe halves). The rejected alternative — folding
     everything into one HFMA2 with b' = -s*(z + 128) — pre-rounds b' at
-    ~0.5s: see memory project_transform_a."""
+    ~0.5s: see memory project_transform_a.
+
+    Stays on the magic route on Blackwell too: the s2f6 hw-cvt decode would
+    yield q-8 instead of magic form, which needs the strip's add constant
+    rebuilt as 8-z in place of -(128+z) — an arch-dependent SF blob for a
+    2-op saving. Revisit only if sm120 W4A16-AWQ shows decode-bound."""
 
     name = "int4awq"
     sf_words = 2
@@ -322,6 +329,60 @@ class Int4SmFold(DecodeFormat):
         return U.repack_w4a8_weight(q), U.repack_w4a8_sf(sf_folded, q.shape[1] * 2)
 
 
+class Int4B8(DecodeFormat):
+    """EXPERIMENTAL biased W4A8 (cutlass PR #3432's mixed-input trick on the
+    int4sm promote seam): weights stored offset-binary (code = q+8, same
+    [-7, 7] grid as int4sm) decode by pure unpack — e4m3 bytes 0x00-0x0F are
+    the linear denormal grid (q+8)*2^-9, so the 5-op decode is EXACT (no
+    int4smf fold rounding). The promote scale carries the 2^9 (sf * 512),
+    leaving acc = sum_blk sf * ((q+8) @ b); the bias is removed pre-store by
+    an epilogue TileLoad correction c[m,n] = -8 * sum_blk rowsum_act[m,blk] *
+    sf[n,blk] — a rank-K/128 term (small host GEMM feeding a TileLoad, NOT a
+    vec op): D = (acc + c) * token_scale. roundtrip=False: the fixture has no
+    correction seam; AI/accuracy_w4a8_biased.py is the harness.
+
+    MEASURED (H100, 2026-08-04, M=512 N=1024 K=512..8192): QGMMA takes the
+    denormal e4m3 operands exactly (one-hot gate bit-exact). Zero-mean acts:
+    rel_rms 1.68e-3 = int4sm = the bf16 store floor, 15x better than
+    int4smf. Positive-mean acts (relu, the down-proj regime): 0.8-2.9e-2
+    growing with K — at/below int4smf, 5-17x worse than int4sm. The
+    truncating fast-accum commits a systematic downward error proportional
+    to the (q+8)-inflated positive wave that the exact fp32 correction
+    cannot see. VERDICT: dominated by int4sm (same promote drain, exact,
+    regime-independent) — kept as a documented negative result."""
+
+    name = "int4b8"
+    tile_k = 128
+    sf_words = 1
+    mma_dtype = cutlass.Float8E4M3FN
+    promote = True
+    roundtrip = False  # gemm output is biased; the harness applies the correction
+
+    @cute.jit
+    def decode_k16(self, xw, sfw, b, consts):
+        r0, r1 = U.decode_u4b8x8_to_e4m3x8_biased(xw[2 * b])
+        r2, r3 = U.decode_u4b8x8_to_e4m3x8_biased(xw[2 * b + 1])
+        return r0, r1, r2, r3
+
+    @cute.jit
+    def promote_scale_pair(self, sfp):
+        """int4sm's exact bf16-pair unpack x 512 (exact pow2 in f32): the
+        decode's 2^-9 cancels here, so acc accumulates sf * (q+8) @ b."""
+        sf0 = U.i32_as_f32(sfp << 16) * 512.0
+        sf1 = U.i32_as_f32(sfp & cutlass.Int32(U._s32(0xFFFF0000))) * 512.0
+        return sf0, sf1
+
+    def quantize_reference(self, w):
+        return U.quantize_int4b8_reference(w)
+
+    def dequant_reference(self, q, sf):
+        return U.dequant_int4_reference(q, sf, group=128)
+
+    def prepare(self, q, sf):
+        q, sf = _pad_n128(q, sf)
+        return U.repack_w4a8_weight(q), U.repack_w4a8_sf(sf, q.shape[1] * 2)
+
+
 class Mxfp4(DecodeFormat):
     """e2m1 nibbles + e8m0 scale per 32 k (exact: power-of-2 scale)."""
 
@@ -353,8 +414,9 @@ class Mxfp4(DecodeFormat):
 
 
 class Int8(DecodeFormat):
-    """int8 weights, dp4a sign-extract decode; the per-channel scale is NOT
-    applied here (epilogue's job — needs the multiplicative colvec op)."""
+    """int8 weights; dp4a sign-extract decode (s2f6 hw cvt on Blackwell);
+    the per-channel scale is NOT applied here (epilogue's job — needs the
+    multiplicative colvec op)."""
 
     name = "int8"
     w8 = True
@@ -362,8 +424,8 @@ class Int8(DecodeFormat):
 
     @cute.jit
     def decode_k16(self, xw, sfw, b, consts):
-        ra, rb = U.decode_i8x4_to_bf16x4_dp4a(xw[2 * b])
-        rc, rd = U.decode_i8x4_to_bf16x4_dp4a(xw[2 * b + 1])
+        ra, rb = U.decode_i8x4_to_bf16x4(xw[2 * b])
+        rc, rd = U.decode_i8x4_to_bf16x4(xw[2 * b + 1])
         return ra, rb, rc, rd
 
     def quantize_reference(self, w):
@@ -515,6 +577,7 @@ W4_FORMATS = {
         Int4Awq(),
         Int4Sm(),
         Int4SmFold(),
+        Int4B8(),
         Mxfp4(),
         Int8(),
         Fp8(),

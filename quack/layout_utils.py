@@ -38,6 +38,42 @@ def expand(a: cute.Tensor, dim: int, size: Int32 | int) -> cute.Tensor:
 
 
 @cute.jit
+def permute_gated_Cregs_f32(t: cute.Tensor) -> None:
+    """The :func:`permute_gated_Cregs_b16` data movement at fp32 granularity,
+    for gated outputs whose storage dtype is narrower than 16 bits (fp8/fp4
+    quantized postact): each 16-bit half of the b16 version is one fp32
+    register here, so the same quad shuffles + half swaps become selects +
+    shuffles, applied BEFORE the storage-dtype convert (the movement is
+    dtype-independent; the b16 version's prmt recombine cannot address
+    sub-16-bit lanes)."""
+    assert t.element_type.width == 32
+    assert cute.size(t.shape) % 4 == 0, "Tensor size must be a multiple of 4"
+    quad_idx = cute.arch.lane_idx() % 4
+    lane_03 = quad_idx == 0 or quad_idx == 3
+    upper_idx = quad_idx // 2 if quad_idx % 2 == 0 else 3 - quad_idx // 2
+    lower_idx = upper_idx ^ 1
+    width = 4
+    mask = cute.arch.WARP_SIZE - width
+    clamp = cute.arch.WARP_SIZE - 1
+    mask_and_clamp = mask << 8 | clamp
+    for i in cutlass.range(cute.size(t.shape) // 4, unroll_full=True):
+        v0, v1, v2, v3 = t[i * 4 + 0], t[i * 4 + 1], t[i * 4 + 2], t[i * 4 + 3]
+        # upper0/lower0 halves of the b16 version, one f32 each
+        x0 = v0 if lane_03 else v2
+        x1 = v1 if lane_03 else v3
+        y0 = v2 if lane_03 else v0
+        y1 = v3 if lane_03 else v1
+        x0 = cute.arch.shuffle_sync(x0, offset=upper_idx, mask_and_clamp=mask_and_clamp)
+        x1 = cute.arch.shuffle_sync(x1, offset=upper_idx, mask_and_clamp=mask_and_clamp)
+        y0 = cute.arch.shuffle_sync(y0, offset=lower_idx, mask_and_clamp=mask_and_clamp)
+        y1 = cute.arch.shuffle_sync(y1, offset=lower_idx, mask_and_clamp=mask_and_clamp)
+        t[i * 4 + 0] = x0 if lane_03 else y0
+        t[i * 4 + 1] = y0 if lane_03 else x0
+        t[i * 4 + 2] = x1 if lane_03 else y1
+        t[i * 4 + 3] = y1 if lane_03 else x1
+
+
+@cute.jit
 def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
     assert t.element_type.width == 16
     assert cute.size(t.shape) % 4 == 0, "Tensor size must be a multiple of 4 for b16 permutation"

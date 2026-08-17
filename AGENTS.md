@@ -103,6 +103,9 @@ After finding a fix, verify that the minimized repro passes, the original repro 
 - Favor concise, self-explanatory code
 - Line length: 100 (ruff)
 - Ruff allows: lambda assignment (E731), single-char vars I/O/l (E741), unused locals (F841)
+- Cache stability is NOT a design constraint: never contort code (epilogue tags,
+  jit-cache keys, semantic digests) to keep compiled-kernel or autotune caches warm
+  across a refactor. A one-time recompile/retune is fine; cleaner code wins.
 
 ## Measured facts & gotchas (hard-won; verify before assuming they changed)
 

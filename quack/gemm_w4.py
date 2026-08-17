@@ -85,7 +85,11 @@ def gemm_w4a16(
     # W4 runs atom_n == 1 on every arch (SM120 included since the (4,1,1)/
     # (8,1,1) decode layouts): tile_n floor is the 16-wide warp N span.
     auto_tm, auto_tn, auto_sk = _pick_w4_cfg(
-        m_act, n_full, k // tk, sm120=get_device_capacity(act.device)[0] == 12
+        m_act,
+        n_full,
+        k // tk,
+        sm120=get_device_capacity(act.device)[0] == 12,
+        device=act.device,
     )
     if tile_m is None and tile_n is None and split_k is None:
         tile_m, tile_n, split_k = auto_tm, auto_tn, auto_sk

@@ -5,6 +5,9 @@
   torchao) with torch.compile'd fast paths.
 - :mod:`quack.blockscaled.utils` — scale-factor packing/unpacking, operand
   builders for tests/benchmarks, and the kernel-level compile path.
+- :mod:`quack.blockscaled.quantize_utils` — the device-side (CuTe-DSL)
+  quantize core shared by the SFD epilogue and fused-kernel quantized
+  outputs (bit-exact cuBLAS/CUTLASS SF semantics).
 
 The GEMM entry points live in :mod:`quack.gemm_interface`; pass
 :class:`BlockScaledOperand` operands (``(data, scale_factor)`` tuples are

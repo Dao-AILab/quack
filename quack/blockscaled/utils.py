@@ -24,6 +24,7 @@ from quack.blockscaled.operand import (
 from quack.blockscaled.quantize import (  # noqa: F401  (pure-torch helpers re-exported)
     FP4_E2M1FN_VALUES,
     QUANTIZERS,
+    _COMPILE_KW,
     _fp4_unpacked_to_value,
     dequant_operand,
     pack_scale_2d_to_blocked_contig,
@@ -253,10 +254,9 @@ BLOCKSCALED_FORMATS = {
 
 # compiled (static shapes) so the swizzle fuses into a couple of kernels instead
 # of an eager pad/permute/contiguous chain; see the dynamic=False and
-# recompile_limit notes in quantize.py (per-wrapper limit: config is thread-local)
-_pack_scale_compiled = torch.compile(
-    pack_scale_2d_to_blocked_contig, dynamic=False, recompile_limit=64
-)
+# recompile_limit notes in quantize.py (per-wrapper limit where torch supports
+# it, global-config fallback on torch < 2.13)
+_pack_scale_compiled = torch.compile(pack_scale_2d_to_blocked_contig, **_COMPILE_KW)
 
 
 def blockscaled_quantize(

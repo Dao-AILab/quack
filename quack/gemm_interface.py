@@ -22,6 +22,7 @@ from quack.gemm_config import (
     blockscaled_config_ok,
     blockscaled_default_config,
     config_supports,
+    cta_tile_shape_m,
     default_config,
     get_all_configs,
 )
@@ -182,7 +183,7 @@ class _Operand(NamedTuple):
     data: Tensor
     sf: Optional[Tensor] = None
     fmt: Optional[BlockScaledFormat] = None
-    pts: Optional[Tensor] = None  # NVFP4 per-tensor scale
+    per_tensor_scale: Optional[Tensor] = None  # NVFP4
     quant_dim: Optional[int] = None  # container operands: which dim the scales run along
 
 
@@ -234,44 +235,88 @@ def _prep_blockscaled(
     return _sf_encode(opA.sf), _sf_encode(opB.sf), opA.fmt.name, opB.fmt.name
 
 
-def _fold_pts(alpha, opA: _Operand, opB: _Operand):
+def _fold_per_tensor_scales(alpha, opA: _Operand, opB: _Operand):
     """Fold NVFP4 per-tensor scales into alpha, out-of-place and without a host
-    sync: a present pts turns alpha into a device scalar (the tensor-alpha path)."""
-    pts = opA.pts
-    if opB.pts is not None:
-        pts = opB.pts if pts is None else pts * opB.pts
-    if pts is None:
+    sync: a present scale turns alpha into a device scalar (the tensor-alpha path)."""
+    scale = opA.per_tensor_scale
+    if opB.per_tensor_scale is not None:
+        scale = opB.per_tensor_scale if scale is None else scale * opB.per_tensor_scale
+    if scale is None:
         return alpha
-    pts = pts.reshape(1)
-    return pts if (isinstance(alpha, float) and alpha == 1.0) else alpha * pts
-
-
-def _reject_blockscaled(op_name: str, **operands) -> None:
-    """Early, legible rejection at entry points without a blockscaled path."""
-    for name, X in operands.items():
-        if isinstance(X, (BlockScaledOperand, tuple, list)):
-            raise TypeError(
-                f"quack.{op_name} does not support blockscaled operands (got {name} as "
-                f"{type(X).__name__}); blockscaled entry points: gemm, gemm_add, "
-                f"gemm_add_inplace, gemm_act, gemm_gated"
-            )
+    scale = scale.reshape(1)
+    return scale if (isinstance(alpha, float) and alpha == 1.0) else alpha * scale
 
 
 def _reserve_blockscaled_out(out_dtype) -> None:
     """``out_dtype`` may name a BlockScaledFormat to request a blockscaled output
-    (the call then returns a BlockScaledOperand). API reserved here; the
-    SF-generation epilogue that implements it is designed in
-    AI/blockscaled_api.md section 7."""
-    if isinstance(out_dtype, (BlockScaledFormat, str)):
-        fmt_d = (
-            out_dtype
-            if isinstance(out_dtype, BlockScaledFormat)
-            else BlockScaledFormat.from_name(out_dtype)
-        )
+    (the call then returns a BlockScaledOperand). ``gemm`` implements it via the
+    SF-generation epilogue (quack.epilogue.quantize_out); the other entry points
+    still reject it here."""
+    if _resolve_blockscaled_out(out_dtype) is not None:
         raise NotImplementedError(
-            f"blockscaled output (out_dtype={fmt_d.name}) requires the SF-generation "
-            f"epilogue - see AI/blockscaled_api.md section 7"
+            f"blockscaled output (out_dtype={out_dtype}) is only supported by quack.gemm "
+            f"for now - see AI/blockscaled_api.md section 7"
         )
+
+
+def _resolve_blockscaled_out(out_dtype) -> Optional[BlockScaledFormat]:
+    """``out_dtype`` naming a BlockScaledFormat requests a quantized (blockscaled)
+    output; returns the descriptor, or None for plain-dtype outputs."""
+    if isinstance(out_dtype, BlockScaledFormat):
+        return out_dtype
+    if isinstance(out_dtype, str):
+        return BlockScaledFormat.from_name(out_dtype)
+    return None
+
+
+def _alloc_blockscaled_out(out_shape, fmt: BlockScaledFormat, device, num_varlen_batches=None):
+    """Allocate (out, out_sf) for a quantized-output GEMM (SF vectors along N).
+
+    out_shape is the logical (..., M, N) shape; fp4 values are stored packed as
+    ``float4_e2m1fn_x2`` with N/2 bytes per row. out_sf is the blocked
+    (..., rm, rk, 32, 4, 4) scale tensor consumed by the kernel (and by the next
+    GEMM's BlockScaledOperand input).
+
+    For varlen_m pass ``num_varlen_batches``: M is total_m and out_sf becomes
+    one M-padded ``(1, ceil(total_m/128) + L - 1, rk, 32, 4, 4)`` buffer with
+    tile-aligned per-batch padding - the same layout varlen_m input SFA uses,
+    so it feeds the next varlen_m blockscaled GEMM directly.
+    """
+    vec = fmt.sf_vec_size
+    *batch, m, n = out_shape
+    if fmt.qdata_dtype == torch.float4_e2m1fn_x2:
+        assert n % 32 == 0, f"fp4 output requires N % 32 == 0 (16 B rows), got N={n}"
+        out = torch.empty(*batch, m, n // 2, dtype=fmt.qdata_dtype, device=device)
+    else:
+        assert n % 16 == 0, f"fp8 output requires N % 16 == 0 (16 B rows), got N={n}"
+        out = torch.empty(*batch, m, n, dtype=fmt.qdata_dtype, device=device)
+    rm, rk = -(-m // 128), -(-n // (4 * vec))
+    if num_varlen_batches is not None:
+        assert not batch
+        rm += num_varlen_batches - 1
+        out_sf = torch.empty(1, rm, rk, 32, 4, 4, dtype=fmt.scale_dtype, device=device)
+    else:
+        out_sf = torch.empty(*batch, rm, rk, 32, 4, 4, dtype=fmt.scale_dtype, device=device)
+    return out, out_sf
+
+
+def _alloc_blockscaled_out_col(out_shape, fmt: BlockScaledFormat, device):
+    """Column-direction variant of :func:`_alloc_blockscaled_out`: SF vectors
+    along M, out_sf blocked over (N, M) as (..., rn, rm_k, 32, 4, 4) with rm_k
+    padded to whole 128-row stripes (128 // (4 * vec) atom groups)."""
+    vec = fmt.sf_vec_size
+    *batch, m, n = out_shape
+    assert fmt.qdata_dtype != torch.float4_e2m1fn_x2, (
+        "column-direction quantized output supports fp8 values only (fp4 packs along N, "
+        "which no consumer contracting over M can use)"
+    )
+    assert n % 16 == 0, f"fp8 output requires N % 16 == 0 (16 B rows), got N={n}"
+    out = torch.empty(*batch, m, n, dtype=fmt.qdata_dtype, device=device)
+    stripe = 128 // (4 * vec)
+    rn = -(-n // 128)
+    rm_k = -(-(-(-m // (4 * vec))) // stripe) * stripe
+    out_sf = torch.empty(*batch, rn, rm_k, 32, 4, 4, dtype=fmt.scale_dtype, device=device)
+    return out, out_sf
 
 
 def _sf_batch_canonicalize(SFA: Tensor, SFB: Tensor, batched: bool) -> Tuple[Tensor, Tensor]:
@@ -323,7 +368,7 @@ def nvmmh_config(A, B, device_capacity):
         return None
 
 
-def _expand_split_k_configs(configs, A, B, device_capacity):
+def _expand_split_k_configs(configs, A, B, device_capacity, blockscaled=False):
     """Add split_k > 1 variants of each surviving config for occupancy-starved shapes.
 
     Only called when the user passed split_k=None ("let the autotuner choose the
@@ -340,10 +385,7 @@ def _expand_split_k_configs(configs, A, B, device_capacity):
     expanded = list(configs)
     for conf in configs:
         c = conf.kwargs["config"]
-        # SM100 2-CTA MMA halves the per-CTA tile M
-        cta_tile_m = (
-            c.tile_m // 2 if device_capacity in (10, 11) and c.cluster_m % 2 == 0 else c.tile_m
-        )
+        cta_tile_m = cta_tile_shape_m(c.tile_m, c.cluster_m, device_capacity, blockscaled)
         tile_m, tile_n = (cta_tile_m, c.tile_n) if not c.swap_ab else (c.tile_n, cta_tile_m)
         ntiles = -(-M // tile_m) * -(-N // tile_n) * L
         k_tiles = -(-K // (c.tile_k or 64))
@@ -371,6 +413,41 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         configs = [conf for conf in configs if not conf.kwargs["config"].use_tma_gather]
     if kwargs.get("SFA", None) is not None:  # blockscaled (SM100 tcgen05 MMA constraints)
         configs = [conf for conf in configs if blockscaled_config_ok(conf.kwargs["config"])]
+    if (
+        kwargs.get("SFD", None) is not None or kwargs.get("SFDCol", None) is not None
+    ):  # quantized output (SM100 SFD epilogue)
+        col_only = kwargs.get("SFDCol", None) is not None
+
+        def _sfd_ok(c: GemmConfig) -> bool:
+            if c.swap_ab:  # SFD assumes N-major D and un-swapped N
+                return False
+            if c.device_capacity in (10, 11):
+                # tile_n % 64 keeps the epi tile N at 32/64, covering whole SF
+                # vectors for both vec sizes (32 for mx, 16 for nvfp4). The CTA
+                # tile M must be 128 (the (4,1) epilogue warp shape, one full epi
+                # row per thread): tile_m 128 with an even cluster_m selects the
+                # 2-CTA MMA whose 64-row CTA tile uses the (2,2) warp shape,
+                # splitting SF vectors across threads (and producing strided
+                # fixup epi tiles the SF atom layout cannot divide).
+                return (
+                    c.tile_n % 64 == 0
+                    and c.tile_m in (128, 256)
+                    and not (c.tile_m == 128 and c.cluster_m % 2 == 0)
+                )
+            if c.device_capacity == 12:
+                if col_only:
+                    # Col vectors run along M: the 64-row epi tile covers
+                    # whole 32-row vectors; the tile must divide into epi
+                    # subtiles for the per-subtile SF flush.
+                    return c.tile_m % 64 == 0
+                # SM90-style register epilogue: epi tile N = gcd(32|64, tile_n)
+                # must cover whole SF vectors (tile_n % 32 covers both vec
+                # sizes), and the epi tile M must divide the 128-row SF pad
+                # (excludes the 192-row epi tile of 192-multiple tile_m).
+                return c.tile_n % 32 == 0 and c.tile_m % 64 == 0 and c.tile_m % 192 != 0
+            return False
+
+        configs = [conf for conf in configs if _sfd_ok(conf.kwargs["config"])]
     # Autotuned split-K: only the plain-gemm family exposes the knob; split_k=None means
     # "tune the factor" (an explicit int is forced in gemm_tuned and needs no variants).
     if (
@@ -379,7 +456,9 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         and not (varlen_m or varlen_k or gather_A)
         and device_capacity in (9, 10, 11, 12)
     ):
-        configs = _expand_split_k_configs(configs, kwargs["A"], kwargs["B"], device_capacity)
+        configs = _expand_split_k_configs(
+            configs, kwargs["A"], kwargs["B"], device_capacity, kwargs.get("SFA") is not None
+        )
     return configs
 
 
@@ -414,10 +493,19 @@ def gemm_tuned(
     bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,  # None: let the autotuner choose the factor (config.split_k)
     split_k_mode: int = SplitKMode.SERIAL,
+    # Quantized output (SM100 SFD epilogue): blocked output scale factors,
+    # written by the kernel. SFD = row direction (SF vectors along N), SFDCol =
+    # column direction (vectors along M); mutually exclusive. sfd_norm_const is
+    # the optional fp32 norm constant folded into the stored scales (the
+    # reciprocal of the nvfp4 per-tensor scale).
+    SFD: Optional[Tensor] = None,
+    sfd_norm_const: Optional[float | Tensor] = None,
+    SFDCol: Optional[Tensor] = None,
 ) -> Tuple[GemmConfig, int, bool, object]:  # (config, split_k, dynamic_scheduler, dispatch plan)
     blockscaled = SFA is not None
     if blockscaled:
         SFA, SFB = _sf_decode(SFA, bs_format_a), _sf_decode(SFB, bs_format_b)
+    quant_out = SFD is not None or SFDCol is not None
     if config is None:
         if blockscaled:
             m = A.shape[-2]
@@ -425,7 +513,9 @@ def gemm_tuned(
                 m, B.shape[-1], device_capacity=get_device_capacity(A.device)[0]
             )
         else:
-            # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue)
+            # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue).
+            # Quantized output bypasses it: nvMMH may pick swap_ab / tile_n / 2-CTA
+            # shapes the SFD epilogue cannot run (see _sfd_ok in the config prune).
             is_pure_gemm = (
                 cu_seqlens_m is None
                 and cu_seqlens_k is None
@@ -433,6 +523,7 @@ def gemm_tuned(
                 and C is None
                 and bias is None
                 and not add_to_output
+                and not quant_out
             )
             if is_pure_gemm:
                 device_capacity = get_device_capacity(A.device)[0]
@@ -455,6 +546,29 @@ def gemm_tuned(
         assert config.cluster_n == 1, "gather_A requires cluster_n=1"
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
+    if quant_out:
+        # Explicit-config calls skip the autotune prune; re-assert the SFD
+        # constraint set (see _sfd_ok in prune_invalid_gemm_configs).
+        assert not config.swap_ab, "Quantized output (SFD) requires an un-swapped config"
+        if config.device_capacity == 12:
+            if SFDCol is not None:
+                assert config.tile_m % 64 == 0, (
+                    "Column-direction quantized output (SFDCol) requires tile_m % 64 == 0"
+                )
+            else:
+                assert config.tile_n % 32 == 0, "Quantized output (SFD) requires tile_n % 32 == 0"
+                assert config.tile_m % 64 == 0 and config.tile_m % 192 != 0, (
+                    "Quantized output (SFD) on SM120 requires a 64/128/256-row tile "
+                    "(the 192-row epi tile does not divide the 128-row SF pad)"
+                )
+        else:
+            assert config.tile_n % 64 == 0, "Quantized output (SFD) requires tile_n % 64 == 0"
+            assert config.tile_m in (128, 256) and not (
+                config.tile_m == 128 and config.cluster_m % 2 == 0
+            ), (
+                "Quantized output (SFD) requires the (4,1) epilogue warp shape "
+                "(the 64-row 2-CTA tile splits SF vectors across threads)"
+            )
     dynamic_scheduler = dynamic_scheduler or config.is_dynamic_persistent
     dispatch_plan = _gemm_execute(
         A,
@@ -480,6 +594,9 @@ def gemm_tuned(
         split_k_mode=split_k_mode,
         bs_format_a=bs_format_a,
         bs_format_b=bs_format_b,
+        SFD=SFD,
+        sfd_norm_const=sfd_norm_const,
+        SFDCol=SFDCol,
     )
     # Resolved decisions, so the eager `gemm` wrapper can record an interface
     # plan (see _GemmIfacePlan). The custom-op route discards this.
@@ -511,6 +628,9 @@ def _gemm_execute(
     split_k_mode: int,
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
+    SFD: Optional[Tensor] = None,
+    sfd_norm_const: Optional[float | Tensor] = None,
+    SFDCol: Optional[Tensor] = None,
     dispatch_plan=None,
 ):
     """Transform operands (batch dims, swap_ab, concat) and launch the GEMM.
@@ -572,6 +692,9 @@ def _gemm_execute(
         else:
             batch_size = B.shape[0] if not varlen_k else cu_seqlens_k.shape[0] - 1
             out_shape = (batch_size, A.shape[-2], n_ext)
+    # fp4 output is stored packed: the last dim holds N/2 float4_e2m1fn_x2 bytes.
+    if out.dtype == torch.float4_e2m1fn_x2:
+        out_shape = (*out_shape[:-1], out_shape[-1] // 2)
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device)
@@ -618,6 +741,9 @@ def _gemm_execute(
             batch_idx_permute=batch_idx_permute,
             SFA=SFA,
             SFB=SFB,
+            SFD=SFD,
+            sfd_norm_const=sfd_norm_const,
+            SFDCol=SFDCol,
         )
         return dispatch_plan
     _swap_map = {"A": "B", "B": "A", "out": "out", "C": "C", "mRowVecBroadcast": "mColVecBroadcast"}
@@ -663,6 +789,9 @@ def _gemm_execute(
         split_k=split_k,
         split_k_mode=split_k_mode,
         b_kn=b_kn,
+        SFD=SFD,
+        sfd_norm_const=sfd_norm_const,
+        SFDCol=SFDCol,
     )
 
 
@@ -671,7 +800,8 @@ def _gemm_execute(
 # quack.epilogue.library.linear_act_mod owns canonicalization, plan caching, and
 # tuning (incl. varlen/gather, blockscaled, concat_layout, and swap-at-trace
 # for the element-mode forms; the gated config space never had swap_ab).
-# SR (rounding_mode/sr_seed) stays on the raw dispatch (quack.gemm_act).
+# SR (rounding_mode/sr_seed) is not exposed here; call
+# linear_act_mod(..., sr=True).gemm(rounding_mode=...) directly.
 
 
 def _gemm_act_call(
@@ -765,7 +895,7 @@ def _act_concat_bias(bias, concat_layout, swap_ab):
 # Ported to the epilogue-object surface (see the gemm_rms note below):
 # quack.epilogue.library.dact_mod / dgated_mod own canonicalization, plan caching,
 # and tuning (incl. varlen/gather and dynamic_scheduler=True, dact's default).
-# The dgated colvec reduce comes back finalized via the generic
+# The colvec reduce comes back finalized via the generic
 # VecReduce.host_finalize — the same partials.sum(dim=-1) the old wrapper ran.
 
 
@@ -781,23 +911,23 @@ def _gemm_dact_call(
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
+    SFA: Optional[Tensor] = None,  # decoded (real-dtype) scale factors
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,  # BlockScaledFormat names (see quack.gemm.gemm)
+    bs_format_b: Optional[str] = None,
     dynamic_scheduler: bool,
     tuned: bool,
     config: Optional[GemmConfig] = None,
 ) -> Optional[Tensor]:
     """Launch dact/dgated on the epilogue object. Returns the finalized colvec
-    reduce (dgated with colvec_reduce=True) or None."""
+    reduce (colvec_reduce=True) or None."""
     from quack.epilogue.library import dact_mod, dgated_mod
 
+    mod_fn = dgated_mod if activation in gated_to_pytorch_fn_map else dact_mod
+    mod = mod_fn(activation, has_scale=colvec_scale is not None, has_reduce=colvec_reduce)
     operands = {}
-    if activation in gated_to_pytorch_fn_map:
-        mod = dgated_mod(activation, has_scale=colvec_scale is not None, has_reduce=colvec_reduce)
-        if colvec_scale is not None:
-            operands["mColVecBroadcast"] = colvec_scale
-    else:
-        if colvec_scale is not None or colvec_reduce:
-            raise ValueError("colvec_scale/colvec_reduce are only supported for dgated")
-        mod = dact_mod(activation)
+    if colvec_scale is not None:
+        operands["mColVecBroadcast"] = colvec_scale
     res = mod(
         A,
         B,
@@ -808,6 +938,10 @@ def _gemm_dact_call(
         dynamic_scheduler=dynamic_scheduler,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         **operands,
     )
     return res.get("mColVecReduce")
@@ -843,12 +977,30 @@ def gemm(
     # carrying the blocked (rm, rk, 32, 4, 4) / (L, rm, rk, 32, 4, 4) scale factors.
     A: Tensor | BlockScaledOperand,
     B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
-    out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    # (M, N) or (L, M, N) or (total_M, N) if varlen_m; a BlockScaledOperand
+    # container for a quantized output (matching the out_dtype format).
+    out: Optional[Tensor | BlockScaledOperand] = None,
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     alpha: float | Tensor = 1.0,
-    # a BlockScaledFormat (or its name) requests a blockscaled output -> returns a
-    # BlockScaledOperand (SF-generation epilogue, milestone M5; reserved for now)
+    # a BlockScaledFormat (or its name) requests a quantized (blockscaled) output:
+    # the kernel writes fp8/fp4 values plus blocked scale factors (SF-generation
+    # epilogue) and the call returns a BlockScaledOperand.
     out_dtype: Optional[torch.dtype | BlockScaledFormat | str] = None,
+    # Quantized output only. out_quant_dim: which logical dim the SF vectors run
+    # along - -1 (default: along N, the next GEMM's contraction dim) or -2 (along
+    # M, for backward consumers contracting over this output's M; fp8 only,
+    # values stay (M, N) n-major). out_transposed (with out_quant_dim=-2):
+    # return D^T instead - a (N, M) / (L, N, M) row-quantized BlockScaledOperand
+    # (quant_dim -1 in its own frame) whose values are contiguous along the
+    # consumer's K = this GEMM's M, i.e. a directly loadable k-major operand
+    # for the backward GEMM. Implemented as the swapped GEMM D^T = B^T A^T
+    # riding the ordinary row-direction path, so it is fp4-capable (nvfp4/mxfp4
+    # pack along M) and pays no cross-warp exchange on SM120.
+    # out_per_tensor_scale: NVFP4 second-level scale - dequant = q * sf * scale;
+    # its reciprocal is folded into the stored scale factors.
+    out_quant_dim: int = -1,
+    out_transposed: bool = False,
+    out_per_tensor_scale: Optional[float | Tensor] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) or (total_K,) indices for gather_A when varlen
@@ -860,23 +1012,81 @@ def gemm(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     split_k: Optional[int] = 1,  # K-dim CTAs per tile; None = let the autotuner choose
     split_k_mode: int = SplitKMode.SERIAL,  # see SplitKMode: SERIAL/SEPARATE deterministic, PARALLEL fastest but arrival-order
-) -> Tensor:
+) -> Tensor | BlockScaledOperand:
     """GEMM with optional output tensor and tuning control."""
-    _reserve_blockscaled_out(out_dtype)
+    fmt_d = _resolve_blockscaled_out(out_dtype)
+    if fmt_d is not None and out_transposed:
+        # D^T quantized along its rows = col-direction quantization of D with
+        # values contiguous along M: run the swapped GEMM (operand .mT views,
+        # no data movement) through the ordinary row-direction path. The
+        # kernel sees its native n-major D — this is the only orientation in
+        # which "SFD under swap_ab" is coherent, and it needs no kernel-side
+        # swap plumbing at all.
+        assert out_quant_dim == -2, "out_transposed requires out_quant_dim=-2"
+        assert bias is None, "out_transposed quantized output does not support bias yet"
+        assert cu_seqlens_m is None and cu_seqlens_k is None and A_idx is None, (
+            "out_transposed quantized output does not support varlen/gather"
+        )
+        assert batch_idx_permute is None and not concat_layout
+        return gemm(
+            B.mT,
+            A.mT,
+            out=out,
+            alpha=alpha,
+            out_dtype=out_dtype,
+            out_quant_dim=-1,
+            out_per_tensor_scale=out_per_tensor_scale,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+            rounding_mode=rounding_mode,
+            sr_seed=sr_seed,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
+        )
+    assert not out_transposed, "out_transposed requires a blockscaled out_dtype"
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     A, B = opA.data, opB.data
     SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
-    alpha = _fold_pts(alpha, opA, opB)
+    alpha = _fold_per_tensor_scales(alpha, opA, opB)
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(
             SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
+        )
+    out_sf = None
+    if fmt_d is not None:
+        assert out_quant_dim in (-1, -2), f"out_quant_dim must be -1 or -2, got {out_quant_dim}"
+        # rounding_mode composes: RS quantizes the rescaled values through
+        # cvt.rs (hw fp8x4/e2m1x4 on sm_100a/103a, sw emulation elsewhere);
+        # the SF bytes themselves stay RN/ceil either way.
+        assert not concat_layout, "quantized output does not support concat_layout"
+        assert split_k in (1, None), "quantized output does not support split_k yet"
+        split_k = 1
+        if out_quant_dim == -2:
+            assert cu_seqlens_m is None and cu_seqlens_k is None, (
+                "column-direction quantized output does not support varlen yet"
+            )
+        if isinstance(out, BlockScaledOperand):
+            assert out.format == fmt_d, (
+                f"out container format {out.format.name} != out_dtype {fmt_d.name}"
+            )
+            # A wrong-direction container has a differently-shaped SF buffer;
+            # the kernel derives its store bounds from that shape, so this
+            # would silently truncate/corrupt instead of erroring later.
+            assert out.quant_dim == out_quant_dim, (
+                f"out container quant_dim {out.quant_dim} != out_quant_dim {out_quant_dim}"
+            )
+            out_sf, out = out.scale, out.qdata
+    else:
+        assert out_per_tensor_scale is None, "out_per_tensor_scale requires a blockscaled out_dtype"
+        assert not isinstance(out, BlockScaledOperand), (
+            "a BlockScaledOperand out requires a blockscaled out_dtype"
         )
     # Eager plan fast path: replay of a previously validated call with different
     # data pointers. The key covers everything the slow path's decisions read,
     # including the alpha/sr modes: the captured dispatch plan depends on them,
     # so this key must subsume the dispatch key. Varlen/gather/permute/concat
-    # calls always take the general path; compiled code takes the custom-op
-    # route below.
+    # calls always take the general path; compiled code and quantized outputs
+    # take the custom-op route below.
     plan_key = None
     if not torch.compiler.is_compiling() and (
         cu_seqlens_m is None
@@ -884,6 +1094,7 @@ def gemm(
         and A_idx is None
         and batch_idx_permute is None
         and not concat_layout
+        and fmt_d is None
     ):
         plan_key = (
             tensor_key(A),
@@ -957,16 +1168,75 @@ def gemm(
             out_shape = (
                 (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
             )
-        out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+        if fmt_d is not None:
+            if out_quant_dim == -1:
+                num_varlen_batches = cu_seqlens_m.shape[0] - 1 if varlen_m else None
+                out, out_sf = _alloc_blockscaled_out(
+                    out_shape, fmt_d, A.device, num_varlen_batches=num_varlen_batches
+                )
+            else:
+                out, out_sf = _alloc_blockscaled_out_col(out_shape, fmt_d, A.device)
+        else:
+            out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    if fmt_d is not None:
+        assert out_sf is not None, (
+            "quantized output requires out as a BlockScaledOperand (or out=None to allocate)"
+        )
+        pts = None
+        sfd_norm_const = None
+        if out_per_tensor_scale is not None:
+            assert fmt_d.has_per_tensor_scale, f"{fmt_d.name} does not take out_per_tensor_scale"
+            if isinstance(out_per_tensor_scale, Tensor):
+                pts = out_per_tensor_scale.float().reshape(1)
+                sfd_norm_const = pts.reciprocal()
+            else:
+                pts = torch.full(
+                    (1,), float(out_per_tensor_scale), dtype=torch.float32, device=out.device
+                )
+                sfd_norm_const = 1.0 / out_per_tensor_scale
+        out_op = BlockScaledOperand(
+            qdata=out, scale=out_sf, format=fmt_d, per_tensor_scale=pts, quant_dim=out_quant_dim
+        )
     # Empty-input fast path: skip kernel launch.
     # M=0 / N=0 — the tile scheduler's ceil_div over a zero dim divides by zero.
     # K=0 — the kernel rejects stride-0 inputs (stride must be divisible by 8);
     #       semantically the empty contraction yields a zero matrix.
     if out.numel() == 0:
-        return out
+        return out_op if fmt_d is not None else out
     if A.numel() == 0:
+        assert fmt_d is None, "quantized output does not support K == 0"
         _empty_k_matmul_into(out, bias=bias)
         return out
+    if fmt_d is not None:
+        # Quantized output always takes the custom-op route (compiling or
+        # eager): the op marshals the SFD/norm-const args and calls the tuner.
+        gemm_quant_out(
+            A,
+            B,
+            out,
+            _sf_encode(out_sf),
+            bs_format_d=fmt_d.name,
+            sfd_dim="n" if out_quant_dim == -1 else "m",
+            bias=bias,
+            alpha=alpha if isinstance(alpha, float) else 1.0,
+            alpha_tensor=alpha if not isinstance(alpha, float) else None,
+            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_k=cu_seqlens_k,
+            A_idx=A_idx,
+            batch_idx_permute=batch_idx_permute,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+            sfd_norm_const=sfd_norm_const if isinstance(sfd_norm_const, float) else 1.0,
+            sfd_norm_const_tensor=sfd_norm_const if isinstance(sfd_norm_const, Tensor) else None,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
+            rounding_mode=rounding_mode,
+            sr_seed=sr_seed if isinstance(sr_seed, int) else 0,
+            sr_seed_tensor=sr_seed if isinstance(sr_seed, Tensor) else None,
+        )
+        return out_op
     if torch.compiler.is_compiling():
         # The torch-library boundary needs schema-typed args: alpha/sr_seed are
         # split by type, concat_layout stringified, e8m0 SFs uint8-viewed
@@ -1106,6 +1376,79 @@ def gemm_out(
     )
 
 
+@torch.library.custom_op(
+    "quack::gemm_quant_out",
+    mutates_args=("out", "SFD"),
+    device_types="cuda",
+)
+def gemm_quant_out(
+    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m
+    B: Tensor,  # (K, N) or (L, K, N) or (total_K, N) if varlen_k
+    out: Tensor,  # (M, N[/2 for fp4]) or (L, M, N[/2]) or (total_M, N[/2]) quantized values
+    # Output scale factors for quantized D (mxfp8/mxfp4/nvfp4), written by the
+    # kernel; e8m0 crosses the boundary as a uint8 view (see _sf_encode),
+    # decoded from bs_format_d. A separate op from gemm_out because
+    # torch.library breaks on None values for tensors named in mutates_args -
+    # here SFD is required.
+    # varlen_m: one M-padded (1, total_padded_rm, rk, 32, 4, 4) buffer with
+    # tile-aligned per-batch padding (input-SFA convention).
+    SFD: Tensor,
+    bs_format_d: str,
+    sfd_dim: str = "n",
+    bias: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
+    cu_seqlens_k: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+    batch_idx_permute: Optional[Tensor] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+    sfd_norm_const: float = 1.0,
+    sfd_norm_const_tensor: Optional[Tensor] = None,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int = 0,
+    sr_seed_tensor: Optional[Tensor] = None,
+) -> None:
+    """GEMM with quantized output: fp8/fp4 values in ``out``, block scale
+    factors in ``SFD`` (vectors along N for sfd_dim="n", along M for "m")."""
+    fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    alpha = _merge_tensor(alpha, alpha_tensor)
+    sr_seed_arg = _merge_tensor(sr_seed, sr_seed_tensor)
+    sfd_norm_const_arg = _merge_tensor(sfd_norm_const, sfd_norm_const_tensor)
+    if isinstance(sfd_norm_const_arg, float) and sfd_norm_const_arg == 1.0:
+        sfd_norm_const_arg = None
+    SFD = _sf_decode(SFD, bs_format_d)
+    if SFD.ndim == 5:
+        SFD = SFD.unsqueeze(0)
+    fn(
+        A,
+        B,
+        out,
+        C=None,
+        bias=bias,
+        alpha=alpha,
+        cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_k=cu_seqlens_k,
+        A_idx=A_idx,
+        batch_idx_permute=batch_idx_permute,
+        dynamic_scheduler=dynamic_scheduler,
+        rounding_mode=rounding_mode,
+        sr_seed=sr_seed_arg,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
+        SFD=SFD if sfd_dim == "n" else None,
+        sfd_norm_const=sfd_norm_const_arg,
+        SFDCol=SFD if sfd_dim == "m" else None,
+    )
+
+
 def gemm_ref(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
     A: Tensor,
@@ -1207,9 +1550,9 @@ def gemm_blockscaled_ref(
     a_dq = a_val * sfa.repeat_interleave(sf_vec, dim=-1)
     b_dq = b_val * sfb.repeat_interleave(sf_vec, dim=-1)
     out = torch.einsum("lmk,lnk->lmn", a_dq, b_dq)
-    for pts in (opA.pts, opB.pts):  # NVFP4 per-tensor scales
-        if pts is not None:
-            out = out * pts
+    for scale in (opA.per_tensor_scale, opB.per_tensor_scale):  # NVFP4 per-tensor scales
+        if scale is not None:
+            out = out * scale
     if not (isinstance(alpha, float) and alpha == 1.0):
         out = out * alpha
     out = out.to(out_dtype)
@@ -1245,7 +1588,7 @@ def gemm_add(
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     A, B = opA.data, opB.data
     SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
-    alpha = _fold_pts(alpha, opA, opB)
+    alpha = _fold_per_tensor_scales(alpha, opA, opB)
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(
             SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None or cu_seqlens_k is not None
@@ -1289,7 +1632,7 @@ def gemm_add(
     concat_str = ",".join(concat_layout) if concat_layout else None
     if add_to_output:
         # Pass flat parts: the operands were already unpacked and validated, and
-        # pts was already folded into alpha above.
+        # per-tensor scales were already folded into alpha above.
         _launch(_gemm_add_inplace_parts)(
             A,
             B,
@@ -1636,7 +1979,7 @@ def gemm_add_inplace(
         SFB=SFB,
         bs_format_a=bs_format_a,
         bs_format_b=bs_format_b,
-        alpha=_fold_pts(alpha, opA, opB),
+        alpha=_fold_per_tensor_scales(alpha, opA, opB),
         beta=beta,
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
@@ -1812,7 +2155,7 @@ def gemm_act(
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     A, B = opA.data, opB.data
     SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
-    alpha = _fold_pts(alpha, opA, opB)
+    alpha = _fold_per_tensor_scales(alpha, opA, opB)
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None)
     is_gated = activation in gated_to_pytorch_fn_map
@@ -1995,8 +2338,10 @@ gemm_gated_ref = gemm_act_ref
 
 
 def gemm_dact(
-    A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
-    B: Tensor,  # (K, N) or (L, K, N)
+    # For blockscaled: a BlockScaledOperand container - see gemm().
+    # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
+    A: Tensor | BlockScaledOperand,
+    B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N)
     PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m; or (M, 2*N) for dgated
     activation: Activation = None,
     dx_out: Optional[
@@ -2005,8 +2350,8 @@ def gemm_dact(
     postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
-    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m (dgated only)
-    colvec_reduce: bool = False,  # dgated only
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
+    colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
@@ -2016,10 +2361,22 @@ def gemm_dact(
     split_k_mode: int = SplitKMode.SERIAL,
 ):
     """GEMM with activation (or gated activation) gradient and optional output tensors."""
-    _reject_blockscaled("gemm_dact", A=A, B=B)
+    _reserve_blockscaled_out(out_dtype)
+    _reserve_blockscaled_out(postact_dtype)
     _check_split_k_unsupported("gemm_dact", split_k)
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
+    if opA.per_tensor_scale is not None or opB.per_tensor_scale is not None:
+        raise NotImplementedError(
+            "gemm_dact does not support NVFP4 per-tensor scales yet (the dact/dgated "
+            "epilogues have no alpha to fold them into)"
+        )
+    if SFA is not None:
+        SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None)
     is_dgated = activation in gated_to_pytorch_fn_map
-    out_dtype = A.dtype if out_dtype is None else out_dtype
+    default_dtype = torch.bfloat16 if SFA is not None else A.dtype
+    out_dtype = default_dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
@@ -2048,35 +2405,27 @@ def gemm_dact(
     if torch.compiler.is_compiling():
         if config is not None:
             raise NotImplementedError("gemm_dact: explicit config under torch.compile")
-        if is_dgated:
-            colvec_reduce_final = gemm_dgated_out(
-                A,
-                B,
-                PreAct,
-                dx_out,
-                postact_out,
-                colvec_scale,
-                activation,
-                colvec_reduce,
-                cu_seqlens_m,
-                A_idx,
-                dynamic_scheduler,
-                tuned,
-            )
-        else:
-            gemm_dact_out(
-                A,
-                B,
-                PreAct,
-                dx_out,
-                postact_out,
-                activation,
-                cu_seqlens_m,
-                A_idx,
-                dynamic_scheduler,
-                tuned,
-            )
-            colvec_reduce_final = None
+        if SFA is not None:
+            SFA, SFB = _sf_encode(SFA), _sf_encode(SFB)
+        out_op = gemm_dgated_out if is_dgated else gemm_dact_out
+        colvec_reduce_final = out_op(
+            A,
+            B,
+            PreAct,
+            dx_out,
+            postact_out,
+            colvec_scale,
+            activation,
+            colvec_reduce,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+            tuned,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
+        )
     else:
         colvec_reduce_final = _gemm_dact_call(
             A,
@@ -2089,6 +2438,10 @@ def gemm_dact(
             colvec_reduce=colvec_reduce,
             cu_seqlens_m=cu_seqlens_m,
             A_idx=A_idx,
+            SFA=_sf_decode(SFA, bs_format_a),
+            SFB=_sf_decode(SFB, bs_format_b),
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
             dynamic_scheduler=dynamic_scheduler,
             tuned=tuned,
             config=config,
@@ -2096,7 +2449,7 @@ def gemm_dact(
     results = [dx_out, postact_out]
     if colvec_reduce:
         results.append(colvec_reduce_final)
-    return tuple(results) if is_dgated else (dx_out, postact_out)
+    return tuple(results)
 
 
 gemm_dgated = gemm_dact
@@ -2106,7 +2459,7 @@ gemm_dgated = gemm_dact
     "quack::gemm_dact_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str? activation=None, bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None) -> Tensor",
 )
 def gemm_dact_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2114,25 +2467,40 @@ def gemm_dact_out(
     PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     dx_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
     activation: ActActivation = None,
+    colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
-) -> None:
+    SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+) -> Tensor:
     """GEMM with activation gradient and pre-allocated output tensors."""
-    _gemm_dact_call(
+    result = _gemm_dact_call(
         A,
         B,
         PreAct,
         dx_out,
         postact_out,
         activation=activation,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
+    if result is None:  # Have to return a tensor, not None, to make torch compile happy
+        return torch.empty(0, device=A.device, dtype=torch.float32)
+    return result
 
 
 def gemm_dact_ref(
@@ -2210,12 +2578,26 @@ def gemm_symmetric_out(
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     beta_tensor: Optional[Tensor] = None,
+    SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
 ) -> None:
     """GEMM with guaranteed symmetric output."""
     alpha = _merge_tensor(alpha, alpha_tensor)
     beta = _merge_tensor(beta, beta_tensor)
     _gemm_symmetric_execute(
-        A, B, out, C, dynamic_scheduler=dynamic_scheduler, alpha=alpha, beta=beta
+        A,
+        B,
+        out,
+        C,
+        dynamic_scheduler=dynamic_scheduler,
+        alpha=alpha,
+        beta=beta,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
     )
 
 
@@ -2240,6 +2622,10 @@ def _symmetric_cold(canon, semaphore, config, dynamic_scheduler, ctx):
         max_swizzle_size=8,
         alpha=ctx["alpha"],
         beta=ctx["beta"],
+        SFA=ctx["SFA"],
+        SFB=ctx["SFB"],
+        bs_format_a=ctx["bs_format_a"],
+        bs_format_b=ctx["bs_format_b"],
     )
 
 
@@ -2248,7 +2634,15 @@ def _symmetric_warm(plan, canon, semaphore, ctx):
     # SM100+, whose scheduler uses CLC), so it is ignored.
     t = canon.tensors
     run_gemm_symmetric_plan(
-        plan, t["A"], t["B"], t["out"], t["C"], alpha=ctx["alpha"], beta=ctx["beta"]
+        plan,
+        t["A"],
+        t["B"],
+        t["out"],
+        t["C"],
+        alpha=ctx["alpha"],
+        beta=ctx["beta"],
+        SFA=ctx["SFA"],
+        SFB=ctx["SFB"],
     )
 
 
@@ -2274,6 +2668,10 @@ def _gemm_symmetric_execute(
     dynamic_scheduler: bool,
     alpha: float | Tensor,
     beta: float | Tensor,
+    SFA: Optional[Tensor] = None,  # decoded (real-dtype) scale factors
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,  # BlockScaledFormat names (see quack.gemm.gemm)
+    bs_format_b: Optional[str] = None,
     dispatch_plan=None,
 ):
     """Launch the symmetric GEMM through the generic variant engine."""
@@ -2282,7 +2680,14 @@ def _gemm_symmetric_execute(
         dict(A=A, B=B, out=out, C=C),
         config=None,
         dynamic_scheduler=dynamic_scheduler,
-        ctx=dict(alpha=alpha, beta=beta),
+        ctx=dict(
+            alpha=alpha,
+            beta=beta,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
+        ),
         dispatch_plan=dispatch_plan,
     )
 
@@ -2291,8 +2696,10 @@ _gemm_symmetric_iface_plan_cache: dict[tuple, IfacePlan] = {}
 
 
 def gemm_symmetric(
-    A: Tensor,  # (M, K) or (L, M, K)
-    B: Tensor,  # (K, M) or (L, K, M)
+    # For blockscaled: a BlockScaledOperand container - see gemm(). B must be
+    # A.mT of the same quantized tensor (that is what makes D symmetric).
+    A: Tensor | BlockScaledOperand,  # (M, K) or (L, M, K)
+    B: Tensor | BlockScaledOperand,  # (K, M) or (L, K, M)
     C: Optional[Tensor] = None,  # (M, M) or (L, M, M)
     out: Optional[Tensor] = None,  # (M, M) or (L, M, M)
     out_dtype: Optional[torch.dtype] = None,
@@ -2303,8 +2710,19 @@ def gemm_symmetric(
     split_k_mode: int = SplitKMode.SERIAL,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with symmetric output."""
-    _reject_blockscaled("gemm_symmetric", A=A, B=B)
+    _reserve_blockscaled_out(out_dtype)
     _check_split_k_unsupported("gemm_symmetric", split_k)
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
+    if SFA is not None and bs_format_a != bs_format_b:
+        raise ValueError(
+            "gemm_symmetric requires matching A/B formats (B is A.mT of the same "
+            f"quantized tensor); got {bs_format_a} / {bs_format_b}"
+        )
+    alpha = _fold_per_tensor_scales(alpha, opA, opB)
+    if SFA is not None:
+        SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3)
     # Eager plan fast path; see gemm(). The key subsumes the dispatch key
     # (alpha/beta modes select compiled epilogues).
     plan_key = None
@@ -2319,14 +2737,29 @@ def gemm_symmetric(
             dynamic_scheduler,
             scalar_mode(alpha),
             scalar_mode(beta),
+            tensor_key(SFA),
+            tensor_key(SFB),
+            bs_format_a,
+            bs_format_b,
         )
         plan = _gemm_symmetric_iface_plan_cache.get(plan_key)
         if plan is not None:
             out = alloc_outputs(plan, dict(out=out), A.device)["out"]
             # No empty-input checks: empty calls return before recording below.
-            plan.replay(dict(A=A, B=B, out=out, C=C), dict(alpha=alpha, beta=beta))
+            plan.replay(
+                dict(A=A, B=B, out=out, C=C),
+                dict(
+                    alpha=alpha,
+                    beta=beta,
+                    SFA=SFA,
+                    SFB=SFB,
+                    bs_format_a=bs_format_a,
+                    bs_format_b=bs_format_b,
+                ),
+            )
             return out
-    out_dtype = A.dtype if out_dtype is None else out_dtype
+    default_dtype = torch.bfloat16 if SFA is not None else A.dtype
+    out_dtype = default_dtype if out_dtype is None else out_dtype
     if A.ndim == 2:
         out_shape = (A.shape[0], B.shape[-1])
     else:
@@ -2347,6 +2780,8 @@ def gemm_symmetric(
         alpha_val = alpha if isinstance(alpha, float) else 1.0
         beta_tensor = beta if not isinstance(beta, float) else None
         beta_val = beta if isinstance(beta, float) else 1.0
+        if SFA is not None:
+            SFA, SFB = _sf_encode(SFA), _sf_encode(SFB)
         gemm_symmetric_out(
             A,
             B,
@@ -2357,10 +2792,24 @@ def gemm_symmetric(
             beta=beta_val,
             alpha_tensor=alpha_tensor,
             beta_tensor=beta_tensor,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
         )
         return out
     dispatch_plan = _gemm_symmetric_execute(
-        A, B, out, C, dynamic_scheduler=dynamic_scheduler, alpha=alpha, beta=beta
+        A,
+        B,
+        out,
+        C,
+        dynamic_scheduler=dynamic_scheduler,
+        alpha=alpha,
+        beta=beta,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
     )
     if plan_key is not None:
         _gemm_symmetric_iface_plan_cache[plan_key] = make_iface_plan(
@@ -2426,7 +2875,7 @@ def gemm_gated_out(
     "quack::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(b!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(b!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None) -> Tensor",
 )
 def gemm_dgated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2441,6 +2890,10 @@ def gemm_dgated_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
+    SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
 ) -> Tensor:
     """GEMM with gated activation gradient and pre-allocated output tensors."""
     result = _gemm_dact_call(
@@ -2454,12 +2907,35 @@ def gemm_dgated_out(
         colvec_reduce=colvec_reduce,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
     )
     if result is None:  # Have to return a tensor, not None, to make torch compile happy
         return torch.empty(0, device=A.device, dtype=torch.float32)
     return result
+
+
+def _colvec_reduce_fake(
+    A: Tensor,
+    colvec_reduce: bool,
+    cu_seqlens_m: Optional[Tensor],
+    A_idx: Optional[Tensor],
+) -> Tensor:
+    """Fake colvec-reduce output for the dact/dgated custom ops (empty if off)."""
+    if not colvec_reduce:
+        return torch.empty(0, dtype=torch.float32, device=A.device)
+    if cu_seqlens_m is not None:
+        total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
+        out_shape = (total_m,)
+    elif A.ndim == 2:
+        out_shape = (A.shape[0],)
+    else:
+        out_shape = (A.shape[0], A.shape[-2])
+    return torch.empty(out_shape, dtype=torch.float32, device=A.device)
 
 
 @torch.library.register_fake("quack::gemm_dgated_out")
@@ -2476,18 +2952,34 @@ def gemm_dgated_out_fake(
     A_idx: Optional[Tensor] = None,
     dynamic_scheduler: bool = True,
     tuned: bool = True,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
 ) -> Tensor:
-    if not colvec_reduce:
-        return torch.empty(0, dtype=torch.float32, device=A.device)
-    else:
-        if cu_seqlens_m is not None:
-            total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
-            out_shape = (total_m,)
-        elif A.ndim == 2:
-            out_shape = (A.shape[0],)
-        else:
-            out_shape = (A.shape[0], A.shape[-2])
-        return torch.empty(out_shape, dtype=torch.float32, device=A.device)
+    return _colvec_reduce_fake(A, colvec_reduce, cu_seqlens_m, A_idx)
+
+
+@torch.library.register_fake("quack::gemm_dact_out")
+def gemm_dact_out_fake(
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    dx_out: Tensor,
+    postact_out: Tensor,
+    colvec_scale: Optional[Tensor] = None,
+    activation: Optional[str] = None,
+    colvec_reduce: bool = False,
+    cu_seqlens_m: Optional[Tensor] = None,
+    A_idx: Optional[Tensor] = None,
+    dynamic_scheduler: bool = True,
+    tuned: bool = True,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+) -> Tensor:
+    return _colvec_reduce_fake(A, colvec_reduce, cu_seqlens_m, A_idx)
 
 
 @gemm_add_inplace_op.register_fake
@@ -2573,7 +3065,6 @@ def _register_noop_fake(custom_op):
 _register_noop_fake(gemm_out)
 _register_noop_fake(gemm_add_out)
 _register_noop_fake(gemm_act_out)
-_register_noop_fake(gemm_dact_out)
 _register_noop_fake(gemm_gated_out)
 
 
@@ -2588,6 +3079,10 @@ def gemm_symmetric_out_fake(
     beta: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
     beta_tensor: Optional[Tensor] = None,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
 ) -> None:
     # Pure no-op: the op only mutates ``out``; kernel compilation is owned
     # by jit_cache + the async compile pool at real execution time.
@@ -2613,15 +3108,22 @@ def _gemm_rms_call(
     dynamic_scheduler: bool,
     tuned: bool,
     config: Optional[GemmConfig] = None,
+    SFA: Optional[Tensor] = None,  # decoded (real-dtype) scale factors
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,  # BlockScaledFormat names (see quack.gemm.gemm)
+    bs_format_b: Optional[str] = None,
+    alpha: float | Tensor = 1.0,  # accumulator scale (folded NVFP4 per-tensor scales)
 ) -> Tensor:
     """Launch the sq_reduce GEMM on the epilogue object; returns the raw
     (..., n_tiles) per-tile squared-sum partials."""
     from quack.epilogue.library import sq_reduce_mod
 
+    has_alpha = scalar_mode(alpha) != 0
     mod = sq_reduce_mod(
         has_c=C is not None,
         has_rowvec=norm_weight is not None,
         has_aux=premult_out is not None,
+        has_alpha=has_alpha,
     )
     outs = {"D": out}
     operands = {}
@@ -2629,6 +3131,8 @@ def _gemm_rms_call(
         outs["mAuxOut"] = premult_out
     if norm_weight is not None:
         operands["mRowVecBroadcast"] = norm_weight
+    if has_alpha:
+        operands["alpha"] = alpha
     res = mod(
         A,
         B,
@@ -2637,6 +3141,10 @@ def _gemm_rms_call(
         config=config,
         tuned=tuned,
         dynamic_scheduler=dynamic_scheduler,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         **operands,
     )
     return res["mColVecReduce"]
@@ -2655,7 +3163,7 @@ def _rms_finalize(partials: Tensor, N: int, eps: float, rstd_shape) -> Tensor:
     "quack::gemm_rms_out",
     mutates_args=("out", "premult_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, Tensor? norm_weight=None, Tensor(a2!)? premult_out=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
+    schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, Tensor? norm_weight=None, Tensor(a2!)? premult_out=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, Tensor? alpha_tensor=None) -> Tensor",
 )
 def _gemm_rms_out(
     A: Tensor,
@@ -2667,6 +3175,11 @@ def _gemm_rms_out(
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+    alpha_tensor: Optional[Tensor] = None,  # folded NVFP4 per-tensor scales
 ) -> Tensor:
     """GEMM + RMS + optional rowvec scaling.
 
@@ -2682,6 +3195,11 @@ def _gemm_rms_out(
         premult_out,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
+        alpha=_merge_tensor(1.0, alpha_tensor),
     )
     return _rms_finalize(partials, B.shape[-1], eps, A.shape[:-1])
 
@@ -2697,6 +3215,11 @@ def _gemm_rms_out_fake(
     eps: float = 1e-6,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    SFA: Optional[Tensor] = None,
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+    alpha_tensor: Optional[Tensor] = None,
 ) -> Tensor:
     rstd_shape = A.shape[:-1]
     return torch.empty(rstd_shape, dtype=torch.float32, device=A.device)
@@ -2721,8 +3244,9 @@ def gemm_rms_ref(
 
 
 def gemm_rms(
-    A: Tensor,  # (M, K) or (L, M, K)
-    B: Tensor,  # (K, N) or (L, K, N)
+    # For blockscaled: a BlockScaledOperand container - see gemm().
+    A: Tensor | BlockScaledOperand,  # (M, K) or (L, M, K)
+    B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N)
     norm_weight: Optional[Tensor] = None,  # (N,) or (L, N)
     out: Optional[Tensor] = None,  # (M, N) or (L, M, N)
@@ -2741,9 +3265,19 @@ def gemm_rms(
     If premult_out is provided, D_raw (the pre-norm_weight value) is also written to it.
     Returns (D_out, rstd).
     """
-    _reject_blockscaled("gemm_rms", A=A, B=B)
+    _reserve_blockscaled_out(out_dtype)
     _check_split_k_unsupported("gemm_rms", split_k)
-    out_dtype = A.dtype if out_dtype is None else out_dtype
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
+    # NVFP4 per-tensor scales fold into the accumulator scale; they MUST land
+    # before the sq-reduce (RMS scale invariance would otherwise hide the error
+    # in D while rstd / premult_out come out wrong by the scale).
+    alpha = _fold_per_tensor_scales(1.0, opA, opB)
+    if SFA is not None:
+        SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3)
+    default_dtype = torch.bfloat16 if SFA is not None else A.dtype
+    out_dtype = default_dtype if out_dtype is None else out_dtype
     N = B.shape[-1]
     if out is None:
         out_shape = (*A.shape[:-1], N)
@@ -2769,6 +3303,8 @@ def gemm_rms(
         # partials can be graph-allocated); rms_final_reduce stays inside it.
         if config is not None:
             raise NotImplementedError("gemm_rms: explicit config under torch.compile")
+        if SFA is not None:
+            SFA, SFB = _sf_encode(SFA), _sf_encode(SFB)
         rstd = _gemm_rms_out(
             A,
             B,
@@ -2779,6 +3315,11 @@ def gemm_rms(
             eps=eps,
             dynamic_scheduler=dynamic_scheduler,
             tuned=tuned,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
+            alpha_tensor=None if isinstance(alpha, float) else alpha,
         )
         return out, rstd
     partials = _gemm_rms_call(
@@ -2791,6 +3332,11 @@ def gemm_rms(
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
         config=config,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
+        alpha=alpha,
     )
     return out, _rms_finalize(partials, N, eps, A.shape[:-1])
 
@@ -2814,15 +3360,22 @@ def _gemm_norm_act_call(
     dynamic_scheduler: bool,
     tuned: bool,
     config: Optional[GemmConfig] = None,
+    SFA: Optional[Tensor] = None,  # decoded (real-dtype) scale factors
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,  # BlockScaledFormat names (see quack.gemm.gemm)
+    bs_format_b: Optional[str] = None,
+    alpha: float | Tensor = 1.0,  # accumulator scale (folded NVFP4 per-tensor scales)
 ) -> None:
     from quack.epilogue.library import norm_act_mod
 
+    has_alpha = scalar_mode(alpha) != 0
     mod = norm_act_mod(
         activation,
         gated=activation in gated_to_pytorch_fn_map,
         has_c=C is not None,
         has_rowvec=False,
         has_colvec=rstd is not None,
+        has_alpha=has_alpha,
     )
     outs = {"mAuxOut": postact_out}
     store_d = preact_out is not None
@@ -2831,6 +3384,8 @@ def _gemm_norm_act_call(
     operands = {}
     if rstd is not None:
         operands["mColVecBroadcast"] = rstd
+    if has_alpha:
+        operands["alpha"] = alpha
     mod(
         A,
         B,
@@ -2840,6 +3395,10 @@ def _gemm_norm_act_call(
         config=config,
         tuned=tuned,
         dynamic_scheduler=dynamic_scheduler,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
         **operands,
     )
 
@@ -2848,7 +3407,7 @@ def _gemm_norm_act_call(
     "quack::gemm_norm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str? activation=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str? activation=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, Tensor? alpha_tensor=None) -> ()",
 )
 def gemm_norm_act_out(
     A: Tensor,
@@ -2860,6 +3419,11 @@ def gemm_norm_act_out(
     activation: ActActivation = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+    alpha_tensor: Optional[Tensor] = None,  # folded NVFP4 per-tensor scales
 ) -> None:
     _gemm_norm_act_call(
         A,
@@ -2871,6 +3435,11 @@ def gemm_norm_act_out(
         activation=activation,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
+        alpha=_merge_tensor(1.0, alpha_tensor),
     )
 
 
@@ -2881,7 +3450,7 @@ _register_noop_fake(gemm_norm_act_out)
     "quack::gemm_norm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str activation='swiglu', bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str activation='swiglu', bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, Tensor? alpha_tensor=None) -> ()",
 )
 def gemm_norm_gated_out(
     A: Tensor,
@@ -2893,6 +3462,11 @@ def gemm_norm_gated_out(
     activation: GatedActivation = "swiglu",
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    SFA: Optional[Tensor] = None,  # blocked scale factors, (L, rm, rk, 32, 4, 4) (see gemm_out)
+    SFB: Optional[Tensor] = None,
+    bs_format_a: Optional[str] = None,
+    bs_format_b: Optional[str] = None,
+    alpha_tensor: Optional[Tensor] = None,  # folded NVFP4 per-tensor scales
 ) -> None:
     _gemm_norm_act_call(
         A,
@@ -2904,6 +3478,11 @@ def gemm_norm_gated_out(
         activation=activation,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
+        alpha=_merge_tensor(1.0, alpha_tensor),
     )
 
 
@@ -2911,8 +3490,9 @@ _register_noop_fake(gemm_norm_gated_out)
 
 
 def gemm_norm_act(
-    A: Tensor,  # (M, K) or (L, M, K)
-    B: Tensor,  # (K, N) or (L, K, N)
+    # For blockscaled: a BlockScaledOperand container - see gemm().
+    A: Tensor | BlockScaledOperand,  # (M, K) or (L, M, K)
+    B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N)
     rstd: Optional[Tensor] = None,  # (M,) or (L, M)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) — residual
     activation: Activation = None,
@@ -2932,11 +3512,21 @@ def gemm_norm_act(
     rstd is a column vector (M,).
     Returns (preact, postact) where preact is the normalized value before activation.
     """
-    _reject_blockscaled("gemm_norm_act", A=A, B=B)
+    _reserve_blockscaled_out(out_dtype)
+    _reserve_blockscaled_out(postact_dtype)
     _check_split_k_unsupported("gemm_norm_act", split_k)
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    A, B = opA.data, opB.data
+    SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
+    # NVFP4 per-tensor scales scale the matmul product ONLY: they fold into the
+    # mod's alpha, applied before the C add and the rstd/norm scales.
+    alpha = _fold_per_tensor_scales(1.0, opA, opB)
+    if SFA is not None:
+        SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3)
     is_gated = activation in gated_to_pytorch_fn_map
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
+    default_dtype = torch.bfloat16 if SFA is not None else A.dtype
+    out_dtype = default_dtype if out_dtype is None else out_dtype
+    postact_dtype = default_dtype if postact_dtype is None else postact_dtype
     if A.ndim == 2:
         out_shape = (A.shape[0], B.shape[-1])
     else:
@@ -2956,8 +3546,25 @@ def gemm_norm_act(
     if torch.compiler.is_compiling():
         if config is not None:
             raise NotImplementedError("gemm_norm_act: explicit config under torch.compile")
+        if SFA is not None:
+            SFA, SFB = _sf_encode(SFA), _sf_encode(SFB)
         op = gemm_norm_gated_out if is_gated else gemm_norm_act_out
-        op(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler, tuned)
+        op(
+            A,
+            B,
+            preact_out,
+            postact_out,
+            C,
+            rstd,
+            activation,
+            dynamic_scheduler,
+            tuned,
+            SFA=SFA,
+            SFB=SFB,
+            bs_format_a=bs_format_a,
+            bs_format_b=bs_format_b,
+            alpha_tensor=None if isinstance(alpha, float) else alpha,
+        )
         return preact_out, postact_out
     _gemm_norm_act_call(
         A,
@@ -2970,6 +3577,11 @@ def gemm_norm_act(
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
         config=config,
+        SFA=_sf_decode(SFA, bs_format_a),
+        SFB=_sf_decode(SFB, bs_format_b),
+        bs_format_a=bs_format_a,
+        bs_format_b=bs_format_b,
+        alpha=alpha,
     )
     return preact_out, postact_out
 

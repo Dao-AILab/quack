@@ -36,7 +36,7 @@ from quack.rmsnorm_config import (
     prune_invalid_rmsnorm_bwd_configs,
     prune_invalid_rmsnorm_fwd_configs,
 )
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 
 
 def _bucket_T_hint(T_hint: int) -> int:

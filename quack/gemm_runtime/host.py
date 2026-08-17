@@ -28,7 +28,7 @@ from cutlass import Float32, Int32
 from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
-from quack.gemm_config import SplitKMode
+from quack.gemm_config import SplitKMode, cta_tile_shape_m
 from quack.epilogue.ops import EpiOp
 from quack.gemm_runtime.identity import (
     resolve_gemm_class,
@@ -37,6 +37,7 @@ from quack.gemm_runtime.identity import (
 )
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
+    compute_cu_tiles_m,
     launch_gemm,
     make_fake_gemm_tensors,
     make_fake_scheduler_args,
@@ -66,6 +67,17 @@ class FakeArgCtx(NamedTuple):
 
 def _ops_by_name(GemmCls):
     return {op.name: op for op in GemmCls._epi_ops}
+
+
+def _has_m_fold_sink(ops, epi_keys):
+    """True when an ACTIVE (present in epi_keys) op is an M-fold (dim==1)
+    reduce sink — the trigger for varlen zero-fill ragging and the cu_tiles_m
+    per-sequence tile prefix."""
+    return any(
+        getattr(ops[name], "fn_port", None) == "sink" and getattr(ops[name], "dim", None) == 1
+        for name, _ in epi_keys
+        if name in ops
+    )
 
 
 @jit_cache
@@ -201,7 +213,13 @@ def _compile_gemm_epi(
     scheduler_args = make_fake_scheduler_args(
         (is_dynamic_persistent and device_capacity[0] == 9), False, l, has_ag=has_ag
     )
-    varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
+    varlen_args = make_fake_varlen_args(
+        varlen_m,
+        False,
+        gather_A,
+        m if varlen_m else None,
+        has_cu_tiles_m=varlen_m and _has_m_fold_sink(ops, epi_keys),
+    )
     mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
     mSFB = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
     post_init = None
@@ -283,6 +301,10 @@ class GemmEpiPlan(NamedTuple):
     # D crosses caller-oriented and is transposed at trace (layout-owning
     # transforms): split-k buffer sizing must use kernel orientation (D.mT).
     d_transposed: bool = False
+    # varlen_m + active M-fold sink: per-CTA M-tile extent used to compute the
+    # cu_tiles_m prefix at launch (None = no prefix needed). Also consumed by
+    # the interface layer's per-sequence finalize.
+    cu_tiles_tile_m: Optional[int] = None
 
 
 def _get_major(t, m_label, n_label):
@@ -476,6 +498,11 @@ def build_gemm_epi_plan(
         tile_N=tile_N,
         cluster_N=cluster_N,
         d_transposed=owned_fmt is not None,
+        cu_tiles_tile_m=(
+            cta_tile_shape_m(tile_M, cluster_M, device_capacity[0], sf_dtype is not None)
+            if varlen_m and _has_m_fold_sink(plan_ops, epi_keys)
+            else None
+        ),
     )
 
 
@@ -533,5 +560,10 @@ def run_gemm_epi_plan(
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
     scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+    cu_tiles_m = (
+        compute_cu_tiles_m(cu_seqlens_m, plan.cu_tiles_tile_m)
+        if cu_seqlens_m is not None and plan.cu_tiles_tile_m is not None
+        else None
+    )
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=cu_tiles_m)
     launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)

@@ -463,6 +463,10 @@ class _XdistWorkerDefer:
     reports late (the master's report handling is order-independent).
     """
 
+    #: See _SingleProcDeferLoop._WEDGE_TIMEOUT_S — same guard for the final
+    #: drain. Class attribute so the regression test can shrink it.
+    _WEDGE_TIMEOUT_S = 600.0
+
     def __init__(self, pool):
         self.pool = pool
         self.deferred = []  # list of (item, awaited_sha)
@@ -511,13 +515,19 @@ class _XdistWorkerDefer:
         else:
             self._log_reports_as(item, reports)
 
-    def _drain_ready(self, nextitem) -> None:
-        """Re-run any deferred items whose compile finished (or failed)."""
+    def _drain_ready(self, nextitem, force: bool = False) -> None:
+        """Re-run any deferred items whose compile finished (or failed).
+
+        ``force=True`` attempts still-pending items too — the wedge escape:
+        the caller has already pushed their attempt counts past
+        ``_MAX_ATTEMPTS``, so ``_attempt`` runs them with the pool suppressed
+        instead of trusting a sha that may never resolve.
+        """
         pending = self.deferred
         self.deferred = []
         for item, sha in pending:
             state, _ = self.pool.poll(sha)
-            if state == "pending":
+            if state == "pending" and not force:
                 self.deferred.append((item, sha))
             else:
                 self._attempt(item, nextitem)  # may re-append to self.deferred
@@ -546,16 +556,23 @@ class _XdistWorkerDefer:
 
         # Drain remaining deferred items, blocking on the pool. The channel
         # to the master is still open, so reports flow normally.
-        deadline = time.monotonic() + 600
+        deadline = time.monotonic() + self._WEDGE_TIMEOUT_S
+        wedged = False
         while self.deferred:
             before = len(self.deferred)
-            self._drain_ready(nextitem=None)
+            self._drain_ready(nextitem=None, force=wedged)
             if self.deferred and len(self.deferred) == before:
                 if time.monotonic() > deadline:
-                    # Pool wedged: force remaining items through in-process.
+                    # Pool wedged: stop trusting "pending" and force the
+                    # remaining items through in-process. force is essential:
+                    # a permanently-pending sha (hung pool worker holding the
+                    # flock) is otherwise skipped by _drain_ready forever and
+                    # the attempts bump alone never takes effect — that
+                    # deadlocked every xdist worker until the CI job timeout.
+                    wedged = True
                     for item, _ in self.deferred:
                         self.attempts[item.nodeid] = _MAX_ATTEMPTS + 1
-                    deadline = float("inf")
+                    continue
                 time.sleep(0.2)
 
 

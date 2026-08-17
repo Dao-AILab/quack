@@ -8,6 +8,7 @@ from cutlass import Int32, Float32, const_expr
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.epilogue.mixin import ComposableEpiMixin
 from quack.epilogue.ops import Scalar, RowVecLoad, ColVecLoad
+from quack.epilogue.quantize_out import BlockScaleFactorStore
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
@@ -73,6 +74,12 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         Scalar("sr_seed", dtype=Int32),
         RowVecLoad("mRowVecBroadcast"),
         ColVecLoad("mColVecBroadcast"),
+        # D quantize codecs (at most one active): the driver's store loop runs
+        # the active codec on the final D fragment right before DStore's
+        # convert (see gemm_base.epilogue / ComposableEpiMixin._epi_store_quant).
+        # Each op's to_params pairs the flat sfd_norm_const arg into its param.
+        BlockScaleFactorStore("mSFD"),
+        BlockScaleFactorStore("mSFDCol", direction="col"),
     )
     # Split-K (serial/parallel): the epilogue runs only on the finalizing split, which
     # needs the per-tile completion flag and the raw-f32-partials workspace. Both are
@@ -96,6 +103,14 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         sr_seed: Optional[Int32 | cute.Tensor] = None
         split_k_semaphore: Optional[cute.Tensor] = None
         split_k_workspace: Optional[cute.Tensor] = None
+        # Blocked (L, rm, rk, 32, 4, 4) output scale factors for quantized D
+        # (mxfp8/mxfp4/nvfp4); optional fp32 norm constant folded into the SF.
+        # mSFD: SF vectors along N (row direction). mSFDCol: SF vectors along
+        # M ((L, rn, rm_k, 32, 4, 4) blocked over (N, M), for backward
+        # consumers contracting over this output's M). At most one of the two.
+        mSFD: Optional[cute.Tensor] = None
+        sfd_norm_const: Optional[Float32 | cute.Tensor] = None
+        mSFDCol: Optional[cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops
 

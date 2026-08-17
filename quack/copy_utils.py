@@ -8,14 +8,16 @@ import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 
 from cutlass import Int32, Int16, Boolean, const_expr
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils import LayoutEnum, block_copy
 import cutlass.pipeline
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+from cutlass.experimental import primitives as prims
 
 from quack import layout_utils
 from quack.utils import make_vector
@@ -133,6 +135,85 @@ def cvt_copy(
     if const_expr(retile):
         src = tiled_copy.retile(src)
     cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+
+
+def _pair_leaf_slices(layout):
+    """Slice coords for the two slots of the contiguous (shape 2, stride 1) leaf.
+
+    Also asserts the pair is the fastest nontrivial mode (all earlier modes
+    size 1), so the flat colex value order is (slot, rest...).
+
+    Why not flat_divide by 2 like the acc_pair idiom in epilogue/visit.py:
+    that works there because compact rmem fragments have the stride-1 pair as
+    mode 0 by construction. Here the split also applies to the smem-side
+    partition, whose flattened layout carries degenerate leading modes from
+    the copy-atom nesting (e.g. (1,2,2,2,1,2):(0,1,256,8,0,16)) — dividing
+    mode 0 would fail on the 1:0, and coalescing first can restructure the
+    compact src differently from the strided dst, breaking the mode-for-mode
+    slot correspondence the caller's select relies on. This helper is the
+    same divide with its preconditions made explicit and checked."""
+    pair_mode = None
+    for i in range(cute.rank(layout)):
+        if const_expr(layout[i].shape == 2 and layout[i].stride == 1):
+            pair_mode = i
+            break
+    assert pair_mode is not None, "no contiguous pair leaf; use a plain copy instead"
+    assert all(layout[i].shape == 1 for i in range(pair_mode)), (
+        "pair leaf must be the fastest nontrivial mode"
+    )
+    coord0 = tuple(0 if i == pair_mode else None for i in range(cute.rank(layout)))
+    coord1 = tuple(1 if i == pair_mode else None for i in range(cute.rank(layout)))
+    return coord0, coord1
+
+
+@dsl_user_op
+def cvt_copy_pair_xor_sts32(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    tidx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store 32-bit acc fragments as two conflict-free full-warp STS.32.
+
+    The acc layout gives lane L the contiguous column pair (2q, 2q+1),
+    q = L%4, of row L>>2. Under every TMA-legal swizzle the pair's bank is
+    4*((q>>1)^r) + 2*(q&1) + slot: the vectorized STS.64 spends the slot bit
+    on vector width, leaving 16 reachable banks per half-warp (uniformly
+    2-way conflicted, 4 wavefronts/instr measured). Two STS.32 that store
+    the pair in per-lane order slot = h, 1-h with h = (L>>1)&1 make the bank
+    a bijection on all 32 lanes: 2x1 conflict-free wavefronts instead. Each
+    thread still writes only its own two values to the same cells, so the
+    smem image (and TMA) is unchanged; the reorder costs one select per
+    stored word on the otherwise-idle ALU pipe.
+
+    Costs a handful of extra registers (w fragments + second address base);
+    only use in epilogues with register headroom — gemm_add's fp32-C
+    epilogue sits exactly at the setmaxnreg cap and spills.
+    """
+    from cutlass.cute.tensor import TensorSSA
+
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    if const_expr(src.element_type != dst.element_type):
+        src = src.to(dst.element_type, loc=loc, ip=ip)
+    assert const_expr(dst.element_type.width == 32)
+    src_flat = cute.make_tensor(src.iterator, cute.flatten(src.layout))
+    dst_flat = cute.make_tensor(dst.iterator, cute.flatten(dst.layout))
+    assert const_expr(src_flat.layout.shape == dst_flat.layout.shape)
+    coord0, coord1 = _pair_leaf_slices(dst_flat.layout)
+    v0, v1 = src_flat[coord0].load(), src_flat[coord1].load()
+    h = (tidx >> 1) & 1
+    hb = h != 0
+    w0 = cute.make_rmem_tensor(v0.shape, dst.element_type)
+    w1 = cute.make_rmem_tensor(v1.shape, dst.element_type)
+    w0.store(TensorSSA(cutlass.select_(hb, v1, v0), v0.shape, dst.element_type))  # slot h
+    w1.store(TensorSSA(cutlass.select_(hb, v0, v1), v1.shape, dst.element_type))  # slot 1 - h
+    dst0 = dst_flat[coord0]
+    # dst leaves are stride >= 2 after slicing off the pair, so these can
+    # never re-vectorize into a 64-bit store
+    cute.autovec_copy(w0, cute.make_tensor(dst0.iterator + h, dst0.layout))
+    cute.autovec_copy(w1, cute.make_tensor(dst0.iterator + (1 - h), dst0.layout))
 
 
 @dsl_user_op
@@ -724,36 +805,43 @@ def _cpasync_reduction_kind_name(reduction_kind: Any) -> str:
     return name
 
 
-def _cpasync_bulk_reduce_suffix(
+def _cpasync_bulk_reduce_args(
     reduction_kind: Any,
     dtype: Type[cutlass.Numeric],
-) -> str:
+) -> Tuple[prims.CpReduceOp, prims.CpReduceType, bool]:
+    """Map (kind, dtype) to cp.reduce.async.bulk (op, type, noftz), enforcing the
+    PTX-ISA legality rules (fp is add-only except f16/bf16 min/max; bitwise ops
+    take b32/b64; inc/dec are u32-only)."""
     op = _cpasync_reduction_kind_name(reduction_kind)
-    if dtype is cutlass.Float16:
-        assert op in {"add", "min", "max"}, f"{op} is not supported for f16 bulk reduce"
-        return f"{op}.noftz.f16" if op == "add" else f"{op}.f16"
-    if dtype is cutlass.BFloat16:
-        assert op in {"add", "min", "max"}, f"{op} is not supported for bf16 bulk reduce"
-        return f"{op}.noftz.bf16" if op == "add" else f"{op}.bf16"
+    if dtype in (cutlass.Float16, cutlass.BFloat16):
+        assert op in {"add", "min", "max"}, f"{op} is not supported for f16/bf16 bulk reduce"
+        reduce_type = (
+            prims.CpReduceType.F16 if dtype is cutlass.Float16 else prims.CpReduceType.BF16
+        )
+        return prims.CpReduceOp(op), reduce_type, op == "add"
     if dtype is cutlass.Float32:
         assert op == "add", f"{op} is not supported for f32 bulk reduce"
-        return "add.f32"
+        return prims.CpReduceOp.ADD, prims.CpReduceType.F32, False
     if dtype is cutlass.Float64:
         assert op == "add", f"{op} is not supported for f64 bulk reduce"
-        return "add.f64"
+        return prims.CpReduceOp.ADD, prims.CpReduceType.F64, False
 
     signed = getattr(dtype, "signed", None)
     width = getattr(dtype, "width", None)
     if signed is not None:
         assert width in (32, 64), f"Unsupported integer bulk-reduce width: {width}"
         if op in {"and", "or", "xor"}:
-            return f"{op}.b{width}"
+            return prims.CpReduceOp(op), prims.CpReduceType(f"b{width}"), False
         if op in {"min", "max", "add"}:
-            return f"{op}.{'s' if signed else 'u'}{width}"
+            return (
+                prims.CpReduceOp(op),
+                prims.CpReduceType(f"{'s' if signed else 'u'}{width}"),
+                False,
+            )
         assert op in {"inc", "dec"} and dtype is cutlass.Uint32, (
             f"{op} bulk reduce is only supported for u32"
         )
-        return f"{op}.u32"
+        return prims.CpReduceOp(op), prims.CpReduceType.U32, False
 
     raise TypeError(f"Unsupported cp.reduce.async.bulk dtype: {dtype}")
 
@@ -769,22 +857,31 @@ def cpasync_bulk_s2g(
     loc=None,
     ip=None,
 ):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
-    if reduction_kind is None:
-        ptx = "cp.async.bulk.global.shared::cta.bulk_group [{$r0}], [{$r1}], {$r2};"
-    else:
-        assert dtype is not None, "dtype is required for cp.reduce.async.bulk"
-        ptx = (
-            "cp.reduce.async.bulk.global.shared::cta.bulk_group."
-            f"{_cpasync_bulk_reduce_suffix(reduction_kind, dtype)} "
-            "[{$r0}], [{$r1}], {$r2};"
-        )
-    cute.arch.inline_ptx(
-        ptx,
-        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
+    # The NVVM ops want a global-space dst; quack gmem pointers are generic-addressed.
+    gmem_global_ptr = llvm.addrspacecast(
+        llvm.PointerType.get(cutlass.AddressSpace.gmem.value),
+        gmem_ptr.to_llvm_ptr(loc=loc, ip=ip),
         loc=loc,
         ip=ip,
     )
+    smem_llvm_ptr = smem_ptr.to_llvm_ptr(loc=loc, ip=ip)
+    if reduction_kind is None:
+        prims.cp_async_bulk_global_shared_cta(
+            gmem_global_ptr, smem_llvm_ptr, store_bytes, loc=loc, ip=ip
+        )
+    else:
+        assert dtype is not None, "dtype is required for cp.reduce.async.bulk"
+        op, reduce_type, noftz = _cpasync_bulk_reduce_args(reduction_kind, dtype)
+        prims.cp_reduce_async_bulk_global_shared_cta(
+            gmem_global_ptr,
+            smem_llvm_ptr,
+            store_bytes,
+            op=op,
+            type=reduce_type,
+            noftz=noftz,
+            loc=loc,
+            ip=ip,
+        )
 
 
 @dsl_user_op
@@ -992,19 +1089,21 @@ def cpasync_bulk_get_copy_fn(
     def copy_bulk(src_idx, dst_idx, tma_bar_ptr: cute.Pointer, **new_kwargs):
         assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        cute.copy(
-            atom,
-            src[None, src_idx],
-            dst[None, dst_idx],
-            mbar_ptr=tma_bar_ptr,
-            **new_kwargs,
-            **kwargs,
-        )
+        with cute.arch.elect_one():
+            cute.copy(
+                atom,
+                src[None, src_idx],
+                dst[None, dst_idx],
+                mbar_ptr=tma_bar_ptr,
+                **new_kwargs,
+                **kwargs,
+            )
 
     def copy_bulk_single_stage(tma_bar_ptr: cute.Pointer, **new_kwargs):
         assert dst_is_smem and not src_is_smem, "cp.async.bulk G2S expects GMEM -> SMEM"
         atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), src.element_type)
-        cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
+        with cute.arch.elect_one():
+            cute.copy(atom, src, dst, mbar_ptr=tma_bar_ptr, **new_kwargs, **kwargs)
 
     return copy_bulk if const_expr(not single_stage) else copy_bulk_single_stage
 

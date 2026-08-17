@@ -9,8 +9,7 @@ and on PRs.
 | File | Purpose |
 |------|---------|
 | `tools/ci/docker/Dockerfile` | image recipe (one Dockerfile, two variants via build args) |
-| `tools/ci/docker/build.sh` | build cu129 and/or cu132 docker image locally |
-| `tools/ci/docker/tag_and_push.sh` | tag and push to `tridao/quack-kernels` on Docker Hub |
+| `tools/ci/docker/build.sh` | step flags `--image` / `--push` / `--sif` per variant: build the docker image, push to `tridao/quack-kernels`, and/or build the runner's cached SIF |
 | `.github/workflows/_test.yml` | reusable workflow with lint/changes/test jobs and the matrix; **the image tag pins live here** |
 | `.github/workflows/ci.yml`, `ci-pr.yml` | thin shells that call `_test.yml` on push / PR |
 | `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs single-pass pytest |
@@ -66,9 +65,12 @@ ci.yml and ci-pr.yml). Three steps:
 
 ```bash
 # 1. Build & push from a box that has docker (one-time Hub login: `docker login -u tridao`)
-./tools/ci/docker/build.sh
-./tools/ci/docker/tag_and_push.sh
-# unattended variant: DOCKERHUB_TOKEN=hub_xxx ./tools/ci/docker/tag_and_push.sh
+./tools/ci/docker/build.sh --image --push
+# On a runner, add --sif to also pre-build the SIFs the gpu-test action caches
+# (rename them to .sif.hold until step 3 lands, or the action's prune deletes
+# them). On a docker-less runner (b300), pre-warm from the pushed images with:
+#   DATE=YY.MM.DD ./tools/ci/docker/build.sh --sif
+# unattended variant: DOCKERHUB_TOKEN=hub_xxx ./tools/ci/docker/build.sh --image --push
 ```
 
 ```yaml

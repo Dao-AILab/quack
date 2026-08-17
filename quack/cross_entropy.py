@@ -23,7 +23,7 @@ from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 
 
 class CrossEntropy(ReductionBase):

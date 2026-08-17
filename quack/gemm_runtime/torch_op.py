@@ -39,12 +39,19 @@ from typing import Optional
 import torch
 
 from quack.blockscaled.operand import BlockScaledFormat
-from quack.gemm_config import GemmConfig, default_config
+from quack.gemm_config import GemmConfig, cta_tile_shape_m, default_config
 from quack.gemm_runtime.identity import (
     TORCH_OP_EPI_MODS as _EPI_REGISTRY,
     TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
 )
 from quack.rounding import RoundingMode
+
+# The compile-path body below runs under Dynamo, and default_config is host
+# plumbing whose result is fixed once the input device is guarded: run it
+# eagerly at trace time and bake the result, instead of letting Dynamo trace
+# through its lru_cache'd helpers (which it does with a UserWarning per
+# wrapper). Marks the function object itself; eager calls are unaffected.
+default_config = torch._dynamo.assume_constant_result(default_config)
 
 
 def _sf_encode(SF: torch.Tensor) -> torch.Tensor:
@@ -157,8 +164,11 @@ def _alloc_outs_from_meta(digest: str, ins: list, meta: str) -> list:
     if m["sink_names"]:
         cfg, lead = m["config"], mod._lead_shape(A, cu, A_idx)
         n = B.shape[-1] if n_ov is None else n_ov
+        cta_tile_m = cta_tile_shape_m(
+            cfg["tile_m"], cfg["cluster_m"], cfg["device_capacity"], named.get("SFA") is not None
+        )
         for name in m["sink_names"]:
-            shape = mod.sinks[name].sink_alloc_shape(lead, n, cfg["tile_m"], cfg["tile_n"])
+            shape = mod.sinks[name].sink_alloc_shape(lead, n, cta_tile_m, cfg["tile_n"])
             outs.append(torch.empty(shape, dtype=torch.float32, device=A.device))
     return outs
 
@@ -276,8 +286,19 @@ def compile_call(
         lead = mod._lead_shape(A, cu_seqlens_m, A_idx)
         n = B.shape[-1] if n_override is None else n_override
         partials = {}
+        cta_tile_m = cta_tile_shape_m(
+            cfg.tile_m, cfg.cluster_m, cfg.device_capacity, SFA is not None
+        )
+        num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
         for name in sink_names:
-            shape = mod.sinks[name].sink_alloc_shape(lead, n, cfg.tile_m, cfg.tile_n)
+            op = mod.sinks[name]
+            shape = op.sink_alloc_shape(
+                lead,
+                n,
+                cta_tile_m,
+                cfg.tile_n,
+                num_seqs=num_seqs if getattr(op, "dim", 0) == 1 else None,
+            )
             partials[name] = torch.empty(shape, dtype=torch.float32, device=A.device)
         outs = []
         if store_d:
@@ -286,6 +307,17 @@ def compile_call(
         outs.extend(partials.values())
         torch.ops.quack.gemm_epi(mod.semantic_digest, ins, outs, meta)
     else:
+        if cu_seqlens_m is not None and any(
+            getattr(mod.sinks[name], "dim", 0) == 1 for name in sink_names
+        ):
+            # The functional op picks its config internally, so the wrapper
+            # can't know the per-CTA tile the cu_tiles finalize needs.
+            raise NotImplementedError(
+                "varlen_m M-fold sinks require the caller-owned op path "
+                "(pass out= buffers) — the functional path can't finalize "
+                "per-sequence partials"
+            )
+        cta_tile_m = None
         outs = torch.ops.quack.gemm_epi_f(mod.semantic_digest, ins, meta)
         i = 1 if store_d else 0
         out = {"D": outs[0]} if store_d else {}
@@ -295,8 +327,13 @@ def compile_call(
         partials = {name: outs[i + j] for j, name in enumerate(sink_names)}
     result = dict(out) if store_d else {k: v for k, v in out.items() if k != "D"}
     for name, buf in partials.items():
-        finalize = getattr(mod.sinks[name], "host_finalize", None)
-        result[name] = finalize(buf) if finalize is not None else buf
+        op = mod.sinks[name]
+        finalize_varlen = getattr(op, "host_finalize_varlen", None)
+        if cu_seqlens_m is not None and cta_tile_m is not None and finalize_varlen is not None:
+            result[name] = finalize_varlen(buf, cu_seqlens_m, cta_tile_m)
+        else:
+            finalize = getattr(op, "host_finalize", None)
+            result[name] = finalize(buf) if finalize is not None else buf
     return result
 
 

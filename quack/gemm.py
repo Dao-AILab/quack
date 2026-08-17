@@ -83,6 +83,9 @@ def _compile_gemm(
     batched=True,
     b_kn=False,
     sf_batched=True,
+    sfd_dtype=None,
+    sfd_norm_const_mode=0,
+    sfd_col_dtype=None,
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
     has_ag=False,
@@ -162,6 +165,13 @@ def _compile_gemm(
             if split_k > 1 and split_k_mode != SplitKMode.SEPARATE
             else None
         ),
+        # varlen_m SFD is one M-padded buffer with a static batch dim of 1
+        # (mirroring SFA above); the column-direction SF is dense-batch only.
+        mSFD=(
+            make_fake_sf_tensor(sfd_dtype, 1 if varlen_m else l) if sfd_dtype is not None else None
+        ),
+        sfd_norm_const=fake_scalar(sfd_norm_const_mode),
+        mSFDCol=(make_fake_sf_tensor(sfd_col_dtype, l) if sfd_col_dtype is not None else None),
     )
     scheduler_args = make_fake_scheduler_args(
         (is_dynamic_persistent and device_capacity[0] <= 9),
@@ -228,6 +238,7 @@ class _GemmPlan(NamedTuple):
     alpha_mode: int
     beta_mode: int
     sr_seed_mode: int
+    sfd_norm_const_mode: int
     epi_static: Optional[object]  # EpilogueArguments when it has no per-call values
     scheduler_static: Optional[object]  # TileSchedulerOptions when it has no per-call values
     max_active_clusters: int
@@ -414,6 +425,16 @@ def gemm(
     # B is passed (k, n) / (l, k, n) and relabeled to kernel order (n, k) at trace
     # time — saves the caller a per-call .mT view. Dense SM90+ only.
     b_kn: bool = False,
+    # SFD: (l, rm, rk, 32, 4, 4) blocked output scale factors for quantized D
+    # (mxfp8/mxfp4/nvfp4). e8m0 SFD => sf_vec 32 (mx), e4m3 SFD => sf_vec 16
+    # (nvfp4). sfd_norm_const is an optional fp32 norm constant (the reciprocal
+    # of the nvfp4 per-tensor scale) folded into the stored scale factors.
+    SFD: Optional[Tensor] = None,
+    sfd_norm_const: Optional[float | Tensor] = None,
+    # Column-direction output scale factors: (l, rn, rm_k, 32, 4, 4) blocked
+    # over (N, M), for backward consumers contracting over this output's M.
+    # Mutually exclusive with SFD.
+    SFDCol: Optional[Tensor] = None,
     # AllGather+GEMM (SM90+, see quack/distributed/all_gather_gemm.py): A is the full
     # gathered (M, K) buffer being filled by a copy stream; (flags, seq,
     # num_shards, first_shard) drive the shard-major rotated schedule and the
@@ -474,6 +495,9 @@ def gemm(
         bs_format_a,
         bs_format_b,
         ag_args is not None,
+        tensor_key(SFD),
+        tensor_key(SFDCol),
+        scalar_mode(sfd_norm_const) if sfd_norm_const is not None else 0,
     )
     plan = _gemm_plan_cache.get(key)
     if plan is None:
@@ -515,6 +539,9 @@ def gemm(
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
             has_ag=ag_args is not None,
+            SFD=SFD,
+            sfd_norm_const=sfd_norm_const,
+            SFDCol=SFDCol,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -536,6 +563,9 @@ def gemm(
         SFA=SFA,
         SFB=SFB,
         ag_args=ag_args,
+        SFD=SFD,
+        sfd_norm_const=sfd_norm_const,
+        SFDCol=SFDCol,
     )
     return plan
 
@@ -560,6 +590,10 @@ def run_gemm_plan(
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
     ag_args: Optional[AllGatherArguments] = None,
+    # Quantized-output tensors (validated at plan build; see _build_gemm_plan).
+    SFD: Optional[Tensor] = None,
+    sfd_norm_const: Optional[float | Tensor] = None,
+    SFDCol: Optional[Tensor] = None,
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -609,6 +643,9 @@ def run_gemm_plan(
             split_k_workspace=(
                 split_k_workspace.permute(3, 1, 2, 0) if split_k_semaphore is not None else None
             ),
+            mSFD=SFD,
+            sfd_norm_const=scalar_arg(sfd_norm_const, plan.sfd_norm_const_mode),
+            mSFDCol=SFDCol,
         )
     scheduler_args = plan_scheduler_args(
         plan, tile_count_semaphore, batch_idx_permute, ag_args, A=A
@@ -670,6 +707,9 @@ def _build_gemm_plan(
     bs_format_a=None,
     bs_format_b=None,
     has_ag=False,
+    SFD=None,
+    sfd_norm_const=None,
+    SFDCol=None,
 ) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -749,6 +789,70 @@ def _build_gemm_plan(
         )
     if split_k > 1 and device_capacity[0] not in [9, 10, 11, 12]:
         raise ValueError("split_k > 1 requires SM90, SM100, SM110, or SM120")
+    # Quantized output: SFD (row direction, SF vectors along N) / SFDCol
+    # (column direction, SF vectors along M). Blocked-atom layout checks here;
+    # the epilogue op asserts the kernel-side constraints at trace time.
+    assert SFD is None or SFDCol is None, "SFD and SFDCol are mutually exclusive"
+    sfd_dtype, sfd_col_dtype = None, None
+    if SFD is None and SFDCol is None:
+        sfd_norm_const = None
+    # Logical output extents for the SF-coverage checks (fp4 D packs N/2 bytes
+    # per row). An undersized SF buffer would NOT fault: the kernel clamps its
+    # SF stores to the buffer's padded extents, silently dropping scale bytes.
+    if SFD is not None or SFDCol is not None:
+        d_m = D.shape[-2]
+        d_n = D.shape[-1] * (2 if D.dtype == torch.float4_e2m1fn_x2 else 1)
+    if SFDCol is not None:
+        assert device_capacity[0] in [10, 11, 12], (
+            "Column-direction quantized output (SFDCol) requires SM100/SM110/SM120"
+        )
+        assert not varlen, "Column-direction SFD does not support varlen yet"
+        sfd_col_dtype = torch2cute_dtype_map[SFDCol.dtype]
+        vec_col = 32 if SFDCol.dtype == torch.float8_e8m0fnu else 16
+        assert SFDCol.dim() == 6 and SFDCol.shape[-3:] == (32, 4, 4), (
+            f"SFDCol must be (l, rn, rm_k, 32, 4, 4), got {tuple(SFDCol.shape)}"
+        )
+        assert SFDCol.stride()[-3:] == (16, 4, 1), (
+            f"SFDCol inner (32, 4, 4) atom must be contiguous, got {SFDCol.stride()[-3:]}"
+        )
+        assert SFDCol.shape[2] % (128 // (4 * vec_col)) == 0, (
+            "SFDCol rm_k must pad the M extent to whole 128-row stripes"
+        )
+        assert SFDCol.shape[1] >= -(-d_n // 128) and SFDCol.shape[2] >= -(-d_m // (4 * vec_col)), (
+            f"SFDCol (rn={SFDCol.shape[1]}, rm_k={SFDCol.shape[2]}) does not cover the "
+            f"({d_m}, {d_n}) output"
+        )
+    if SFD is not None:
+        assert device_capacity[0] in [10, 11, 12], (
+            "Quantized output (SFD) requires SM100/SM110/SM120"
+        )
+        sfd_dtype = torch2cute_dtype_map[SFD.dtype]
+        assert SFD.dim() == 6 and SFD.shape[-3:] == (32, 4, 4), (
+            f"SFD must be (l, rm, rk, 32, 4, 4), got {tuple(SFD.shape)}"
+        )
+        assert SFD.stride()[-3:] == (16, 4, 1), (
+            f"SFD inner (32, 4, 4) atom must be contiguous, got strides {SFD.stride()[-3:]}"
+        )
+        vec = 32 if SFD.dtype == torch.float8_e8m0fnu else 16
+        assert SFD.shape[2] >= -(-d_n // (4 * vec)), (
+            f"SFD rk={SFD.shape[2]} does not cover N={d_n} (vec {vec})"
+        )
+        if not varlen_m:
+            assert SFD.shape[1] >= -(-d_m // 128), f"SFD rm={SFD.shape[1]} does not cover M={d_m}"
+        if varlen_m:
+            # One M-padded buffer with tile-aligned per-batch padding (same
+            # convention as varlen_m input SFA); rows for batch b start at
+            # padded tile offset cu_seqlens_m[b] // 128 + b.
+            num_batches = cu_seqlens_m.shape[0] - 1
+            total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
+            min_rm = -(-total_m // 128) + (num_batches - 1)
+            assert SFD.shape[0] == 1 and SFD.shape[1] >= min_rm, (
+                f"varlen_m SFD must be (1, total_padded_rm >= {min_rm}, rk, 32, 4, 4), "
+                f"got {tuple(SFD.shape)}"
+            )
+    if SFD is not None or SFDCol is not None:
+        assert not add_to_output, "Quantized output (SFD) is incompatible with add_to_output"
+        assert split_k == 1, "Quantized output (SFD/SFDCol) does not support split_k yet"
     # SM120 fp8 rides MmaFP8Op (m16n8k32); k-major-only for fp8 operands is
     # enforced by the shared dtype/layout validation below, same as SM90.
     if use_tma_gather:
@@ -806,6 +910,7 @@ def _build_gemm_plan(
         gemm_add_to_output = False
 
     colvec_ndim = colvec_gemm.ndim if colvec_gemm is not None else 0
+    sfd_norm_const_mode = 0 if sfd_norm_const is None else scalar_mode(sfd_norm_const)
     tile_shape_mnk = (tile_M, tile_N) if tile_K is None else (tile_M, tile_N, tile_K)
     compiled_fn = _compile_gemm(
         a_dtype,
@@ -844,6 +949,9 @@ def _build_gemm_plan(
         batched,
         b_kn,
         SFA.ndim == 6 if blockscaled else True,
+        sfd_dtype,
+        sfd_norm_const_mode,
+        sfd_col_dtype,
         a_mma_dtype,
         b_mma_dtype,
         has_ag,
@@ -858,6 +966,7 @@ def _build_gemm_plan(
     # SERIAL/PARALLEL split-K passes per-call semaphore/workspace tensors through the
     # epilogue args, so those can never be static; SEPARATE always is (every epi
     # operand is routed to the reduce kernel, the modes above were zeroed).
+    # SFD/SFDCol are per-call tensors, so they disable the static template too.
     epi_static = None
     if (
         alpha_mode == 0
@@ -866,6 +975,8 @@ def _build_gemm_plan(
         and rowvec_gemm is None
         and colvec_gemm is None
         and (split_k == 1 or staged_split_k)
+        and SFD is None
+        and SFDCol is None
     ):
         epi_static = GemmDefaultEpiMixin.EpilogueArguments(
             alpha=None,
@@ -887,6 +998,7 @@ def _build_gemm_plan(
         alpha_mode=alpha_mode,
         beta_mode=beta_mode,
         sr_seed_mode=sr_seed_mode,
+        sfd_norm_const_mode=sfd_norm_const_mode,
         epi_static=epi_static,
         scheduler_static=scheduler_static,
         max_active_clusters=max_active_clusters,

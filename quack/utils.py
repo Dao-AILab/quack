@@ -7,8 +7,8 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass._mlir.dialects import llvm, vector
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.base_dsl.typing import Vector
+from cutlass.cutlass_dsl import dsl_user_op
 
 
 @dsl_user_op
@@ -130,46 +130,20 @@ def make_vector(elem_type, *values, loc=None, ip=None):
 
     Example: make_vector(cutlass.Uint32, v0, v1) -> <2 x i32> MLIR vector
     """
-    from cutlass._mlir import ir
-
-    n = len(values)
-    mlir_ty = elem_type.mlir_type
-    vec_ty = ir.VectorType.get([n], mlir_ty)
-    vec = llvm.mlir_undef(vec_ty, loc=loc, ip=ip)
-    for i, v in enumerate(values):
-        vec = vector.insert(
-            elem_type(v).ir_value(loc=loc, ip=ip),
-            vec,
-            dynamic_position=[],
-            static_position=[i],
-            loc=loc,
-            ip=ip,
-        )
-    return vec
+    scalars = tuple(elem_type(v) for v in values)
+    return Vector.from_elements(scalars, elem_type, loc=loc, ip=ip).ir_value()
 
 
 @dsl_user_op
 def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
-    vec_f32x2 = vector.from_elements(
-        T.vector(2, T.f32()), (a.ir_value(), b.ir_value()), loc=loc, ip=ip
-    )
-    vec_i64x1 = vector.bitcast(T.vector(1, T.i64()), vec_f32x2)
-    res = cutlass.Int64(
-        vector.extract(vec_i64x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
-    )
-    return res
+    vec = Vector.from_elements((Float32(a), Float32(b)), Float32, loc=loc, ip=ip)
+    return vec.bitcast(cutlass.Int64, loc=loc, ip=ip).to_elements(loc=loc, ip=ip)[0]
 
 
 @dsl_user_op
 def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
-    vec_i64x1 = vector.from_elements(T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip)
-    vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
-    res0 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
-    )
-    res1 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
-    )
+    vec = Vector.from_elements((cutlass.Int64(c),), cutlass.Int64, loc=loc, ip=ip)
+    res0, res1 = vec.bitcast(Float32, loc=loc, ip=ip).to_elements(loc=loc, ip=ip)
     return res0, res1
 
 

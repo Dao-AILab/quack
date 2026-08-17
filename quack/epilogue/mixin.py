@@ -35,7 +35,6 @@ manually.
 
 from dataclasses import make_dataclass, MISSING
 
-import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
@@ -175,6 +174,16 @@ class ComposableEpiMixin:
     def _epi_store_ops(self):
         return tuple(op for op in self._epi_ops if op.is_tile_store())
 
+    def _epi_store_quant(self, output_name):
+        """The quantize codec op (BlockScaleFactorStore) attached to the named
+        stored output, or None. "D" names the main output. Resolved from the
+        filtered (active) op set, so a call without the SF tensor quantizes
+        nothing."""
+        for op in self._epi_ops:
+            if getattr(op, "quant_output", None) == output_name:
+                return op
+        return None
+
     def epi_setup_aux_out(
         self,
         params,
@@ -185,11 +194,13 @@ class ComposableEpiMixin:
         varlen_manager,
         tidx,
     ):
-        """One store context quadruple per active TileStore op (see
-        TileStore.store_setup); the driver's epilogue loop consumes them in
-        op order, matching epi_visit_subtile's returned tuple."""
+        """One store context per active TileStore op: ``(op, quant) +
+        op.store_setup(...)`` — see gemm_base.epilogue for the full context
+        shape. The driver's epilogue loop consumes them in op order, matching
+        epi_visit_subtile's returned tuple."""
         return tuple(
-            op.store_setup(
+            (op, self._epi_store_quant(op.name))
+            + op.store_setup(
                 self,
                 params,
                 epi_smem_tensors[op.name],
@@ -200,21 +211,6 @@ class ComposableEpiMixin:
                 tidx,
             )
             for op in self._epi_store_ops()
-        )
-
-    @cute.jit
-    def epi_convert_aux_out(
-        self,
-        output_idx: cutlass.Constexpr[int],
-        tRS_rAuxOut,
-        sr_seed,
-        tidx,
-        tile_coord_mnkl,
-        num_prev_subtiles,
-        epi_idx,
-    ):
-        return self._epi_store_ops()[output_idx].store_convert(
-            self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
         )
 
     def _compute_tile_shape_or_override(
@@ -318,6 +314,7 @@ class ComposableEpiMixin:
         params,
         epi_tensors,
         epi_coord,
+        tRS_rD,
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
@@ -325,8 +322,16 @@ class ComposableEpiMixin:
         varlen_manager,
         tidx,
     ):
+        # Two-phase flush: every op stages its stripe first (intra-warp
+        # reduce + write to its own disjoint staging smem), then ONE shared
+        # barrier orders all the staging writes, then every op merges and
+        # writes gmem. A multi-sink epilogue pays a single arrive_and_wait
+        # per flush instead of one per sink — and the shared barrier is a
+        # strictly weaker sync than per-sink barriers.
+        pending = []
+        needs_barrier = False
         for op in self._epi_ops:
-            op.end_loop(
+            staged = op.end_loop_stage(
                 self,
                 getattr(params, op.name),
                 epi_tensors[op.name],
@@ -334,9 +339,20 @@ class ComposableEpiMixin:
                 epi_tile,
                 tiled_copy_t2r,
                 tiled_copy_r2s,
+                tidx,
+            )
+            if const_expr(staged is not None):
+                pending.append((op, staged))
+                needs_barrier = needs_barrier or staged[0]
+        if const_expr(needs_barrier):
+            self.epilogue_barrier.arrive_and_wait()
+        for entry in pending:
+            entry[0].end_loop_finish(
+                self,
+                getattr(params, entry[0].name),
+                entry[1][1],
                 tile_coord_mnkl,
                 varlen_manager,
-                tidx,
             )
 
     @cute.jit

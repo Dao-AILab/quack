@@ -4,8 +4,16 @@ import time
 import torch
 from triton.testing import do_bench
 
+import cutlass
+
+from quack.cute_dsl_utils import get_device_capacity, torch2cute_dtype_map
 from quack.gemm import gemm as quack_gemm
-from quack.gemm_interface import SplitKMode
+from quack.gemm_default_epi import GemmDefaultSm100
+
+# SplitKMode from gemm_config, not gemm_interface (same object): gemm_interface
+# pulls in the blockscaled modules, which would defeat the deferred import in
+# _run_blockscaled and cost every dense run ~0.5s of startup.
+from quack.gemm_config import SplitKMode
 
 """
 GEMM benchmark using quack.gemm.gemm() for both the dense path and the SM100
@@ -24,6 +32,13 @@ Usage (dense):
 Usage (blockscaled MXFP8, with cuBLAS comparison):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
         --tile_shape_mnk 256,256 --cluster_shape_mnk 2,1 --sf_vec_size 32
+
+NOTE: --tile_shape_mnk/--cluster_shape_mnk default to the SM100 shape (128,256).
+On SM120 (RTX 50) the blockscaled config that blockscaled_default_config picks --
+and the only one competitive with cuBLAS -- is (128,128) pingpong + dynamic
+persistent, so pass those flags explicitly or the numbers mean nothing:
+    python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 --sf_vec_size 32 \
+        --tile_shape_mnk 128,128 --pingpong --dynamic_persistent
 
 Usage (blockscaled MXFP4):
     python benchmarks/benchmark_gemm.py --mnkl 4096,4096,4096,1 \
@@ -192,6 +207,15 @@ def parse_arguments() -> argparse.Namespace:
         help="Output dtype: BFloat16/Float16/Float32 (applies to both dense and blockscaled).",
     )
     parser.add_argument(
+        "--quant_out",
+        type=str,
+        default=None,
+        choices=["mxfp8", "mxfp4", "nvfp4"],
+        help="Quantize the output in the epilogue (SFD generation): fp8/fp4 D plus blocked "
+        "scale factors. Overrides --d_dtype. Blockscaled path, SM100 only; when the input "
+        "format matches, a cublasLt D-out-scale baseline is benchmarked and bit-compared.",
+    )
+    parser.add_argument(
         "--c_dtype",
         type=str,
         default=None,
@@ -251,23 +275,24 @@ def _run_blockscaled(args):
     Both dense and varlen_m run through the unified quack.gemm.gemm() dispatch
     (SFA/SFB tensors, dynamic-shape compile cache).
     """
-    import cutlass
+    # Deferred on purpose: the only blockscaled-only module here that the top of
+    # the file doesn't already pull in transitively. It drags in
+    # quack.blockscaled.operand + .quantize for ~0.5s -- ~30% of startup that
+    # dense runs would pay for nothing. See the SplitKMode import note above.
     from quack.blockscaled.utils import (
         create_blockscaled_varlen_m_operands,
         scale_blocked_for_cublas,
         torch_dtype_for_cutlass,
     )
-    from quack.cute_dsl_utils import get_device_capacity, torch2cute_dtype_map
-    from quack.gemm_default_epi import GemmDefaultSm100
 
     sm_major = get_device_capacity(torch.device("cuda"))[0]
     assert sm_major in (10, 11, 12), (
         f"Blockscaled GEMM requires SM100 (B200/B300), SM110, or SM120 (RTX 50); got SM{sm_major}x."
     )
 
-    if args.varlen_k or args.gather_A or args.pingpong:
+    if args.varlen_k or args.gather_A:
         raise NotImplementedError(
-            "blockscaled + varlen_k/gather/pingpong is not wired up yet. "
+            "blockscaled + varlen_k/gather is not wired up yet. "
             "Only same-format --varlen_m is currently supported for blockscaled."
         )
 
@@ -283,6 +308,15 @@ def _run_blockscaled(args):
         )
     d_dtype = cutlass.dtype(args.d_dtype)
     from quack.blockscaled.operand import BlockScaledFormat
+
+    quant_fmt = None
+    if args.quant_out is not None:
+        if args.varlen_m:
+            raise NotImplementedError("--quant_out does not support varlen_m in this bench yet")
+        quant_fmt = BlockScaledFormat.from_name(
+            "mxfp8_e4m3" if args.quant_out == "mxfp8" else args.quant_out
+        )
+        d_dtype = quant_fmt.to_cutlass_dtype()
 
     def _format_from_dtype_triple():
         """Resolve the (--ab_dtype, --sf_dtype, --sf_vec_size) triple to a format
@@ -406,6 +440,7 @@ def _run_blockscaled(args):
                 tile_N=mma_tiler_mnk[1],
                 cluster_M=cluster_shape_mn[0],
                 cluster_N=cluster_shape_mn[1],
+                pingpong=args.pingpong,
                 persistent=True,
                 is_dynamic_persistent=args.dynamic_persistent,
                 max_swizzle_size=args.max_swizzle_size,
@@ -421,21 +456,39 @@ def _run_blockscaled(args):
         # (l, rm, rk, 32, 4, 4) blocked scales as-is, plus (l, m, n) D.
         a_ref, A, mSFA = _quantize_dense_operand(l, m, k, a_major == "m", fmt_a)
         b_ref, B, mSFB = _quantize_dense_operand(l, n, k, b_major == "n", fmt_b)
-        mD = torch.empty(l, m, n, dtype=torch_dtype_for_cutlass(d_dtype), device="cuda").permute(
-            1, 2, 0
-        )
+        mSFD = None
+        if quant_fmt is not None:
+            n_stored = n // 2 if quant_fmt.qdata_dtype == torch.float4_e2m1fn_x2 else n
+            mD_q = torch.empty(l, m, n_stored, dtype=quant_fmt.qdata_dtype, device="cuda")
+            vec_d = quant_fmt.sf_vec_size
+            mSFD = torch.empty(
+                l,
+                -(-m // 128),
+                -(-n // (4 * vec_d)),
+                32,
+                4,
+                4,
+                dtype=quant_fmt.scale_dtype,
+                device="cuda",
+            )
+            mD = mD_q  # (l, m, n_stored); the SFD dequant owns the ref check
+        else:
+            mD = torch.empty(
+                l, m, n, dtype=torch_dtype_for_cutlass(d_dtype), device="cuda"
+            ).permute(1, 2, 0)
 
         def fn():
             quack_gemm(
                 A,
                 B,
-                mD.permute(2, 0, 1),
+                mD.permute(2, 0, 1) if quant_fmt is None else mD,
                 None,
                 tile_count_semaphore=None,
                 tile_M=mma_tiler_mnk[0],
                 tile_N=mma_tiler_mnk[1],
                 cluster_M=cluster_shape_mn[0],
                 cluster_N=cluster_shape_mn[1],
+                pingpong=args.pingpong,
                 persistent=True,
                 is_dynamic_persistent=args.dynamic_persistent,
                 max_swizzle_size=args.max_swizzle_size,
@@ -443,6 +496,7 @@ def _run_blockscaled(args):
                 SFB=mSFB,
                 bs_format_a=fmt_a.name,
                 bs_format_b=fmt_b.name,
+                SFD=mSFD,
             )
 
     if not args.skip_ref_check:
@@ -455,13 +509,32 @@ def _run_blockscaled(args):
                 [a_ref_dq[cu_seqlens_m[i] : cu_seqlens_m[i + 1]] @ b_ref_dq[i].T for i in range(l)]
             )
             torch.testing.assert_close(mD.float(), ref, atol=tol, rtol=1e-3)
+        elif quant_fmt is not None:
+            # Dequantize (D, SFD) and bound the error by the quantization step.
+            from quack.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
+
+            vec_d = quant_fmt.sf_vec_size
+            ref = torch.einsum("mkl,nkl->lmn", a_ref, b_ref)
+            sf_2d = unpack_scale_blocked_to_2d(mSFD, m, -(-n // vec_d)).float()
+            vals = (
+                torch.stack([dequant_operand(mD[i]) for i in range(l)])
+                if quant_fmt.qdata_dtype == torch.float4_e2m1fn_x2
+                else mD.float()
+            )
+            scale = sf_2d.repeat_interleave(vec_d, -1)[..., :n]
+            half_gap = 16.0 if quant_fmt.qdata_dtype == torch.float8_e4m3fn else 1.0
+            err = (vals * scale - ref).abs()
+            bound = scale * half_gap * 1.05 + 1e-2
+            assert (err <= bound).all(), (
+                f"quant-out ref check failed: max err {err.max().item():.4f}"
+            )
         else:
             # a_ref / b_ref are each dequantized with their own format.
             ref = torch.einsum("mkl,nkl->mnl", a_ref, b_ref)
             torch.testing.assert_close(mD.float(), ref, atol=tol, rtol=1e-3)
         print("Ref check PASSED")
 
-    print("Running SM100 Blockscaled GEMM with:")
+    print(f"Running SM{sm_major}0 Blockscaled GEMM with:")
     print(f"mnkl: {args.mnkl}")
     print(f"tile_shape_mnk: {mma_tiler_mnk}, cluster_shape_mnk: {cluster_shape_mnk}")
     print(f"format A: {fmt_a.name}, format B: {fmt_b.name}, d_dtype: {args.d_dtype}")
@@ -486,6 +559,38 @@ def _run_blockscaled(args):
         print(
             f"(skipping cuBLAS: F.scaled_mm needs a_major=k, b_major=k; got a={a_major}, b={b_major})"
         )
+        return
+    if quant_fmt is not None:
+        # cublasLt quantized-output baseline: the D-out scale-generation
+        # epilogue (CUBLASLT_MATMUL_DESC_D_OUT_SCALE_*), not exposed by torch.
+        if fmt_a.name != fmt_b.name or fmt_a.name != quant_fmt.name:
+            print(
+                f"(skipping cuBLAS: quant-out baseline needs input format == output format; "
+                f"got {fmt_a.name} x {fmt_b.name} -> {quant_fmt.name})"
+            )
+            return
+        from quack.bench.cublaslt_quant_out import CublasLtQuantOutGemm
+
+        g = CublasLtQuantOutGemm(
+            A[0].contiguous(),
+            mSFA[0].contiguous(),
+            B[0].contiguous(),
+            mSFB[0].contiguous(),
+            m,
+            n,
+            k,
+            args.quant_out,
+        )
+        if not args.skip_ref_check:
+            D_cub, SFD_cub = g.run()
+            torch.cuda.synchronize()
+            vals_eq = torch.equal(D_cub.view(torch.uint8), mD[0].view(torch.uint8))
+            sf_eq = torch.equal(SFD_cub.view(torch.uint8), mSFD[0].view(torch.uint8))
+            print(f"quack vs cuBLAS quant-out: values bit_exact={vals_eq}  SF bit_exact={sf_eq}")
+        t_cublas = _bench_and_report(
+            "cuBLAS", g.run, flops, args.warmup_iterations, args.iterations
+        )
+        print(f"  (quack speedup vs cuBLAS: {t_cublas / timing:.2f}x)")
         return
     if fmt_a.name != fmt_b.name or fmt_a.elem_bits == 6:
         # F.scaled_mm takes one scaling recipe per fp8/fp4 operand dtype; mixed
@@ -541,6 +646,12 @@ def run(args):
         or args.bs_format_b is not None
     ):
         return _run_blockscaled(args)
+    if args.quant_out is not None:
+        raise NotImplementedError(
+            "--quant_out is wired for the blockscaled path only; pass matching input "
+            "formats too (e.g. --sf_vec_size 32 for mxfp8, or --ab_dtype Float4E2M1FN "
+            "--sf_dtype Float8E4M3FN --sf_vec_size 16 for nvfp4)"
+        )
     m, n, k, l = args.mnkl
     tile_M, tile_N = args.tile_shape_mnk[:2]
     tile_K = args.tile_shape_mnk[2] if len(args.tile_shape_mnk) == 3 else None
@@ -551,8 +662,6 @@ def run(args):
     tolerance = args.tolerance
     ab_dtype = _torch_dtype(args.ab_dtype) if args.ab_dtype is not None else torch.bfloat16
     d_dtype = _torch_dtype(args.d_dtype)
-
-    from quack.cute_dsl_utils import get_device_capacity
 
     device_capacity = get_device_capacity(torch.device("cuda"))
     if device_capacity[0] in [10, 11]:

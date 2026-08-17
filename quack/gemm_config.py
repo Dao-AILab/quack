@@ -54,6 +54,20 @@ class GemmConfig:
     use_tma_gather: bool = False
 
 
+def cta_tile_shape_m(
+    tile_m: int, cluster_m: int, device_capacity: int, blockscaled: bool = False
+) -> int:
+    """Per-CTA M tile. Mirrors GemmSm100.use_2cta_instrs (keep in sync): on
+    SM100/SM103 an even cluster_m with MMA tiler M in {128, 256} ({256} only
+    when blockscaled) selects the 2-CTA MMA, which splits tile_m across the
+    CTA pair. Tile schedulers, OOB limits, and reduce-sink partial slots all
+    count M in this unit — host-side buffers sized per M tile must use it too."""
+    if device_capacity not in (10, 11) or cluster_m % 2:
+        return tile_m
+    valid_2cta_m = (256,) if blockscaled else (128, 256)
+    return tile_m // 2 if tile_m in valid_2cta_m else tile_m
+
+
 def blockscaled_config_ok(c: GemmConfig) -> bool:
     """Can this config run a blockscaled GEMM (SM100 tcgen05 MMA, or SM120
     warp MMA)? THE single statement of the constraint set — both autotune
@@ -280,11 +294,17 @@ def blockscaled_default_config(m: int, n: int, device_capacity: int = 10) -> Gem
     the per-tile scale-apply + TMEM drain overlaps the next tile's MMA instead
     of serializing after it.
 
-    SM120 (warp MMA, no clusters) sticks to a (128, 128) tile — the one shape
-    every blockscaled-legal SM120 tiling supports.
+    On SM120 (warp MMA, no clusters), (128, 128) pingpong — riding CLC via
+    is_dynamic_persistent — measured best across mxfp8/nvfp4/mxfp4 at 2048³
+    through 8192³ on RTX 5090 (interleaved medians, 2026-07-30). The older
+    snapshot codebase's fp4-at->=8192 (256, 128) cooperative rule (see
+    AI/sm120_blockscaled_gemm_worklog.md) no longer holds: (256, 128) is now
+    the WORST of the three candidates at 8192³ (nvfp4 1051 vs pingpong 1354
+    TF); the sole exception is mxfp4 8192³ where (128, 128) coop leads
+    pingpong by ~5% — not enough for a format-special rule.
     """
     if device_capacity == 12:
-        return _blockscaled_config(128, 128, (1, 1), device_capacity=12)
+        return _blockscaled_config(128, 128, (1, 1), device_capacity=12, pingpong=True)
     if m >= 512 and n >= 256:
         tile_m, tile_n, cluster = 256, 256, (2, 1)
     elif m >= 512 and n >= 128:
@@ -295,13 +315,13 @@ def blockscaled_default_config(m: int, n: int, device_capacity: int = 10) -> Gem
 
 
 @lru_cache(maxsize=None)
-def _blockscaled_config(tile_m, tile_n, cluster, device_capacity=10):
+def _blockscaled_config(tile_m, tile_n, cluster, device_capacity=10, pingpong=False):
     return GemmConfig(
         tile_m=tile_m,
         tile_n=tile_n,
         cluster_m=cluster[0],
         cluster_n=cluster[1],
-        pingpong=False,
+        pingpong=pingpong,
         is_dynamic_persistent=True,
         device_capacity=device_capacity,
     )

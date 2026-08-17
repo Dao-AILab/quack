@@ -225,6 +225,7 @@ class TransformModBase:
                 self.padded_n(B),
                 A.shape[-1] // fmt.tile_k,
                 sm120=get_device_capacity(A.device)[0] == 12,
+                device=A.device,
             )
         return GemmConfig(
             tile_m=tm,

@@ -30,9 +30,12 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op, target_version
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
+from cutlass.experimental import primitives as prims
+
+from quack.cute_dsl_utils import get_compile_target_capacity
 
 __all__ = [
     "repack_nvfp4_weight",
@@ -133,25 +136,30 @@ def repack_nvfp4_sf(sf: torch.Tensor) -> torch.Tensor:
     return sf_u8[rows, cols].contiguous()
 
 
-def repack_int4_weight(w_packed: torch.Tensor) -> torch.Tensor:
+def repack_int4_weight(w_packed: torch.Tensor, s2f6: bool = False) -> torch.Tensor:
     """(M, K/2) packed-uint4b8 uint8 -> (M/64, K/64, 128, 16) blob for the
     magic-mantissa int4 decode: on top of the byte permutation, each 4-byte
     word (4 register pairs) is nibble-interleaved to
     [p0.lo p1.lo p2.lo p3.lo | p0.hi p1.hi p2.hi p3.hi], so pair j falls out
     of (word >> 4j) & 0x000F000F as 16-bit lanes (lo, hi). Nibbles stay raw
-    uint4b8 (no sign XOR); the +8 offset folds into the decode's -136 bias."""
+    uint4b8 (no sign XOR); the +8 offset folds into the decode's -136 bias.
+
+    s2f6=True (the Blackwell hw-cvt decode, Int4 only — AWQ stays on the
+    magic route): word bytes 1 and 2 swap, i.e.
+    [p0.lo p1.lo p0.hi p1.hi | p2.lo p3.lo p2.hi p3.hi] — the converter
+    consumes byte pairs per 16-bit half, so pair j sits in nibbles j%2 and
+    j%2 + 2 of half j//2. Pass use_s2f6_int_cvt() so the blob order tracks
+    the decode branch."""
     blob = repack_nvfp4_weight(w_packed)
     v = blob.view(*blob.shape[:-1], 4, 4).int()  # (..., word, byte=pair)
     lo, hi = v & 0xF, v >> 4
-    b = torch.stack(
-        [
-            lo[..., 0] | (lo[..., 1] << 4),
-            lo[..., 2] | (lo[..., 3] << 4),
-            hi[..., 0] | (hi[..., 1] << 4),
-            hi[..., 2] | (hi[..., 3] << 4),
-        ],
-        dim=-1,
-    )
+    bytes01 = [lo[..., 0] | (lo[..., 1] << 4), hi[..., 0] | (hi[..., 1] << 4)]
+    bytes23 = [lo[..., 2] | (lo[..., 3] << 4), hi[..., 2] | (hi[..., 3] << 4)]
+    if s2f6:
+        order = [bytes01[0], bytes01[1], bytes23[0], bytes23[1]]
+    else:
+        order = [bytes01[0], bytes23[0], bytes01[1], bytes23[1]]
+    b = torch.stack(order, dim=-1)
     return b.to(torch.uint8).view(blob.shape).contiguous()
 
 
@@ -256,6 +264,21 @@ def dequant_int4sm_reference(packed: torch.Tensor, scales: torch.Tensor, group: 
         n, kb * 2
     )
     return vals * scales.float().repeat_interleave(group, dim=1)
+
+
+def quantize_int4b8_reference(w: torch.Tensor, group: int = 128):
+    """(N, K) float -> offset-binary packed (N, K/2) + bf16 scales: the same
+    symmetric [-7, 7] grid as int4sm (head-to-head accuracy comparisons stay
+    quantizer-identical), stored as code = q + 8 for the biased e4m3 decode.
+    Dequant is dequant_int4_reference (nibble - 8 == q)."""
+    n, k = w.shape
+    assert k % group == 0
+    wb = w.float().view(n, k // group, group)
+    scale = (wb.abs().amax(dim=-1) / 7.0).clamp(min=1e-8).to(torch.bfloat16)
+    q = torch.clamp(torch.round(wb / scale.float()[..., None]), -7, 7).view(n, k)
+    code = (q + 8).to(torch.uint8)
+    packed = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
+    return packed, scale
 
 
 def repack_w4a8_weight(w_packed: torch.Tensor) -> torch.Tensor:
@@ -501,18 +524,12 @@ def asm_i32(operands, asm, constraints, *, loc=None, ip=None):
 def prmt(a: Int32, b: Int32, sel: Int32, *, loc=None, ip=None) -> Int32:
     # Not cute.arch.prmt: that wrapper emits its (identical) asm with
     # has_side_effects=True, which blocks LLVM from CSE/hoisting a pure op.
-    res = asm_i32(
-        [
-            Int32(a).ir_value(loc=loc, ip=ip),
-            Int32(b).ir_value(loc=loc, ip=ip),
-            Int32(sel).ir_value(loc=loc, ip=ip),
-        ],
-        "prmt.b32 $0, $1, $2, $3;",
-        "=r,r,r,r",
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(res)
+    # The nvvm.prmt dialect op is modeled Pure AND semantically known to
+    # LLVM: constant selectors fold, and an immediate selector stays an
+    # immediate in SASS instead of burning a register on the "=r,r,r,r"
+    # constraint. prmt.b32 d, a, b, c reads {b:a} bytes selected by c,
+    # which is prims.prmt(lo=a, hi=b, selector=c).
+    return prims.prmt(a, sel, prims.PermuteMode.DEFAULT, hi=b, loc=loc, ip=ip)
 
 
 @cute.jit
@@ -688,13 +705,27 @@ def _arch_has_bf16_narrow_cvt():
     convert decodes e2m1 at 2.0x the prmt-LUT sequence's rate (2.45x with
     the fused scale) and e4m3 at 1.6x the f16-route — both are shorter AND
     faster, so the arch check is the only gate."""
-    from cutlass.base_dsl.arch import Arch
+    from cutlass.base_dsl.enums import Arch
 
     arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
     # Arch orders by (major, minor, suffix): everything from sm_100 up has
     # the hw cvt, and unlike the block-scaled mma there is no per-op
     # admissible list to mirror — the cvt is plain PTX.
     return arch >= Arch.sm_100
+
+
+def use_s2f6_int_cvt():
+    """True when the int4/int8 -> bf16 integer decodes take the Blackwell
+    scaled fixed-point converter (cvt.rn.satfinite.scaled::n2::ue8m0.bf16x2
+    .s2f6x2, one F2FP.BF16.S2_6 per pair). Two gates on top of the fp4/fp8
+    family's arch check: the s2f6 source type needs PTX ISA 9.1 (CUDA 13.1;
+    the e2m1/e4m3 converts predate it), and the COMPILE-TARGET arch is what
+    matters — under the QUACK_ARCH=120-on-H100 proxy ptxas still targets the
+    physical sm_90a, so this must stay off there (get_compile_target_capacity
+    exists for exactly this split). Single predicate shared by the device
+    decode branch, make_i4_decode_consts, AND the host repack word order
+    (repack_int4_weight(s2f6=...)) so the two sides cannot drift."""
+    return get_compile_target_capacity()[0] >= 10 and target_version(min_version="13.1")
 
 
 def make_decode_luts():
@@ -833,7 +864,13 @@ def make_i4_decode_consts():
     (0x43004300 = bf16x2 (128, 128) exponent magic, 0xC308C308 = bf16x2
     (-136, -136) bias). tid-pinned: the magic LOP3's immediate slot is taken
     by the 0x000F000F mask and HADD2 has no bf16x2 immediate form, so both
-    must be stable registers."""
+    must be stable registers.
+
+    Blackwell (s2f6 hw-cvt decode): no consts — everything the sequence
+    needs is immediate-able (masks in LOP3 slots, the ue8m0 scale rides the
+    converter as an immediate)."""
+    if use_s2f6_int_cvt():
+        return None
     return (pin_b32_vreg(0x43004300), pin_b32_vreg(0xC308C308))
 
 
@@ -852,13 +889,59 @@ def decode_u4x8_to_magicx8(x: Int32, magic) -> Tuple[Int32, Int32, Int32, Int32]
     )
 
 
+@dsl_user_op
+def decode_u4b8x8_to_bf16x8_cvt(x: Int32, *, loc=None, ip=None):
+    """8 raw uint4b8 nibbles (s2f6 word order — repack_int4_weight(s2f6=True))
+    -> 4 bf16x2 via the Blackwell scaled fixed-point converter. nibble^8
+    staged in a byte's high nibble reads as s2f6 (= q * 16/64 = q/4) and the
+    fused ue8m0 scale 0x81 (2^2) restores the exact integer q = nibble-8;
+    satfinite never binds (|q| <= 8). 7 SASS per 8 values: SHL + 2 LOP3
+    ((a&b)^c = 0x6A fuses the nibble mask with the sign-bit flip) + 4
+    F2FP.BF16.S2_6 (the b16 half selects fold into the converter's operand
+    unpack, the scale is an immediate) — vs the magic route's 11, with no
+    fma-pipe HADD2s and no const registers. Output pairs come from byte
+    halves — R0=(n0,n2) R1=(n1,n3) R2=(n4,n6) R3=(n5,n7) — which is why the
+    s2f6 repack swaps word bytes 1 and 2."""
+    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32, i32, i32)>")
+    res = llvm.inline_asm(
+        struct_ty,
+        [Int32(x).ir_value(loc=loc, ip=ip)],
+        "{.reg .b32 e, o; .reg .b16 e0, e1, o0, o1, s;\n\t"
+        "shl.b32 e, $4, 4;\n\t"
+        "lop3.b32 e, e, 0xF0F0F0F0, 0x80808080, 0x6A;\n\t"
+        "lop3.b32 o, $4, 0xF0F0F0F0, 0x80808080, 0x6A;\n\t"
+        "mov.b32 {e0, e1}, e;\n\t"
+        "mov.b32 {o0, o1}, o;\n\t"
+        "mov.b16 s, 0x8181;\n\t"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.bf16x2.s2f6x2 $0, e0, s;\n\t"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.bf16x2.s2f6x2 $1, o0, s;\n\t"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.bf16x2.s2f6x2 $2, e1, s;\n\t"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.bf16x2.s2f6x2 $3, o1, s;}",
+        "=r,=r,=r,=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    i32 = T.i32()
+    return (
+        Int32(llvm.extractvalue(i32, res, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [1], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [2], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [3], loc=loc, ip=ip)),
+    )
+
+
 @cute.jit
 def decode_u4b8x8_to_bf16x8(x: Int32, consts) -> Tuple[Int32, Int32, Int32, Int32]:
     """8 raw uint4b8 nibbles in repack_int4_weight order -> 4 bf16x2 registers
-    R_j = pair j, exact. Magic-mantissa 128 + nibble (see
+    R_j = pair j, exact. Blackwell targets take the scaled s2f6 hw converter
+    (7 SASS, no consts — and a matching repack word order, see
+    use_s2f6_int_cvt); pre-Blackwell: magic-mantissa 128 + nibble (see
     decode_u4x8_to_magicx8); HADD2 -136 yields the exact integer q = nibble-8.
     1 LOP3 (+1 SHF for j>0) + 1 HADD2 per pair — shallower and lighter on the
     ALU pipe than the prmt/sign-extend cvt sequence."""
+    if const_expr(use_s2f6_int_cvt()):
+        return decode_u4b8x8_to_bf16x8_cvt(x)
     magic, bias = consts
     t0, t1, t2, t3 = decode_u4x8_to_magicx8(x, magic)
     return (
@@ -871,6 +954,20 @@ def decode_u4b8x8_to_bf16x8(x: Int32, consts) -> Tuple[Int32, Int32, Int32, Int3
 
 def make_e4m3_luts():
     return (mov_b32_vreg(E4M3_LUT_A), mov_b32_vreg(E4M3_LUT_B))
+
+
+@cute.jit
+def decode_u4b8x8_to_e4m3x8_biased(x: Int32) -> Tuple[Int32, Int32]:
+    """8 offset-binary nibbles (code = q+8, w4a8 repack order) -> 8 e4m3
+    bytes encoding (q+8) * 2^-9 EXACTLY: e4m3 bytes 0x00-0x0F are the linear
+    denormal grid v * 2^-9, so the decode is a pure unpack — 5 SASS per 8
+    values (SHR + 2 AND + 2 PRMT) vs int4sm's 9, with no LUT consts. The
+    codes are all positive; the +8 bias is the caller's problem (epilogue
+    correction of -8 * sum(b) per k-group, cutlass PR #3432's biased
+    mixed-input trick) and the 2^9 rides the promote scale."""
+    lo = x & Int32(_s32(0x0F0F0F0F))
+    hi = (x >> 4) & Int32(_s32(0x0F0F0F0F))
+    return prmt(lo, hi, Int32(0x5140)), prmt(lo, hi, Int32(0x7362))
 
 
 @cute.jit
@@ -943,17 +1040,8 @@ def decode_i4smx8_scaled_e4m3x8(x: Int32, ta_r, tb_r, ta_r8, tb_r8) -> Tuple[Int
 
 @dsl_user_op
 def i32_as_f32(v: Int32, *, loc=None, ip=None):
-    """Bitcast an Int32 register to Float32 (a plain mov)."""
-    res = llvm.inline_asm(
-        T.f32(),
-        [Int32(v).ir_value(loc=loc, ip=ip)],
-        "mov.b32 $0, $1;",
-        "=f,r",
-        has_side_effects=False,
-        loc=loc,
-        ip=ip,
-    )
-    return Float32(res)
+    """Bitcast an Int32 register to Float32 (arith.bitcast, zero instructions)."""
+    return prims.mov_b32(Int32(v), target_type=Float32, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -994,6 +1082,45 @@ def decode_i8x4_to_bf16x4_dp4a(x: Int32) -> Tuple[Int32, Int32]:
     f2 = _dp4a_extract_f32(x, 2)
     f3 = _dp4a_extract_f32(x, 3)
     return _pack_bf16x2_f32(f0, f1), _pack_bf16x2_f32(f2, f3)
+
+
+@dsl_user_op
+def decode_i8x4_to_bf16x4_cvt(x: Int32, *, loc=None, ip=None):
+    """4 int8 bytes -> 2 bf16x2 via the Blackwell scaled fixed-point
+    converter: an int8 byte read as s2f6 is b/64 and the fused ue8m0 scale
+    0x85 (2^6) restores it — exact, satfinite never binds. 2 SASS per 4
+    values (byte pairs are the converter's natural operand, half selects
+    fold) vs the dp4a route's 6. Same (bytes 0,1), (bytes 2,3) register
+    order as the dp4a route — no repack change."""
+    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    res = llvm.inline_asm(
+        struct_ty,
+        [Int32(x).ir_value(loc=loc, ip=ip)],
+        "{.reg .b16 p0, p1, s;\n\t"
+        "mov.b32 {p0, p1}, $2;\n\t"
+        "mov.b16 s, 0x8585;\n\t"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.bf16x2.s2f6x2 $0, p0, s;\n\t"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.bf16x2.s2f6x2 $1, p1, s;}",
+        "=r,=r,r",
+        has_side_effects=False,
+        loc=loc,
+        ip=ip,
+    )
+    i32 = T.i32()
+    return (
+        Int32(llvm.extractvalue(i32, res, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, res, [1], loc=loc, ip=ip)),
+    )
+
+
+@cute.jit
+def decode_i8x4_to_bf16x4(x: Int32) -> Tuple[Int32, Int32]:
+    """4 int8 bytes -> 2 bf16x2 registers (R0 = bytes 0,1; R1 = bytes 2,3).
+    Blackwell targets take the scaled s2f6 hw converter (2 SASS);
+    pre-Blackwell the dp4a extract route (6)."""
+    if const_expr(use_s2f6_int_cvt()):
+        return decode_i8x4_to_bf16x4_cvt(x)
+    return decode_i8x4_to_bf16x4_dp4a(x)
 
 
 @dsl_user_op

@@ -17,6 +17,7 @@ the ctor factory and their semantic digest to the compile key.
 """
 
 import functools
+from typing import Optional
 
 import torch
 
@@ -84,8 +85,86 @@ def _pick_tile_n(m_act: int, tile_n_min: int = 16) -> int:
     return 192
 
 
+@functools.lru_cache
+def _sms_or_default(device_index: int = 0, default: int = 170) -> int:
+    """SM count of ``device_index``, or ``default`` when no device can answer.
+
+    Resolved lazily and only on the SM120 prefill path: the callers that reach
+    this rule also run GPU-blind — the CPU-only cross-compile workflow
+    (``QUACK_ARCH`` + ``CUDA_VISIBLE_DEVICES=""``) and trace-time meta/fake
+    tensors have no device, and querying eagerly raises
+    ``CUDA_ERROR_NOT_INITIALIZED`` there. Same fallback convention as
+    :func:`quack.gemm_heuristic._device_physics` (try, then a per-arch
+    constant); 170 is the SM120 part this rule was measured on. A wrong guess
+    only selects a different tile — never a wrong result — and a CPU-only
+    precompile that guesses wrong just misses the ``.o`` cache and recompiles
+    in-process. (The async-compile pool workers never get here: they compile
+    from a pickled key whose config the parent already resolved.)"""
+    try:
+        from quack.cute_dsl_utils import get_device_multiprocessor_count
+
+        return get_device_multiprocessor_count(device_index)
+    except Exception:
+        return default
+
+
+def _wave_eff(ctas: int, sms: int) -> float:
+    """Fraction of the machine busy averaged over the launch: a grid of 192
+    CTAs on 170 SMs runs 1.13 waves, so the tail wave leaves 87% of the part
+    idle and the launch costs two full waves."""
+    return ctas / (-(-ctas // sms) * sms)
+
+
+# Serial split-k costs an f32 partials round-trip per extra split, amortized
+# over the k-tiles each split keeps -- measured as ~sk^2/k_tiles (8B gate,
+# k_tiles=64: sk=2 costs 5%, sk=4 costs 20%; 8B down, k_tiles=224: sk=4 costs
+# ~6%, which is why long-K shapes tolerate split-k that short-K ones don't).
+_PREFILL_SK_PENALTY = 0.6
+# Scores within this band are a tie; break toward fewer splits, then the wider
+# tile (wave efficiency saturates past ~10 waves, and there the H100 wide-tile
+# invariant takes over: 70B gate m=2048 (128,256,1) 8254us > (128,64,1) 8424).
+_PREFILL_TIE = 0.02
+
+
+def _pick_prefill_cfg(m_act: int, n128: int, k_tiles: int, sms: int, tile_n_min: int) -> tuple:
+    """SM120 prefill (m > 256): maximize busy-machine fraction.
+
+    RTX 5090-measured (int4, all 8 Llama-8B/70B layer shapes x m in
+    {512, 1024, 2048}, AI/prefill_surface.log): the old fixed (128, 256, 1)
+    ignored grid coverage and starved the 170-SM part whenever
+    ``n_full/128 * ceil(m/256)`` landed near or below one wave -- 8B down
+    m=512 is 64 CTAs, 2.12x off the best config. Score each candidate by
+    wave efficiency x tile-fill efficiency, discounted by the split-k
+    finalize penalty; this lands within 0.6% of the measured best on
+    average (worst 2.8%) across those 24 cells."""
+    cands = []
+    for tn in (256, 192, 128, 64):
+        if tn < tile_n_min:
+            continue
+        mt = -(-m_act // tn)
+        for sk in (1, 2, 4):
+            if sk > 1 and k_tiles // sk < 8:
+                continue  # too few k-tiles left per split to amortize the finalize
+            score = (
+                _wave_eff(n128 * mt * sk, sms)
+                * (m_act / (mt * tn))  # rows computed vs rows wanted
+                / (1.0 + _PREFILL_SK_PENALTY * sk * sk / k_tiles)
+            )
+            cands.append((score, sk, tn))
+    top = max(c[0] for c in cands)
+    ties = [c for c in cands if c[0] >= top * (1.0 - _PREFILL_TIE)]
+    _, sk, tn = min(ties, key=lambda c: (c[1], -c[2]))
+    return 128, tn, sk
+
+
 def pick_w4_cfg(
-    m_act: int, n_full: int, k_tiles: int, tile_n_min: int = 16, sm120: bool = False
+    m_act: int,
+    n_full: int,
+    k_tiles: int,
+    tile_n_min: int = 16,
+    sm120: bool = False,
+    sms: Optional[int] = None,
+    device=None,
 ) -> tuple:
     """(tile_m, tile_n, split_k). Measured invariant (H100, int4/qtip, incl.
     the machete faceoff): every winning config puts the grid at ~112-128 CTAs
@@ -94,19 +173,27 @@ def pick_w4_cfg(
     byte), tile_n is the largest with under half a tile of padding on m, and
     serial split-k makes up remaining grid coverage when each split keeps
     >= ~24 k-tiles (and tile_n <= 128: the f32 finalize round-trip scales
-    with tile area). Prefill (m > 256): (128, 256, 1). ``tile_n_min``: the
-    arch's tile_N floor. ``sm120``: RTX 5090-measured decode rule (see below)."""
+    with tile area). Prefill (m > 256): (128, 256, 1) on H100,
+    coverage-scored on SM120 (see :func:`_pick_prefill_cfg`). ``tile_n_min``:
+    the arch's tile_N floor. ``sm120``: RTX 5090-measured rules (see below).
+    ``sms`` / ``device``: SM count for the SM120 prefill score — pass ``sms``
+    to pin it, else it is resolved lazily from ``device`` (see
+    :func:`_sms_or_default`) only when that branch is taken, so GPU-blind
+    callers never trigger a driver query."""
     if n_full % 128 != 0:
         tn = _pick_tile_n(m_act, tile_n_min) if m_act <= 128 else 192
         mt = -(-m_act // tn)
         sk = 2 if (m_act <= 32 and (n_full // 64) * mt < 128 and k_tiles >= 32) else 1
         return 64, tn, sk
     if m_act > 256:
-        # SM120 (RTX 5090 measured): short-K prefill wants 128-wide tiles —
-        # qkv m=2048 (128,128,1) 207 TF vs (128,256,1) 177 (matches Marlin);
-        # long-K keeps 256 (down m=2048: (128,256) 183 > (128,128) 175).
-        if sm120 and k_tiles <= 96:
-            return 128, 128, 1
+        # SM120: coverage-scored (the fixed tiles below starve the 170-SM
+        # part on narrow-N / long-K shapes). H100 keeps the measured constant
+        # — its prefill rule was tuned against the machete faceoff and there
+        # is no Hopper part here to re-measure a replacement on.
+        if sm120:
+            if sms is None:
+                sms = _sms_or_default(getattr(device, "index", None) or 0)
+            return _pick_prefill_cfg(m_act, n_full // 128, k_tiles, sms, tile_n_min)
         return 128, 256, 1
     n128 = n_full // 128
     if sm120 and m_act <= 64:
