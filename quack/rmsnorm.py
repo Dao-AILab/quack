@@ -36,6 +36,16 @@ from quack.rmsnorm_config import (
     prune_invalid_rmsnorm_bwd_configs,
     prune_invalid_rmsnorm_fwd_configs,
 )
+
+# Re-exported: the pure-torch references live in a backend-neutral module so
+# ROCm can import them without the CuTe stack.
+from quack.rmsnorm_torch import (  # noqa: F401
+    layernorm_mean_ref,
+    layernorm_ref,
+    layernorm_rstd_ref,
+    rmsnorm_bwd_ref,
+    rmsnorm_ref,
+)
 from cutlass.base_dsl.enums import Arch
 
 
@@ -558,40 +568,6 @@ def rmsnorm_fwd_tuned(
         weight_offset,
         config=config,
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
-
-
-def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6, weight_offset=0.0):
-    x_f32 = x.float()
-    if residual is not None:
-        residual_f32 = residual.float()
-        x_f32 = x_f32 + residual_f32
-    x_norm = x_f32 / (torch.sqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps))
-    out = x_norm * (w.float() + weight_offset) if w is not None else x_norm
-    if bias is not None:
-        out = out + bias.float()
-    if residual is None:
-        return out.to(x.dtype)
-    else:
-        return out.to(x.dtype), x_f32.to(residual.dtype)
-
-
-def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6, weight_offset=0.0):
-    """Reference implementation for RMSNorm backward pass."""
-    x_f32 = x.float()
-    x_hat = x_f32 * rstd.unsqueeze(1)
-    if w is not None:
-        wdy = dout * (w.float() + weight_offset)
-    else:
-        wdy = dout
-    c1 = (x_hat * wdy).mean(dim=-1, keepdim=True)
-    dx = (wdy - x_hat * c1) * rstd.unsqueeze(1)
-
-    # dL/dW
-    if w is not None:
-        dw = (dout * x_hat).sum(dim=0)
-        return dx.to(x.dtype), dw.to(w.dtype)
-    else:
-        return dx.to(x.dtype), None
 
 
 class RMSNormBackward(ReductionBase):
@@ -1838,20 +1814,3 @@ def layernorm_bwd(
         dw = torch.zeros_like(weight)
         db = torch.zeros_like(weight) if has_bias else None
     return dx, dw, db
-
-
-def layernorm_ref(x: Tensor, w: Tensor, eps: float = 1e-6) -> Tensor:
-    """Reference implementation for LayerNorm."""
-    x_f32 = x.float()
-    return torch.nn.functional.layer_norm(x_f32, w.shape, w, None, eps).to(x.dtype)
-
-
-def layernorm_rstd_ref(x: torch.Tensor, eps: float = 1e-6):
-    x_f32 = x.float()
-    mean = x_f32.mean(dim=-1, keepdim=True)
-    var = ((x_f32 - mean) ** 2).mean(dim=-1)
-    return 1.0 / torch.sqrt(var + eps)
-
-
-def layernorm_mean_ref(x: torch.Tensor) -> torch.Tensor:
-    return x.float().mean(dim=-1)

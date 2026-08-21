@@ -1,25 +1,33 @@
 import argparse
-import os
 from typing import Optional
 
-os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
+import torch
+import torch._functorch.config as _functorch_config
+from triton.testing import Benchmark, do_bench, perf_report
 
-import torch  # noqa: E402
-import torch._functorch.config as _functorch_config  # noqa: E402
-from triton.testing import Benchmark, do_bench, perf_report  # noqa: E402
-
-from quack.bench.bench_utils import run_and_print  # noqa: E402
-from quack.rmsnorm import rmsnorm, rmsnorm_bwd, rmsnorm_fwd, rmsnorm_ref  # noqa: E402
+from quack._platform import IS_ROCM_BUILD
+from quack.bench.bench_utils import run_and_print
+from quack.rmsnorm_torch import rmsnorm_ref
 
 # Inductor's donated-buffer optimization is incompatible with retain_graph=True
 # (used so we benchmark only bwd, not fwd+bwd). Disable it for the torch.compile
 # bwd path. Must be set before torch.compile builds the bwd graph.
 _functorch_config.donated_buffer = False
 
-try:
-    import cudnn
-except ImportError:
-    cudnn = None
+# Keep N static: after the first recompile, automatic dynamic shapes generalize the
+# reduction dimension and Inductor drops its persistent-reduction schedule, so
+# dynamic=False gives every (M, N) a fresh graph. The recompile budget is per code
+# object and the ladder's rungs share one; at the default limit of 8 the last rungs
+# silently report eager timings under the torch.compile heading.
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
+
+cudnn = None
+if not IS_ROCM_BUILD:
+    try:
+        import cudnn
+    except ImportError:
+        pass
 
 
 MN_PAIRS = [
@@ -105,7 +113,7 @@ def make_bwd_benchmark(
 
 
 def _fwd_mem_bytes(x: torch.Tensor, w: torch.Tensor, residual: Optional[torch.Tensor]) -> int:
-    nbytes = 2 * x.numel() * x.dtype.itemsize + w.numel() * 4
+    nbytes = 2 * x.numel() * x.dtype.itemsize + w.numel() * w.dtype.itemsize
     if residual is not None:
         nbytes += 2 * residual.numel() * residual.dtype.itemsize
     return nbytes
@@ -166,11 +174,15 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     )
 
     if provider == "quack":
+        # Resolve only after CLI parsing: FlyDSL is optional, and ROCm
+        # ``--help``/``--backward`` must not import the forward backend.
+        from quack import rmsnorm_fwd
+
         fn = lambda: rmsnorm_fwd(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
     elif provider == "torch_compile":
-        compiled = torch.compile(rmsnorm_ref)
+        compiled = torch.compile(rmsnorm_ref, dynamic=False)
         fn = lambda: compiled(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
@@ -187,6 +199,9 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
 
 
 def rmsnorm_bwd_runner(M, N, provider, dtype_name, residual_dtype_name):
+    # CuTe-only: there is no FlyDSL backward, and the setup below needs rmsnorm().
+    from quack.rmsnorm import rmsnorm, rmsnorm_bwd
+
     dtype = DTYPE_MAP[dtype_name]
     residual_dtype = DTYPE_MAP[residual_dtype_name] if residual_dtype_name else None
     eps = 1e-6
@@ -230,7 +245,7 @@ def rmsnorm_bwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     elif provider == "torch_compile":
         x_ref = x.detach().clone().requires_grad_()
         w_ref = w.detach().clone().requires_grad_()
-        y_ref = torch.compile(rmsnorm_ref)(x_ref, w_ref, eps=eps)
+        y_ref = torch.compile(rmsnorm_ref, dynamic=False)(x_ref, w_ref, eps=eps)
         fn = lambda: torch.autograd.grad(y_ref, [x_ref, w_ref], grad_outputs=dy, retain_graph=True)
         ms = _bench(fn, grad_to_none=(x_ref, w_ref))
         sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 2
@@ -259,6 +274,8 @@ def main():
     if (args.M is None) != (args.N is None):
         parser.error("--M and --N must be given together")
     x_vals = [(args.M, args.N)] if args.M is not None else None
+    if args.backward and IS_ROCM_BUILD:
+        parser.error("--backward is CuTe-only; there is no FlyDSL RMSNorm backward kernel yet")
 
     torch.manual_seed(0)
 
