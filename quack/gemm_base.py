@@ -20,7 +20,7 @@ from cutlass.utils.distributed import multimem_red_add1, spin_lock_ld_lt_relaxed
 
 from quack.cute_dsl_utils import ParamsBase
 from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
-from quack.epi_reduce import EpiReduceArguments
+from quack.epi_reduce import EpiReduceArguments, epi_reduce_flag_slot
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
@@ -798,16 +798,17 @@ class GemmBase:
         is_producer: cutlass.Constexpr[bool] = True,
         # epi_reduce_mode materials, unused when mode is None: the r2s copy (producer
         # commit addressing) and the comm bundle — one collective allocation, one
-        # argument (flags, counters, the partials workspace and its mc view). The
-        # reducer passes slab_m explicitly: it is unrecoverable from the padded
-        # workspace shape.
+        # argument (flags, counters, the partials workspace and its mc view).
+        # flag_ntile_mn is the real (unpadded) CTA-tile grid feeding
+        # epi_reduce_flag_slot; the reducer passes slab_len explicitly.
         tiled_copy_r2s: Optional[cute.TiledCopy] = None,
         # Producer TMA commit pair (copy_D's sibling; passed directly — the epi_fn
         # closure is opaque, like epi_store_pipeline above)
         tRS_sWs: Optional[cute.Tensor] = None,
         copy_ws: Optional[Callable] = None,
         epi_reduce_args: Optional[EpiReduceArguments] = None,
-        slab_m: Optional[Int32] = None,
+        flag_ntile_mn: Optional[Tuple[Int32, Int32]] = None,
+        slab_len: Optional[Int32] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """Split-rank protocol wrapper — the cross-rank sibling of epilogue_split_k.
         Ranks are one more split of the reduction dim, with SPATIAL roles (warp
@@ -859,20 +860,17 @@ class GemmBase:
                 and copy_ws is not None
                 and epi_reduce_args is not None
             ), "producer needs the ws commit pair, tiled_copy_r2s and epi_reduce_args"
-            ws = epi_reduce_args.workspace
-            # Flag contract: M-major CTA-tile linear id, derived identically by the
-            # reducer branch below; the grid extents come from the workspace shape
-            # (M has one extra pad block, hence the -1; N pads to whole tiles). A
-            # fully-OOB CTA half (partial MMA tile) stores into the pad block's
-            # dead slot but has no rows to announce — in_bounds keeps its coord
-            # from aliasing the next column's flag.
-            cta_tiles_m = ws.shape[0] // cta_m - 1
-            cta_tiles_n = ws.shape[1] // cta_n
+            # Flag contract: epi_reduce_flag_slot over the real tile grid, shared
+            # with the reducer branch below. A fully-OOB CTA half (partial MMA
+            # tile) stores into the workspace pad block's dead slot but has no
+            # rows to announce — in_bounds keeps its coord from aliasing the
+            # next column's flag.
             tile_id = Int32(
-                tile_coord_mnkl[0]
-                + cta_tiles_m * (tile_coord_mnkl[1] + cta_tiles_n * tile_coord_mnkl[3])
+                epi_reduce_flag_slot(
+                    tile_coord_mnkl[0], tile_coord_mnkl[1], tile_coord_mnkl[3], flag_ntile_mn
+                )
             )
-            in_bounds = tile_coord_mnkl[0] < cta_tiles_m
+            in_bounds = tile_coord_mnkl[0] < flag_ntile_mn[0]
 
             # The rank's partial commit replaces the epilogue closure as the finalize
             # action; load_acc_subtile stays the one argument left unbound.
@@ -909,57 +907,63 @@ class GemmBase:
                 is_tma_warp,
             )
         else:
-            assert epi_reduce_args is not None and slab_m is not None, (
-                "reducer needs epi_reduce_args and slab_m"
+            assert epi_reduce_args is not None and flag_ntile_mn is not None and slab_len is not None, (
+                "reducer needs epi_reduce_args, flag_ntile_mn and slab_len"
             )
             # Finalizer wait — the sibling of split-K's sem.wait_eq(S-1). Producer
-            # tiles (and their flags) are anchored at global row 0; consumer tiles
-            # at the slab start, which need not be a multiple of cta_m. Same shape,
-            # out of phase: this tile's valid rows span 1-2 producer tiles (exactly
-            # 1 when M % (TP*cta_m) == 0). Flag-grid extents mirror the producer
-            # branch above (workspace shape, -1 for the pad block).
-            ws = epi_reduce_args.workspace
-            slab_row0 = self.rank_id * slab_m
-            cta_tiles_m_total = ws.shape[0] // cta_m - 1
-            n_tiles_total = ws.shape[1] // cta_n
-            slab_tiles_m = cute.ceil_div(slab_m, cta_m)
-            m_tile, n_tile = tile_coord_mnkl[0], tile_coord_mnkl[1]
+            # tiles (and their flags) are anchored at (0, 0); consumer tiles at the
+            # slab start, which need not be tile-aligned along the slab axis. Same
+            # shape, out of phase: this tile's valid slab-axis extent spans 1-2
+            # producer tiles (exactly 1 when slab_len % (TP*cta_slab) == 0).
+            if const_expr(self.epi_reduce_slab_dim == "m"):
+                cta_slab = cta_m
+                s_tile = tile_coord_mnkl[0]
+            else:
+                cta_slab = cta_n
+                s_tile = tile_coord_mnkl[1]
             batch = tile_coord_mnkl[3]
-            row0 = m_tile * cta_m
-            rows_here = Int32(cta_m)
-            if slab_m - row0 < cta_m:
-                rows_here = slab_m - row0
-            g_row0 = slab_row0 + row0
-            prod_m0 = g_row0 // cta_m
-            prod_m1 = (g_row0 + rows_here - 1) // cta_m
-            flag_base = cta_tiles_m_total * (n_tile + n_tiles_total * batch)
+            slab_anchor = self.rank_id * slab_len
+            slab_tiles = cute.ceil_div(slab_len, cta_slab)
+            s0 = s_tile * cta_slab
+            len_here = Int32(cta_slab)
+            if slab_len - s0 < cta_slab:
+                len_here = slab_len - s0
+            g_s0 = slab_anchor + s0
+            prod_s0 = g_s0 // cta_slab
+            prod_s1 = (g_s0 + len_here - 1) // cta_slab
+            if const_expr(self.epi_reduce_slab_dim == "m"):
+                slot0 = epi_reduce_flag_slot(prod_s0, tile_coord_mnkl[1], batch, flag_ntile_mn)
+                slot1 = epi_reduce_flag_slot(prod_s1, tile_coord_mnkl[1], batch, flag_ntile_mn)
+            else:
+                slot0 = epi_reduce_flag_slot(tile_coord_mnkl[0], prod_s0, batch, flag_ntile_mn)
+                slot1 = epi_reduce_flag_slot(tile_coord_mnkl[0], prod_s1, batch, flag_ntile_mn)
 
             # Wait >= world, then consume: +1, and whoever brings the flag to
             # world + consumers resets it. A flag has 2 consumers on this rank
-            # only when the slab anchor is cta_m-misaligned and both neighbors
+            # only when the slab anchor is cta_slab-misaligned and both neighbors
             # exist; both have finished waiting before the reset fires. Safe
             # under PDL: the next launch's producer release sits behind its
             # griddepcontrol-gated loads, so it cannot land before this reset.
             if tidx == 0:
-                misaligned = slab_row0 % cta_m != 0
+                misaligned = slab_anchor % cta_slab != 0
                 flags = epi_reduce_args.tile_flags
-                f0 = flags.iterator + flag_base + prod_m0
+                f0 = flags.iterator + slot0
                 spin_lock_ld_lt_relaxed_wait(
                     lock_ptr=f0, expected_val=self.num_ranks, scope="gpu"
                 )
                 cons0 = Int32(1)
-                if misaligned and m_tile > 0:
+                if misaligned and s_tile > 0:
                     cons0 = Int32(2)
                 r0 = cute.arch.atomic_add(f0.llvm_ptr, Int32(1), sem="relaxed", scope="gpu")
                 if r0 == self.num_ranks + cons0 - 1:
                     cute.arch.store(f0.llvm_ptr, Int32(0), sem="relaxed", scope="gpu")
-                if prod_m1 != prod_m0:
-                    f1 = flags.iterator + flag_base + prod_m1
+                if prod_s1 != prod_s0:
+                    f1 = flags.iterator + slot1
                     spin_lock_ld_lt_relaxed_wait(
                         lock_ptr=f1, expected_val=self.num_ranks, scope="gpu"
                     )
                     cons1 = Int32(1)
-                    if m_tile + 1 < slab_tiles_m:
+                    if s_tile + 1 < slab_tiles:
                         cons1 = Int32(2)
                     r1 = cute.arch.atomic_add(f1.llvm_ptr, Int32(1), sem="relaxed", scope="gpu")
                     if r1 == self.num_ranks + cons1 - 1:

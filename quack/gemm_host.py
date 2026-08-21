@@ -231,10 +231,15 @@ def _compile_gemm_epi(
         b_mma_dtype=b_mma_dtype,
     )
     if epi_reduce is not None:
-        # Epilogue tensors are slab-local (m / world): a fresh m sym, untied
-        # from the operand m; C is epilogue-consumed so it rides the same sym,
-        # and so does D under reduce_scatter (the slab-shaped output).
-        m = cute.sym_int()
+        # Epilogue tensors are slab-local (slab_len / world along the slab axis):
+        # a fresh sym for that axis, untied from the operand's; C is
+        # epilogue-consumed so it rides the same syms, and so does D under
+        # reduce_scatter (the slab-shaped output).
+        # The slab axis is D's strided axis: n-major D -> M slab, m-major -> N.
+        if d_major == "n":
+            m = cute.sym_int()
+        else:
+            n = cute.sym_int()
         if mC is not None:
             c_leading = 1 if c_major == "n" else 0
             mC = fake_batched(
@@ -560,8 +565,12 @@ def run_gemm_epi_plan(
             plan.cluster_M,
             plan.cluster_N,
             plan.is_sm100_family,
-            # RS epi_reduce: D is slab-shaped but the GEMM tile grid is full-M.
+            # RS epi_reduce: D is slab-shaped (along the slab axis) but the
+            # GEMM tile grid spans the full problem; take extents from A/B.
             len_m=A.shape[-2]
+            if getattr(plan, "epi_reduce_mode", None) == "reduce_scatter"
+            else None,
+            len_n=B.shape[-2]
             if getattr(plan, "epi_reduce_mode", None) == "reduce_scatter"
             else None,
         )

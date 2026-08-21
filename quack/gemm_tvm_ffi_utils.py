@@ -288,18 +288,19 @@ def make_scheduler_args(
     )
 
 
-def make_fake_epi_reduce_args(d_dtype, mode, ws_dtype):
+def make_fake_epi_reduce_args(d_dtype, mode, ws_dtype, d_major="n"):
     """Fake EpiReduceArguments for epi_reduce_mode compiles (see quack.epi_reduce).
 
-    Comm views are kernel-order (m, n, l): __call__ does not rotate them. mD_mc
-    exists only under all_reduce (reduce_scatter commits to the plain kernel mD).
+    Comm views are kernel-order (m, n, l): __call__ does not rotate them; their
+    majorness follows D's. mD_mc exists only under all_reduce (reduce_scatter
+    commits to the plain kernel mD).
     """
     from quack.epi_reduce import EpiReduceArguments
 
     mnl_fake = lambda dtype: fake_tensor(
         dtype,
         (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-        leading_dim=1,
+        leading_dim=1 if d_major == "n" else 0,
         divisibility=128 // dtype.width,  # 16 B
     )
     flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
@@ -788,7 +789,12 @@ def compile_gemm_kernel(
     if epi_reduce is not None:
         er_args = (
             make_fake_epi_reduce_args(
-                mD.element_type, epi_reduce[0], torch2cute_dtype_map[epi_reduce[3]]
+                mD.element_type,
+                epi_reduce[0],
+                torch2cute_dtype_map[epi_reduce[3]],
+                # comm views share D's majorness; the fake mD's static unit
+                # stride carries it (leading_dim at construction)
+                d_major="n" if mD.stride[-1] == 1 else "m",
             ),
         )
     return cute.compile(

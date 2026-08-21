@@ -15,6 +15,7 @@ slab-shaped D for reduce_scatter, multimem_st broadcast into symmetric D for
 all_reduce). Pipelines: epi_pipeline stages C for the reducer; the reducer's aux
 stores ride its own epi_store_pipeline instance."""
 
+import math
 from typing import NamedTuple, Optional
 
 import torch
@@ -49,13 +50,16 @@ class EpiReduceArguments(NamedTuple):
     tile_flags_mc: Optional[cute.Tensor] = None
 
 
-def epi_reduce_workspace_shape(m, n, cta_m, cta_n):
-    """Padded workspace extents: N rounded to whole tiles, M rounded up plus one
-    extra cta_m block. The pad keeps every workspace access in-allocation with no
-    predication: reducer tiles anchor at rank*slab_m (not cta_m-aligned) and fully
-    OOB phantom cluster CTAs store into the dead last block; nothing consumes pad."""
+def epi_reduce_workspace_shape(m, n, cta_m, cta_n, slab_dim="m"):
+    """Padded workspace extents; the pad keeps every workspace access
+    in-allocation with no predication, and nothing consumes it. M always carries
+    one extra cta_m block: fully OOB phantom cluster CTAs (2-CTA pairing is
+    along M) store into the dead last block. The slab axis carries an extra
+    block too: reducer tiles anchor at rank*slab_len, which is not tile-aligned,
+    and read a full tile unpredicated — under slab_dim="m" the phantom block
+    already covers this; slab_dim="n" moves the anchor pad to N."""
     m_pad = ((m + cta_m - 1) // cta_m + 1) * cta_m
-    n_pad = (n + cta_n - 1) // cta_n * cta_n
+    n_pad = ((n + cta_n - 1) // cta_n + (1 if slab_dim == "n" else 0)) * cta_n
     return m_pad, n_pad
 
 
@@ -70,24 +74,41 @@ def validate_epi_reduce_args(
     is a silent OOB multimem write). m is the full GEMM M (from A): D carries only
     the slab under reduce_scatter."""
     era = epi_reduce_args
-    if m % num_ranks:
-        raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
     if D is None:
         raise ValueError("epi_reduce_mode requires D (the output tensor)")
-    vec = 16 // D.element_size()
-    if n % vec:
-        raise ValueError(f"epi_reduce_mode: n ({n}) must be divisible by {vec}")
-    if D.stride(-1) != 1:
-        raise ValueError("epi_reduce_mode: D must be n-major (multimem vectors)")
-    d_rows = m // num_ranks if mode == "reduce_scatter" else m
-    if D.shape[-2] != d_rows or D.shape[-1] != n:
+    if D.stride(-1) == 1:
+        d_major = "n"
+    elif D.stride(-2) == 1:
+        d_major = "m"
+    else:
+        raise ValueError("epi_reduce_mode: D must be contiguous along m or n (multimem vectors)")
+    # The slab axis is always D's strided axis, so each rank's slice of D is
+    # contiguous (cutlass's rule). AR picks its work split by this rule; RS
+    # callers encode the same choice in D's shape, cross-checked below.
+    slab_dim = "m" if d_major == "n" else "n"
+    slab_len = m if slab_dim == "m" else n
+    if slab_len % num_ranks:
         raise ValueError(
-            f"epi_reduce_mode={mode}: D rows x cols ({d_rows}, {n}) expected, "
+            f"epi_reduce_mode: {slab_dim} ({slab_len}) must be divisible by world ({num_ranks})"
+        )
+    vec = 16 // D.element_size()
+    # Multimem atoms run along D's contiguous axis: that extent must divide
+    # into whole 16 B vectors.
+    contig_len = n if d_major == "n" else m
+    if contig_len % vec:
+        raise ValueError(
+            f"epi_reduce_mode: {d_major} ({contig_len}) must be divisible by {vec}"
+        )
+    d_rows = m // num_ranks if mode == "reduce_scatter" and slab_dim == "m" else m
+    d_cols = n // num_ranks if mode == "reduce_scatter" and slab_dim == "n" else n
+    if D.shape[-2] != d_rows or D.shape[-1] != d_cols:
+        raise ValueError(
+            f"epi_reduce_mode={mode}: D rows x cols ({d_rows}, {d_cols}) expected, "
             f"got ({D.shape[-2]}, {D.shape[-1]})"
         )
     use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
     cta_m = tile_M // (2 if use_2cta else 1)
-    ws_mnl = (*epi_reduce_workspace_shape(m, n, cta_m, tile_N), l)
+    ws_mnl = (*epi_reduce_workspace_shape(m, n, cta_m, tile_N, slab_dim), l)
     for name, t in (("workspace", era.workspace), ("workspace_mc", era.workspace_mc)):
         if t is None or tuple(t.shape) != ws_mnl:
             raise ValueError(
@@ -96,23 +117,39 @@ def validate_epi_reduce_args(
             )
     if era.workspace.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError(f"epi_reduce_args.workspace dtype {era.workspace.dtype} not multimem-reducible")
-    if era.workspace_mc.dtype != era.workspace.dtype or era.workspace.stride(1) != 1:
-        raise ValueError("epi_reduce_args.workspace must be n-major, workspace_mc same dtype")
+    ws_contig = 1 if d_major == "n" else 0
+    if era.workspace_mc.dtype != era.workspace.dtype or era.workspace.stride(ws_contig) != 1:
+        raise ValueError(
+            f"epi_reduce_args.workspace must be {d_major}-major (matching D), "
+            "workspace_mc same dtype"
+        )
     if mode == "all_reduce" and era.workspace.dtype != D.dtype:
         # Not inherent: the broadcast commit hardcodes 16 B multimem_st of D-dtype
         # atoms; teach it 8/32 B atoms if a workload needs mismatched-dtype AR.
         raise ValueError("all_reduce requires workspace dtype == D dtype")
     ws_vec = 16 // era.workspace.element_size()
-    if n % ws_vec:
-        raise ValueError(f"epi_reduce_mode: n ({n}) must be divisible by {ws_vec} (workspace vectors)")
-    # Fixed 4 comm warps (128 threads): the per-rank tile slice must spread evenly
-    # across them in whole 128 b ld_reduce atoms. Future fix: vary the warp count
-    # per cutlass's _pick_num_comm_warp_for_128b.
-    slab_elements = cta_m * tile_N // num_ranks
+    if contig_len % ws_vec:
+        raise ValueError(
+            f"epi_reduce_mode: {d_major} ({contig_len}) must be divisible by {ws_vec} "
+            "(workspace vectors)"
+        )
+    # Fixed 4 comm warps (128 threads): the reducer's smallest visit unit must
+    # spread evenly across them in whole 128 b ld_reduce atoms. The slab axis's
+    # visit extent tracks the per-rank tile share (the slab can be thinner than
+    # one tile); the contiguous axis keeps the full tile extent, capped at the
+    # 32 visit height (mirrors the epi_reduce_tile formula).
+    # Future fix: vary the warp count per cutlass's _pick_num_comm_warp_for_128b.
+    if d_major == "n":
+        visit_unit = (cta_m // num_ranks, tile_N)
+    else:
+        atom_val = 16 // D.element_size()
+        atom_thr_n = 128 // math.gcd(cta_m // atom_val, 128)
+        visit_unit = (cta_m, min(32, max(atom_thr_n, tile_N // num_ranks)))
+    slab_elements = visit_unit[0] * visit_unit[1]
     if slab_elements % 128 or (slab_elements // 128) % ws_vec:
         raise ValueError(
-            f"comm warps (128 threads) can't cover the per-rank tile slice "
-            f"({cta_m}/{num_ranks} x {tile_N} {era.workspace.dtype}) in 128 b atoms"
+            f"comm warps (128 threads) can't cover the reducer visit unit "
+            f"({visit_unit[0]} x {visit_unit[1]} {era.workspace.dtype}) in 128 b atoms"
         )
     if mode == "reduce_scatter":
         if era.mD_mc is not None:
@@ -199,6 +236,14 @@ def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
     return slot_layout((cta_m, cta_n, cluster_id))
 
 
+def epi_reduce_flag_slot(m_tile, n_tile, batch, flag_ntile_mn):
+    """Flag index of CTA tile (m_tile, n_tile, batch): M-major linear id over
+    the real (unpadded) tile grid. The single definition of the producer ->
+    reducer flag map; extents come from the problem shape, never from padded
+    buffer shapes."""
+    return m_tile + flag_ntile_mn[0] * (n_tile + flag_ntile_mn[1] * batch)
+
+
 # ---- multimem reduce + store ----
 # Tile-agnostic (no GEMM state; a standalone RS kernel could bind them), under a
 # three-part contract: the reduce reads a symmetric padded workspace through its mc
@@ -217,18 +262,23 @@ def multimem_reduce_subtile(
     no_release: cutlass.Constexpr[bool] = False,
     row_limit: Optional[Int32] = None,
     subtile_rows: Optional[cutlass.Constexpr[int]] = None,
+    col_limit: Optional[Int32] = None,
+    subtile_cols: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     """Reduce this subtile's workspace partials across all ranks into tRS_rD via
     multimem ld_reduce; passed to epilogue() as load_acc_subtile by the reducer
     warps. Within a live subtile the loads are unpredicated (the padded workspace
     keeps every access in-allocation; edge garbage is skipped by the commit and
-    predicated away by epi ops). Subtiles wholly past the slab tail
-    (epi_coord[0] * subtile_rows >= row_limit) have nothing to store, so skip
-    their ld_reduce traffic too — at small M only 1-2 subtiles are live."""
+    predicated away by epi ops). Subtiles wholly past the slab tail have nothing
+    to store, so skip their ld_reduce traffic too — at small slabs only 1-2
+    subtiles are live. The caller passes the gate matching the subtile grid's
+    slab axis: rows for an M slab (n-major D), cols for an N slab (m-major)."""
     # Dead-subtile traffic is serial multimem round trips: 0.041 vs 0.035 ms, AR M=64 TP=2.
     in_slab = cutlass.Boolean(True)
     if const_expr(row_limit is not None):
         in_slab = epi_coord[0] * subtile_rows < row_limit
+    if const_expr(col_limit is not None):
+        in_slab = epi_coord[1] * subtile_cols < col_limit
     if in_slab:
         _atom, chunk, sub_loop_n = tRS_rD.shape
         ld_reduce = multimem_ld_reduce_128b(frgWs_mc.element_type)
