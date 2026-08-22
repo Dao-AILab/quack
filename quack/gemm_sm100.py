@@ -1847,9 +1847,16 @@ class GemmSm100(GemmTmaBase):
                             # Epi pipeline's producer commit is a NOP
                             epi_pipeline.producer_commit(epi_producer_state)
                             epi_producer_state.advance()
-                    # Advance to next tile
-                    tile_scheduler.advance_to_next_work()
-                    work_tile = tile_scheduler.get_current_work()
+                    # Advance to next tile. Under epi_reduce this warp stages C for the
+                    # comm warps and runs at most epi_c_stage subtiles ahead of them, so
+                    # like them it must not be a scheduler-pipeline consumer (a
+                    # reduce_scatter comm warp waits on a producer far ahead — the
+                    # self-deadlock decode_next_work exists for): step locally.
+                    if const_expr(self.epi_reduce_mode is not None):
+                        work_tile = tile_scheduler.decode_next_work()
+                    else:
+                        tile_scheduler.advance_to_next_work()
+                        work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
                 epi_pipeline.producer_tail(epi_producer_state)
 
@@ -2978,7 +2985,10 @@ class GemmSm100(GemmTmaBase):
         warps_per_cta = self.num_ab_load_warps + len(
             (self.mma_warp_id, *self.epilog_warp_id, self.scheduler_warp_id, *extra_warp_ids)
         )
-        if has_C:
+        # The epi-load warp consumes the scheduler pipeline only when it stages C for
+        # the epilogue warps; under epi_reduce it stages C for the comm warps and steps
+        # locally like them (decode_next_work), so it is not counted here either.
+        if has_C and self.epi_reduce_mode is None:
             warps_per_cta += 1
         consumer_arrive_cnt = warps_per_cta * cluster_size
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
