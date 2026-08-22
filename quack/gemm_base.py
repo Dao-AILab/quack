@@ -255,7 +255,17 @@ class GemmBase:
         is_tma_warp: cutlass.Boolean,
         # epi_reduce_mode reducer: store D straight from registers, replacing copy_D.
         commit_D: Optional[Callable] = None,
+        # The tile this epilogue is framed on: the CTA tile unless the caller runs it on
+        # a sub-tile (epi_reduce comm warps: a (cta_m / world, cta_n) stripe). Flows to
+        # the subtile grid, the ops (EpiContext) and the aux-store setup, next to
+        # epi_tile and tile_coord_mnkl, which index within / locate this frame.
+        # Constexpr: a plain tuple kwarg would be staged to runtime Int32s.
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        # Resolve at trace time without rebinding the argument (the DSL would stage it).
+        frame_mn = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else self.cta_tile_shape_mnk[:2]
+        )
         has_C = const_expr(tRS_rC is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
@@ -284,11 +294,10 @@ class GemmBase:
             tile_coord_mnkl,
             varlen_manager,
             tidx,
+            tile_shape_mn=frame_mn,
         )
 
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
         epi_tile_layout = cute.make_ordered_layout(
             epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
         )
@@ -306,6 +315,7 @@ class GemmBase:
             epilogue_barrier,
             tidx,
             tRS_rD.layout,
+            tile_shape_mn=frame_mn,
         )
 
         if const_expr(self.epi_needs_acc_prepass):
@@ -397,6 +407,7 @@ class GemmBase:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn=frame_mn,
             )
             # Convert each output to its storage dtype.
             tRS_rAuxOuts_out = tuple(
@@ -479,6 +490,7 @@ class GemmBase:
             tile_coord_mnkl,
             varlen_manager,
             tidx,
+            tile_shape_mn=frame_mn,
         )
 
         return epi_read_state, epi_producer_state
@@ -1057,6 +1069,7 @@ class GemmBase:
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
         tRS_rD_layout=None,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> Tuple[cute.Tensor, ...]:
         return ()
 
@@ -1096,6 +1109,7 @@ class GemmBase:
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> None:
         pass
 
@@ -1110,11 +1124,12 @@ class GemmBase:
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> None:
         pass
 
     def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
+        self, args: EpilogueArguments, *, epi_tile=None, loc=None, ip=None
     ) -> EpilogueParams:
         return self.EpilogueParams()
 
@@ -1131,6 +1146,7 @@ class GemmBase:
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
         return ()
 
@@ -1162,6 +1178,7 @@ class GemmBase:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn=None,
     ):
         """Return a tuple of ``(tiled_copy_r2s, tRS_sAuxOut, copy_aux_out,
         store_pred)`` quadruples — one per aux output (see
@@ -1285,6 +1302,7 @@ class GemmTmaBase(GemmBase):
         mC: Optional[cute.Tensor],
         epilogue_args,
         varlen_m: bool,
+        epi_tile_c: Optional[cute.Tile] = None,  # C staging tile (None: self.epi_tile)
     ):
         add_to_output = const_expr(
             hasattr(epilogue_args, "add_to_output") and epilogue_args.add_to_output
@@ -1305,7 +1323,10 @@ class GemmTmaBase(GemmBase):
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
-                mC, self.epi_c_smem_layout_staged, self.epi_tile, op_type="load"
+                mC,
+                self.epi_c_smem_layout_staged,
+                epi_tile_c if epi_tile_c is not None else self.epi_tile,
+                op_type="load",
             )
         return (
             tma_atom_d,

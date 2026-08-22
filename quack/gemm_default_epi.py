@@ -99,9 +99,9 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
 
     # EpilogueParams auto-generated from _epi_ops
 
-    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+    def epi_to_underlying_arguments(self, args, *, epi_tile=None, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
-        d = self._epi_ops_to_params_dict(args)
+        d = self._epi_ops_to_params_dict(args, epi_tile=epi_tile)
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
             if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)

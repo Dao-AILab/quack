@@ -90,6 +90,9 @@ class EpiContext:
         epilogue_barrier,
         tidx,
         tRS_rD_layout=None,
+        # The tile the epilogue is framed on; the CTA tile unless the caller runs the
+        # epilogue on a sub-tile (epi_reduce comm warps: a (cta_m / world, cta_n) stripe).
+        tile_shape_mn=None,
     ):
         self.epi_tile = epi_tile
         self.tiled_copy_t2r = tiled_copy_t2r
@@ -99,8 +102,10 @@ class EpiContext:
         self.epilogue_barrier = epilogue_barrier
         self.tidx = tidx
         self.tRS_rD_layout = tRS_rD_layout
-        self.tile_M = gemm.cta_tile_shape_mnk[0]
-        self.tile_N = gemm.cta_tile_shape_mnk[1]
+        if tile_shape_mn is None:
+            tile_shape_mn = gemm.cta_tile_shape_mnk[:2]
+        self.tile_M = tile_shape_mn[0]
+        self.tile_N = tile_shape_mn[1]
         self.batch_idx = tile_coord_mnkl[3]
         self.num_epi_threads = gemm.num_epi_warps * cute.arch.WARP_SIZE
         self.partition_for_epilogue_fn = partial(
@@ -206,7 +211,16 @@ class EpiSmemBytes(NamedTuple):
 
 
 class EpiOp:
-    """Base class for composable epilogue operations."""
+    """Base class for composable epilogue operations.
+
+    Tile frame rule: the device-side per-tile hooks take the tile the epilogue
+    is framed on from ``ctx.tile_M/tile_N`` (begin) or the ``tile_shape_mn``
+    argument (end_loop/end/store_setup/load_g2s_copy_fn), never from
+    ``gemm.cta_tile_shape_mnk`` — callers may run the epilogue on a sub-tile of
+    the CTA tile (the epi_reduce comm warps run it on a (cta_m / world, cta_n)
+    stripe). Host-side sizing (smem_bytes, smem_struct_field) stays on the CTA
+    tile, a superset of any frame.
+    """
 
     # --- Value-port protocol (quack.gemm_epilogue fn frontend). Ports are how
     # an op joins the fn's per-element dataflow; the resource lifecycle below
@@ -342,6 +356,7 @@ class EpiOp:
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
         """Return a per-subtile gmem->smem copy function, or None."""
         return None
@@ -373,8 +388,10 @@ class EpiOp:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
-        """Per-subtile cleanup after epi_visit_subtile."""
+        """Per-subtile cleanup after epi_visit_subtile. ``tile_shape_mn`` is the
+        epilogue's frame (see EpiContext); None means the CTA tile."""
         pass
 
     def needs_async_fence(self):
@@ -392,6 +409,7 @@ class EpiOp:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """Cleanup after all subtiles (reductions, direct writes)."""
         pass
@@ -776,7 +794,7 @@ class TileStore(EpiOp):
             (self._dtype_field(), object, None),
         ]
 
-    def to_params(self, gemm, args):
+    def to_params(self, gemm, args, epi_tile=None):
         tensor = getattr(args, self.name)
         layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
         if self.gated:
@@ -789,7 +807,10 @@ class TileStore(EpiOp):
                 )
         setattr(gemm, self._layout_gemm_attr(), layout)
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
-        epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
+        # epi_tile: the staging tile for this output (None: gemm.epi_tile); callers that
+        # run the epilogue on a sub-tile pass their own (epi_reduce comm warps).
+        if self.epi_tile_fn:
+            epi_tile = self.epi_tile_fn(gemm, epi_tile if epi_tile is not None else gemm.epi_tile)
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
             gemm, tensor, epi_tile=epi_tile
         )
@@ -900,17 +921,19 @@ class TileStore(EpiOp):
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn=None,
     ):
-        """Per-CTA-tile setup. Returns the driver's store context quadruple
+        """Per-tile setup. Returns the driver's store context quadruple
         ``(tiled_copy_r2s, tRS_sAux, copy_fn, store_pred)`` where store_pred
-        is None (always store) or a per-tile Boolean."""
+        is None (always store) or a per-tile Boolean. ``tile_shape_mn`` is the
+        epilogue's frame (None: the CTA tile)."""
         tiled_copy_aux_r2s = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         tRS_sAux = tiled_copy_aux_r2s.get_slice(tidx).partition_D(smem_tensor)
         batch_idx = tile_coord_mnkl[3]
-        if self.gated:
-            tile_shape_mn = (gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1] // 2)
-        else:
+        if tile_shape_mn is None:
             tile_shape_mn = gemm.cta_tile_shape_mnk[:2]
+        if self.gated:
+            tile_shape_mn = (tile_shape_mn[0], tile_shape_mn[1] // 2)
         copy_aux, _, _ = gemm.epilog_gmem_copy_and_partition(
             getattr(params, self._tma_atom_key()),
             varlen_manager.offset_batch_epi(getattr(params, self.name), batch_idx),
@@ -1023,11 +1046,12 @@ class TileLoad(EpiOp):
             (self._dtype_field(), object, None),
         ]
 
-    def to_params(self, gemm, args):
+    def to_params(self, gemm, args, epi_tile=None):
         tensor = getattr(args, self.name)
         setattr(gemm, self._layout_gemm_attr(), cutlass.utils.LayoutEnum.from_tensor(tensor))
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
-        epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
+        if self.epi_tile_fn:
+            epi_tile = self.epi_tile_fn(gemm, epi_tile if epi_tile is not None else gemm.epi_tile)
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
             gemm, tensor, epi_tile=epi_tile, op_type="load", stage=gemm.epi_c_stage
         )
@@ -1080,13 +1104,14 @@ class TileLoad(EpiOp):
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
         tensor = getattr(params, self.name)
         batch_idx = tile_coord_mnkl[3]
         copy_tile_fn, _, _ = gemm.epilog_gmem_copy_and_partition(
             getattr(params, self._tma_atom_key()),
             varlen_manager.offset_batch_epi(tensor, batch_idx),
-            gemm.cta_tile_shape_mnk[:2],
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2],
             getattr(params, self._epi_tile_key()),
             smem_tensor,
             tile_coord_mnkl,
@@ -1401,11 +1426,13 @@ class ColVecReduce(VecReduce):
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """Flush the current M stripe when the last N subtile has accumulated."""
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        frame_mn = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
         if const_expr(epi_coord[1] == epi_tile_shape[1] - 1):
             vals_cur = self._end_loop_values(state, epi_coord)
             sExch = self._end_loop_smem(state)
@@ -1437,7 +1464,7 @@ class ColVecReduce(VecReduce):
                 tidx=tidx,
                 reference_src=reference_src,
             )
-            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            tile_M, tile_N = frame_mn
             tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
             tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
             ref_layout = vals_cur[0].layout
@@ -1512,11 +1539,13 @@ class RowVecReduce(VecReduce):
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """Flush the current N stripe when the last M subtile has accumulated."""
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        frame_mn = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
         if const_expr(epi_coord[0] == epi_tile_shape[0] - 1):
             tDrReduce, sDrReduce = state[0], state[1]
             tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
@@ -1565,7 +1594,7 @@ class RowVecReduce(VecReduce):
                 tidx=tidx,
                 reference_src=tiled_copy_t2r is None,
             )
-            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            tile_M, tile_N = frame_mn
             tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
             tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
             tDcD_n = layout_utils.convert_layout_zero_stride(tDcD_cur, tDrReduce_cur.layout)[

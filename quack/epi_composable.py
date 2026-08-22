@@ -86,17 +86,22 @@ class ComposableEpiMixin:
             op for op in type(self)._epi_ops if getattr(args, op.name, None) is not None
         )
 
-    def _epi_ops_to_params_dict(self, args):
+    def _epi_ops_to_params_dict(self, args, epi_tile=None):
         """Filter `_epi_ops` to active ops, then merge each op's to_params into
         a single dict. Subclasses call this from epi_to_underlying_arguments,
         add custom fields, then construct self.EpilogueParams(**d). Filtering
         here means every later iteration of self._epi_ops (host- and
         device-side) walks only active ops, and each op hook can assume its
-        arg is non-None."""
+        arg is non-None. ``epi_tile`` overrides the staging tile of the tile
+        ops (None: gemm.epi_tile) for callers that run the epilogue on a
+        sub-tile (epi_reduce comm warps)."""
         self._filter_epi_ops(args)
         d = {}
         for op in self._epi_ops:
-            d.update(op.to_params(self, args))
+            if op.is_tile_store() or op.is_tile_load():
+                d.update(op.to_params(self, args, epi_tile=epi_tile))
+            else:
+                d.update(op.to_params(self, args))
         return d
 
     def resolve_epi_m_major(self, args):
@@ -180,6 +185,7 @@ class ComposableEpiMixin:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn=None,
     ):
         """One store context quadruple per active TileStore op (see
         TileStore.store_setup); the driver's epilogue loop consumes them in
@@ -194,6 +200,7 @@ class ComposableEpiMixin:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn,
             )
             for op in self._epi_store_ops()
         )
@@ -247,6 +254,7 @@ class ComposableEpiMixin:
         epilogue_barrier,
         tidx,
         tRS_rD_layout=None,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         ctx = EpiContext(
             self,
@@ -258,6 +266,7 @@ class ComposableEpiMixin:
             epilogue_barrier,
             tidx,
             tRS_rD_layout,
+            tile_shape_mn=tile_shape_mn,
         )
         results = {
             op.name: op.begin(
@@ -289,6 +298,7 @@ class ComposableEpiMixin:
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
         return tuple(
             op.load_g2s_copy_fn(
@@ -298,6 +308,7 @@ class ComposableEpiMixin:
                 tile_coord_mnkl,
                 varlen_manager,
                 epi_pipeline,
+                tile_shape_mn,
             )
             for op in self._epi_ops
             if op.is_tile_load()
@@ -320,6 +331,7 @@ class ComposableEpiMixin:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         for op in self._epi_ops:
             op.end_loop(
@@ -333,6 +345,7 @@ class ComposableEpiMixin:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn,
             )
 
     @cute.jit
@@ -346,6 +359,7 @@ class ComposableEpiMixin:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         for op in self._epi_ops:
             op.end(
@@ -358,4 +372,5 @@ class ComposableEpiMixin:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn,
             )

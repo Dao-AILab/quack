@@ -2,8 +2,12 @@
 classes (quack.epilogues.linear_act_mod / sq_reduce_mod), driven through the
 host plan path (EpiMod.gemm with epi_reduce_mode / epi_reduce_args).
 
-The epi-reduce warps keep D linear (act: mAuxOut = act_fn(D); sq: D = D_raw * w
-with sq partials from pre-w D_raw), all slab-local. Marked `dist`: deselected by
+The comm warps keep D linear (act: mAuxOut = act_fn(D); sq: D = D_raw * w with
+sq partials from pre-w D_raw). Epilogue operands follow the mode: slab-local
+under reduce_scatter (the epilogue runs on the owner's slab), full replicated
+tensors under all_reduce (each rank runs it on its stripe of every tile, at
+global coordinates; outputs are full-M with this rank's rows written). Marked
+`dist`: deselected by
 default, run with `pytest --dist-only` (never under pytest-xdist — one pytest
 process launches multiple torchrun ranks).
 """
@@ -20,21 +24,24 @@ import torch
 WORLD_SIZES = [4]
 # (m, n, k, l, act) -> test_gemm_act_reduce x extras x rs/ar; bf16 only — dtype
 # coverage lives in test_gemm_epi_reduce.py
+# The cutlass-aligned comm contract needs full tiles and slabs of whole CTA tiles
+# (quack/epi_reduce.py validate_epi_reduce_args), so the batched cases keep the K
+# residue and odd tile counts but not partial M/N tiles.
 CASES = [
     (4096, 4096, 4096, 1, "relu"),  # baseline
-    (528, 4104, 736, 3, "gelu_tanh_approx"),  # partial M/N tiles + K residue, batched
+    (1024, 4352, 736, 3, "gelu_tanh_approx"),  # K residue, batched, n_tiles=17
 ]
 # (m, n, k, l) -> test_gemm_sq_reduce x {plain, c} x rs/ar
 SQ_CASES = [
     (4096, 4096, 4096, 1),  # baseline
-    (528, 4104, 736, 3),  # partial M/N tiles + K residue, batched; n_tiles=17 colvec stride
+    (1024, 4352, 736, 3),  # K residue, batched; n_tiles=17 colvec stride
 ]
 # (m, n, k, l, act, split_k, split_k_mode) -> test_gemm_act_reduce_split_k x rs/ar,
 # always with all extras (bias + C + colvec) so the C-load path stays in play.
 SPLIT_K_CASES = [
     (2048, 3072, 2048, 1, "relu", 2, "serial"),  # full tiles, even k-tile split
-    (848, 2120, 1056, 2, "gelu_tanh_approx", 2, "serial"),  # partial M/N tiles + K residue
-    (1552, 1544, 1120, 2, "relu", 2, "parallel"),  # partial M/N tiles + K residue
+    (1024, 2048, 1056, 2, "gelu_tanh_approx", 2, "serial"),  # K residue, batched
+    (1536, 1536, 1120, 2, "relu", 2, "parallel"),  # K residue, batched
 ]
 TORCH_ACT = {
     "relu": torch.nn.functional.relu,
@@ -116,22 +123,31 @@ def _run_gemm_act_reduce(
     d_arg, epi_reduce_args = _make_comm(
         epi_reduce_mode, m, n, l, tile_m, tile_n, cluster_m, world_size
     )
-    # Aux is slab-local under epi_reduce (epilogue coords are m/TP-shaped).
-    aux_gpu = torch.empty(l, m_per_rank, n, dtype=torch.bfloat16, device="cuda")
-    # Bias/C add post-reduce on every rank, so they must agree across ranks: common
-    # seed, and each rank passes its slab slice of one logical full C.
+    # Epilogue operand contract: reduce_scatter runs the epilogue on the owner's slab,
+    # so C/colvec/aux are slab-local (m/TP rows); all_reduce runs it at global
+    # coordinates with every rank taking stripe ``rank`` (cta_m/TP rows) of every
+    # CTA tile, so C/colvec are the full replicated tensors and aux is full-M with
+    # only this rank's stripe rows written.
+    is_rs = epi_reduce_mode == "reduce_scatter"
+    cta_m = tile_m // cluster_m  # 2-CTA MMA: CTA tile rows
+    owned_rows = (
+        slice(rank * m_per_rank, (rank + 1) * m_per_rank)
+        if is_rs
+        else ((torch.arange(m) % cta_m) // (cta_m // world_size) == rank).cuda()
+    )
+    aux_gpu = torch.zeros(l, m_per_rank if is_rs else m, n, dtype=torch.bfloat16, device="cuda")
+    # Bias/C add post-reduce on every rank, so they must agree across ranks: common seed.
     torch.manual_seed(2222)
     bias_gpu = torch.randn(l, n, dtype=torch.float32).cuda() if has_bias else None
     c_gpu, c_full_cpu = None, None
     if has_c:
         c_full_cpu = torch.randn(l, m, n, dtype=torch.float32).to(torch.bfloat16)
-        c_gpu = c_full_cpu[:, rank * m_per_rank : (rank + 1) * m_per_rank].contiguous().cuda()
+        c_gpu = (c_full_cpu[:, owned_rows] if is_rs else c_full_cpu).contiguous().cuda()
     colvec_gpu, colvec_full = None, None
     if has_colvec:
-        # ColVecLoad is m-shaped, so it's slab-local under epi_reduce like C.
         assert m_per_rank % 4 == 0, f"colvec rows ({m_per_rank}) need 16B alignment (4 x fp32)"
         colvec_full = torch.randn(l, m, dtype=torch.float32).cuda()
-        colvec_gpu = colvec_full[:, rank * m_per_rank : (rank + 1) * m_per_rank].contiguous()
+        colvec_gpu = (colvec_full[:, owned_rows] if is_rs else colvec_full).contiguous()
 
     mod = linear_act_mod(act, gated=False, has_c=has_c, has_rowvec=has_bias, has_colvec=has_colvec)
     epi_args = {"mAuxOut": aux_gpu}
@@ -150,7 +166,8 @@ def _run_gemm_act_reduce(
         tile_N=tile_n,
         cluster_M=cluster_m,
         cluster_N=cluster_n,
-        is_dynamic_persistent=True,
+        # The comm warps replay their CTA's static tile sequence (decode_next_work).
+        is_dynamic_persistent=False,
         split_k=split_k,
         split_k_mode=sk_mode,
         epi_reduce_mode=epi_reduce_mode,
@@ -158,7 +175,7 @@ def _run_gemm_act_reduce(
     )
 
     # d_arg is the output itself: RS a plain (l, m/world, n) slab; AR the full
-    # reduced D on every rank. Aux is slab-local in both modes.
+    # reduced D on every rank. Aux: the slab (RS) / this rank's stripe rows (AR).
     out = d_arg
     aux_out = aux_gpu
 
@@ -224,25 +241,22 @@ def _run_gemm_act_reduce(
         if has_bias:
             post += bias_gpu.unsqueeze(1)
         if has_colvec:
-            cv = colvec_gpu if epi_reduce_mode == "reduce_scatter" else colvec_full
-            post += cv.unsqueeze(-1)
-        slab = (
-            post
-            if epi_reduce_mode == "reduce_scatter"
-            else (post[:, rank * m_per_rank : (rank + 1) * m_per_rank])
-        )
-        return post, slab
+            post += colvec_full.unsqueeze(-1) if not is_rs else colvec_gpu.unsqueeze(-1)
+        # The rows whose epilogue this rank ran (aux is only written there).
+        mine = post if is_rs else post[:, owned_rows]
+        return post, mine
 
-    post_ref, slab_ref = epilogue_ref(torch.float32)
-    post_pt, slab_pt = epilogue_ref(torch.bfloat16)
-    aux_ref = TORCH_ACT[act](slab_ref)
-    aux_pt = TORCH_ACT[act](slab_pt).to(torch.bfloat16)
+    post_ref, mine_ref = epilogue_ref(torch.float32)
+    post_pt, mine_pt = epilogue_ref(torch.bfloat16)
+    aux_ref = TORCH_ACT[act](mine_ref)
+    aux_pt = TORCH_ACT[act](mine_pt).to(torch.bfloat16)
     torch.cuda.synchronize()
 
     d_err = (out.float() - post_ref).abs().max()
     d_base = (post_pt.bfloat16().float() - post_ref).abs().max()
     assert d_err < 2 * d_base + 1e-5, f"D err {d_err} vs 2x baseline {d_base}"
-    aux_err = (aux_out.float() - aux_ref).abs().max()
+    aux_mine = aux_out if is_rs else aux_out[:, owned_rows]
+    aux_err = (aux_mine.float() - aux_ref).abs().max()
     aux_base = (aux_pt.float() - aux_ref).abs().max()
     assert aux_err < 2 * aux_base + 1e-5, f"aux err {aux_err} vs 2x baseline {aux_base}"
     if rank == 0:
@@ -271,21 +285,33 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
     n_tiles = (n + tile_n - 1) // tile_n
 
     a_gpu, b_gpu = _make_ab(m, n, k_local, l, k, rank)
-    d_torch_gpu, epi_reduce_args = _make_comm(
+    # d_arg is caller-order (l, m, n): RS a plain slab, AR this rank's view of the
+    # full symmetric D.
+    d_arg, epi_reduce_args = _make_comm(
         epi_reduce_mode, m, n, l, tile_m, tile_n, cluster_m, world_size
     )
-    d_arg = d_torch_gpu.permute(2, 0, 1)
-    # Per-N-tile sq partials, slab-local under epi_reduce; norm_weight is common
-    # across ranks (multiplies the reduced D on every rank).
-    colvec_gpu = torch.zeros(l, m_per_rank, n_tiles, dtype=torch.float32, device="cuda")
+    # Epilogue operand contract (see _run_gemm_act_reduce): RS slab-local, AR global
+    # with this rank writing its stripe rows of every CTA tile.
+    is_rs = epi_reduce_mode == "reduce_scatter"
+    cta_m = tile_m // cluster_m
+    owned_rows = (
+        slice(rank * m_per_rank, (rank + 1) * m_per_rank)
+        if is_rs
+        else ((torch.arange(m) % cta_m) // (cta_m // world_size) == rank).cuda()
+    )
+    # Per-N-tile sq partials; norm_weight is common across ranks (multiplies the
+    # reduced D on every rank).
+    colvec_gpu = torch.zeros(
+        l, m_per_rank if is_rs else m, n_tiles, dtype=torch.float32, device="cuda"
+    )
     torch.manual_seed(2222)
     w_gpu = torch.randn(l, n, dtype=torch.float32).cuda()
     # Residual C adds pre-sq (D_raw = reduce + C, stats of the post-residual stream);
-    # common seed, each rank passes its slab slice of one logical full C.
+    # common seed.
     c_gpu = None
     if has_c:
         c_full_cpu = torch.randn(l, m, n, dtype=torch.float32).to(torch.bfloat16)
-        c_gpu = c_full_cpu[:, rank * m_per_rank : (rank + 1) * m_per_rank].contiguous().cuda()
+        c_gpu = (c_full_cpu[:, owned_rows] if is_rs else c_full_cpu).contiguous().cuda()
 
     mod = sq_reduce_mod(has_c=has_c, has_rowvec=True, has_aux=False)
     epi_args = {"mRowVecBroadcast": w_gpu, "mColVecReduce": colvec_gpu}
@@ -299,15 +325,12 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
         tile_N=tile_n,
         cluster_M=cluster_m,
         cluster_N=cluster_n,
-        is_dynamic_persistent=True,
+        is_dynamic_persistent=False,  # comm warps replay a static tile sequence
         epi_reduce_mode=epi_reduce_mode,
         epi_reduce_args=epi_reduce_args,
     )
 
-    if epi_reduce_mode == "reduce_scatter":
-        out = d_torch_gpu[rank * m_per_rank : (rank + 1) * m_per_rank].permute(2, 0, 1)
-    else:
-        out = d_torch_gpu.permute(2, 0, 1)
+    out = d_arg
 
     # r2r: D and the sq partials must both be bit-identical across relaunches.
     runs, sq_runs = [], []
@@ -353,19 +376,12 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
             dist.all_reduce(d_full)
             post = d_full.float()
         if has_c:
-            if epi_reduce_mode == "reduce_scatter":
-                post += c_gpu.float()
-            else:
-                post += c_full_cpu.cuda().float()
-        slab = (
-            post
-            if epi_reduce_mode == "reduce_scatter"
-            else (post[:, rank * m_per_rank : (rank + 1) * m_per_rank])
-        )
+            post += c_gpu.float() if is_rs else c_full_cpu.cuda().float()
+        mine = post if is_rs else post[:, owned_rows]
         # Per-tile sq partials (sq is pre-norm_weight), matching the kernel's slots.
         pad = n_tiles * tile_n - n
-        s = torch.nn.functional.pad(slab, (0, pad)) if pad else slab
-        sq_tiles = s.view(l, m_per_rank, n_tiles, tile_n).square().sum(-1)
+        s = torch.nn.functional.pad(mine, (0, pad)) if pad else mine
+        sq_tiles = s.view(l, mine.shape[1], n_tiles, tile_n).square().sum(-1)
         return post * w_gpu.unsqueeze(1), sq_tiles
 
     d_ref, sqt_ref = epilogue_ref(torch.float32)
@@ -376,12 +392,13 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
     d_base = (d_pt.bfloat16().float() - d_ref).abs().max()
     # Assert per-tile (the kernel's actual output): localized defects aren't diluted
     # by a row fold, and fold-accumulated rounding bias isn't asserted (printed only).
-    sq_err = (colvec_gpu - sqt_ref).abs().max()
+    sq_mine = colvec_gpu if is_rs else colvec_gpu[:, owned_rows]
+    sq_err = (sq_mine - sqt_ref).abs().max()
     sq_base = (sqt_pt - sqt_ref).abs().max()
     if rank == 0:
         print(
             f"D err {d_err:.3e} base {d_base:.3e} | sq tile err {sq_err:.3e} "
-            f"base {sq_base:.3e} bias {(colvec_gpu - sqt_ref).mean():.2e}"
+            f"base {sq_base:.3e} bias {(sq_mine - sqt_ref).mean():.2e}"
         )
     assert d_err < 2 * d_base + 1e-5, f"D err {d_err}, baseline {d_base}"
     assert sq_err < 2 * sq_base + 1e-5, f"sq tile err {sq_err}, baseline {sq_base}"

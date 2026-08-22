@@ -270,19 +270,6 @@ def signal_tile_owner(
                     )
 
 
-def visit_slice(epi_slice_layout, tRS_rD, commit_subtile, load_acc_subtile):
-    """Walk the slice's subtiles, reducing each into registers and committing it.
-    Stands in for epilogue() as the comm warps' epi_fn until the epilogue can be
-    framed on the slice; the epi ops then run between these two calls."""
-    # Plain range: this runs in the caller's trace, so the loop is unrolled here
-    # (range_constexpr is only valid inside a preprocessed jit function).
-    for epi_idx in range(cute.size(epi_slice_layout)):
-        epi_coord = epi_slice_layout.get_hier_coord(epi_idx)
-        load_acc_subtile(tRS_rD, epi_coord)
-        commit_subtile(tRS_rD, epi_coord)
-    return None, None
-
-
 @cute.jit
 def commit_subtile_local(
     frgD: cute.Tensor,

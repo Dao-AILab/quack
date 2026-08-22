@@ -514,7 +514,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
     _epi_mod_vectorize = None  # False = keep the SM100 loop vectorizer off (escape hatch)
     _extra_param_fields = ()  # the fn is a class attr, not a param
 
-    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+    def epi_to_underlying_arguments(self, args, *, epi_tile=None, loc=None, ip=None):
         self.rounding_mode = self._epi_mod_rounding
         self.epi_needs_acc_prepass = self._epi_mod_prepass_fn is not None
         if self._epi_mod_packed_cd:
@@ -524,7 +524,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
         # Aux-output constraints (gated 16-bit n-major, SM90 tile_N % 32) are
         # asserted by each TileStore op in to_params; the store path itself is
         # the generic ComposableEpiMixin/TileStore one.
-        d = self._epi_ops_to_params_dict(args)
+        d = self._epi_ops_to_params_dict(args, epi_tile=epi_tile)
         for key in getattr(self, "concat_layout", None) or ():
             if key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
@@ -1427,9 +1427,11 @@ class EpiMod:
         # stays caller-oriented (swap-at-trace transposes those at trace).
         if epi_reduce_mode is not None and m % num_ranks:
             raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
-        # epi_reduce_mode: C and every epi output/sink are slab-local (m / world); D
-        # too under reduce_scatter (all_reduce D stays full-M symmetric).
-        m_epi = m if epi_reduce_mode is None else m // num_ranks
+        # reduce_scatter: C, D and every epi output/sink are slab-local (m / world) —
+        # the epilogue runs on the owner's slab. all_reduce: full-M (the epilogue runs
+        # at global coordinates, each rank on its stripe of every tile; C/colvec are
+        # the replicated full tensors, outputs are full-M with this rank's rows written).
+        m_epi = m // num_ranks if epi_reduce_mode == "reduce_scatter" else m
         m_i, n_i = (n_gemm, m) if swap_ab else (m_epi, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
