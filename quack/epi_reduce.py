@@ -1,19 +1,17 @@
 """Fused-communication (epi_reduce_mode) GEMM epilogue pieces; nothing here runs on
 its own — gemm_sm100's kernel binds each piece into the shared GemmBase machinery.
-Sections below: host contract / reducer tile scheduler / cross-launch exit barrier /
-multimem reduce + store. The split-rank protocol itself (flag contract, producer
-partial commit, reducer wait + consume/reset) lives in gemm_base's
-epilogue_split_rank / split_rank_partial_commit, the cross-rank siblings of the
-split-K pair.
+Sections below: host contract / cross-launch exit barrier / flag map.
 
-Dataflow: both warp groups run epilogue_split_rank. The producer's finalize action
-is split_rank_partial_commit — register-direct workspace-dtype partials into the
-padded symmetric workspace, then the tile signal. The reducer's is epilogue() between two
-bound functions: multimem ld_reduce from the workspace in, EVT/C_load/aux
-TileStores unchanged in the middle, register-direct store out (this rank's plain
-slab-shaped D for reduce_scatter, multimem_st broadcast into symmetric D for
-all_reduce). Pipelines: epi_pipeline stages C for the reducer; the reducer's aux
-stores ride its own epi_store_pipeline instance."""
+Dataflow (cutlass-aligned, no separate reducer schedule): the producer warp group
+runs epilogue_split_rank — split_rank_partial_commit stores register-direct
+workspace-dtype partials into the padded symmetric workspace, then the tile
+signal. The comm warps replay their own CTA's tile sequence
+(gemm_sm100.epi_reduce_comm): per tile they wait the flag, multimem-ld_reduce a
+1/world slice of the workspace, and store it — multimem_st broadcast into
+symmetric D (all_reduce: every rank takes slice ``rank`` of its own tile) or a
+plain local store into the slab-shaped D (reduce_scatter: cutlass's owner remap —
+the CTA at (m, n) reduces stripe m // tiles_per_rank of the owned tile
+m % tiles_per_rank + rank * tiles_per_rank)."""
 
 import math
 from typing import NamedTuple, Optional
@@ -27,7 +25,6 @@ from cutlass import Int32, const_expr
 
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.dist_utils import multimem_ld_reduce_128b
-from quack.fast_math import FastDivmod
 
 
 # ---- host contract ----
@@ -35,9 +32,9 @@ from quack.fast_math import FastDivmod
 
 @mlir_namedtuple
 class EpiReduceArguments(NamedTuple):
-    """Comm-side tensors for epi_reduce_mode. tile_flags are sized to one problem
-    shape (the tile->slot mapping) plus a num_sms exit-slot tail (one per resident
-    CTA, cross-launch exit barrier)."""
+    """Comm-side tensors for epi_reduce_mode. The flag array is sized to one
+    problem shape (the tile->slot mapping) plus a num_sms exit-slot tail (one per
+    resident CTA, cross-launch exit barrier)."""
 
     mD_mc: Optional[cute.Tensor] = None  # multicast view of symmetric D — all_reduce only
     # Partials workspace (any multimem-reducible dtype, default d_dtype),
@@ -45,21 +42,23 @@ class EpiReduceArguments(NamedTuple):
     # target) and its multicast view (reducer ld_reduce).
     workspace: Optional[cute.Tensor] = None
     workspace_mc: Optional[cute.Tensor] = None
-    # producer -> consumer, ceil(M/cta_M) * ceil(N/cta_N) * L entries
+    # producer -> consumer flags, ceil(M/cta_M) * ceil(N/cta_N) * L entries plus
+    # the exit-slot tail. Every wait/consume reads the local array; signals write
+    # through the multicast view (all_reduce, exit barrier) or the owner's
+    # per-peer view (reduce_scatter, whose tiles have a single consuming rank).
     tile_flags: Optional[cute.Tensor] = None
     tile_flags_mc: Optional[cute.Tensor] = None
+    tile_flags_per_peer: Optional[tuple] = None
 
 
-def epi_reduce_workspace_shape(m, n, cta_m, cta_n, slab_dim="m"):
+def epi_reduce_workspace_shape(m, n, cta_m, cta_n):
     """Padded workspace extents; the pad keeps every workspace access
-    in-allocation with no predication, and nothing consumes it. M always carries
-    one extra cta_m block: fully OOB phantom cluster CTAs (2-CTA pairing is
-    along M) store into the dead last block. The slab axis carries an extra
-    block too: reducer tiles anchor at rank*slab_len, which is not tile-aligned,
-    and read a full tile unpredicated — under slab_dim="m" the phantom block
-    already covers this; slab_dim="n" moves the anchor pad to N."""
+    in-allocation with no predication, and nothing consumes it. M carries one
+    extra cta_m block: fully OOB phantom cluster CTAs (2-CTA pairing is along M)
+    store into the dead last block. Comm reads are tile-aligned (full tiles
+    enforced in validate), so no other pad is needed."""
     m_pad = ((m + cta_m - 1) // cta_m + 1) * cta_m
-    n_pad = ((n + cta_n - 1) // cta_n + (1 if slab_dim == "n" else 0)) * cta_n
+    n_pad = (n + cta_n - 1) // cta_n * cta_n
     return m_pad, n_pad
 
 
@@ -76,39 +75,35 @@ def validate_epi_reduce_args(
     era = epi_reduce_args
     if D is None:
         raise ValueError("epi_reduce_mode requires D (the output tensor)")
-    if D.stride(-1) == 1:
-        d_major = "n"
-    elif D.stride(-2) == 1:
-        d_major = "m"
-    else:
-        raise ValueError("epi_reduce_mode: D must be contiguous along m or n (multimem vectors)")
-    # The slab axis is always D's strided axis, so each rank's slice of D is
-    # contiguous (cutlass's rule). AR picks its work split by this rule; RS
-    # callers encode the same choice in D's shape, cross-checked below.
-    slab_dim = "m" if d_major == "n" else "n"
-    slab_len = m if slab_dim == "m" else n
-    if slab_len % num_ranks:
-        raise ValueError(
-            f"epi_reduce_mode: {slab_dim} ({slab_len}) must be divisible by world ({num_ranks})"
-        )
-    vec = 16 // D.element_size()
-    # Multimem atoms run along D's contiguous axis: that extent must divide
-    # into whole 16 B vectors.
-    contig_len = n if d_major == "n" else m
-    if contig_len % vec:
-        raise ValueError(
-            f"epi_reduce_mode: {d_major} ({contig_len}) must be divisible by {vec}"
-        )
-    d_rows = m // num_ranks if mode == "reduce_scatter" and slab_dim == "m" else m
-    d_cols = n // num_ranks if mode == "reduce_scatter" and slab_dim == "n" else n
-    if D.shape[-2] != d_rows or D.shape[-1] != d_cols:
-        raise ValueError(
-            f"epi_reduce_mode={mode}: D rows x cols ({d_rows}, {d_cols}) expected, "
-            f"got ({D.shape[-2]}, {D.shape[-1]})"
-        )
+    if D.stride(-1) != 1:
+        # Pending the aligned-mode mirror: m-major D (swap_ab) ran on the
+        # removed slab walk and is temporarily rejected.
+        raise ValueError("epi_reduce_mode: D must be n-major")
     use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
     cta_m = tile_M // (2 if use_2cta else 1)
-    ws_mnl = (*epi_reduce_workspace_shape(m, n, cta_m, tile_N, slab_dim), l)
+    # Cutlass-aligned comm contract: full tiles (comm reads/stores are
+    # unpredicated whole slices), whole-row slice quantum, and (RS) slabs of
+    # whole CTA tiles so the owner remap is exact.
+    if m % num_ranks:
+        raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
+    if m % cta_m or n % tile_N:
+        raise ValueError(
+            f"epi_reduce_mode requires full tiles: m % {cta_m} == 0 and n % {tile_N} == 0"
+        )
+    if cta_m % num_ranks:
+        raise ValueError(f"epi_reduce_mode: cta_m ({cta_m}) must be divisible by world")
+    if mode == "reduce_scatter" and (m // num_ranks) % cta_m:
+        raise ValueError(f"reduce_scatter: the slab (m/world) must be whole CTA tiles of {cta_m}")
+    vec = 16 // D.element_size()
+    if n % vec:
+        raise ValueError(f"epi_reduce_mode: n ({n}) must be divisible by {vec} (16 B vectors)")
+    d_rows = m // num_ranks if mode == "reduce_scatter" else m
+    if D.shape[-2] != d_rows or D.shape[-1] != n:
+        raise ValueError(
+            f"epi_reduce_mode={mode}: D rows x cols ({d_rows}, {n}) expected, "
+            f"got ({D.shape[-2]}, {D.shape[-1]})"
+        )
+    ws_mnl = (*epi_reduce_workspace_shape(m, n, cta_m, tile_N), l)
     for name, t in (("workspace", era.workspace), ("workspace_mc", era.workspace_mc)):
         if t is None or tuple(t.shape) != ws_mnl:
             raise ValueError(
@@ -117,39 +112,26 @@ def validate_epi_reduce_args(
             )
     if era.workspace.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError(f"epi_reduce_args.workspace dtype {era.workspace.dtype} not multimem-reducible")
-    ws_contig = 1 if d_major == "n" else 0
-    if era.workspace_mc.dtype != era.workspace.dtype or era.workspace.stride(ws_contig) != 1:
-        raise ValueError(
-            f"epi_reduce_args.workspace must be {d_major}-major (matching D), "
-            "workspace_mc same dtype"
-        )
+    if era.workspace_mc.dtype != era.workspace.dtype or era.workspace.stride(1) != 1:
+        raise ValueError("epi_reduce_args.workspace must be n-major, workspace_mc same dtype")
     if mode == "all_reduce" and era.workspace.dtype != D.dtype:
         # Not inherent: the broadcast commit hardcodes 16 B multimem_st of D-dtype
         # atoms; teach it 8/32 B atoms if a workload needs mismatched-dtype AR.
         raise ValueError("all_reduce requires workspace dtype == D dtype")
     ws_vec = 16 // era.workspace.element_size()
-    if contig_len % ws_vec:
+    if n % ws_vec:
         raise ValueError(
-            f"epi_reduce_mode: {d_major} ({contig_len}) must be divisible by {ws_vec} "
-            "(workspace vectors)"
+            f"epi_reduce_mode: n ({n}) must be divisible by {ws_vec} (workspace vectors)"
         )
-    # Fixed 4 comm warps (128 threads): the reducer's smallest visit unit must
-    # spread evenly across them in whole 128 b ld_reduce atoms. The slab axis's
-    # visit extent tracks the per-rank tile share (the slab can be thinner than
-    # one tile); the contiguous axis keeps the full tile extent, capped at the
-    # 32 visit height (mirrors the epi_reduce_tile formula).
-    # Future fix: vary the warp count per cutlass's _pick_num_comm_warp_for_128b.
-    if d_major == "n":
-        visit_unit = (cta_m // num_ranks, tile_N)
-    else:
-        atom_val = 16 // D.element_size()
-        atom_thr_n = 128 // math.gcd(cta_m // atom_val, 128)
-        visit_unit = (cta_m, min(32, max(atom_thr_n, tile_N // num_ranks)))
-    slab_elements = visit_unit[0] * visit_unit[1]
-    if slab_elements % 128 or (slab_elements // 128) % ws_vec:
+    # Fixed 4 comm warps (128 threads), 128 b atoms along n: the (cta_m/world,
+    # tile_N) slice's thread rows must divide its row count (kernel assert
+    # mirrored here). Future: vary warps per cutlass _pick_num_comm_warp_for_128b.
+    atom_thr_n = math.gcd(tile_N // ws_vec, 128)
+    atom_thr_m = 128 // atom_thr_n
+    if (cta_m // num_ranks) % atom_thr_m:
         raise ValueError(
-            f"comm warps (128 threads) can't cover the reducer visit unit "
-            f"({visit_unit[0]} x {visit_unit[1]} {era.workspace.dtype}) in 128 b atoms"
+            f"comm warps (128 threads) can't cover the ({cta_m // num_ranks} x {tile_N} "
+            f"{era.workspace.dtype}) slice in 128 b atoms"
         )
     if mode == "reduce_scatter":
         if era.mD_mc is not None:
@@ -163,77 +145,25 @@ def validate_epi_reduce_args(
     ntiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
     num_sms = torch.cuda.get_device_properties(D.device).multi_processor_count
     # tile flags + exit-slot tail (one per resident CTA)
-    if era.tile_flags.numel() < ntiles + num_sms or era.tile_flags_mc.numel() < ntiles + num_sms:
-        raise ValueError(f"epi_reduce_args.tile_flags needs >= {ntiles} + {num_sms} entries")
+    if era.tile_flags_per_peer is None or len(era.tile_flags_per_peer) != num_ranks:
+        raise ValueError(f"epi_reduce_args.tile_flags_per_peer must hold {num_ranks} peer views")
+    for t in (era.tile_flags, era.tile_flags_mc, *era.tile_flags_per_peer):
+        if t is None or t.numel() < ntiles + num_sms:
+            raise ValueError(f"epi_reduce_args tile flags need >= {ntiles} + {num_sms} entries")
 
 
-# ---- reducer tile scheduler ----
-# The reducer warps and the epi-load warp (C staging) walk the same slab-order
-# static persistent schedule.
-
-
-@mlir_namedtuple
-class EpiReduceSchedulerParams(NamedTuple):
-    tile_sched_params: utils.PersistentTileSchedulerParams
-    num_persistent_clusters: Int32
-
-    @staticmethod
-    def create(problem_shape_ntile_mnl, cluster_shape_mnk, max_active_clusters):
-        assert cluster_shape_mnk[2] == 1, (
-            "EpiReduceSchedulerParams assumes cluster_shape_mnk[2] == 1"
-        )
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            problem_shape_ntile_mnl, cluster_shape_mnk
-        )
-        num_persistent_clusters = cutlass.min(
-            cute.size(tile_sched_params.problem_layout_ncluster_mnl),
-            max_active_clusters,
-        )
-        return EpiReduceSchedulerParams(tile_sched_params, num_persistent_clusters)
+# ---- flag map + cross-launch exit barrier ----
 
 
 @cute.jit
-def clc_block_to_static_scheduler_coord(cluster_shape_mn):
-    """CLC launch grid is grid=(cl_m * ncl_mn, cl_n, batch): block_idx is already the
-    hierarchical coord, so peel the cluster-local part with FastDivmod and
-    linearize the cluster coord through its layout.
-    Returns (linear persistent cluster id, CTA m in cluster, CTA n in cluster)."""
+def epi_reduce_exit_slot(exit_base: Int32) -> Int32:
+    """This CTA's exit-barrier slot in the flag tail (one per CTA of the grid,
+    past the tile flags at exit_base). Keep the block_idx/grid_dim reads and their
+    use inside one jit returning a scalar: materialized separately they
+    mis-compute the slot, which writes out of bounds."""
     bidx, bidy, bidz = cute.arch.block_idx()
-    gdx, gdy, gdz = cute.arch.grid_dim()
-    cl_m, cl_n = cluster_shape_mn
-    cl_m_fdd, cl_n_fdd = FastDivmod(cl_m), FastDivmod(cl_n)
-    c_m, cta_m = divmod(bidx, cl_m_fdd)
-    c_n, cta_n = divmod(bidy, cl_n_fdd)
-    grid_m, _ = divmod(gdx, cl_m_fdd)
-    grid_n, _ = divmod(gdy, cl_n_fdd)
-    cluster_layout = cute.make_layout((grid_m, grid_n, gdz))
-    return cluster_layout((c_m, c_n, bidz)), cta_m, cta_n
-
-
-@cute.jit
-def make_epi_reduce_tile_scheduler(params: EpiReduceSchedulerParams):
-    tile_sched_params = params.tile_sched_params
-    cluster_shape_mn = tile_sched_params.cluster_shape_mn
-    cl_m, cl_n = cluster_shape_mn
-    cluster_id, cta_m, cta_n = clc_block_to_static_scheduler_coord(cluster_shape_mn)
-    return utils.StaticPersistentTileScheduler.create(
-        tile_sched_params,
-        (cta_m, cta_n, cluster_id),
-        (cl_m, cl_n, params.num_persistent_clusters),
-    )
-
-
-# ---- cross-launch exit sync barrier: one slot per resident CTA ----
-
-
-@cute.jit
-def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
-    # Keep the block_idx-derived coords inside one jit: returning the tuple to the
-    # kernel and re-consuming it in a second jit mis-materializes the slot -> OOB write.
-    cluster_shape_mn = params.tile_sched_params.cluster_shape_mn
-    cluster_id, cta_m, cta_n = clc_block_to_static_scheduler_coord(cluster_shape_mn)
-    slot_layout = cute.make_layout((*cluster_shape_mn, params.num_persistent_clusters))
-    return slot_layout((cta_m, cta_n, cluster_id))
+    gdx, gdy, _ = cute.arch.grid_dim()
+    return exit_base + bidx + gdx * (bidy + gdy * bidz)
 
 
 def epi_reduce_flag_slot(m_tile, n_tile, batch, flag_ntile_mn):
@@ -244,13 +174,27 @@ def epi_reduce_flag_slot(m_tile, n_tile, batch, flag_ntile_mn):
     return m_tile + flag_ntile_mn[0] * (n_tile + flag_ntile_mn[1] * batch)
 
 
+def epi_reduce_slab(m_tile, tiles_per_slab):
+    """reduce_scatter splits the tile grid along M into one slab per rank. Returns
+    (slab, pos) for tile row m_tile, which both sides of the protocol read: the
+    producer signals rank ``slab``, the only rank that consumes the tile; the comm
+    warps at m_tile reduce stripe ``slab`` of the tile at ``pos`` in their own slab.
+    The single definition of who owns what."""
+    return m_tile // tiles_per_slab, m_tile % tiles_per_slab
+
+
 # ---- multimem reduce + store ----
 # Tile-agnostic (no GEMM state; a standalone RS kernel could bind them), under a
 # three-part contract: the reduce reads a symmetric padded workspace through its mc
-# view (unpredicated — pad keeps every access in-allocation); the partition's value
-# atom is one contiguous 128b vector (n-major, N % (16B/elem) == 0); subtile
-# (mi, ni) owns the even fragment block rows [mi*chunk, (mi+1)*chunk) x cols
+# view (unpredicated — full tiles are enforced in validate_epi_reduce_args); the
+# partition's value atom is one contiguous 128b vector (n-major, N % (16B/elem) == 0);
+# subtile (mi, ni) owns the even fragment block rows [mi*chunk, (mi+1)*chunk) x cols
 # [ni*sub_loop_n, (ni+1)*sub_loop_n).
+#
+# The pair is the epilogue's contract: the reduce fills registers, the commit drains
+# them, and the epi ops run in between once epilogue() can be framed on the slice.
+# Splitting there is also what lets the workspace hold wider partials than D — the
+# commit owns the d_dtype conversion.
 
 
 @cute.jit
@@ -260,41 +204,26 @@ def multimem_reduce_subtile(
     epi_coord: cute.Coord,
     # load_acc_subtile signature compat (acc prepass); a multimem load has nothing to release.
     no_release: cutlass.Constexpr[bool] = False,
-    row_limit: Optional[Int32] = None,
-    subtile_rows: Optional[cutlass.Constexpr[int]] = None,
-    col_limit: Optional[Int32] = None,
-    subtile_cols: Optional[cutlass.Constexpr[int]] = None,
 ) -> None:
     """Reduce this subtile's workspace partials across all ranks into tRS_rD via
-    multimem ld_reduce; passed to epilogue() as load_acc_subtile by the reducer
-    warps. Within a live subtile the loads are unpredicated (the padded workspace
-    keeps every access in-allocation; edge garbage is skipped by the commit and
-    predicated away by epi ops). Subtiles wholly past the slab tail have nothing
-    to store, so skip their ld_reduce traffic too — at small slabs only 1-2
-    subtiles are live. The caller passes the gate matching the subtile grid's
-    slab axis: rows for an M slab (n-major D), cols for an N slab (m-major)."""
-    # Dead-subtile traffic is serial multimem round trips: 0.041 vs 0.035 ms, AR M=64 TP=2.
-    in_slab = cutlass.Boolean(True)
-    if const_expr(row_limit is not None):
-        in_slab = epi_coord[0] * subtile_rows < row_limit
-    if const_expr(col_limit is not None):
-        in_slab = epi_coord[1] * subtile_cols < col_limit
-    if in_slab:
-        _atom, chunk, sub_loop_n = tRS_rD.shape
-        ld_reduce = multimem_ld_reduce_128b(frgWs_mc.element_type)
-        tmp_results = cute.make_rmem_tensor((4, chunk, sub_loop_n), cutlass.Int32)
-        for ii in cutlass.range_constexpr(chunk):
-            i = epi_coord[0] * chunk + ii
-            for jj in cutlass.range_constexpr(sub_loop_n):
-                j = epi_coord[1] * sub_loop_n + jj
-                mc_ptr = frgWs_mc[None, i, j].iterator
-                x, y, z, w = ld_reduce(mc_ptr)
-                tmp_results[0, ii, jj] = x
-                tmp_results[1, ii, jj] = y
-                tmp_results[2, ii, jj] = z
-                tmp_results[3, ii, jj] = w
-        tmp_rD = cute.recast_tensor(tmp_results, frgWs_mc.element_type)
-        tRS_rD.store(tmp_rD.load().to(tRS_rD.element_type))
+    multimem ld_reduce; bound as epilogue()'s load_acc_subtile by the comm warps.
+    Every load of the subtile is issued before the commit's stores, which is what
+    keeps a latency-bound visit off one switch round trip per atom."""
+    _atom, chunk, sub_loop_n = tRS_rD.shape
+    ld_reduce = multimem_ld_reduce_128b(frgWs_mc.element_type)
+    tmp_results = cute.make_rmem_tensor((4, chunk, sub_loop_n), cutlass.Int32)
+    for ii in cutlass.range_constexpr(chunk):
+        i = epi_coord[0] * chunk + ii
+        for jj in cutlass.range_constexpr(sub_loop_n):
+            j = epi_coord[1] * sub_loop_n + jj
+            mc_ptr = frgWs_mc[None, i, j].iterator
+            x, y, z, w = ld_reduce(mc_ptr)
+            tmp_results[0, ii, jj] = x
+            tmp_results[1, ii, jj] = y
+            tmp_results[2, ii, jj] = z
+            tmp_results[3, ii, jj] = w
+    tmp_rD = cute.recast_tensor(tmp_results, frgWs_mc.element_type)
+    tRS_rD.store(tmp_rD.load().to(tRS_rD.element_type))
 
 
 def _subtile_to_dtype(tRS_rD, dtype):
@@ -307,42 +236,80 @@ def _subtile_to_dtype(tRS_rD, dtype):
 
 
 @cute.jit
+def signal_tile_broadcast(
+    tile_flags_mc: cute.Tensor, tile_id: Int32, in_bounds: cutlass.Boolean
+) -> None:
+    """Announce a finished partial to every rank's copy of the tile's flag: the
+    all_reduce consumer set, where each rank reduces a stripe of every tile."""
+    if in_bounds:
+        with cute.arch.elect_one():
+            utils.distributed.multimem_red_add1(
+                lock_ptr=tile_flags_mc.iterator + tile_id, scope="gpu", order="release"
+            )
+
+
+@cute.jit
+def signal_tile_owner(
+    tile_flags_per_peer: tuple,
+    tile_id: Int32,
+    owner_rank: Int32,
+    in_bounds: cutlass.Boolean,
+) -> None:
+    """Announce a finished partial to the owning rank's copy only: the
+    reduce_scatter consumer set, where one rank reduces the tile. The DSL cannot
+    index a tuple of tensors by a runtime value, so the constexpr loop
+    materializes the world-way dispatch."""
+    if in_bounds:
+        with cute.arch.elect_one():
+            for r in cutlass.range_constexpr(len(tile_flags_per_peer)):
+                if owner_rank == r:
+                    utils.distributed.red_add1(
+                        lock_ptr=tile_flags_per_peer[r].iterator + tile_id,
+                        order="release",
+                        scope="gpu",
+                    )
+
+
+def visit_slice(epi_slice_layout, tRS_rD, commit_subtile, load_acc_subtile):
+    """Walk the slice's subtiles, reducing each into registers and committing it.
+    Stands in for epilogue() as the comm warps' epi_fn until the epilogue can be
+    framed on the slice; the epi ops then run between these two calls."""
+    # Plain range: this runs in the caller's trace, so the loop is unrolled here
+    # (range_constexpr is only valid inside a preprocessed jit function).
+    for epi_idx in range(cute.size(epi_slice_layout)):
+        epi_coord = epi_slice_layout.get_hier_coord(epi_idx)
+        load_acc_subtile(tRS_rD, epi_coord)
+        commit_subtile(tRS_rD, epi_coord)
+    return None, None
+
+
+@cute.jit
 def commit_subtile_local(
     frgD: cute.Tensor,
-    frgD_crd: cute.Tensor,
-    row_limit: Int32,
-    col_limit: Int32,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
 ) -> None:
-    """reduce_scatter commit: vectorized stores of the reduced, post-EVT subtile
-    into this rank's plain slab-shaped D at slab-local coords. Passed to epilogue()
-    as commit_D. Owns d_dtype conversion and edge predication: D has no padding, so
-    skip rows past the slab tail and cols past N (n-major D: an OOB column wraps
-    into the next row)."""
+    """reduce_scatter commit: vectorized stores of the reduced (post-EVT) subtile into
+    this rank's plain slab-shaped D. Passed to epilogue() as commit_D. Owns the
+    d_dtype conversion, so the workspace may hold wider partials than D."""
     _atom, chunk, sub_loop_n = tRS_rD.shape
     tmp_out = _subtile_to_dtype(tRS_rD, frgD.element_type)
     for ii in cutlass.range_constexpr(chunk):
         i = epi_coord[0] * chunk + ii
         for jj in cutlass.range_constexpr(sub_loop_n):
             j = epi_coord[1] * sub_loop_n + jj
-            crd = frgD_crd[((0, 0), i, j)]
-            if crd[0] < row_limit and crd[1] < col_limit:
-                cute.autovec_copy(tmp_out[None, ii, jj], frgD[None, i, j])
+            cute.autovec_copy(tmp_out[None, ii, jj], frgD[None, i, j])
 
 
 @cute.jit
 def commit_subtile_broadcast(
     frgD_mc: cute.Tensor,
-    frgD_crd: cute.Tensor,
-    row_limit: Int32,
-    col_limit: Int32,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
 ) -> None:
-    """all_reduce commit: multimem_st broadcast of the reduced, post-EVT subtile to
-    every rank's symmetric D. Passed to epilogue() as commit_D. Same d_dtype
-    conversion and edge predication as the local commit (D is exactly (m, n, l))."""
+    """all_reduce commit: multimem_st broadcast of the reduced (post-EVT) subtile to
+    every rank's symmetric D. Passed to epilogue() as commit_D. The 128b broadcast
+    atom is why all_reduce requires workspace dtype == D dtype."""
     _atom, chunk, sub_loop_n = tRS_rD.shape
     tmp_out = _subtile_to_dtype(tRS_rD, frgD_mc.element_type)
     out_i32 = cute.recast_tensor(tmp_out, cutlass.Int32)
@@ -350,12 +317,10 @@ def commit_subtile_broadcast(
         i = epi_coord[0] * chunk + ii
         for jj in cutlass.range_constexpr(sub_loop_n):
             j = epi_coord[1] * sub_loop_n + jj
-            crd = frgD_crd[((0, 0), i, j)]
-            if crd[0] < row_limit and crd[1] < col_limit:
-                utils.distributed.multimem_st_4xb32(
-                    frgD_mc[None, i, j].iterator,
-                    out_i32[0, ii, jj].ir_value(),
-                    out_i32[1, ii, jj].ir_value(),
-                    out_i32[2, ii, jj].ir_value(),
-                    out_i32[3, ii, jj].ir_value(),
-                )
+            utils.distributed.multimem_st_4xb32(
+                frgD_mc[None, i, j].iterator,
+                out_i32[0, ii, jj].ir_value(),
+                out_i32[1, ii, jj].ir_value(),
+                out_i32[2, ii, jj].ir_value(),
+                out_i32[3, ii, jj].ir_value(),
+            )

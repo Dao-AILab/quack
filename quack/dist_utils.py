@@ -79,12 +79,19 @@ def make_symm_mem_tensor(shape, torch_dtype, permute):
 
 
 def make_symm_mem_flags(num_flags):
-    """Zero-filled symmetric int32 flag array + multicast view via torch symm_mem.
-    Each rank zero-fills its own copy before the (collective) rendezvous."""
+    """Zero-filled symmetric int32 flag array via torch symm_mem: this rank's
+    local array (every wait reads it), its multicast view (broadcast signals),
+    and per-peer P2P views (slot r writes rank r's array; slot rank aliases the
+    local one). Each rank zero-fills its own copy before the (collective)
+    rendezvous."""
     import torch.distributed._symmetric_memory as symm_mem
 
     flags = symm_mem.empty((num_flags,), dtype=torch.int32, device="cuda")
     flags.fill_(0)
     hdl = symm_mem.rendezvous(flags, group=dist.group.WORLD)
     flags_mc = _wrap_device_ptr(hdl.multicast_ptr, (num_flags,), flags.dtype)
-    return flags, flags_mc
+    flags_per_peer = tuple(
+        _wrap_device_ptr(hdl.buffer_ptrs[r], (num_flags,), flags.dtype)
+        for r in range(dist.get_world_size())
+    )
+    return flags, flags_mc, flags_per_peer

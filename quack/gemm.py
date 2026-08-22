@@ -120,12 +120,14 @@ def _compile_gemm(
         mD = fake_batched(
             d_dtype, m, n, cute.sym_int(), 1 if d_major == "n" else 0, 128 // d_dtype.width
         )
-    if epi_reduce is not None:
-        # Epilogue tensors are slab-local (slab_len / world along the slab axis):
-        # a fresh sym for that axis, untied from the operand's; C is
-        # epilogue-consumed so it rides the same syms (mirrors
-        # gemm_host._compile_gemm_epi), and so does D under reduce_scatter (the
-        # slab-shaped output; all_reduce D stays full-M symmetric).
+    if epi_reduce is not None and epi_reduce[0] == "reduce_scatter":
+        # reduce_scatter: epilogue tensors are slab-local (slab_len / world along
+        # the slab axis) — a fresh sym for that axis, untied from the operand's; C
+        # and colvec are epilogue-consumed on the owner's slab so they ride the same
+        # syms as the slab-shaped D (mirrors gemm_host._compile_gemm_epi).
+        # all_reduce keeps the operand extents: every rank reduces a stripe of every
+        # tile at global coordinates, so C/colvec are the full replicated tensors
+        # and D is full-M symmetric.
         # The slab axis is D's strided axis: n-major D -> M slab, m-major -> N.
         if d_major == "n":
             m = cute.sym_int()
@@ -140,15 +142,14 @@ def _compile_gemm(
                 1 if c_major == "n" else 0,
                 128 // c_dtype.width,
             )
-        if epi_reduce[0] == "reduce_scatter":
-            mD = fake_batched(
-                d_dtype,
-                m,
-                n,
-                l if batched else None,
-                1 if d_major == "n" else 0,
-                128 // d_dtype.width,
-            )
+        mD = fake_batched(
+            d_dtype,
+            m,
+            n,
+            l if batched else None,
+            1 if d_major == "n" else 0,
+            128 // d_dtype.width,
+        )
 
     def fake_scalar(mode, dtype=Float32):
         if mode == 0:
@@ -461,8 +462,10 @@ def gemm(
     ag_args: Optional[AllGatherArguments] = None,
     # GEMM+ReduceScatter/AllReduce (SM100+, see quack/epi_reduce.py):
     # partials live in epi_reduce_args' symmetric workspace; D is the true output
-    # (reduce_scatter: plain slab-local (m / world); all_reduce: full-M symmetric)
-    # and C/colvec_bias are slab-local.
+    # (reduce_scatter: plain slab-local (m / world); all_reduce: full-M symmetric).
+    # C/colvec_bias follow D: slab-local under reduce_scatter (consumed on the
+    # owner's slab), full replicated tensors under all_reduce (each rank reduces a
+    # stripe of every tile at global coordinates).
     epi_reduce_mode: Optional[str] = None,  # "reduce_scatter" | "all_reduce"
     epi_reduce_args: Optional[EpiReduceArguments] = None,
 ) -> _GemmPlan:

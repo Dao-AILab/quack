@@ -230,11 +230,11 @@ def _compile_gemm_epi(
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
     )
-    if epi_reduce is not None:
-        # Epilogue tensors are slab-local (slab_len / world along the slab axis):
-        # a fresh sym for that axis, untied from the operand's; C is
-        # epilogue-consumed so it rides the same syms, and so does D under
-        # reduce_scatter (the slab-shaped output).
+    if epi_reduce is not None and epi_reduce[0] == "reduce_scatter":
+        # reduce_scatter: epilogue tensors are slab-local (slab_len / world along
+        # the slab axis) — a fresh sym for that axis, untied from the operand's; C
+        # and colvec ride the same syms as the slab-shaped D. all_reduce keeps the
+        # operand extents (C/colvec replicated full tensors, D full-M symmetric).
         # The slab axis is D's strided axis: n-major D -> M slab, m-major -> N.
         if d_major == "n":
             m = cute.sym_int()
@@ -245,11 +245,8 @@ def _compile_gemm_epi(
             mC = fake_batched(
                 c_dtype, m, n, l if batched else None, c_leading, div_for_dtype(c_dtype)
             )
-        if epi_reduce[0] == "reduce_scatter":
-            d_leading = 1 if d_major == "n" else 0
-            mD = fake_batched(
-                d_dtype, m, n, l if batched else None, d_leading, div_for_dtype(d_dtype)
-            )
+        d_leading = 1 if d_major == "n" else 0
+        mD = fake_batched(d_dtype, m, n, l if batched else None, d_leading, div_for_dtype(d_dtype))
     fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab)
     ops = _ops_by_name(GemmCls)
     fields = {}

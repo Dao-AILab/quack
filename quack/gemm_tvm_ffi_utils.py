@@ -288,7 +288,7 @@ def make_scheduler_args(
     )
 
 
-def make_fake_epi_reduce_args(d_dtype, mode, ws_dtype, d_major="n"):
+def make_fake_epi_reduce_args(d_dtype, mode, num_ranks, ws_dtype, d_major="n"):
     """Fake EpiReduceArguments for epi_reduce_mode compiles (see quack.epi_reduce).
 
     Comm views are kernel-order (m, n, l): __call__ does not rotate them; their
@@ -310,6 +310,7 @@ def make_fake_epi_reduce_args(d_dtype, mode, ws_dtype, d_major="n"):
         workspace_mc=mnl_fake(ws_dtype),
         tile_flags=flags(),
         tile_flags_mc=flags(),
+        tile_flags_per_peer=tuple(flags() for _ in range(num_ranks)),
     )
 
 
@@ -791,6 +792,7 @@ def compile_gemm_kernel(
             make_fake_epi_reduce_args(
                 mD.element_type,
                 epi_reduce[0],
+                epi_reduce[1],
                 torch2cute_dtype_map[epi_reduce[3]],
                 # comm views share D's majorness; the fake mD's static unit
                 # stride carries it (leading_dim at construction)

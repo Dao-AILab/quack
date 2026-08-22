@@ -148,7 +148,7 @@ def _run_gemm_epi_reduce(
     torch_ws = cutlass_torch.dtype(dtype_map[ws_dtype]) if ws_dtype is not None else None
     d_arg, epi_reduce_args = make_epi_reduce_args(
         epi_reduce_mode, torch_d, m, n, l, tile_m, tile_n, cluster_m, world_size,
-        ws_dtype=torch_ws, d_major=d_major,
+        ws_dtype=torch_ws,
     )
     tf_torch = epi_reduce_args.tile_flags
 
