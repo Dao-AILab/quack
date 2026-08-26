@@ -57,7 +57,7 @@ def mbarrier_arrive_release_cluster(
     remote_ptr = prims.mapa(
         mbar_ptr.to_llvm_ptr(loc=loc, ip=ip), peer_cta_rank_in_cluster, loc=loc, ip=ip
     )
-    prims.mbarrier_arrive(remote_ptr, scope=prims.MemScope.CLUSTER, relaxed=True, loc=loc, ip=ip)
+    prims.mbarrier_arrive(mbar_ptr=remote_ptr, scope=prims.MemScope.CLUSTER, relaxed=True, loc=loc, ip=ip)
 
 
 @dsl_user_op
