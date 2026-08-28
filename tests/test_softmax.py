@@ -111,11 +111,12 @@ def test_softmax_numerical_stability(use_compile):
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
-# N=8192 takes the direct global->register load path (N <= 8192); N=8193 falls
+# N=8192 takes the direct global->register load path (N <= 8192); N=8448 (just over
+# the threshold, and still a multiple of the copy vector size, unlike 8193) falls
 # back to the SMEM cp.async path. Non-power-of-2 small N (760, 3000) forces the
 # non-even-N predicated direct load, whose OOB register lanes must be filled with
 # -inf so the max reduction stays correct (regression for the skip-SMEM change).
-@pytest.mark.parametrize("N", [760, 3000, 8192, 8193])
+@pytest.mark.parametrize("N", [760, 3000, 8192, 8448])
 def test_softmax_fwd_direct_load(N, input_dtype):
     """Direct global->register load path (small N) must match the SMEM path."""
     device = "cuda"
