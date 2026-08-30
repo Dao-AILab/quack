@@ -107,7 +107,7 @@ def _run_gemm_act_reduce(
     import torch.distributed as dist
 
     from quack.dist_utils import init_distributed, clean_distributed
-    from quack.epilogues import linear_act_mod
+    from quack.epilogue.library import linear_act_mod
     from quack.gemm_config import SplitKMode
 
     init_distributed()
@@ -272,7 +272,7 @@ def _run_gemm_sq_reduce(m, n, k, l=1, epi_reduce_mode="reduce_scatter", has_c=Fa
     import torch.distributed as dist
 
     from quack.dist_utils import init_distributed, clean_distributed
-    from quack.epilogues import sq_reduce_mod
+    from quack.epilogue.library import sq_reduce_mod
 
     init_distributed()
     rank, world_size = dist.get_rank(), dist.get_world_size()

@@ -7,8 +7,8 @@ from enum import IntEnum
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Uint32, Float32, Boolean, const_expr
-from cutlass._mlir.dialects import nvvm
 from cutlass.cute.experimental import iket
+from cutlass.experimental import primitives as prims
 
 
 import quack.utils as utils
@@ -900,17 +900,14 @@ class TileScheduler:
                 # If varlen_m, problem_shape_ncluster_mnl[0] is None, so we use atomic_add
                 # instead of atomic_inc, and at the end of the kernel must reset the semaphore to 0.
                 if const_expr(params.problem_shape_ncluster_mnl[0] is not None):
-                    next_work_linear_idx = num_persistent_clusters + Int32(
-                        nvvm.atomicrmw(
-                            op=nvvm.AtomicOpKind.INC,
-                            ptr=params.tile_count_semaphore.llvm_ptr,
-                            a=Int32(
-                                cute.size(params.problem_shape_ncluster_mnl) * params.num_split_k
-                                - 1
-                            ).ir_value(),
-                            loc=loc,
-                            ip=ip,
-                        )
+                    next_work_linear_idx = num_persistent_clusters + prims.atomicrmw(
+                        prims.AtomicOp.INC,
+                        params.tile_count_semaphore.llvm_ptr,
+                        Int32(
+                            cute.size(params.problem_shape_ncluster_mnl) * params.num_split_k - 1
+                        ),
+                        loc=loc,
+                        ip=ip,
                     )
                 else:  # varlen_m
                     next_work_linear_idx = num_persistent_clusters + cute.arch.atomic_add(

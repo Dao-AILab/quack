@@ -10,8 +10,9 @@ from cutlass import Int32, Float32, Float4E2M1FN
 from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
 from quack.tile_scheduler import AgSchedulerArguments, RasterOrderOption, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
@@ -20,7 +21,7 @@ def resolve_blockscaled_formats(bs_format_a, bs_format_b):
     """Resolve a blockscaled GEMM's per-operand format names into descriptors,
     checking presence and hardware pair legality. Single owner of this step for
     both the gemm_interface path and direct kernel-layer callers
-    (quack.gemm.gemm / quack.gemm_act.gemm_act)."""
+    (quack.gemm.gemm / epilogue-mod .gemm)."""
     if bs_format_a is None or bs_format_b is None:
         raise ValueError(
             "blockscaled GEMM requires bs_format_a and bs_format_b (BlockScaledFormat "
@@ -107,7 +108,15 @@ def validate_blockscaled_sf(
     varlen_m = num_batches is not None and not varlen_k
     assert not varlen_k or num_batches is not None, "varlen_k requires num_batches"
     assert SFB is not None, "SFA and SFB must be provided together"
-    assert device_capacity[0] in [10, 11], "Blockscaled GEMM requires SM100/SM110"
+    assert device_capacity[0] in [10, 11, 12], "Blockscaled GEMM requires SM100/SM110/SM120"
+    # SM120 warp-MMA blockscaled: same-dtype MXFP8 (MmaMXF8Op), same-dtype
+    # fp4 (packed kind::mxf4 / mxf4nvf4), or any kind::mxf8f6f4 pair with
+    # independent a/b dtypes — fp8/fp6/fp4 mixes incl. e4m3 x e5m2
+    # (sub-byte sides of mixed pairs ride padded 16U4_ALIGN8B /
+    # 16U6_ALIGN16B tensormaps + ldsm.b4x16_p64/b6x16_p32 unpack).
+    # MN-major operands (incl. varlen_k's m-major A / n-major B) are fp8-only
+    # on SM120: both sides ride the transposing b8 ldmatrix (m16n16.trans.b8);
+    # B needs a hand-built TV layout (GemmSm120._nmajor_b_tiled_copy).
     # Per-instruction the scale config is shared: every legal pair has matching
     # scale dtype and vec size (nvfp4 only pairs with itself; all other formats
     # are e8m0 / vec 32).
@@ -212,24 +221,6 @@ def validate_blockscaled_sf(
             f"got {SF.stride()[-3:]}"
         )
     return sf_dtype, sf_vec_size
-
-
-def div_for_dtype(dtype):
-    """16-byte alignment: divisibility in elements = 128 // dtype_width_bits."""
-    return 128 // dtype.width
-
-
-def fake_batched(dtype, x, y, l, leading_dim, divisibility):
-    """Batch-first (l, x, y) fake tensor; ``leading_dim`` indexes into (x, y).
-
-    Batched tensors cross the FFI boundary in the caller's natural torch order
-    (l, x, y) and the kernel rotates them to (x, y, l) at trace time
-    (GemmBase.rotate_batch_last), so the batch dim always prepends — hence the
-    ``+ 1``. Pass ``l=None`` for a varlen-flattened 2D (x, y) tensor.
-    """
-    if l is None:
-        return fake_tensor(dtype, (x, y), leading_dim=leading_dim, divisibility=divisibility)
-    return fake_tensor(dtype, (l, x, y), leading_dim=leading_dim + 1, divisibility=divisibility)
 
 
 def get_major(t, dim0, dim1):
@@ -352,17 +343,30 @@ def make_fake_scheduler_args(
     )
 
 
-def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx):
+def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None):
     if cu_seqlens_m is None and cu_seqlens_k is None:
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
         mCuSeqlensK=cu_seqlens_k,
         mAIdx=A_idx,
+        mCuTilesM=cu_tiles_m,
     )
 
 
-def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
+def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
+    """Per-sequence M-tile prefix for varlen M-fold reduce sinks:
+    cumsum of ceil(seqlen / tile_m_cta), zero-padded, (num_seqs + 1,) int32.
+    Device-only ops (graph-safe); recomputed per launch from the live
+    cu_seqlens values."""
+    import torch
+
+    seqlens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
+    tiles = torch.div(seqlens + (tile_m_cta - 1), tile_m_cta, rounding_mode="floor")
+    return torch.cat([tiles.new_zeros(1), tiles.cumsum(0, dtype=torch.int32)])
+
+
+def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False):
     if not varlen_m and not varlen_k:
         return None
     num_seqlens = cute.sym_int()
@@ -375,6 +379,12 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
         ),
         mAIdx=(
             fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4) if gather_A else None
+        ),
+        # cu_tiles_m has num_seqs + 1 entries, same as cu_seqlens_m — share the sym.
+        mCuTilesM=(
+            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
+            if has_cu_tiles_m
+            else None
         ),
     )
 
@@ -532,8 +542,12 @@ def launch_gemm(
     SFB=None,
     epi_reduce_args=None,
 ):
-    """Invoke the compiled kernel; SM100/110 signatures take trailing (SFA, SFB,
-    epi_reduce_args)."""
+    """Invoke the compiled kernel. Kernel signatures uniformly take trailing
+    (SFA, SFB) — None unless blockscaled — and the compiled TVM-FFI arg spec
+    bakes the full declared arity, so they are always passed; SM100/110
+    signatures take a further trailing epi_reduce_args. A layout-owning
+    transform's A is a TransformAOperand bundle — one slot, the host never
+    unpacks it."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
     # getattr: gemm.py / gemm_symmetric.py pass their own plan NamedTuples.
@@ -544,7 +558,7 @@ def launch_gemm(
             A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, epi_reduce_args
         )
     else:
-        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args)
+        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
 
 
 def make_fake_gemm_tensors(
@@ -599,7 +613,10 @@ def make_fake_gemm_tensors(
     b_leading = 1 if b_major == "k" else 0
     d_leading = 1 if d_major == "n" else 0
     c_leading = 1 if c_major == "n" else 0
-    m, n, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    m, l = cute.sym_int(), cute.sym_int()
+    # Sub-byte (fp4) D is n-major with a statically packed contiguous extent.
+    n_div = div_for_dtype(d_dtype) if d_dtype is not None and d_dtype.width < 8 else 1
+    n = cute.sym_int(divisibility=n_div)
     a_packed_f6 = a_mma_dtype is not None and a_mma_dtype.width == 6
     b_packed_f6 = b_mma_dtype is not None and b_mma_dtype.width == 6
     # Sub-byte tensors need their contiguous extent statically divisible; sub-byte
@@ -722,6 +739,8 @@ def compile_gemm_kernel(
     scheduler_args,
     varlen_args,
     post_init=None,
+    transform_a=None,  # A-operand transform factory (SM90 RS mainloop);
+    # layout-owning transforms take mA as a TransformAOperand bundle
     mSFA=None,
     mSFB=None,
     use_tma_gather=False,
@@ -745,11 +764,35 @@ def compile_gemm_kernel(
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
         split_k_kwargs = {"split_k": split_k, "split_k_mode": split_k_mode}
+    if transform_a is not None:
+        assert device_capacity[0] in (9, 12), "A-operand transforms are SM90/SM120 only"
+        split_k_kwargs["transform_a"] = transform_a
     if device_capacity[0] == 8:
         sm8x_kwargs = {"is_persistent": persistent, "num_warps": num_warps}
         sm8x_kwargs["arch"] = device_capacity[0] * 10 + device_capacity[1]
         GemmCls = partial(GemmCls, **sm8x_kwargs)
     elif device_capacity[0] in [9, 12]:
+        if device_capacity[0] == 12:
+            if sf_vec_size is not None:
+                # SM120 blockscaled (real SFA/SFB); SM90 has no blockscaled
+                # path. MMA element types ride along when they differ from
+                # storage dtypes (packed fp6 crosses the FFI boundary as raw
+                # bytes).
+                split_k_kwargs["sf_vec_size"] = sf_vec_size
+                split_k_kwargs["a_mma_dtype"] = a_mma_dtype
+                split_k_kwargs["b_mma_dtype"] = b_mma_dtype
+            # SM120's dynamic persistence is CLC (cluster launch control, same
+            # Blackwell feature as sm100's) — no tile-count semaphore needed.
+            # Pingpong included: it consumes CLC responses one-at-a-time
+            # (128x128 pingpong + CLC is the best-measured mxfp8 config, see
+            # AI/sm120_blockscaled_gemm_worklog.md).
+            # Gate on the COMPILE TARGET, not the dispatch arch: CLC
+            # instructions are sm_100+, so the H100 CI proxy legs
+            # (QUACK_ARCH=120 compiled for sm_90a) must fall back to the
+            # static persistent scheduler or NVVM rejects the kernel.
+            split_k_kwargs["use_clc_persistence"] = (
+                is_dynamic_persistent and persistent and get_compile_target_capacity()[0] >= 10
+            )
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         er_kwargs = (
@@ -785,7 +828,11 @@ def compile_gemm_kernel(
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    sf_args = () if device_capacity[0] in (8, 9, 12) else (mSFA, mSFB)
+    # Unified signature across archs: every kernel class takes trailing
+    # (SFA, SFB) — None unless blockscaled (SM120), and SM100 consumes them
+    # natively. The compiled TVM-FFI arg spec bakes the full declared arity
+    # (defaults included), so they are always passed here and at launch.
+    sf_args = (mSFA, mSFB)
     er_args = ()
     if epi_reduce is not None:
         er_args = (

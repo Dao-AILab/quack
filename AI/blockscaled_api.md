@@ -306,6 +306,36 @@ packed fp6 at the boundary.
 
 All other kernel `sf_*` plumbing is input-side; blockscaled D adds the output side.
 
+**Status: shipped for `gemm`** (`quack.epilogue.quantize_out.BlockScaleFactorStore`
++ `quack::gemm_quant_out`; tests/test_gemm_quant_out.py). `out_dtype` takes a
+format name, `out_quant_dim=-1|-2` is the direction knob (-2 is fp8-only: fp4
+packs along N, which no consumer contracting over M can use), and the call
+returns a `BlockScaledOperand`. gemm_add / act-mod postact quantization still
+reject via `_reserve_blockscaled_out`. Both directions run on SM100/SM110
+and SM120 (row: all three formats, plain and blockscaled inputs, k- and
+n-major B; col: fp8 values). On SM120 a vec-32 row SFD widens the tiled-MMA
+warp run to 32 contiguous N columns (`GemmSm120.mma_n_warp_run`; ~1.5% over
+the exchange at epilogue-heavy shapes) so SF vectors stay warp-local; when
+tile_n is not a multiple of `32 * atom_n`, and always for the col direction
+(whose 32-row vectors span two 16-row warp M stripes), the epilogue uses a
+per-subtile smem amax exchange with one epilogue barrier instead (see
+BlockScaleFactorStore). Gated postact (swiglu FC1) quantization also runs on
+SM120: the halved postact store keeps the 16-column warp run (its dummy-MMA
+STSM retile contract encodes it; narrow dtypes apply the same register
+permute at fp32 granularity pre-convert — layout_utils.permute_gated_Cregs_f32)
+and the quantize rides the exchange.
+
+Measured on RTX 5090 (2026-08-05, benchmarks/benchmark_gemm.py --quant_out,
+tile 128,128 pingpong dynamic-persistent, boost clocks): the SFD epilogue is
+FREE — mxfp8-in 8192³ runs 728 TF with mxfp8 out vs 726 TF with bf16 out (fp8
+D halves store traffic, offsetting the SF work). vs cuBLASLt's D-out-scale
+path (which is the CUTLASS C++ cutlass3x_sm120_bstensorop kernel with
+Sm120BlockScaleFactorRowStore, JIT-shipped): quack 1.02–1.07x faster across
+mxfp8/nvfp4 at 4096³/8192³ (e.g. nvfp4 8192³: 1495 vs 1435 TF), with values
+AND SF bytes bit-identical to cuBLAS in every configuration. cublasLt has no
+mxfp4-out baseline (AlgoGetHeuristic NOT_SUPPORTED for fp4-D + e8m0 out-scale);
+quack runs it at the nvfp4 rate.
+
 - API (D12): `out_dtype` accepts a `BlockScaledFormat` (or name) on
   `gemm`/`gemm_add`/`gemm_act`; the plain blockscaled output default stays bf16. A
   format request makes `gemm` allocate qdata + an SFD buffer in the blocked layout

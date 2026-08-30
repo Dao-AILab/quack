@@ -245,9 +245,11 @@ def test_gemm_act_alpha(input_dtype, activation, alpha_kind, has_bias):
 
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx", "tanh"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("colvec_reduce", [False, True])
+@pytest.mark.parametrize("has_colvec_scale", [False, True])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("n", [1504, 2048])
-def test_gemm_dact(n, k, input_dtype, activation):
+def test_gemm_dact(n, k, has_colvec_scale, colvec_reduce, input_dtype, activation):
     """Test GEMM with activation gradient computation."""
     device = "cuda"
     torch.random.manual_seed(0)
@@ -255,14 +257,39 @@ def test_gemm_dact(n, k, input_dtype, activation):
     dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
     weight = torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)
     preact = torch.randn((m, n), device=device, dtype=input_dtype, requires_grad=True)
+    colvec_scale = torch.randn(m, device=device) if has_colvec_scale else None
     # Disable tuning for faster test
-    dx, postact = gemm_dact(dout_input, weight.T, preact, activation=activation, tuned=False)
+    dx, postact, *rest = gemm_dact(
+        dout_input,
+        weight.T,
+        preact,
+        activation=activation,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce,
+        tuned=False,
+    )
+    if colvec_reduce:
+        colvec_reduce_out = rest[0]
     dx_ref, postact_ref = gemm_dact_ref(
         dout_input.float(), weight.float().T, preact.float(), activation=activation
     )
     dx_pt, postact_pt = gemm_dact_ref(dout_input, weight.T, preact, activation=activation)
+    if colvec_reduce:
+        colvec_reduce_ref = (postact_ref * gemm_ref(dout_input.float(), weight.float().T)).sum(
+            dim=-1
+        )
+        colvec_reduce_pt = (postact_pt * gemm_ref(dout_input, weight.T)).sum(dim=-1)
+    if has_colvec_scale:
+        dx_ref *= colvec_scale.float()[:, None]
+        postact_ref *= colvec_scale.float()[:, None]
+        dx_pt *= colvec_scale[:, None]
+        postact_pt *= colvec_scale[:, None]
     assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+    if colvec_reduce:
+        assert (colvec_reduce_out - colvec_reduce_ref).abs().max() < 2 * (
+            colvec_reduce_pt - colvec_reduce_ref
+        ).abs().max() + 1e-5
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -920,7 +947,7 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
 def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
     """Regression test for https://github.com/Dao-AILab/quack/issues/135:
 
-    Passing both colvec (rstd) and rowvec (norm_weight) to gemm_norm_act_fn
+    Passing both colvec (rstd) and rowvec (norm_weight) to norm_act_mod
     produced corrupted output for tile shapes where the vec smem region was
     smaller than the tiled cp_async partition tile. cp_async with pred=False
     zero-fills the destination instead of skipping the write, which corrupted
@@ -929,7 +956,7 @@ def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
     device = "cuda"
     if get_device_capacity(torch.device(device))[0] != 9:
         pytest.skip("This regression test targets SM90.")
-    from quack.gemm_norm_act import gemm_norm_act_fn
+    from quack.epilogue.library import norm_act_mod
 
     torch.manual_seed(0)
     A = torch.randn(1, M, K, device=device, dtype=input_dtype)
@@ -940,20 +967,16 @@ def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
         input_dtype
     )
     out = torch.empty(1, M, N, dtype=input_dtype, device=device)
-    gemm_norm_act_fn(
+    norm_act_mod(None, gated=False, has_c=False, has_rowvec=True, has_colvec=True).gemm(
         A,
         B,
-        D=None,
-        C=None,
-        PostAct=out,
-        tile_count_semaphore=None,
-        activation=None,
+        None,
+        None,
+        epi_args=dict(mAuxOut=out, mRowVecBroadcast=rowvec, mColVecBroadcast=colvec),
         tile_M=tile_M,
         tile_N=tile_N,
         cluster_M=1,
         cluster_N=1,
-        colvec=colvec,
-        rowvec=rowvec,
     )
     # Bf16 dot-product noise tolerance: pre-fix this same test saw absolute
     # errors of >1e3 because some output tiles were entirely zeroed out.

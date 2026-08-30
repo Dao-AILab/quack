@@ -8,8 +8,8 @@ import cutlass.cute as cute
 from cutlass import Boolean, const_expr
 
 import quack.copy_utils as copy_utils
-from quack.epi_ops import ColVecLoad, EpiOp, RowVecLoad, TileLoad
-from quack.gemm_epilogue import gemm_epilogue, pack, unpack
+from quack.epilogue.ops import ColVecLoad, EpiOp, RowVecLoad, TileLoad
+from quack.epilogue.frontend import gemm_epilogue, pack, unpack
 
 
 class RotaryCosSinLoad(EpiOp):

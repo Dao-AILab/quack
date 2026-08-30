@@ -99,7 +99,7 @@ def _run_rank():
     # runner.gather() CONTEXT — proves any epilogue-mod GEMM overlaps by
     # calling it inline in the with-body with ONE ag_args kwarg (same route
     # serves rope etc.).
-    from quack.gemm_act import gemm_act
+    from quack.epilogue.library import linear_act_mod
 
     dtype, shard_m, n, k = torch.bfloat16, 1024, 2048, 4096
     torch.manual_seed(4321)
@@ -117,7 +117,20 @@ def _run_rank():
         ref = torch.nn.functional.silu(acc)
         baseline = torch.nn.functional.silu(acc.to(dtype).float())
         with runner.gather(a_shard) as (a_full, ag_args):
-            gemm_act(a_full, b, None, None, postact, None, "silu", 128, 256, 2, 1, ag_args=ag_args)
+            linear_act_mod(
+                "silu", gated=False, has_c=False, has_rowvec=False, has_colvec=False
+            ).gemm(
+                a_full,
+                b,
+                None,
+                None,
+                epi_args=dict(mAuxOut=postact),
+                tile_M=128,
+                tile_N=256,
+                cluster_M=2,
+                cluster_N=1,
+                ag_args=ag_args,
+            )
         torch.cuda.synchronize(device)
         err = (postact.float() - ref).abs().max().item()
         tol = (baseline - ref).abs().max().item() + 1e-4

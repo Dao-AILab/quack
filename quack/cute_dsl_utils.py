@@ -129,6 +129,34 @@ def get_device_capacity(
     return _get_device_capacity_cached(device)
 
 
+@lru_cache
+def get_compile_target_capacity() -> Tuple[int, int]:
+    """Return (major, minor) of the ptxas COMPILE TARGET, not the dispatch arch.
+
+    ``get_device_capacity`` answers "which kernel class / configs get traced"
+    and honors ``QUACK_ARCH``. This helper answers "which instructions may the
+    traced code emit" — a property of the actual compile target, and the two
+    diverge on the CI proxy legs (``QUACK_ARCH=120`` on an H100 still compiles
+    the SM120-dispatched code for sm_90a). Same derivation order as the
+    async-compile pool's ``_detect_arch_env``: ``CUTE_DSL_ARCH`` if set (pool
+    workers are GPU-blind and get it pinned), else the physical GPU, else
+    ``QUACK_ARCH`` (CPU-only cross-compile box, where dispatch arch is the
+    only target there is).
+    """
+    cute_arch = os.environ.get("CUTE_DSL_ARCH")
+    if cute_arch is not None:
+        return _parse_arch_str(cute_arch)
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_capability()
+    arch_override = os.environ.get("QUACK_ARCH")
+    if arch_override is not None:
+        return _parse_arch_str(arch_override)
+    raise RuntimeError(
+        "Cannot determine compile target: no GPU present and neither "
+        "CUTE_DSL_ARCH nor QUACK_ARCH is set"
+    )
+
+
 def _partition_fields(obj):
     """Split dataclass fields into (constexpr_dict, non_constexpr_dict) by type."""
     all_fields = {field.name: getattr(obj, field.name) for field in fields(obj)}
@@ -184,6 +212,19 @@ def _namedtuple_dynamic_fields(self):
         yield field_val
 
 
+def _namedtuple_extract_mlir_values(self):
+    """Generic ``__extract_mlir_values__`` for ``@mlir_namedtuple`` classes.
+
+    Must agree with ``__get_mlir_types__`` field-for-field: without this, the
+    DSL's default tuple walk emits values for static fields (e.g. a plain int
+    width) that the declared types skipped — an off-by-N operand arity at the
+    generated call site (llvm.call verification failure)."""
+    values = []
+    for field_val in _namedtuple_dynamic_fields(self):
+        values.extend(cutlass.extract_mlir_values(field_val))
+    return values
+
+
 def _namedtuple_c_pointers(self):
     """Generic ``JitArgument.__c_pointers__`` for ``@mlir_namedtuple`` classes."""
     from cutlass.base_dsl.typing import get_c_pointers
@@ -221,6 +262,7 @@ def mlir_namedtuple(cls):
     """
     cls.__c_pointers__ = _namedtuple_c_pointers
     cls.__get_mlir_types__ = _namedtuple_get_mlir_types
+    cls.__extract_mlir_values__ = _namedtuple_extract_mlir_values
     cls.__new_from_mlir_values__ = _namedtuple_new_from_mlir_values
     return cls
 

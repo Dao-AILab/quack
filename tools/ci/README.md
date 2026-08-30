@@ -9,11 +9,10 @@ and on PRs.
 | File | Purpose |
 |------|---------|
 | `tools/ci/docker/Dockerfile` | image recipe (one Dockerfile, two variants via build args) |
-| `tools/ci/docker/build.sh` | build cu129 and/or cu132 docker image locally |
-| `tools/ci/docker/tag_and_push.sh` | tag and push to `tridao/quack-kernels` on Docker Hub |
+| `tools/ci/docker/build.sh` | step flags `--image` / `--push` / `--sif` per variant: build the docker image, push to `tridao/quack-kernels`, and/or build the runner's cached SIF |
 | `.github/workflows/_test.yml` | reusable workflow with lint/changes/test jobs and the matrix; **the image tag pins live here** |
 | `.github/workflows/ci.yml`, `ci-pr.yml` | thin shells that call `_test.yml` on push / PR |
-| `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs two-pass pytest |
+| `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs single-pass pytest |
 
 ## Image variants
 
@@ -41,9 +40,11 @@ compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
 - `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24`
-  (free-memory threshold 50 GB). Cold kernel-compile misses are shipped to a
-  pool of 24 CPU workers (forkserver sidecar, GPU-blind) while the affected
-  tests defer and retry once their `.o` lands; warm runs pay nothing. The
+  (free-memory threshold 50 GB). The action waits up to 5 minutes, polling
+  every 15 seconds, when runner assignment races with transient GPU
+  contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
+  workers (forkserver sidecar, GPU-blind) while the affected tests defer and
+  retry once their `.o` lands; warm runs pay nothing. The
   persistent kernel cache (`QUACK_CACHE_DIR`) carries `.o` files across runs
   on the same runner. CI prunes QuACK source-fingerprint cache directories
   older than 7 days before each test run, plus interrupted `.o.tmp.*` exports
@@ -64,9 +65,12 @@ ci.yml and ci-pr.yml). Three steps:
 
 ```bash
 # 1. Build & push from a box that has docker (one-time Hub login: `docker login -u tridao`)
-./tools/ci/docker/build.sh
-./tools/ci/docker/tag_and_push.sh
-# unattended variant: DOCKERHUB_TOKEN=hub_xxx ./tools/ci/docker/tag_and_push.sh
+./tools/ci/docker/build.sh --image --push
+# On a runner, add --sif to also pre-build the SIFs the gpu-test action caches
+# (rename them to .sif.hold until step 3 lands, or the action's prune deletes
+# them). On a docker-less runner (b300), pre-warm from the pushed images with:
+#   DATE=YY.MM.DD ./tools/ci/docker/build.sh --sif
+# unattended variant: DOCKERHUB_TOKEN=hub_xxx ./tools/ci/docker/build.sh --image --push
 ```
 
 ```yaml

@@ -631,23 +631,6 @@ def test_pytree_treespec_json_roundtrip_preserves_custom_and_legacy_formats():
         assert restored.shape == op.shape
 
 
-# -- rejection guards at non-blockscaled entry points ------------------------
-
-
-def test_rejection_guards():
-    from quack.gemm_interface import gemm_dact, gemm_rms, gemm_symmetric
-
-    _, t = _quantize(MXFP8_E4M3)
-    y = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-    for fn, name in (
-        (lambda: gemm_dact(t, y.T, y), "gemm_dact"),
-        (lambda: gemm_symmetric(t, t.mT), "gemm_symmetric"),
-        (lambda: gemm_rms(t, y.T), "gemm_rms"),
-    ):
-        with pytest.raises(TypeError, match=name):
-            fn()
-
-
 def test_mma_kind_for_pair():
     from quack.blockscaled.operand import mma_kind_for_pair
 

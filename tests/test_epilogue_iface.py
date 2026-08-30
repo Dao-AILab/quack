@@ -6,9 +6,9 @@ torch references, independent of the variant wrappers."""
 import pytest
 import torch
 
-from quack.epi_ops import ColVecReduce, RowVecReduce
+from quack.epilogue.ops import ColVecReduce, RowVecReduce
 from quack.gemm_config import GemmConfig
-from quack.gemm_epilogue import gemm_epilogue
+from quack.epilogue.frontend import gemm_epilogue
 
 torch.manual_seed(0)
 
@@ -77,8 +77,11 @@ def test_reduce_finalized():
 
 
 # RowVecReduce requires cluster_M == 1: partials silently corrupt under
-# cluster_M=2 (see the xfail below + HANDOFF known issues; likely the same
-# SM100 cluster-coordinate bug as the gated aux-store corruption).
+# cluster_M=2 on SM100. NOT the gated (2, 2) aux-store bug — fixing that one
+# left this still failing (strict xfail, so a shared cause would have XPASSed).
+# Own cause: the sink buffer is sized by the MMA tile (config.tile_m) but
+# indexed by a CTA-granular tile_coord_mnkl[0], which 2-CTA halves, so the
+# bounds guard drops the back half of M.
 CFG_CM1 = CFG.__class__(**{**CFG.__dict__, "cluster_m": 1})
 
 
@@ -91,8 +94,10 @@ def test_rowvec_reduce_finalized():
 
 @pytest.mark.xfail(
     strict=True,
-    reason="RowVecReduce partials corrupt with cluster_M=2 on SM100 — open bug, "
-    "see HANDOFF known issues (gated cluster_M=2 family)",
+    reason="RowVecReduce partials corrupt with cluster_M=2 on SM100 — open bug, and "
+    "NOT the gated (2, 2) aux-store bug: that fix landed and this still fails. The "
+    "sink buffer is sized by the MMA tile but indexed per CTA tile, so the back half "
+    "of M is dropped (colsum comes back as the sum over the first half of the rows)",
 )
 def test_rowvec_reduce_cluster_m2():
     from quack.cute_dsl_utils import get_device_capacity
@@ -162,7 +167,7 @@ def test_batched_3d():
 
 
 def test_eager_tuned_smoke():
-    """tuned=True rides quack.epi_autotune (sweep once per metadata class,
+    """tuned=True rides quack.gemm_runtime.autotune (sweep once per metadata class,
     warm replay after); numerics must match the pinned-config call."""
     A, B = _inputs(m=256, n=512, k=256)
     bias = torch.randn(1, B.shape[-1], device="cuda", dtype=torch.float32)
@@ -189,7 +194,7 @@ def test_from_class_static():
     plain D = A @ B)."""
     from quack.cute_dsl_utils import get_device_capacity
     from quack.gemm import GemmDefaultSm100
-    from quack.gemm_epilogue import epilogue_from_class
+    from quack.epilogue.frontend import epilogue_from_class
 
     # quack capability, not torch's: QUACK_ARCH overrides (e.g. the CI sm120
     # legs) dispatch non-SM100 classes on SM100 hardware.

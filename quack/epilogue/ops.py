@@ -18,25 +18,88 @@ import operator
 import hashlib
 import inspect
 from functools import partial
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as blackwell_helpers
-from cutlass import Boolean, Float32, const_expr
+from cutlass import Boolean, Float32, Int32, Uint32, const_expr
 from cutlass.cute.nvgpu import warp
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+from cutlass.experimental import primitives as prims
 
-from quack.epi_utils import assume_stride_divisibility, setup_epi_tensor
+import torch
+
+from quack.compile_utils import div_for_dtype, fake_batched, make_fake_tensor
+from quack.cute_dsl_utils import torch2cute_dtype_map
+import quack.sm90_utils as sm90_utils
 from quack.rounding import (
+    SR_STORE_DTYPES,
     RoundingMode,
-    convert_f32_to_bf16_sr,
-    convert_f32_to_f16_sr,
+    convert_f32_frag_sr,
     epilogue_aux_out_sr_seed,
+    epilogue_sr_seed,
 )
+from quack.reduce import swap_shuffle_reduce
 from quack.sm90_utils import partition_for_epilogue
 import quack.utils as utils
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
+
+
+def assume_stride_divisibility(tensor):
+    """Assume all strides are divisible by 32 bits (except static strides).
+
+    Used for broadcast vectors and similar tensors where stride alignment is guaranteed.
+    Returns a new tensor with the assumed strides.
+    """
+    if tensor is None:
+        return None
+    divby = 32 // tensor.element_type.width
+    if divby <= 1:  # >= 32-bit elements: nothing to assume
+        return tensor
+    new_stride = tuple(
+        cute.assume(s, divby=divby) if not cute.is_static(s) else s for s in tensor.stride
+    )
+    return cute.make_tensor(tensor.iterator, cute.make_layout(tensor.shape, stride=new_stride))
+
+
+def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
+    """Create copy metadata + smem layout for a supplemental epilogue tensor.
+
+    Args:
+        gemm: The GEMM object (provides arch, epi_stage, and epilogue layout helpers).
+        tensor: The global memory tensor to set up for the epilogue.
+        epi_tile: Epilogue tile shape. Defaults to gemm.epi_tile.
+        op_type: "store" or "load".
+
+    Returns:
+        (copy_atom, tensor, smem_layout_staged, epi_tile). copy_atom is None for pre-TMA archs.
+    """
+    if epi_tile is None:
+        epi_tile = gemm.epi_tile
+    if stage is None:
+        stage = gemm.epi_stage
+    dtype = tensor.element_type
+    layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
+    utils_cls = blackwell_helpers if gemm.arch >= 100 else sm90_utils
+    smem_layout_staged = utils_cls.make_smem_layout_epi(dtype, layout, epi_tile, stage)
+    # Ragging-for-TMA is for varlen_m stores that need a per-batch row offset baked
+    # into the TMA descriptor. Loads don't currently support varlen_m, so skip the
+    # ragging conversion.
+    tma_input = (
+        copy_utils.create_ragged_tensor_for_tma(tensor, ragged_dim=0, ptr_shift=True)
+        if op_type != "load" and cute.rank(tensor) == 2
+        else tensor
+    )
+    tma_atom, tma_tensor = gemm._make_tma_epi_atoms_and_tensors(
+        tma_input,
+        smem_layout_staged,
+        epi_tile,
+        op_type=op_type,
+    )
+    return tma_atom, tma_tensor, smem_layout_staged, epi_tile
 
 
 def _callable_config_key(fn):
@@ -163,6 +226,33 @@ def _get_lane_warp_layouts(tiled_copy, reference_src=True):
     return lane_layout_MN, warp_layout_MN
 
 
+def _mode_flat_stride(layout, mode):
+    """Trace-time introspection: the constant stride ``s`` if ``layout``
+    mode ``mode`` enumerates the flat arithmetic progression ``r -> r*s``
+    (the lane geometry ``swap_shuffle_reduce`` needs), else None. A nested
+    mode qualifies when its (shape, stride) pairs chain column-major
+    (stride[i+1] == stride[i] * shape[i])."""
+
+    def flat(x):
+        return sum((flat(e) for e in x), []) if isinstance(x, (tuple, list)) else [x]
+
+    try:
+        shapes = [int(v) for v in flat(layout.shape[mode])]
+        strides = [int(v) for v in flat(layout.stride[mode])]
+    except (TypeError, ValueError):  # dynamic layout: no static answer
+        return None
+    base, expected = None, None
+    for sh, st in zip(shapes, strides):
+        if sh == 1:
+            continue
+        if base is None:
+            base = st
+        elif st != expected:
+            return None
+        expected = st * sh
+    return base
+
+
 @cute.jit
 def _lane_warp_info_n(tiled_copy, reference_src, tidx):
     """(lanes_in_N, warps_in_N, warp_n_idx, is_lane_n_leader) for N-direction
@@ -222,10 +312,16 @@ class EpiOp:
     tile, a superset of any frame.
     """
 
-    # --- Value-port protocol (quack.gemm_epilogue fn frontend). Ports are how
-    # an op joins the fn's per-element dataflow; the resource lifecycle below
+    # --- Value-port protocol (quack.epilogue.frontend fn frontend). fn_port is
+    # THE declaration of how an op joins the fn's per-element dataflow (the
+    # frontend never isinstance-dispatches); the resource lifecycle below
     # (begin/begin_loop/end_loop/end) stays the smem/TMA/flush protocol.
-    #   "value": the fn receives op.name as a per-element value (loads, scalars).
+    #   "row" / "col" / "tile" / "scalar": built-in fragment kinds — the fn
+    #            receives op.name as a per-element value (or the scalar), with
+    #            the frontend's standard shape checks and swap-relabeling.
+    #   "value": custom value-source op: the fn receives op.name per element;
+    #            begin_loop's fragment must be elementwise congruent with the
+    #            accumulator tile and DENSE (fn_prepare may densify).
     #   "apply": the fn receives op.name as a CALLABLE — `y = rope(acc)` — so the
     #            op's math slots into the fn's dataflow at a user-chosen point.
     #            fn_apply runs inside the (possibly vectorized) loop: index only
@@ -235,6 +331,7 @@ class EpiOp:
     #            dense fragment and hands it to fn_sink_flush once per subtile
     #            (fragment-level, so sinks can do numerically smart things like
     #            one rescale per subtile instead of per element).
+    #   None: not usable from the fn frontend (hand-written mixins only).
     fn_port = None
 
     def fn_prepare(self, gemm, state, paired):
@@ -277,12 +374,12 @@ class EpiOp:
         )
 
     def __quack_semantic_key__(self):
-        # Fail-closed semantic-key protocol (quack.gemm_epilogue): op instances
+        # Fail-closed semantic-key protocol (quack.epilogue.frontend): op instances
         # captured by epilogue fns fingerprint as their cache identity.
         return self.cache_key()
 
     # --- Host-side: torch-arg schema (drives the generic plan/compile layer in
-    # quack.gemm_host). Each op describes its own argument in three steps:
+    # quack.gemm_runtime.host). Each op describes its own argument in three steps:
     # host_arg_key extracts a small picklable descriptor from the caller's torch
     # value (part of the jit_cache disk key), host_fake_arg rebuilds the fake
     # trace-time argument from that descriptor alone, and host_call_arg converts
@@ -292,19 +389,30 @@ class EpiOp:
         (the op is filtered out of the compiled epilogue)."""
         if value is None:
             return None
-        from quack.cute_dsl_utils import torch2cute_dtype_map
 
         return (torch2cute_dtype_map[value.dtype], value.ndim)
 
     def host_fake_arg(self, key, fctx):
         """Fake trace-time argument reconstructed from ``host_arg_key``'s
-        descriptor. ``fctx`` is a quack.gemm_host.FakeArgCtx with the shared
+        descriptor. ``fctx`` is a quack.gemm_runtime.host.FakeArgCtx with the shared
         (m, n, k, l) sym ints and the batched/varlen_m flags."""
         return None
 
     def host_call_arg(self, value, key):
         """Per-call runtime argument matching the compiled signature."""
         return value
+
+    def arg_spec_type(self, const=False):
+        """Type annotation for this op's EpilogueArguments field. ``const``
+        reflects host_arg_form: a Constexpr[...] annotation makes the TVM-FFI
+        converter emit NO runtime argument (value baked at trace, None at
+        call — see the converter patch in quack.cute_dsl_utils)."""
+        return Optional[cute.Tensor]
+
+    def host_arg_form(self, value):
+        """Mint-key suffix for per-call arg FORMS that change the compiled
+        signature (e.g. constexpr vs tensor); "" when there is one form."""
+        return ""
 
     # --- Host-side: args → params ---
     def param_fields(self):
@@ -376,7 +484,7 @@ class EpiOp:
         """Issue this op's tile-load smem->register copy for one epilogue stage."""
         pass
 
-    def end_loop(
+    def end_loop_stage(
         self,
         gemm,
         param,
@@ -385,13 +493,32 @@ class EpiOp:
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
         tidx,
         tile_shape_mn: cutlass.Constexpr = None,
     ):
-        """Per-subtile cleanup after epi_visit_subtile. ``tile_shape_mn`` is the
-        epilogue's frame (see EpiContext); None means the CTA tile."""
+        """Per-subtile flush, phase 1: intra-warp reduce + smem staging.
+
+        Returns None when this op has nothing to flush at this epi_coord,
+        else ``(needs_barrier, finish_state)``. The driver (epi_end_loop)
+        issues ONE shared epilogue barrier per subtile covering every op
+        that staged — a multi-sink epilogue syncs once per flush, not once
+        per sink (each sink stages into its own disjoint smem) — then calls
+        ``end_loop_finish(finish_state)``. ``tile_shape_mn`` is the epilogue's
+        frame (see EpiContext); None means the CTA tile."""
+        return None
+
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
+        """Per-subtile flush, phase 2 (after the driver's shared barrier):
+        merge the smem-staged partials + write gmem. ``tile_shape_mn`` as in
+        end_loop_stage."""
         pass
 
     def needs_async_fence(self):
@@ -418,6 +545,8 @@ class EpiOp:
 class Scalar(EpiOp):
     """Loads a scalar value or device pointer once per tile. No smem."""
 
+    fn_port = "scalar"
+
     def __init__(self, name, dtype=None):
         super().__init__(name)
         self.dtype = dtype
@@ -428,10 +557,10 @@ class Scalar(EpiOp):
     def _target_dtype(self):
         return self.dtype if self.dtype is not None else Float32
 
-    def _validate_pointer_value(self, value):
-        import torch
-        from quack.cute_dsl_utils import torch2cute_dtype_map
+    def arg_spec_type(self, const=False):
+        return Optional[(self.dtype or Float32) | cute.Tensor]
 
+    def _validate_pointer_value(self, value):
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"scalar '{self.name}' pointer value must be a torch.Tensor")
         if value.numel() != 1:
@@ -509,8 +638,6 @@ class VecLoad(EpiOp):
     dim = None  # 0 for col (M), 1 for row (N)
 
     def host_fake_arg(self, key, fctx):
-        from quack.compile_utils import make_fake_tensor
-
         dtype, ndim = key
         vec_dim = fctx.n if self.dim == 1 else fctx.m
         shape = (fctx.l, vec_dim) if ndim == 2 else (vec_dim,)
@@ -621,6 +748,7 @@ class RowVecLoad(VecLoad):
     """Loads a row vector (N,) via cp_async, broadcasts along M with stride (0,1)."""
 
     dim = 1
+    fn_port = "row"
 
 
 class ColVecLoad(VecLoad):
@@ -632,6 +760,7 @@ class ColVecLoad(VecLoad):
     """
 
     dim = 0
+    fn_port = "col"
 
     @cute.jit
     def _get_gmem_vec(self, param, ctx):
@@ -714,9 +843,16 @@ class TileStore(EpiOp):
         store_pred_fn: optional ``(gemm, tile_coord_mnkl) -> Boolean``
             evaluated once per CTA tile; False skips this op's gmem store
             (e.g. GemmSymmetric skips the mirrored write on diagonal tiles)
+        quant: optional quantize codec (BlockScaleFactorStore) for this
+            output, declared where the output is declared. Declaration sugar:
+            the EpiMod frontend lifts it into the op set (extra_ops), and the
+            driver runs it on the final fragment right before store_convert
+            (see gemm_base.epilogue and ComposableEpiMixin._epi_store_quant).
     """
 
-    def __init__(self, name, epi_tile_fn=None, gated=False, rounding=None, store_pred_fn=None):
+    def __init__(
+        self, name, epi_tile_fn=None, gated=False, rounding=None, store_pred_fn=None, quant=None
+    ):
         super().__init__(name)
         if gated and epi_tile_fn is None:
             epi_tile_fn = _gated_epi_tile_fn
@@ -724,6 +860,11 @@ class TileStore(EpiOp):
         self.gated = gated
         self.rounding = rounding
         self.store_pred_fn = store_pred_fn
+        if quant is not None:
+            assert getattr(quant, "quant_output", None) == name, (
+                f"quantize codec for output {name!r} must declare output={name!r}"
+            )
+        self.quant = quant
 
     def config_key(self):
         return (
@@ -731,6 +872,7 @@ class TileStore(EpiOp):
             self.gated,
             self.rounding,
             _callable_config_key(self.store_pred_fn),
+            self.quant.cache_key() if self.quant is not None else None,
         )
 
     def is_tile_store(self):
@@ -760,19 +902,21 @@ class TileStore(EpiOp):
     def host_arg_key(self, value):
         if value is None:
             return None
-        from quack.cute_dsl_utils import torch2cute_dtype_map
 
         major = "n" if value.stride(-1) == 1 else "m"
         return (torch2cute_dtype_map[value.dtype], major)
 
     def host_fake_arg(self, key, fctx):
-        from quack.gemm_tvm_ffi_utils import div_for_dtype, fake_batched
-
         dtype, major = key
         # A halved/reshaped tile (epi_tile_fn, e.g. gated postact) has an N
         # extent unrelated to the GEMM's n: use a fresh sym. Such tiles are
-        # n-major by construction (asserted in to_params).
-        n = cute.sym_int() if self.epi_tile_fn is not None else fctx.n
+        # n-major by construction (asserted in to_params). Sub-byte (fp4)
+        # tiles also need a fresh sym: their packed contiguous extent must be
+        # statically divisible (the FFI packing check).
+        if self.epi_tile_fn is not None or dtype.width < 8:
+            n = cute.sym_int(divisibility=div_for_dtype(dtype))
+        else:
+            n = fctx.n
         leading = 1 if (major == "n" or self.epi_tile_fn is not None) else 0
         batch = fctx.l if (fctx.batched and not fctx.varlen_m) else None
         if fctx.swapped:
@@ -798,7 +942,15 @@ class TileStore(EpiOp):
         tensor = getattr(args, self.name)
         layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
         if self.gated:
-            assert tensor.element_type.width == 16, "gated aux output must be 16-bit for now"
+            # The smem store path degrades to a universal SIMT copy for
+            # narrow dtypes (get_smem_store_atom / SM100's get_smem_store_op),
+            # so fp8/fp4 gated postact (quantized output) works on SM100 and
+            # SM120 (the SM120 halved retile lays the narrow atom over the
+            # 16-bit C-atom geometry, same as the fp8/fp4 D store); SM90's
+            # STSM path remains 16-bit only.
+            assert tensor.element_type.width == 16 or (
+                gemm.arch in (100, 120) and tensor.element_type.width in (4, 8)
+            ), "gated aux output must be 16-bit (or fp8/fp4 on SM100/SM120)"
             assert gemm.d_layout is None or gemm.d_layout.is_n_major_c()
             assert layout.is_n_major_c()
             if gemm.arch == 90:
@@ -828,7 +980,8 @@ class TileStore(EpiOp):
         # epi_tile may contain Layout entries (from SM100's compute_epilogue_tile_shape
         # fixup path), so extract the int shape first.
         return EpiSmemBytes(
-            d_stage=cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
+            # multiply before dividing: sub-byte dtypes (fp4) would floor to 0
+            d_stage=cute.size(cute.shape(epi_tile)) * arg_tensor.element_type.width // 8
         )
 
     def smem_struct_field(self, gemm, params):
@@ -866,9 +1019,11 @@ class TileStore(EpiOp):
 
     # --- Device-side store path (driven by gemm_base.epilogue) ---
 
-    def _make_copy_atom_r2s(self, gemm, params, tiled_copy_t2r):
+    def _make_copy_atom_r2s(self, gemm, params, tiled_copy_t2r, dtype_override=None):
         """Build the register-to-shared copy atom for this output."""
-        dtype = getattr(gemm, self._dtype_gemm_attr())
+        dtype = (
+            dtype_override if dtype_override is not None else getattr(gemm, self._dtype_gemm_attr())
+        )
         layout = getattr(gemm, self._layout_gemm_attr())
         if gemm.arch == 100:
             return blackwell_helpers.get_smem_store_op(
@@ -894,21 +1049,55 @@ class TileStore(EpiOp):
         copy_atom_r2s = self._make_copy_atom_r2s(gemm, params, tiled_copy_t2r)
         if self.gated and gemm.arch == 120:
             # SM120 halved postact: retile through an N-doubled permuted MMA so
-            # each warp's STSM lanes cover the halved tile contiguously.
-            copy_atom_postact_c = self._make_copy_atom_r2s(gemm, params, cutlass.Float16)
-            op = warp.MmaF16BF16Op(gemm.a_dtype, gemm.acc_dtype, gemm.mma_inst_mnk)
+            # each warp's STSM lanes cover the halved tile contiguously. The
+            # C-side atom is always the 16-bit STSM one — for narrow (fp8/fp4)
+            # quantized postact it only provides the source-layout geometry
+            # while copy_atom_r2s is the universal narrow atom, exactly like
+            # the D path's tiled_copy_C_atom (see epilog_smem_copy_atom).
+            copy_atom_postact_c = self._make_copy_atom_r2s(
+                gemm, params, cutlass.Float16, dtype_override=cutlass.Float16
+            )
+            # dummy tiled mma: only its C-side (M, N) fragment geometry is
+            # consumed, which is identical for every mma.sync inst K and
+            # operand width — so build it 16-bit even for fp8/blockscaled
+            # GEMMs (MmaF16BF16Op rejects fp8 dtypes and inst K 32)
+            dummy_dtype = gemm.a_dtype if gemm.a_dtype.width == 16 else cutlass.BFloat16
+            op = warp.MmaF16BF16Op(dummy_dtype, gemm.acc_dtype, (16, 8, 16))
             tC = cute.make_layout(gemm.atom_layout_mnk)
             atom_m, atom_n, atom_k = gemm.atom_layout_mnk
             permutation_mnk = (
                 gemm.mma_inst_mnk[0] * atom_m,
                 gemm.mma_inst_mnk[1] * atom_n * 2,
-                gemm.mma_inst_mnk[2] * atom_k,
+                16 * atom_k,
             )
             tiled_mma_gated_postact = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
             tiled_copy_c_atom = cute.make_tiled_copy_C_atom(
                 copy_atom_postact_c, tiled_mma_gated_postact
             )
             return cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_c_atom)
+        if self.gated and gemm.arch == 100:
+            # Gated aux is half of D's N, but make_tiled_copy_S inherits D's full-N
+            # tiler and over-emits 2x — harmless under (4,1) (stride-0 duplicate),
+            # corrupting under (2,2) (cta_tile_m=64 + 2-CTA). Retile from aux's own
+            # tile: one thread per (M row, N warp) = the tmem_load ownership of regs.
+            cta_tile_aux_m = gemm.cta_tile_shape_mnk[0]
+            _, num_n_warps, _ = gemm.epi_smem_warp_shape_mnk()
+            assert cta_tile_aux_m * num_n_warps == gemm.num_epi_warps * cute.arch.WARP_SIZE, (
+                f"gated aux store on SM100 needs one M row per epilogue thread, but "
+                f"cta_tile_m={cta_tile_aux_m} x num_n_warps={num_n_warps} != "
+                f"{gemm.num_epi_warps * cute.arch.WARP_SIZE} threads. tile_m=64 without 2-CTA "
+                f"gives 16 tmem datapaths per warp and is already wrong there without this "
+                f"branch too (pre-existing, unfixed). Use tile_m=128 or 256."
+            )
+            # Index [1] first: on SM100 both epi-tile modes are Layouts, not ints.
+            epi_tile_aux_n = cute.size(getattr(params, self._epi_tile_key())[1])
+            assert epi_tile_aux_n % num_n_warps == 0, (
+                f"gated aux epi tile N={epi_tile_aux_n} must split evenly across "
+                f"{num_n_warps} N warps"
+            )
+            thr_layout = cute.make_layout((cta_tile_aux_m, num_n_warps), stride=(1, cta_tile_aux_m))
+            val_layout = cute.make_layout((1, epi_tile_aux_n // num_n_warps))
+            return cute.make_tiled_copy_tv(copy_atom_r2s, thr_layout, val_layout)
         return cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_r2s)
 
     def store_setup(
@@ -923,10 +1112,11 @@ class TileStore(EpiOp):
         tidx,
         tile_shape_mn=None,
     ):
-        """Per-tile setup. Returns the driver's store context quadruple
+        """Per-tile setup. Returns the tail of the driver's store context
         ``(tiled_copy_r2s, tRS_sAux, copy_fn, store_pred)`` where store_pred
-        is None (always store) or a per-tile Boolean. ``tile_shape_mn`` is the
-        epilogue's frame (None: the CTA tile)."""
+        is None (always store) or a per-tile Boolean (the mixin prepends the
+        op itself and its quantize codec — see gemm_base.epilogue).
+        ``tile_shape_mn`` is the epilogue's frame (None: the CTA tile)."""
         tiled_copy_aux_r2s = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         tRS_sAux = tiled_copy_aux_r2s.get_slice(tidx).partition_D(smem_tensor)
         batch_idx = tile_coord_mnkl[3]
@@ -953,27 +1143,81 @@ class TileStore(EpiOp):
         dtype (per-op rounding), plus the gated STSM register permute."""
         dtype = getattr(gemm, self._dtype_gemm_attr())
         rounding = self.rounding if self.rounding is not None else gemm.rounding_mode
+        if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width < 16):
+            # The store TV follows the 16-bit STSM C-atom contract (see
+            # _make_tiled_copy_r2s); narrow (fp8/fp4) quantized postact
+            # applies the same register permute at fp32 granularity
+            # BEFORE the convert (after quantize — placement only).
+            layout_utils.permute_gated_Cregs_f32(tRS_rAuxOut)
         if const_expr(
             rounding == RoundingMode.RS
             and tRS_rAuxOut.element_type == cutlass.Float32
-            and dtype in (cutlass.BFloat16, cutlass.Float16)
+            and dtype in SR_STORE_DTYPES
         ):
-            from cutlass.cute.tensor import TensorSSA
-
             seed = epilogue_aux_out_sr_seed(sr_seed, tile_coord_mnkl, num_prev_subtiles + epi_idx)
-            tRS_rAuxOut_out = cute.make_rmem_tensor_like(tRS_rAuxOut, dtype)
-            src_vec = tRS_rAuxOut.load()
-            if const_expr(dtype == cutlass.BFloat16):
-                raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
-            else:
-                raw_vec = convert_f32_to_f16_sr(src_vec, seed, tidx)
-            tRS_rAuxOut_out.store(TensorSSA(raw_vec, src_vec.shape, dtype))
+            tRS_rAuxOut_out = convert_f32_frag_sr(tRS_rAuxOut, dtype, seed, tidx)
         else:
             tRS_rAuxOut_out = tRS_rAuxOut.to(dtype)
-        if const_expr(self.gated and gemm.arch in (90, 120)):
-            # Only needed where the store uses STSM
+        if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width == 16):
+            # The STSM store contract's register permute (16-bit prmt form).
             layout_utils.permute_gated_Cregs_b16(tRS_rAuxOut_out)
         return tRS_rAuxOut_out
+
+    @cute.jit
+    def store_r2s(self, gemm, tiled_copy, frag_out, tRS_s_stage, tidx):
+        """Copy one converted subtile from registers to this op's smem stage."""
+        # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
+        cute.copy(tiled_copy, tiled_copy.retile(frag_out).contiguous(), tRS_s_stage)
+
+
+class DStore(EpiOp):
+    """The main D output's device store path, as a store op.
+
+    D's host plumbing stays kernel-owned — the TMA atom, the staged smem
+    layout, and the ``sD`` struct field feed tile/stage sizing, split-K's
+    workspace re-pointing, and ``add_to_output`` — so unlike TileStore this op
+    has no host hooks and does not live in ``_epi_ops``. The driver
+    (gemm_base.epilogue) assembles its store context directly from the
+    kernel-built pieces (tiled_copy_r2s, tRS_sD, copy_D); this op owns the
+    convert (kernel-global rounding, D's stochastic-rounding seed) and the
+    register-to-smem copy (including SM90's fp32 pair-XOR STS.32 path), so
+    every stored output — D included — flows through the same
+    store_convert / store_r2s hooks and the same quantize seam.
+    """
+
+    def __init__(self):
+        super().__init__("D")
+
+    @cute.jit
+    def store_convert(
+        self, gemm, tRS_rD, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        """Convert one subtile of tRS_rD from acc_dtype to d_dtype."""
+        dtype = gemm.d_dtype
+        if const_expr(
+            gemm.rounding_mode == RoundingMode.RS
+            and tRS_rD.element_type == cutlass.Float32
+            and dtype in SR_STORE_DTYPES
+        ):
+            seed = epilogue_sr_seed(sr_seed, tile_coord_mnkl, num_prev_subtiles + epi_idx)
+            tRS_rD_out = convert_f32_frag_sr(tRS_rD, dtype, seed, tidx)
+        elif const_expr(tRS_rD.element_type != dtype):
+            tRS_rD_out = tRS_rD.to(dtype)
+        else:
+            tRS_rD_out = tRS_rD
+        return tRS_rD_out
+
+    @cute.jit
+    def store_r2s(self, gemm, tiled_copy, frag_out, tRS_s_stage, tidx):
+        if const_expr(gemm.epi_r2s_pair_xor()):
+            # fp32 n-major D whose smem swizzle 2-way-conflicts vectorized
+            # STS.64: pair-exchanged STS.32 (frag_out is the unconverted f32
+            # fragment — pair_xor implies d_dtype == acc_dtype).
+            copy_utils.cvt_copy_pair_xor_sts32(frag_out, tRS_s_stage, tidx)
+        else:
+            # frag_out is tRS_rD (already retiled by the kernel) or its
+            # converted same-layout copy: no retile needed.
+            cute.copy(tiled_copy, frag_out, tRS_s_stage)
 
 
 class _TileLoadState(NamedTuple):
@@ -1000,6 +1244,8 @@ class TileLoad(EpiOp):
     descriptor and smem buffer, and the pipeline transaction count includes C plus
     all enabled TileLoad buffers. Supported on SM90, SM100, and SM120.
     """
+
+    fn_port = "tile"
 
     def __init__(self, name, epi_tile_fn=None):
         super().__init__(name)
@@ -1072,7 +1318,8 @@ class TileLoad(EpiOp):
         # epi_tile may contain Layout entries from SM100's compute_epilogue_tile_shape
         # fixup; extract the int shape first.
         return EpiSmemBytes(
-            c_stage=cute.size(cute.shape(epi_tile)) * (arg_tensor.element_type.width // 8)
+            # multiply before dividing: sub-byte dtypes (fp4) would floor to 0
+            c_stage=cute.size(cute.shape(epi_tile)) * arg_tensor.element_type.width // 8
         )
 
     def smem_struct_field(self, gemm, params):
@@ -1149,6 +1396,13 @@ class TileLoad(EpiOp):
 
 
 @cute.jit
+def _vec_reduce_combine(a, b, combine):
+    if const_expr(combine == "add"):
+        return a + b
+    return cute.arch.fmax(a, b, abs=combine == "max_abs")
+
+
+@cute.jit
 def colvec_reduce_accumulate(
     gemm, tDrReduce, tRS_rInput, transform_fn=None, rScale=None, combine="add"
 ):
@@ -1157,14 +1411,15 @@ def colvec_reduce_accumulate(
     If transform_fn is provided, accumulates transform_fn(input[i]).
     If rScale is provided, accumulates input[i] * rScale[i] (uses packed mul/fma for SM100).
     If neither, accumulates input directly (identity).
-    ``combine="max"`` folds with fmax instead of add (plain input only): the
-    aliased-lane assignment is order-free, so one scalar loop serves all archs.
+    ``combine="max"`` folds with fmax and ``"max_abs"`` with max.abs instead
+    of add (plain input only): the aliased-lane assignment is order-free, so
+    one scalar loop serves all archs.
     """
-    if const_expr(combine == "max"):
-        assert transform_fn is None and rScale is None, "max combine takes the input directly"
+    if const_expr(combine != "add"):
+        assert transform_fn is None and rScale is None, "max combines take the input directly"
         if const_expr(tDrReduce is not None):
             for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
-                tDrReduce[i] = cute.arch.fmax(tDrReduce[i], tRS_rInput[i])
+                tDrReduce[i] = _vec_reduce_combine(tDrReduce[i], tRS_rInput[i], combine)
         return
     if const_expr(tDrReduce is not None):
         if const_expr(transform_fn is None):
@@ -1205,13 +1460,14 @@ def rowvec_reduce_accumulate(
 
     Reduces along M dimension, keeping N. The zero-stride layout on M ensures
     elements at different M positions but same N column accumulate correctly.
-    ``combine="max"`` folds with fmax instead of add (plain input only).
+    ``combine="max"`` folds with fmax and ``"max_abs"`` with max.abs instead
+    of add (plain input only).
     """
-    if const_expr(combine == "max"):
-        assert transform_fn is None and rScale is None, "max combine takes the input directly"
+    if const_expr(combine != "add"):
+        assert transform_fn is None and rScale is None, "max combines take the input directly"
         if const_expr(tDrReduce is not None):
             for i in cutlass.range(cute.size(tDrReduce), unroll_full=True):
-                tDrReduce[i] = cute.arch.fmax(tDrReduce[i], tRS_rInput[i])
+                tDrReduce[i] = _vec_reduce_combine(tDrReduce[i], tRS_rInput[i], combine)
         return
     if const_expr(tDrReduce is not None):
         if const_expr(transform_fn is None):
@@ -1246,11 +1502,15 @@ def rowvec_reduce_accumulate(
 class VecReduce(EpiOp):
     """Base class for row/column vector reductions.
 
-    ``combine`` selects the reduction: "add" (default) or "max". Note on
-    ragged last tiles: out-of-bounds accumulator elements are zero (predicated
-    B loads), which is the identity for add but NOT for max — max reductions
-    on non-divisible N should reduce a non-negative quantity (e.g. |x|, the
-    amax case) or pad N.
+    ``combine`` selects the reduction: "add" (default), "max", or "max_abs".
+    max_abs folds raw inputs with PTX max.abs and clears its XOR-derived sign
+    only at the final store. Out-of-bounds accumulator elements are zero
+    (predicated loads), the identity for add and max_abs. They are NOT the
+    identity for max, so max reduces mask OOB elements to -inf via a
+    per-element coordinate select (``check_oob``, on by default; the select
+    is an ALU op, see OnlineLSEReduce for the measured cost). Pass
+    ``check_oob=False`` to compile it out when the reduce dim is known
+    tile-divisible; the frontend host rejects ragged shapes then.
     """
 
     dim = 0  # 0 for colvec output along M, 1 for rowvec output along N
@@ -1260,12 +1520,18 @@ class VecReduce(EpiOp):
     # merge: 1 for plain reduces, 2 for coupled accumulators (OnlineLSE).
     reduce_planes = 1
 
-    def __init__(self, name, combine="add", scaled=False):
+    def __init__(self, name, combine="add", scaled=False, check_oob=None):
         super().__init__(name)
-        if combine not in ("add", "max"):
+        if combine not in ("add", "max", "max_abs"):
             raise ValueError(f"unsupported combine {combine!r}")
         if scaled and combine != "add":
             raise ValueError("scaled reduces only support combine='add'")
+        if check_oob is not None and combine != "max":
+            raise ValueError("check_oob applies only to combine='max'")
+        # add/max_abs OOB zeros ARE the fold identity: normalized to True so
+        # the frontend's ragged-shape reject never trips (no mask is emitted
+        # — codegen gates on combine == "max").
+        self.check_oob = check_oob if check_oob is not None else True
         self.combine = combine
         # scaled=True: the fn returns the two FACTORS ``(val, scale)`` under
         # this op's name and the fold is one fused ``fma(val, scale, acc)`` —
@@ -1276,7 +1542,27 @@ class VecReduce(EpiOp):
         self.scaled = scaled
 
     def config_key(self):
-        return (self.combine, self.scaled)
+        return (self.combine, self.scaled, self.check_oob)
+
+    def sink_alloc_shape(self, lead, n, tile_m, tile_n, num_seqs=None):
+        """Buffer shape for a (lead=(batch?, m) or (total_m,), n) problem at
+        (tile_m, tile_n): per-CTA-tile partials along the reduce dim. THE
+        single statement of the sink tiling rule — validation (EpiMod.gemm),
+        eager allocation (_alloc_sinks), the torch-op fakes, and the autotune
+        worst-case/slicing all call this. ``tile_m`` is the PER-CTA M tile
+        (``cta_tile_shape_m``: half the config tile under the SM100 2-CTA
+        MMA) — the kernel indexes partial slots by the per-CTA tile coord.
+
+        ``num_seqs`` (varlen_m only, dim==1): partial rows are per-sequence
+        tile-prefix slots — sum(ceil(len_b / tile_m)) is bounded by
+        total_m // tile_m + num_seqs (the host can't see device seqlens);
+        rows past the live prefix are never read by the cu_tiles-segment
+        finalize (host_finalize_varlen)."""
+        if self.dim == 0:
+            return (*lead, -(-n // tile_n))
+        if num_seqs is not None:
+            return (lead[-1] // tile_m + num_seqs, n)
+        return (*lead[:-1], -(-lead[-1] // tile_m), n)
 
     def host_finalize(self, partials):
         """Fold the per-tile partial buffer into the user-visible reduce value
@@ -1287,16 +1573,37 @@ class VecReduce(EpiOp):
         axis = -1 if self.dim == 0 else -2
         return partials.sum(dim=axis) if self.combine == "add" else partials.amax(dim=axis)
 
+    def _mask_oob_active(self):
+        return self.combine == "max" and self.check_oob
+
+    @cute.jit
+    def _mask_oob(self, frag, coords, limit, tile_shape_mn):
+        """Mask elements past the ragged reduce-dim boundary to the max fold
+        identity (-inf), in place — the frag is this sink's scratch (one
+        flush per fragment). Rebased compare, same idiom as
+        OnlineLSEReduce._fold: the static per-element offset (an ISETP
+        immediate) compares against limit - base, deleting the per-element
+        coordinate materialization."""
+        rd = self._reduce_dim()
+        proj_stride = (1, 0) if rd == 0 else (0, 1)
+        lay_r = cute.composition(cute.make_layout(tile_shape_mn, stride=proj_stride), coords.layout)
+        limit_rel = limit - coords[0][rd]
+        for i in cutlass.range(cute.size(frag), unroll_full=True):
+            off_r = cute.crd2idx(i, lay_r)
+            frag[i] = frag[i] if off_r < limit_rel else -math.inf
+
     @cute.jit
     def fn_sink_flush(self, gemm, state, frag, scale=None):
+        if const_expr(self._mask_oob_active()):
+            acc, coords, limit = state
+            self._mask_oob(frag, coords, limit, gemm.cta_tile_shape_mnk[:2])
+            state = acc
         if const_expr(self.dim == 0):
             colvec_reduce_accumulate(gemm, state, frag, rScale=scale, combine=self.combine)
         else:
             rowvec_reduce_accumulate(gemm, state, frag, rScale=scale, combine=self.combine)
 
     def host_fake_arg(self, key, fctx):
-        from quack.compile_utils import make_fake_tensor
-
         dtype, ndim = key
         # Reduce outputs are partial per CTA tile along the reduced dim:
         # ColVecReduce (l, m, n_tiles), RowVecReduce (l, m_tiles, n); rank 2
@@ -1364,14 +1671,34 @@ class VecReduce(EpiOp):
             cute.make_rmem_tensor(vec_mma_layout, Float32)
         ).layout
         tDrReduce = cute.make_rmem_tensor(tDrReduce_layout, Float32)
-        return (tDrReduce, smem_tensor)
+        state = (tDrReduce, smem_tensor)
+        if const_expr(self._mask_oob_active()):
+            # OOB accumulator zeros are not a max identity: the fold masks on
+            # the per-element reduce-dim coordinate against the ragged tile
+            # boundary. Same partitioning as the accumulators, so linear
+            # indices line up in fn_sink_flush.
+            tDcD = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+            )
+            if const_expr(self._reduce_dim() == 1):
+                limit = ctx.varlen_manager.len_n() - ctx.tile_coord_mnkl[1] * ctx.tile_N
+            else:
+                limit = (
+                    ctx.varlen_manager.len_m(ctx.tile_coord_mnkl[3])
+                    - ctx.tile_coord_mnkl[0] * ctx.tile_M
+                )
+            state = (tDrReduce, smem_tensor, tDcD, limit)
+        return state
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
         tDrReduce = state[0]
         result = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
         if const_expr(epi_coord[self._reduce_dim()] == 0):
-            cute.filter_zeros(result).fill(0.0 if const_expr(self.combine == "add") else -math.inf)
+            cute.filter_zeros(result).fill(-math.inf if const_expr(self.combine == "max") else 0.0)
+        if const_expr(self._mask_oob_active()):
+            c_cur = state[2][None, None, None, epi_coord[0], epi_coord[1]]
+            return (result, c_cur, state[3])
         return result
 
 
@@ -1405,16 +1732,17 @@ class ColVecReduce(VecReduce):
     @cute.jit
     def _merge(self, vals, others):
         """Combine two value tuples (same-row partials from different lanes/warps)."""
-        red_op = operator.add if const_expr(self.combine == "add") else cute.arch.fmax
-        return (red_op(vals[0], others[0]),)
+        return (_vec_reduce_combine(vals[0], others[0], self.combine),)
 
     @cute.jit
     def _finalize(self, vals):
         """Value tuple -> the scalar written to gmem."""
-        return vals[0]
+        # Two-input max.xorsign.abs preserves the maximum magnitude but XORs
+        # operand signs, so clear that arbitrary sign once after the full fold.
+        return cute.math.abs(vals[0]) if const_expr(self.combine == "max_abs") else vals[0]
 
     @cute.jit
-    def end_loop(
+    def end_loop_stage(
         self,
         gemm,
         param,
@@ -1423,12 +1751,13 @@ class ColVecReduce(VecReduce):
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
         tidx,
         tile_shape_mn: cutlass.Constexpr = None,
     ):
-        """Flush the current M stripe when the last N subtile has accumulated."""
+        """Stage the current M stripe (intra-warp reduce + smem write) when
+        its last N subtile has accumulated; merge/gmem-write run in
+        end_loop_finish after the driver's shared barrier."""
+        staged = None
         frame_mn = const_expr(
             tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
         )
@@ -1442,20 +1771,6 @@ class ColVecReduce(VecReduce):
                 tiled_copy, reference_src, tidx
             )
             num_vals = const_expr(len(vals_cur))
-
-            # Intra-warp butterfly across N lanes, tuple-valued.
-            if const_expr(lanes_in_N > 1):
-                flts = tuple(cute.filter_zeros(v) for v in vals_cur)
-                for i in cutlass.range(cute.size(flts[0]), unroll_full=True):
-                    off = lanes_in_N // 2
-                    while off > 0:
-                        others = tuple(cute.arch.shuffle_sync_bfly(f[i], offset=off) for f in flts)
-                        merged = self._merge(tuple(f[i] for f in flts), others)
-                        # range_constexpr: k indexes Python TUPLES, which
-                        # need trace-time ints (staged range vars can't).
-                        for k in cutlass.range_constexpr(num_vals):
-                            flts[k][i] = merged[k]
-                        off = off // 2
 
             partition_for_epilogue_fn = partial(
                 partition_for_epilogue,
@@ -1473,15 +1788,108 @@ class ColVecReduce(VecReduce):
             )
             tDcD_m = layout_utils.convert_layout_zero_stride(tDcD_cur, ref_layout)[None, 0]
 
-            # Inter-warp exchange through smem (rows are absolute CTA-tile
-            # rows, so stripes write disjoint slots; one barrier suffices).
-            if const_expr(warps_in_N > 1):
-                if warp_n_idx > 0 and is_lane_n_leader:
-                    for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
-                        row_idx = tDcD_m[m][0]
+            # Intra-warp reduction across N lanes, tuple-valued. Swap shuffle
+            # when the geometry allows: ~E shuffles+merges instead of the
+            # butterfly's E*log2(lanes), and results end DISTRIBUTED (N-lane
+            # g owns slice g of this thread-group's rows) so the smem/gmem
+            # stores below spread across lanes instead of leader-serializing.
+            E = const_expr(cute.size(tDcD_m, mode=[0]))
+            num_slices = const_expr(min(lanes_in_N, E))
+            use_swap_shuffle = const_expr(
+                lanes_in_N > 1
+                and E % num_slices == 0
+                and num_slices == 1 << int(math.log2(num_slices))
+            )
+            slice_elems = const_expr(E // num_slices if use_swap_shuffle else E)
+            lane_g = cute.arch.lane_idx() % lanes_in_N
+            if const_expr(use_swap_shuffle):
+                swap_shuffle_reduce(
+                    vals_m,
+                    self._merge,
+                    num_lanes=lanes_in_N,
+                    lane_stride=1,
+                    slice_elems=slice_elems,
+                )
+            elif const_expr(lanes_in_N > 1):
+                flts = tuple(cute.filter_zeros(v) for v in vals_cur)
+                for i in cutlass.range(cute.size(flts[0]), unroll_full=True):
+                    off = lanes_in_N // 2
+                    while off > 0:
+                        others = tuple(cute.arch.shuffle_sync_bfly(f[i], offset=off) for f in flts)
+                        merged = self._merge(tuple(f[i] for f in flts), others)
+                        # range_constexpr: k indexes Python TUPLES, which
+                        # need trace-time ints (staged range vars can't).
                         for k in cutlass.range_constexpr(num_vals):
-                            sExch[row_idx, warp_n_idx - 1, k] = vals_m[k][m]
-                gemm.epilogue_barrier.arrive_and_wait()
+                            flts[k][i] = merged[k]
+                        off = off // 2
+
+            # Stage the partials for the inter-warp merge (rows are absolute
+            # CTA-tile rows, so stripes write disjoint slots). The driver's
+            # SHARED barrier — one per epi_coord across ALL reduce ops —
+            # orders these writes before end_loop_finish.
+            if const_expr(warps_in_N > 1):
+                if const_expr(use_swap_shuffle):
+                    if warp_n_idx > 0 and lane_g < num_slices:
+                        for j in cutlass.range_constexpr(slice_elems):
+                            row_idx = tDcD_m[lane_g * slice_elems + j][0]
+                            for k in cutlass.range_constexpr(num_vals):
+                                sExch[row_idx, warp_n_idx - 1, k] = vals_m[k][j]
+                else:
+                    if warp_n_idx > 0 and is_lane_n_leader:
+                        for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
+                            row_idx = tDcD_m[m][0]
+                            for k in cutlass.range_constexpr(num_vals):
+                                sExch[row_idx, warp_n_idx - 1, k] = vals_m[k][m]
+            staged = (
+                warps_in_N > 1,
+                (
+                    vals_m,
+                    tDcD_m,
+                    sExch,
+                    warps_in_N,
+                    warp_n_idx,
+                    is_lane_n_leader,
+                    use_swap_shuffle,
+                    num_slices,
+                    slice_elems,
+                    lane_g,
+                ),
+            )
+        return staged
+
+    @cute.jit
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
+        """Inter-warp merge from smem + gmem write for a stripe staged by
+        end_loop_stage (runs after the driver's shared barrier). Under swap
+        shuffle each lane merges/writes only its OWNED slice."""
+        vals_m, tDcD_m, sExch = staged[0], staged[1], staged[2]
+        warps_in_N, warp_n_idx, is_lane_n_leader = staged[3], staged[4], staged[5]
+        use_swap_shuffle, num_slices, slice_elems, lane_g = (
+            staged[6],
+            staged[7],
+            staged[8],
+            staged[9],
+        )
+        num_vals = const_expr(len(vals_m))
+        if const_expr(warps_in_N > 1):
+            if const_expr(use_swap_shuffle):
+                if warp_n_idx == 0 and lane_g < num_slices:
+                    for j in cutlass.range_constexpr(slice_elems):
+                        row_idx = tDcD_m[lane_g * slice_elems + j][0]
+                        for warp_n in cutlass.range_constexpr(1, warps_in_N):
+                            others = tuple(sExch[row_idx, warp_n - 1, k] for k in range(num_vals))
+                            merged = self._merge(tuple(v[j] for v in vals_m), others)
+                            for k in cutlass.range_constexpr(num_vals):
+                                vals_m[k][j] = merged[k]
+            else:
                 if warp_n_idx == 0 and is_lane_n_leader:
                     for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
                         row_idx = tDcD_m[m][0]
@@ -1491,18 +1899,29 @@ class ColVecReduce(VecReduce):
                             for k in cutlass.range_constexpr(num_vals):
                                 vals_m[k][m] = merged[k]
 
-            # Write to gmem
-            batch_idx = tile_coord_mnkl[3]
-            limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
-            limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
-            if const_expr(not varlen_manager.varlen_m):
-                mColVec = param[batch_idx, None, tile_coord_mnkl[1]]
-            else:
-                mColVec = cute.domain_offset(
-                    (varlen_manager.params.cu_seqlens_m[batch_idx],),
-                    param[None, tile_coord_mnkl[1]],
-                )
-            gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
+        # Write to gmem (limits in the epilogue frame: the slab stripe under epi_reduce)
+        tile_M = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )[0]
+        batch_idx = tile_coord_mnkl[3]
+        limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
+        limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
+        if const_expr(not varlen_manager.varlen_m):
+            mColVec = param[batch_idx, None, tile_coord_mnkl[1]]
+        else:
+            mColVec = cute.domain_offset(
+                (varlen_manager.params.cu_seqlens_m[batch_idx],),
+                param[None, tile_coord_mnkl[1]],
+            )
+        gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
+        if const_expr(use_swap_shuffle):
+            in_warp0 = True if const_expr(warps_in_N == 1) else warp_n_idx == 0
+            if tile_coord_mnkl[1] < limit_n_tiles and in_warp0 and lane_g < num_slices:
+                for j in cutlass.range_constexpr(slice_elems):
+                    row_idx = tDcD_m[lane_g * slice_elems + j][0]
+                    if row_idx < limit_m:
+                        gColVec[row_idx] = self._finalize(tuple(v[j] for v in vals_m))
+        else:
             should_write_gmem = (
                 is_lane_n_leader
                 if const_expr(warps_in_N == 1)
@@ -1520,14 +1939,35 @@ class RowVecReduce(VecReduce):
     then reduces across M lanes/warps and writes to gmem per completed N stripe.
 
     Output shape is (L, ceildiv(M, tile_M), N): one partial sum per CTA-M tile per
-    N column. This mirrors ColVecReduce with M/N swapped.
+    N column. This mirrors ColVecReduce with M/N swapped. Under varlen_m the
+    partial rows are per-sequence tile-prefix slots (see sink_alloc_shape's
+    num_seqs form and host_finalize_varlen).
     """
 
     dim = 1
     epi_m_major_preference = 4
 
+    def host_finalize_varlen(self, partials, cu_seqlens_m, tile_m_cta):
+        """Per-sequence fold of a varlen partial buffer into (num_seqs, n).
+
+        Rows are grouped by the cu_tiles_m prefix (sequence b owns rows
+        [cu_tiles[b], cu_tiles[b+1])); rows past the prefix total (the buffer
+        is an upper bound) are never read. Device-only ops, graph-safe.
+        Non-add combines are rejected under varlen at plan time (zero-filled
+        OOB rows are not a max identity, and a segment-max is not graph-safe),
+        so only the add fold appears here.
+        """
+        import torch
+
+        assert self.combine == "add"
+        seqlens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
+        tiles = torch.div(seqlens + (tile_m_cta - 1), tile_m_cta, rounding_mode="floor").long()
+        cu_tiles = torch.cat([tiles.new_zeros(1), tiles.cumsum(0)])
+        csum = torch.cat([partials.new_zeros((1, partials.shape[-1])), partials.cumsum(0)])
+        return csum[cu_tiles[1:]] - csum[cu_tiles[:-1]]
+
     @cute.jit
-    def end_loop(
+    def end_loop_stage(
         self,
         gemm,
         param,
@@ -1536,12 +1976,13 @@ class RowVecReduce(VecReduce):
         epi_tile,
         tiled_copy_t2r,
         tiled_copy_r2s,
-        tile_coord_mnkl,
-        varlen_manager,
         tidx,
         tile_shape_mn: cutlass.Constexpr = None,
     ):
-        """Flush the current N stripe when the last M subtile has accumulated."""
+        """Stage the current N stripe (intra-warp reduce + smem write) when
+        its last M subtile has accumulated; merge/gmem-write run in
+        end_loop_finish after the driver's shared barrier."""
+        staged = None
         frame_mn = const_expr(
             tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
         )
@@ -1566,24 +2007,9 @@ class RowVecReduce(VecReduce):
                     "RowVecReduce assumes contiguous N lanes when lanes_in_N > 1"
                 )
 
-            # Intra-warp shuffle reduction across M lanes. M lanes may be either contiguous
-            # (SM100 N-major output) or strided by N lanes (SM100 M-major output).
-            red_op = operator.add if const_expr(self.combine == "add") else cute.arch.fmax
             tDrReduce_n = layout_utils.convert_layout_zero_stride(
                 tDrReduce_cur, tDrReduce_cur.layout
             )[None, 0]
-            if const_expr(lanes_in_M > 1):
-                for n in cutlass.range(cute.size(tDrReduce_n), unroll_full=True):
-                    reduction_rows = lanes_in_M // 2
-                    while reduction_rows > 0:
-                        tDrReduce_n[n] = red_op(
-                            tDrReduce_n[n],
-                            cute.arch.shuffle_sync_bfly(
-                                tDrReduce_n[n],
-                                offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
-                            ),
-                        )
-                        reduction_rows = reduction_rows // 2
 
             warp_M = warp_layout_MN[0]
             warps_in_M = const_expr(cute.size(warp_M))
@@ -1601,35 +2027,162 @@ class RowVecReduce(VecReduce):
                 None, 0
             ]
 
-            # Inter-warp reduction through smem
+            # Intra-warp reduction across M lanes (contiguous on SM100
+            # N-major output, strided by N lanes otherwise). Swap shuffle
+            # when the M lanes form a flat pow2-strided run and the slice
+            # count is pow2: ~E shuffles+merges instead of E*log2(lanes),
+            # results DISTRIBUTED (M-lane g owns col slice g) so the smem/
+            # gmem stores below spread across lanes.
+            E = const_expr(cute.size(tDcD_n, mode=[0]))
+            s_m_flat = _mode_flat_stride(lane_layout_MN, 0)
+            s_m = const_expr(s_m_flat if s_m_flat is not None else 1)
+            num_slices = const_expr(min(lanes_in_M, E))
+            use_swap_shuffle = const_expr(
+                lanes_in_M > 1
+                and s_m_flat is not None
+                and s_m == 1 << int(math.log2(s_m))
+                and E % num_slices == 0
+                and num_slices == 1 << int(math.log2(num_slices))
+            )
+            slice_elems = const_expr(E // num_slices if use_swap_shuffle else E)
+            lane_g = (cute.arch.lane_idx() // s_m) % lanes_in_M
+            if const_expr(use_swap_shuffle):
+                swap_shuffle_reduce(
+                    (tDrReduce_n,),
+                    lambda vals, others: (_vec_reduce_combine(vals[0], others[0], self.combine),),
+                    num_lanes=lanes_in_M,
+                    lane_stride=s_m,
+                    slice_elems=slice_elems,
+                )
+            elif const_expr(lanes_in_M > 1):
+                for n in cutlass.range(cute.size(tDrReduce_n), unroll_full=True):
+                    reduction_rows = lanes_in_M // 2
+                    while reduction_rows > 0:
+                        tDrReduce_n[n] = _vec_reduce_combine(
+                            tDrReduce_n[n],
+                            cute.arch.shuffle_sync_bfly(
+                                tDrReduce_n[n],
+                                offset=cute.crd2idx((reduction_rows, 0), lane_layout_MN),
+                            ),
+                            self.combine,
+                        )
+                        reduction_rows = reduction_rows // 2
+
+            # Stage the partials for the inter-warp merge (cols are absolute
+            # CTA-tile cols, so stripes write disjoint slots). The driver's
+            # SHARED barrier — one per epi_coord across ALL reduce ops —
+            # orders these writes before end_loop_finish.
             warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE)
             warp_m_idx = warp_layout_MN.get_hier_coord(warp_idx)[0]
             if const_expr(warps_in_M > 1):
-                if warp_m_idx > 0 and is_lane_m_leader:
-                    for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
-                        col_idx = tDcD_n[n][1]
-                        sDrReduce[col_idx, warp_m_idx - 1, 0] = tDrReduce_n[n]
-                gemm.epilogue_barrier.arrive_and_wait()
+                if const_expr(use_swap_shuffle):
+                    if warp_m_idx > 0 and lane_g < num_slices:
+                        for j in cutlass.range_constexpr(slice_elems):
+                            col_idx = tDcD_n[lane_g * slice_elems + j][1]
+                            sDrReduce[col_idx, warp_m_idx - 1, 0] = tDrReduce_n[j]
+                else:
+                    if warp_m_idx > 0 and is_lane_m_leader:
+                        for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
+                            col_idx = tDcD_n[n][1]
+                            sDrReduce[col_idx, warp_m_idx - 1, 0] = tDrReduce_n[n]
+            staged = (
+                warps_in_M > 1,
+                (
+                    tDrReduce_n,
+                    tDcD_n,
+                    sDrReduce,
+                    warps_in_M,
+                    warp_m_idx,
+                    is_lane_m_leader,
+                    use_swap_shuffle,
+                    num_slices,
+                    slice_elems,
+                    lane_g,
+                ),
+            )
+        return staged
+
+    @cute.jit
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
+        """Inter-warp merge from smem + gmem write for a stripe staged by
+        end_loop_stage (runs after the driver's shared barrier)."""
+        tDrReduce_n, tDcD_n, sDrReduce = staged[0], staged[1], staged[2]
+        warps_in_M, warp_m_idx, is_lane_m_leader = staged[3], staged[4], staged[5]
+        use_swap_shuffle, num_slices, slice_elems, lane_g = (
+            staged[6],
+            staged[7],
+            staged[8],
+            staged[9],
+        )
+        if const_expr(warps_in_M > 1):
+            if const_expr(use_swap_shuffle):
+                if warp_m_idx == 0 and lane_g < num_slices:
+                    for j in cutlass.range_constexpr(slice_elems):
+                        col_idx = tDcD_n[lane_g * slice_elems + j][1]
+                        for warp_m in cutlass.range_constexpr(1, warps_in_M):
+                            tDrReduce_n[j] = _vec_reduce_combine(
+                                tDrReduce_n[j],
+                                sDrReduce[col_idx, warp_m - 1, 0],
+                                self.combine,
+                            )
+            else:
                 if warp_m_idx == 0 and is_lane_m_leader:
                     for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
                         col_idx = tDcD_n[n][1]
                         for warp_m in cutlass.range_constexpr(1, warps_in_M):
-                            tDrReduce_n[n] = red_op(
-                                tDrReduce_n[n], sDrReduce[col_idx, warp_m - 1, 0]
+                            tDrReduce_n[n] = _vec_reduce_combine(
+                                tDrReduce_n[n],
+                                sDrReduce[col_idx, warp_m - 1, 0],
+                                self.combine,
                             )
 
-            # Write to gmem
-            batch_idx = tile_coord_mnkl[3]
-            limit_m_tiles = param.shape[1] if not varlen_manager.varlen_m else param.shape[0]
-            if const_expr(not varlen_manager.varlen_m):
-                mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
-            else:
-                mRowVec = param[tile_coord_mnkl[0], None]
-            gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
-            limit_n = min(
-                cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
-                tile_N,
+        # Write to gmem (limits in the epilogue frame: the slab stripe under epi_reduce)
+        tile_N = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )[1]
+        batch_idx = tile_coord_mnkl[3]
+        if const_expr(not varlen_manager.varlen_m):
+            limit_m_tiles = param.shape[1]
+            mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
+        else:
+            # The scheduler's m-tile index is sequence-local: offset by the
+            # per-sequence tile prefix (cu_tiles_m) so sequences' partial rows
+            # stay disjoint, and bound by this sequence's own tile count. The
+            # host sizes the buffer as total_m // tile_M_cta + num_seqs (upper
+            # bound on the prefix total) and finalizes per cu_tiles_m segment.
+            assert varlen_manager.params.cu_tiles_m is not None, (
+                "varlen_m RowVecReduce requires the cu_tiles_m prefix (host passes it "
+                "whenever an M-fold sink is active)"
             )
+            limit_m_tiles = varlen_manager.len_m_tiles(batch_idx)
+            mRowVec = param[varlen_manager.tile_m_offset(batch_idx) + tile_coord_mnkl[0], None]
+        gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
+        limit_n = min(
+            cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
+            tile_N,
+        )
+        # Two-input max.xorsign.abs leaves an XOR-derived sign; clear it once
+        # after the full reduction.
+        if const_expr(use_swap_shuffle):
+            in_warp0 = True if const_expr(warps_in_M == 1) else warp_m_idx == 0
+            if tile_coord_mnkl[0] < limit_m_tiles and in_warp0 and lane_g < num_slices:
+                for j in cutlass.range_constexpr(slice_elems):
+                    col_idx = tDcD_n[lane_g * slice_elems + j][1]
+                    if col_idx < limit_n:
+                        gRowVec[col_idx] = (
+                            cute.math.abs(tDrReduce_n[j])
+                            if const_expr(self.combine == "max_abs")
+                            else tDrReduce_n[j]
+                        )
+        else:
             should_write_gmem = (
                 is_lane_m_leader
                 if const_expr(warps_in_M == 1)
@@ -1639,45 +2192,128 @@ class RowVecReduce(VecReduce):
                 for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
                     col_idx = tDcD_n[n][1]
                     if col_idx < limit_n:
-                        gRowVec[col_idx] = tDrReduce_n[n]
+                        gRowVec[col_idx] = (
+                            cute.math.abs(tDrReduce_n[n])
+                            if const_expr(self.combine == "max_abs")
+                            else tDrReduce_n[n]
+                        )
 
 
 class GroupedColStatsBase(EpiOp):
-    """Deterministic additive per-(tile row, N-group) prepass statistics.
+    """Deterministic per-(tile row, N-group) prepass statistics.
 
     Prepass-sink + main-phase value-port base: the prepass fn returns the
-    statistic input under this op's name; the fold accumulates sums per
+    statistic input under this op's name; the fold accumulates per
     (row, group of ``group_cols`` N columns) with NO float atomics and NO
-    per-subtile smem traffic. The sweep folds each thread's run sums into
-    REGISTER accumulators — the register index is static: rows from the
-    (compile-time) epi_m coordinate, groups by their thread-relative visit
-    ORDINAL, which is compile-time per epi_n because each thread's per-subtile
-    run lies in exactly one group. At prepass end (``fn_prepass_end``) each
-    slot is butterflied across the contiguous N-lane group (fixed tree) and
-    the lane leader stores it ONCE to its (row, group, warp_n) smem plane —
-    single writer, absolute group recovered from the coordinate partition.
-    The prepass barrier orders all stores before the main pass reads;
-    ``stat_total`` sums the warp_n planes in fixed order, so the statistic is
-    bitwise run-to-run reproducible. Statistics never leave the kernel —
-    the in-kernel counterpart to VecReduce's per-tile gmem partials.
+    per-subtile smem traffic. ``combine`` (class attribute) selects the fold:
+    "add" (default, identity 0.0) or "max" (identity -inf: a TRUE max, never
+    clamped). "max" caveat: the prepass folds the raw accumulator fragment
+    with no OOB masking, so a ragged last N tile's OOB zeros (predicated
+    loads) would contaminate the max — keep the group span tile-divisible
+    (scaled_exp enforces this via its writer's host_validate).
+    The sweep folds each
+    thread's run into REGISTER accumulators — the register index is static:
+    rows from the (compile-time) epi_m coordinate, groups by their
+    thread-relative visit ORDINAL, which is compile-time per epi_n because
+    each thread's per-subtile run lies in exactly one group. At prepass end
+    (``fn_prepass_end``) each slot is butterflied across the contiguous
+    N-lane group (fixed tree) and the lane leader stores it ONCE to its
+    (row, group, warp_n) smem plane — single writer, absolute group recovered
+    from the coordinate partition. Smem uniformly holds RAW per-warp_n
+    partials. The prepass barrier orders those stores before every consumer
+    warp folds the planes in fixed order, applies ``stat_value``, and keeps
+    its finalized values in ``rStats``. No second barrier is needed because
+    the resolved values are thread-private registers. GroupedColStatsOut
+    independently folds the same raw planes once per output slot and writes
+    the finalized value directly to gmem.
+    Statistics never leave the kernel — the in-kernel counterpart to
+    VecReduce's per-tile gmem partials.
 
-    Subclasses define ``_group_cols(arg_tensor)`` (host) and ``fn_prepare``
-    (device, consuming ``stat_total``), and by convention return the stats
-    state from ``stats_begin``/``stats_slice`` as element 0 of their
-    begin/begin_loop state.
+    Default host schema: a 1-D host tensor whose length is the group width
+    (a real per-group resource like an rmsnorm weight, or a dummy that only
+    fixes the width). Stats-only subclasses just set ``combine`` and define
+    ``stat_value`` (per-row value from the finalized statistic); subclasses
+    carrying extra per-element resources override ``begin``/``begin_loop``/
+    ``fn_prepare``, keeping the stats state from ``stats_begin``/
+    ``stats_slice`` as element 0 of their state (``fn_sink_flush`` reads it
+    there).
     """
 
     fn_port = "value"
+    combine = "add"  # class attribute; "max" folds with fmax from a -inf identity
 
-    def _group_cols(self, arg_tensor):
-        raise NotImplementedError
+    def _combine_op(self):
+        return {"add": operator.add, "max": cute.arch.fmax}[self.combine]
+
+    def _fold_identity(self):
+        return {"add": 0.0, "max": -math.inf}[self.combine]
+
+    def host_arg_key(self, value):
+        if isinstance(value, int):
+            # Plain group width: a true constexpr — baked at trace, no kernel
+            # argument at all (distinct key from the tensor form, which
+            # carries a runtime pointer).
+            return ("width", value)
+        return (torch2cute_dtype_map[value.dtype], value.shape[0])
+
+    def host_fake_arg(self, key, fctx):
+        if key[0] == "width":
+            # Baked at trace through the Constexpr[int]-annotated Args field.
+            return key[1]
+        dtype, group_cols = key
+        return make_fake_tensor(
+            dtype, (group_cols,), leading_dim=0, divisibility=128 // dtype.width
+        )
+
+    def host_call_arg(self, value, key):
+        # Constexpr-annotated fields carry no runtime argument: the traced
+        # value is baked; pass None at call time (converter emits ConstNone).
+        return None if isinstance(value, int) else value
+
+    def host_validate(self, value, *, n, tile_N, **_):
+        """Validate the reduction-group geometry independently of optional
+        consumers such as GroupedColStatsOut.
+
+        A group is a complete, globally aligned N interval. Both the CTA tile
+        and GEMM N must therefore contain an integer number of groups; silently
+        flooring either would merge a partial group into the wrong statistic
+        or finalize it with the wrong denominator.
+        """
+        if isinstance(value, int):
+            group_cols = value
+        elif value.ndim != 1:
+            raise ValueError(
+                f"'{self.name}': grouped-stats descriptor must be an int width or a "
+                f"1-D tensor, got shape {tuple(value.shape)}"
+            )
+        else:
+            group_cols = value.shape[0]
+        if group_cols <= 0:
+            raise ValueError(f"'{self.name}': grouped-stats width must be positive")
+        if n % group_cols or tile_N % group_cols:
+            raise ValueError(
+                f"'{self.name}': stats group width {group_cols} must divide "
+                f"N={n} and tile_N={tile_N}"
+            )
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def arg_spec_type(self, const=False):
+        return cutlass.Constexpr[int] if const else Optional[cute.Tensor]
+
+    def host_arg_form(self, value):
+        return "Const" if isinstance(value, int) else ""  # suffix must stay symbol-name-safe
+
+    def _group_cols(self, arg):
+        return arg if isinstance(arg, int) else arg.shape[0]
 
     def _stats_shape_attr(self):
         return f"_{self.name}_stats_smem_shape"
 
     def to_params(self, gemm, args):
         tensor = getattr(args, self.name)
-        # One accumulator per (tile row, group, warp_n). Sizing by tile_M
+        # One statistics slot per (tile row, group, warp_n). Sizing by tile_M
         # (not epi_tile[0]) matters on SM90, whose epi tiles are 64 rows:
         # epi_M > 1 subtiles land on distinct rows and must not alias. The
         # warp_n axis keeps a single deterministic writer per slot when the
@@ -1707,6 +2343,9 @@ class GroupedColStatsBase(EpiOp):
         """Coordinate partition, row-broadcast reference layout, lane/warp
         geometry, and zeroed accumulators (+ barrier) — everything the fold
         and read-back need."""
+        assert gemm.arch in (90, 100, 120), (
+            f"{type(self).__name__} needs the acc prepass (SM90/SM100/SM120)"
+        )
         tDcC = ctx.partition_for_epilogue_fn(cute.make_identity_tensor((ctx.tile_M, ctx.tile_N)))
         tDrM_ref = ctx.partition_for_epilogue_fn(
             cute.make_rmem_tensor(
@@ -1719,13 +2358,30 @@ class GroupedColStatsBase(EpiOp):
         tDcC = cute.group_modes(tDcC, 3, cute.rank(tDcC))
         ref_layout = cute.group_modes(tDrM_ref, 3, cute.rank(tDrM_ref))[None, None, None, 0].layout
         tiled_copy = ctx.tiled_copy_t2r if ctx.tiled_copy_t2r is not None else ctx.tiled_copy_r2s
+        reference_src = ctx.tiled_copy_t2r is None
         lanes_in_N, warps_in_N, warp_n_idx, is_lane_n_leader = _lane_warp_info_n(
-            tiled_copy, ctx.tiled_copy_t2r is None, ctx.tidx
+            tiled_copy, reference_src, ctx.tidx
         )
-        # Zero the smem planes: begin runs before the driver prepass sweep.
-        # Needed even though fn_prepass_end STOREs (not adds): a warp whose
-        # column interleave misses a group never writes that plane, and
-        # persistent tiles reuse the smem — readers must see 0 there.
+        # Reduction ownership is factored by the actual tiled-copy layout:
+        # warp-N coordinates contribute partials to the SAME (row, group);
+        # every other epilogue warp must partition M and therefore own
+        # DISJOINT rows. This rules out an unmodelled replicated/spatial warp
+        # mode whose writers would race in the same smem plane.
+        _, warp_layout_MN = _get_lane_warp_layouts(tiled_copy, reference_src)
+        warps_in_M = const_expr(cute.size(warp_layout_MN, mode=[0]))
+        num_epi_warps = const_expr(ctx.num_epi_threads // cute.arch.WARP_SIZE)
+        assert warps_in_M * warps_in_N == num_epi_warps, (
+            "grouped stats require every non-N epilogue warp to partition M"
+        )
+        smem_warps_n = const_expr(cute.size(smem_tensor, mode=[2]))
+        assert warps_in_N == smem_warps_n, (
+            "grouped-stats smem plane count must match the tiled-copy warp-N layout"
+        )
+        # Fill the smem planes with the fold identity: begin runs before the
+        # driver prepass sweep. Needed even though fn_prepass_end STOREs (not
+        # adds): a warp whose column interleave misses a group never writes
+        # that plane, and persistent tiles reuse the smem — readers must see
+        # the identity there.
         # Strided: the flat extent can exceed the epilogue thread count
         # (e.g. 192-row tiles under pingpong's single 128-thread warpgroup,
         # whose exclusive epilogue window covers the shared smem).
@@ -1734,10 +2390,10 @@ class GroupedColStatsBase(EpiOp):
         for i0 in cutlass.range(0, total, ctx.num_epi_threads, unroll_full=True):
             i = i0 + ctx.tidx
             if i < total:
-                sFlat[i] = Float32(0.0)
+                sFlat[i] = Float32(self._fold_identity())
         ctx.epilogue_barrier.arrive_and_wait()
         lane_info = (lanes_in_N, warps_in_N, warp_n_idx, is_lane_n_leader)
-        # Register accumulators for the sweep: (rows_total, group ordinals).
+        # Register-resident statistics for the sweep: (rows_total, group ordinals).
         # Static indexing requires each thread's per-subtile run to lie in one
         # group, and subtile/group boundaries to nest.
         epi_shape = cute.zipped_divide(
@@ -1752,14 +2408,24 @@ class GroupedColStatsBase(EpiOp):
             cute.size(layout_utils.convert_layout_zero_stride(ref_layout, ref_layout), mode=[0])
         )
         n_ords = const_expr(ctx.tile_N // max(group_cols, n_e))
-        rAcc = cute.make_rmem_tensor((rows_sub * epi_m_cnt, n_ords), Float32)
-        rAcc.fill(0.0)
+        rStats = cute.make_rmem_tensor((rows_sub * epi_m_cnt, n_ords), Float32)
+        rStats.fill(self._fold_identity())
         geom = (rows_sub, n_e, epi_m_cnt, n_ords)
-        return (smem_tensor, tDcC, ref_layout, group_cols, lane_info, rAcc, geom)
+        return (
+            smem_tensor,
+            tDcC,
+            ref_layout,
+            group_cols,
+            lane_info,
+            rStats,
+            geom,
+            ctx.num_epi_threads,
+            ctx.tidx,
+        )
 
     @cute.jit
     def stats_slice(self, state, epi_coord):
-        smem_tensor, tDcC, ref_layout, group_cols, lane_info, rAcc, geom = state
+        smem_tensor, tDcC, ref_layout, group_cols, lane_info, rStats, geom = state[:7]
         rows_sub, n_e = geom[0], geom[1]
         # Static register indices for this subtile: row base from epi_m, and
         # the group's thread-relative visit ordinal from epi_n.
@@ -1771,7 +2437,7 @@ class GroupedColStatsBase(EpiOp):
             ref_layout,
             group_cols,
             lane_info,
-            rAcc,
+            rStats,
             row_base,
             ord_n,
         )
@@ -1779,30 +2445,31 @@ class GroupedColStatsBase(EpiOp):
     @cute.jit
     def fn_sink_flush(self, gemm, state, frag):
         """Prepass sink: fold frag (the statistic input) into the register
-        accumulators at static (row, ordinal) slots — no smem and no shuffles
+        statistics at static (row, ordinal) slots — no smem and no shuffles
         in the sweep; fn_prepass_end exchanges and stores once per slot."""
+        combine = self._combine_op()
         stats = state[0]
         ref_layout, group_cols = stats[2], stats[3]
-        rAcc, row_base, ord_n = stats[5], stats[6], stats[7]
+        rStats, row_base, ord_n = stats[5], stats[6], stats[7]
         x_mn = layout_utils.convert_layout_zero_stride(frag, ref_layout)
         num_rows = const_expr(cute.size(x_mn, mode=[0]))
         num_cols = const_expr(cute.size(x_mn, mode=[1]))
         assert group_cols % num_cols == 0, "thread column run must divide the group width"
         for r in cutlass.range_constexpr(num_rows):
-            partial = Float32(0.0)
+            partial = Float32(self._fold_identity())
             for c in cutlass.range(num_cols, unroll_full=True):
-                partial += x_mn[r, c]
-            rAcc[row_base + r, ord_n] = rAcc[row_base + r, ord_n] + partial
+                partial = combine(partial, x_mn[r, c])
+            rStats[row_base + r, ord_n] = combine(rStats[row_base + r, ord_n], partial)
 
     @cute.jit
     def fn_prepass_end(self, gemm, state):
         """Prepass-end flush: butterfly each register slot across the N-lane
-        group (fixed tree) and store it once to its (row, group, warp_n) smem
-        plane — single writer; the absolute group is recovered from the
-        coordinate partition. The driver's prepass barrier (right after this
-        hook) orders the stores before the main pass reads."""
-        smem_tensor, tDcC, ref_layout, group_cols, lane_info, rAcc, geom = state[0]
-        lanes_in_N, _, warp_n_idx, is_lane_n_leader = lane_info
+        group (fixed tree), retain a finalized register value immediately when
+        no cross-warp fold is needed, and store the RAW partial once to its
+        (row, group, warp_n) smem plane. The driver's barrier after this hook
+        publishes all raw planes before cross-warp register resolution."""
+        smem_tensor, tDcC, ref_layout, group_cols, lane_info, rStats, geom = state[0][:7]
+        lanes_in_N, warps_in_N, warp_n_idx, is_lane_n_leader = lane_info
         rows_sub, n_e, epi_m_cnt, n_ords = geom
         e_per_ord = const_expr(max(1, group_cols // n_e))
         for em in cutlass.range_constexpr(epi_m_cnt):
@@ -1811,26 +2478,211 @@ class GroupedColStatsBase(EpiOp):
                     tDcC[None, None, None, (em, o * e_per_ord)], ref_layout
                 )
                 for r in cutlass.range_constexpr(rows_sub):
-                    total = rAcc[em * rows_sub + r, o]
+                    partial = rStats[em * rows_sub + r, o]
                     if const_expr(lanes_in_N > 1):
-                        total = cute.arch.warp_reduction(
-                            total, operator.add, threads_in_group=lanes_in_N
+                        partial = cute.arch.warp_reduction(
+                            partial, self._combine_op(), threads_in_group=lanes_in_N
                         )
+                    if const_expr(warps_in_N == 1):
+                        # The full statistic is in hand. Finalize its replicated
+                        # all-reduce value in every consumer lane and retain
+                        # only the STATS in rStats (never the GEMM accumulator).
+                        rStats[em * rows_sub + r, o] = self.stat_value(partial, group_cols)
                     if is_lane_n_leader:
                         # coord = (tile-M row, first column of the run) —
                         # column // group_cols is the absolute group.
                         coord = c_mn[r, 0]
-                        smem_tensor[coord[0], coord[1] // group_cols, warp_n_idx] = total
+                        smem_tensor[coord[0], coord[1] // group_cols, warp_n_idx] = partial
+
+    def prepass_resolve_needed(self, gemm):
+        """Cross-warp register resolution is needed exactly when the epilogue
+        warp layout splits N. The driver's first prepass barrier has already
+        made every raw partial plane visible."""
+        return getattr(gemm, self._stats_shape_attr())[2] > 1
 
     @cute.jit
-    def stat_total(self, stats, row, group):
-        """Finalized sum for (row, group): fixed-order warp_n plane sum."""
-        sSum, lane_info = stats[0], stats[4]
+    def fn_prepass_resolve(self, gemm, state):
+        """Post-barrier all-reduce (warps_n > 1): every consumer lane folds
+        the raw smem planes for its own (row, group) slots in fixed order,
+        applies ``stat_value``, and overwrites its thread-private rStats.
+        No shared writes means no second barrier."""
+        stats = state[0]
+        smem_tensor, tDcC, ref_layout, group_cols, lane_info, rStats, geom = stats[:7]
         warps_in_N = lane_info[1]
-        total = sSum[row, group, 0]
-        for w in cutlass.range_constexpr(1, warps_in_N):
-            total += sSum[row, group, w]
-        return total
+        rows_sub, n_e, epi_m_cnt, n_ords = geom
+        combine = self._combine_op()
+        e_per_ord = const_expr(max(1, group_cols // n_e))
+        for em in cutlass.range_constexpr(epi_m_cnt):
+            for o in cutlass.range_constexpr(n_ords):
+                c_mn = layout_utils.convert_layout_zero_stride(
+                    tDcC[None, None, None, (em, o * e_per_ord)], ref_layout
+                )
+                for r in cutlass.range_constexpr(rows_sub):
+                    coord = c_mn[r, 0]
+                    group = coord[1] // group_cols
+                    total = smem_tensor[coord[0], group, 0]
+                    for w in cutlass.range_constexpr(1, warps_in_N):
+                        total = combine(total, smem_tensor[coord[0], group, w])
+                    rStats[em * rows_sub + r, o] = self.stat_value(total, group_cols)
+
+    # --- Stats-only defaults: the host arg's length fixes the group width;
+    # the value port broadcasts a per-row function of the finalized statistic.
+    # Subclasses with extra per-element resources override all three, keeping
+    # the stats state as element 0 (fn_sink_flush reads it there). ---
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        return (self.stats_begin(gemm, smem_tensor, ctx, const_expr(self._group_cols(param))),)
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        return [self.stats_slice(state[0], epi_coord)]
+
+    def stat_value(self, total, group_cols):
+        """Per-row Float32 value derived from the finalized (row, group)
+        statistic — the default ``fn_prepare``'s only hook. ``group_cols``
+        is the compile-time group width (for mean-style finalizes)."""
+        raise NotImplementedError
+
+    def out(self, name):
+        """Companion gmem writer for this op's finalized values — declare it
+        in ``extra_ops``; see GroupedColStatsOut."""
+        return GroupedColStatsOut(name, self)
+
+    @cute.jit
+    def fn_prepare(self, gemm, state, paired):
+        stats = state[0]
+        c_cur, ref_layout = stats[1], stats[2]
+        out = cute.make_rmem_tensor(c_cur.layout.shape, Float32)
+        out_mn = layout_utils.convert_layout_zero_stride(out, ref_layout)
+        rStats, row_base, ord_n = stats[5], stats[6], stats[7]
+        for r in cutlass.range_constexpr(cute.size(out_mn, mode=[0])):
+            # Finalized values are register-resident for both the single- and
+            # multi-warp_n paths; fn_prepass_end / fn_prepass_resolve wrote
+            # them back to rStats before the main sweep.
+            v = rStats[row_base + r, ord_n]
+            for c in cutlass.range(cute.size(out_mn, mode=[1]), unroll_full=True):
+                out_mn[r, c] = v
+        return out
+
+
+class GroupedColStatsOut(EpiOp):
+    """Companion gmem writer for a GroupedColStatsBase op: write the sibling's
+    finalized per-(row, group) values (``stat_value``) to a
+    (l?, m, N/group_cols) buffer.
+
+    The sibling's smem contains raw per-warp_n partial planes after the prepass
+    barrier. At the first main-phase subtile this op elects one flat writer per
+    (row, group), folds those planes in fixed order, finalizes, and writes
+    directly to gmem — no finalized-smem publication or second barrier.
+    This is outside the per-element hot path (contrast: routing the value port
+    through a reduce sink costs a combine per element, and a reduce slot is per
+    (row, n-tile) — too coarse for sub-tile groups like per-head rstd).
+    Declare via ``extra_ops`` alongside the stats op (the fn never sees it);
+    the buffer arg is optional — absent, the op is compiled out."""
+
+    def __init__(self, name, stats_op):
+        super().__init__(name)
+        assert isinstance(stats_op, GroupedColStatsBase), "stats_op must be a grouped-stats op"
+        self.stats_op = stats_op
+
+    def config_key(self):
+        return (self.stats_op.cache_key(),)
+
+    def host_fake_arg(self, key, fctx):
+        dtype, ndim = key
+        groups = cute.sym_int()
+        shape = (fctx.l, fctx.m, groups) if ndim == 3 else (fctx.m, groups)
+        return make_fake_tensor(dtype, shape, leading_dim=ndim - 1, divisibility=1)
+
+    def host_validate(self, value, *, m, n, tile_M, tile_N, batch, varlen_m, epi_args):
+        """Buffer shape from the sibling's group width (its 1-D arg length):
+        (l?, m, n/width), with the groups nesting in N and in the tile."""
+        descriptor = epi_args[self.stats_op.name]
+        self.stats_op.host_validate(descriptor, n=n, tile_N=tile_N)
+        width = self.stats_op._group_cols(descriptor)
+        inner = (m, n // width)
+        expected = inner if varlen_m or batch is None else (batch, *inner)
+        if tuple(value.shape) != expected:
+            raise ValueError(f"'{self.name}': expected shape {expected}, got {tuple(value.shape)}")
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        # The SIBLING's stats planes (its to_params stashed the shape).
+        return getattr(storage_epi, f"s_{self.stats_op.name}").get_tensor(
+            cute.make_layout(getattr(gemm, self.stats_op._stats_shape_attr()))
+        )
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        return (smem_tensor, ctx.num_epi_threads)
+
+    @cute.jit
+    def end_loop_stage(
+        self,
+        gemm,
+        param,
+        state,
+        epi_coord,
+        epi_tile,
+        tiled_copy_t2r,
+        tiled_copy_r2s,
+        tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
+        """First main-phase subtile: stage this op for the finish phase. No
+        barrier request — the sibling's prepass barrier already ordered the
+        raw warp_n stats planes this op reads."""
+        if const_expr(epi_coord[0] == 0 and epi_coord[1] == 0):
+            return (False, (state, tidx))
+        return None
+
+    @cute.jit
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
+        """Elect one writer per (row, group), fold the sibling's raw warp_n
+        planes, finalize, and write directly to gmem. The value port uses
+        rStats and never reads stats smem in the main pass."""
+        state, tidx = staged
+        sStats, num_epi_threads = state
+        rows, groups, warps_n = getattr(gemm, self.stats_op._stats_shape_attr())
+        group_cols = const_expr(gemm.cta_tile_shape_mnk[1] // groups)
+        combine = self.stats_op._combine_op()
+        batch_idx = tile_coord_mnkl[3]
+        limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * rows, rows)
+        # (l, m, G) batched; (m, G) dense-2D (batch_idx == 0) or varlen_m
+        # (total_m rows, segment offset via cu_seqlens).
+        if const_expr(cute.rank(param) == 3):
+            mOut = param[batch_idx, None, None]
+        elif const_expr(varlen_manager.varlen_m):
+            mOut = cute.domain_offset((varlen_manager.params.cu_seqlens_m[batch_idx],), param)
+        else:
+            mOut = param
+        limit_g = mOut.shape[1]
+        row0 = tile_coord_mnkl[0] * rows
+        g0 = tile_coord_mnkl[1] * groups
+        total_slots = const_expr(rows * groups)
+        for i0 in cutlass.range(0, total_slots, num_epi_threads, unroll_full=True):
+            i = i0 + tidx
+            if i < total_slots:
+                r = i // groups
+                g = i % groups
+                if r < limit_m and g0 + g < limit_g:
+                    stat = sStats[r, g, 0]
+                    for w in cutlass.range_constexpr(1, warps_n):
+                        stat = combine(stat, sStats[r, g, w])
+                    mOut[row0 + r, g0 + g] = self.stats_op.stat_value(stat, group_cols)
 
 
 class OnlineLSEReduce(ColVecReduce):
@@ -1846,7 +2698,7 @@ class OnlineLSEReduce(ColVecReduce):
     ((l, m, n_tiles)); the host finalizes with a (tiny, stable) logsumexp over
     the n_tiles axis.
 
-    Unlike plain VecReduce, ragged last N tiles are handled: the fold masks
+    Ragged last N tiles are handled like plain max VecReduce: the fold masks
     OOB elements to the fold identity via a per-element select on the N
     coordinate (OOB accumulator zeros are not an LSE identity), so N need not
     be divisible by tile_N. The select keeps the exp chain straight-line —
@@ -1861,8 +2713,6 @@ class OnlineLSEReduce(ColVecReduce):
         self.check_oob = check_oob
 
     def host_finalize(self, partials):
-        import torch
-
         return torch.logsumexp(partials, dim=-1)
 
     def config_key(self):
@@ -2011,3 +2861,302 @@ class OnlineLSEReduce(ColVecReduce):
             )
         else:
             self._fold(m_acc, s_acc, frag)
+
+
+@dsl_user_op
+def _dup_s16sat_from_s32(x: Int32, *, loc=None, ip=None) -> Uint32:
+    """sat16(x) packed into both halves of a b32 (one ALU instruction).
+
+    Feeds the f16x2 EQUALITY compares below as raw bit patterns: f16
+    equality is bit equality away from NaN/±0, and this scheme is exact for
+    ALL int32 inputs when the comparands are small POSITIVE ints — in-range
+    values map injectively, high saturation (0x7FFF) and the in-range slice
+    [31745, 32767] are f16 NaNs (match nothing), low saturation 0x8000 is
+    -0.0 (aliases only a ±0 comparand — callers bias by +1 so no comparand
+    is zero), and f16 compares never flush denormals. This replaces a
+    cvt.rn.f16.s32 (quarter-rate XU pipe) whose exactness needed a rounding
+    argument."""
+    return Uint32(prims.convert_and_pack_integer(x, x, T.i16(), is_signed=True, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _selp_pair_f16x2(
+    a2: Uint32, b2: Uint32, f0: Float32, f1: Float32, vin: Float32, *, loc=None, ip=None
+) -> Float32:
+    """One packed f16x2 equality (HSETP2: TWO predicates per instruction) plus
+    the two dependent f32 selects — 3 SASS for 2 elements vs 4 for the scalar
+    ISETP+FSEL pair. Inline PTX: the DSL has no two-predicate compare."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Uint32(a2).ir_value(loc=loc, ip=ip),
+                Uint32(b2).ir_value(loc=loc, ip=ip),
+                Float32(f0).ir_value(loc=loc, ip=ip),
+                Float32(f1).ir_value(loc=loc, ip=ip),
+                Float32(vin).ir_value(loc=loc, ip=ip),
+            ],
+            "{.reg .pred p, q; .reg .f32 t;\n"
+            "setp.eq.f16x2 p|q, $1, $2;\n"
+            "selp.f32 t, $3, $5, p;\n"
+            "selp.f32 $0, $4, t, q;}",
+            "=f,r,r,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+class ColVecSelect(EpiOp):
+    """Per-row column selection ("gather along N"): out[m] = the fn value at
+    column idx[m], written directly to an (l, m) / (m,) f32 colvec.
+
+    The fn returns the value under this op's name (a plain sink plane). The
+    per-row column index arrives through a companion integer ColVecLoad
+    (int32/int64) declared in ``extra_ops`` — the fn never sees it. This op
+    reads idx[row] straight from the companion's staged smem (one broadcast
+    LDS per aliased row-slot; smem is runtime-addressable where register
+    fragments are not) and compares in INTEGER against the static
+    per-element N offsets (rebased-compare idiom of OnlineLSEReduce._fold:
+    one ISETP against an immediate per element). At most one element in the
+    whole (M, N) grid satisfies ``col == idx[row]``, so unlike a reduce
+    there is no fold, no lane/warp exchange, and no barrier: whichever
+    thread holds the matching element predicated-stores it straight to
+    gmem. Rows whose index falls outside [0, N) (e.g. ignore_index -100)
+    are never written — pre-fill the output when that matters.
+
+    (Routing the index through the fn as a value-port operand instead costs
+    measurably more on an epilogue-exposed shape: the broadcast index frags
+    get materialized per element, converted to f32, and collected into a
+    second sink plane — all deleted by the companion-smem read.)
+
+    Extraction structure (see fn_sink_flush): per M-stripe, precompute WHICH
+    epi_n subtile each row-slot's target falls in and OR one-hot bits into a
+    Uint32 register mask; every subtile flush then tests one trace-time-
+    constant bit (`mask & (1 << epi_n)` = a LOP3 + branch — no smem load, no
+    compares on the hot path). The rarely-taken block extracts via packed
+    f16x2 equality (setp.eq.f16x2: TWO predicates per instruction, inline
+    PTX) — static footprint matters because the block is instantiated per
+    subtile and its I-cache pressure is the measurable residual on short-K
+    D-less shapes. Free vs the plain online-LSE epilogue at K >= 1024.
+
+    TOMBSTONES — measured dead ends, do not retry (H100, M=4096 V=128256,
+    pp 128x192, same-process interleaved medians):
+      * idx through the fn value port (scaled two-plane sink): broadcast
+        index frags materialized per element + f32 cvt + a second collection
+        plane — several times the select tax of the companion-smem read.
+      * per-element `if` around the store: ptxas rebuilds the entire gmem
+        address chain inside every element's BSSY/BRA block (+25% kernel).
+      * separate `hit` boolean guarding the store: ptxas emits the compare
+        chain TWICE (a predicate chain for the branch plus FSELs
+        re-materialized inside it) — guard on the selected value instead.
+      * FMNMX tree over independent selects (more ILP than a serial fold):
+        LOSES on the throughput-bound cooperative schedule — the epilogue
+        wall is the warpgroup-shared ALU pipe, not select latency.
+      * UNFENCED one-hot R2P extraction (flash-attn mask.py digit-inversion
+        of the j->offset map; R2P confirmed in SASS): loses to the fenced
+        window everywhere (K=512 D-less 1.18x vs 0.98x of plain) — R2P pays
+        when every element consumes a predicate every visit (attention
+        masking), not needle-in-haystack equality.
+      * one-hot R2P as the FENCED block body: correct, but static size is a
+        wash vs the scalar chain; select tax at K=512 D-less: scalar
+        ISETP+FSEL chain +0.166ms, one-hot R2P +0.137, packed f16x2 +0.124
+        (1 I2F.F16 + 4 HSETP2 + 8 FSEL per 8-element slot; ptxas folds the
+        offset pairs into HSETP2 half2 immediates and dual-issues the
+        broadcast via the .H0_H0 operand) — f16x2 shipped.
+    """
+
+    fn_port = "sink"
+
+    def __init__(self, name, idx_op):
+        super().__init__(name)
+        if not isinstance(idx_op, ColVecLoad):
+            raise ValueError(
+                f"ColVecSelect {name!r}: idx_op must be the companion ColVecLoad "
+                "staging the per-row column indices"
+            )
+        self.idx_op = idx_op
+
+    def config_key(self):
+        return (self.idx_op.cache_key(),)
+
+    def host_fake_arg(self, key, fctx):
+        dtype, ndim = key
+        shape = (fctx.l, fctx.m) if ndim == 2 else (fctx.m,)
+        return make_fake_tensor(dtype, shape, leading_dim=ndim - 1, divisibility=1)
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
+
+    def sink_alloc_shape(self, lead, n, tile_m, tile_n, num_seqs=None):
+        # Full colvec, not per-tile partials: config-independent (tiles
+        # ignored), and there is no host_finalize — the buffer IS the result.
+        return tuple(lead)
+
+    def host_validate(self, value, *, m, n, tile_M, tile_N, batch, varlen_m, epi_args):
+        idx = epi_args.get(self.idx_op.name)
+        if idx is None:
+            raise ValueError(f"sink '{self.name}' requires the '{self.idx_op.name}' index operand")
+        if idx.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"'{self.idx_op.name}' must be int32 or int64, got {idx.dtype}")
+        expected = (m,) if varlen_m or batch is None else (batch, m)
+        if tuple(value.shape) != expected:
+            raise ValueError(
+                f"sink '{self.name}': expected shape {expected}, got {tuple(value.shape)}"
+            )
+        if value.dtype != torch.float32:
+            raise ValueError(f"sink '{self.name}' must be float32, got {value.dtype}")
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        # The COMPANION's staged index vector (the smem field is declared by
+        # the companion; this is the same view its get_smem_tensor returns).
+        return getattr(storage_epi, f"s_{self.idx_op.name}").get_tensor(
+            cute.make_layout(gemm.cta_tile_shape_mnk[0])
+        )
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        # Reference colvec-broadcast partition: its zero-N-stride layout
+        # groups aliased same-row elements in fn_sink_flush (layout only —
+        # the tensor itself is never read or written, so it costs nothing).
+        vec_mma_layout = cute.make_layout((ctx.tile_M, ctx.tile_N), stride=(1, 0))
+        tDrRef = ctx.partition_for_epilogue_fn(cute.make_rmem_tensor(vec_mma_layout, Float32))
+        tDcD = ctx.partition_for_epilogue_fn(cute.make_identity_tensor((ctx.tile_M, ctx.tile_N)))
+        if const_expr(ctx.varlen_manager.varlen_m):
+            mVec = cute.domain_offset(
+                (ctx.varlen_manager.params.cu_seqlens_m[ctx.batch_idx],), param
+            )
+        elif const_expr(cute.rank(param) == 2):
+            mVec = param[ctx.batch_idx, None]
+        else:
+            mVec = param  # dense rank-1 (m,)
+        gVec = cute.local_tile(mVec, (ctx.tile_M,), (ctx.tile_coord_mnkl[0],))
+        limit_m = min(
+            ctx.varlen_manager.len_m(ctx.batch_idx) - ctx.tile_coord_mnkl[0] * ctx.tile_M,
+            ctx.tile_M,
+        )
+        n_off = ctx.tile_coord_mnkl[1] * ctx.tile_N
+        epi_shape = cute.zipped_divide(
+            cute.make_layout((ctx.tile_M, ctx.tile_N)), ctx.epi_tile
+        ).shape[1]
+        n_epi = const_expr(cute.size(epi_shape[1]))
+        etN = const_expr(ctx.tile_N // n_epi)
+        # Per-stripe state for the subtile bitmask: the rebased target
+        # per row-slot and the Uint32 hit mask over epi_n subtiles.
+        assert n_epi <= 32, "ColVecSelect: > 32 N subtiles per tile needs mask chunking"
+        ref0 = tDrRef[None, None, None, 0, 0]
+        n_slots = const_expr(
+            cute.size(layout_utils.convert_layout_zero_stride(ref0, ref0.layout), mode=[0])
+        )
+        tMask = cute.make_rmem_tensor(1, Uint32)
+        tRel0 = cute.make_rmem_tensor(n_slots, Int32)
+        return (smem_tensor, tDrRef, tDcD, gVec, limit_m, n_off, tMask, tRel0, etN)
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        ref_cur = state[1][None, None, None, epi_coord[0], epi_coord[1]]
+        c_cur = state[2][None, None, None, epi_coord[0], epi_coord[1]]
+        return (state[0], ref_cur, c_cur, *state[3:], epi_coord)
+
+    @cute.jit
+    def fn_sink_flush(self, gemm, state, frag):
+        sIdx, ref_frag, coords, gVec, limit_m, n_off, tMask, tRel0, etN, epi_coord = state
+        ref = ref_frag.layout
+        frag_g = layout_utils.convert_layout_zero_stride(frag, ref)
+        coords_g = layout_utils.convert_layout_zero_stride(coords, ref)
+        # Static per-element N offset relative to the thread's base column
+        # (rebased compare, same idiom as OnlineLSEReduce._fold): the compare
+        # is one ISETP against an immediate, no per-element coordinate
+        # materialization.
+        lay_n = cute.composition(
+            cute.make_layout(gemm.cta_tile_shape_mnk[:2], stride=(0, 1)), coords_g.layout
+        )
+        n_aliased = const_expr(cute.size(frag_g, mode=[1]))
+        n_slots = const_expr(cute.size(frag_g, mode=[0]))
+        # Stripe-mask window (mask.py philosophy applied to the guard):
+        # the rows of a slot are fixed for a whole M stripe, so at the
+        # stripe's first subtile compute, per slot, WHICH epi_n subtile
+        # (if any) the target falls in, and OR one-hot bits into a
+        # Uint32 mask over subtiles. Every flush then tests one
+        # trace-time-constant bit — `mask & (1 << epi_n)` is a single
+        # LOP3 + branch, with no smem load and no compares on the hot
+        # path (vs an LDS -> IADD -> 2x ISETP -> branch chain per slot
+        # per subtile). The rare taken block re-derives idx_rel from the
+        # stashed rebased target with one immediate subtract per slot.
+        # range_constexpr so si is a Python int: crd2idx then folds to
+        # Python ints at trace time (static bounds / shift immediates).
+        n_epi = const_expr(gemm.cta_tile_shape_mnk[1] // etN)
+        epi_n = const_expr(epi_coord[1])
+        if const_expr(epi_n == 0 or gemm.epi_m_major):
+            # First subtile of this row-stripe (epi_m_major visits new
+            # rows every subtile, so it recomputes every time and the
+            # mask degenerates to a per-subtile test — still correct).
+            n_base0 = coords_g[0, 0][1] + n_off - epi_n * etN
+            mask = Uint32(0)
+            for si in cutlass.range_constexpr(n_slots):
+                offs = [cute.crd2idx((si, j), lay_n) for j in range(n_aliased)]
+                row = coords_g[si, 0][0]
+                # OOB rows hold garbage indices (predicated g2s copy):
+                # bake the row bound in as a value nothing can hit.
+                t_rel = Int32(cutlass.select_(row < limit_m, Int32(sIdx[row]) - n_base0, -1))
+                tRel0[si] = t_rel
+                e = t_rel // etN
+                w = t_rel - e * etN
+                # w/e >= 0 both checked: safe under floor OR trunc
+                # division semantics for negative t_rel.
+                ok = (w >= 0) & (w <= max(offs)) & (e >= 0) & (e < n_epi)
+                e_safe = Int32(cutlass.select_(ok, e, 0))  # shift stays in [0, 31]
+                mask = mask | Uint32(cutlass.select_(ok, Uint32(1) << e_safe, Uint32(0)))
+            tMask[0] = mask
+        if Boolean(tMask[0] & (Uint32(1) << epi_n)):
+            # Rare block body = packed f16x2 equality (below): what
+            # matters here is STATIC size — the block is instantiated
+            # per subtile and its I-cache footprint is the dominant
+            # residual on short-K D-less shapes (ladder in the class
+            # tombstones). Fresh *_cur names: a name born inside a
+            # dynamic-if body that is also assigned in a sibling
+            # (possibly compiled-out const_expr) arm trips
+            # TYPE_UNSTABLE_JOIN (None on the not-taken path).
+            for si in cutlass.range_constexpr(n_slots):
+                offs_cur = [cute.crd2idx((si, j), lay_n) for j in range(n_aliased)]
+                row_cur = coords_g[si, 0][0]
+                # +1 bias folded into the immediate (see _select_packed16).
+                ir1_cur = Int32(tRel0[si] - (epi_n * etN - 1))
+                self._select_packed16(frag_g, gVec, si, row_cur, ir1_cur, offs_cur, n_aliased)
+
+    @cute.jit
+    def _select_packed16(self, frag_g, gVec, si, row, idx1, offs, n_aliased):
+        # Packed-16 compare chain: pack sat16(idx1 = idx_rel + 1, the bias
+        # pre-folded into the caller's immediate subtract) into both halves
+        # of a b32 once, then one setp.eq.f16x2 per OFFSET PAIR yields two
+        # predicates per instruction feeding the two selects (inline PTX
+        # helpers above). The compares run on raw bit patterns with
+        # comparand halves = the +1-biased offsets — trace-time immediates
+        # (the stripe rebase already made the offsets thread-independent
+        # statics), exact for ALL idx_rel (see _dup_s16sat_from_s32); odd
+        # tails pad with an f16 NaN half. The -inf miss sentinel guards the
+        # store, so a genuinely -inf value at the target column is not
+        # written (as in the legacy kernel).
+        assert max(offs) + 1 < 31745, "packed16 select: biased offsets reach the f16 NaN range"
+        a2 = _dup_s16sat_from_s32(idx1)
+        val = Float32(-math.inf)
+        for j in cutlass.range_constexpr(0, n_aliased, 2):
+            lo = offs[j] + 1
+            hi = offs[j + 1] + 1 if j + 1 < n_aliased else 0x7FFF  # NaN pad
+            f1 = frag_g[si, j + 1] if j + 1 < n_aliased else Float32(0.0)
+            val = _selp_pair_f16x2(a2, Uint32(lo | (hi << 16)), frag_g[si, j], f1, val)
+        if val != Float32(-math.inf):
+            gVec[row] = val
+
+    # TOMBSTONE: the one-hot R2P extraction that used to live here (digit-
+    # inversion of the j->offset map by pow2 strides, one-hot mask, R2P into
+    # the predicate bank, valid-guarded store — flash-attn mask.py idiom) was
+    # measured and removed: unfenced it loses to the stripe-mask fence by
+    # ~15pp of plain-matmul time, and as the fenced block body it loses to
+    # the packed f16x2 chain above (+0.137 vs +0.124ms select tax, K=512
+    # D-less) while being no smaller statically. See the class docstring
+    # tombstones for the full ladder before resurrecting any of it.

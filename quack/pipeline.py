@@ -6,8 +6,8 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate, and_, dsl_user_op
-from cutlass._mlir.dialects import nvvm as _nvvm, llvm
-from cutlass.cute.typing import AddressSpace, Int, Pointer
+from cutlass.cute.typing import Int, Pointer
+from cutlass.experimental import primitives as prims
 from cutlass.pipeline import PipelineState, PipelineUserType
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineOp
 from cutlass.pipeline import agent_sync, alloc_reserved_mbarrier
@@ -53,23 +53,11 @@ def mbarrier_arrive_release_cluster(
     release-acquire relation. This is the cheaper form of mbarrier.arrive.release.cluster,
     which lowers to MEMBAR.GPU.
     """
-    _nvvm.fence_sync_restrict(_nvvm.MemOrderKind.RELEASE, loc=loc, ip=ip)
-    remote_ptr = _nvvm.mapa(
-        llvm.PointerType.get(AddressSpace.dsmem),
-        mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
-        Int32(peer_cta_rank_in_cluster).ir_value(loc=loc, ip=ip),
-        loc=loc,
-        ip=ip,
+    prims.fence_sync_restrict(prims.MemOrder.RELEASE, loc=loc, ip=ip)
+    remote_ptr = prims.mapa(
+        mbar_ptr.to_llvm_ptr(loc=loc, ip=ip), peer_cta_rank_in_cluster, loc=loc, ip=ip
     )
-    _nvvm.mbarrier_arrive(
-        None,
-        remote_ptr,
-        count=Int32(1).ir_value(loc=loc, ip=ip),
-        scope=_nvvm.MemScopeKind.CLUSTER,
-        relaxed=True,
-        loc=loc,
-        ip=ip,
-    )
+    prims.mbarrier_arrive(remote_ptr, scope=prims.MemScope.CLUSTER, relaxed=True, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -84,16 +72,14 @@ def mbarrier_acquire_cluster(mbar_ptr: Pointer, phase: Int, *, loc=None, ip=None
     The result must feed control flow, otherwise the test_wait is dead-code-eliminated;
     branch to a (never-taken) blocking wait so the observation cannot be dropped.
     """
-    status = Boolean(
-        _nvvm.mbarrier_wait_parity(
-            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
-            Int32(phase).ir_value(loc=loc, ip=ip),
-            _nvvm.MBarrierWaitKind.TEST,
-            scope=_nvvm.MBarrierScopeKind.CLUSTER,
-            order=_nvvm.MemOrderKind.ACQUIRE,
-            loc=loc,
-            ip=ip,
-        )
+    status = prims.mbarrier_wait_parity(
+        mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+        phase,
+        prims.MBarrierWait.TEST,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.ACQUIRE,
+        loc=loc,
+        ip=ip,
     )
     if_generate(
         status == 0,

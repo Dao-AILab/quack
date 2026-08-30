@@ -17,6 +17,12 @@ class VarlenArguments(NamedTuple):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None
+    # Per-sequence M-tile prefix (num_seqs + 1,): cumsum of
+    # ceil(seqlen / cta_tile_M). Host-computed (device tensor) and only passed
+    # when an epilogue op needs per-sequence tile indexing (M-fold reduce
+    # sinks); the tile scheduler's m index is sequence-local, so a batchless
+    # per-M-tile buffer needs this offset to keep sequences' rows disjoint.
+    mCuTilesM: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -25,6 +31,7 @@ class VarlenManager:
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
+        cu_tiles_m: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -33,6 +40,7 @@ class VarlenManager:
                 cu_seqlens_m=args.mCuSeqlensM,
                 cu_seqlens_k=args.mCuSeqlensK,
                 mAIdx=args.mAIdx,
+                cu_tiles_m=args.mCuTilesM,
             )
 
     def __init__(
@@ -101,10 +109,33 @@ class VarlenManager:
         # static problem N (from mB) the kernel passed at construction.
         return self._len_n_static
 
+    def tile_m_offset(self, batch_idx: Int32) -> Int32:
+        """This sequence's first row in a per-M-tile buffer (cu_tiles_m prefix)."""
+        return self.params.cu_tiles_m[batch_idx]
+
+    def len_m_tiles(self, batch_idx: Int32) -> Int32:
+        """Number of M tiles this sequence owns (from the cu_tiles_m prefix)."""
+        return self.params.cu_tiles_m[batch_idx + 1] - self.params.cu_tiles_m[batch_idx]
+
     def offset_batch_A(self, mA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
         if const_expr(self.varlen_m):
-            mA_mk = cute.domain_offset((params.cu_seqlens_m[batch_idx], None), mA_mkl)
+            offset = params.cu_seqlens_m[batch_idx]
+            ragged_rank = const_expr(cute.rank(mA_mkl))
+            if const_expr(ragged_rank == 2):  # Didn't create ragged tensor (gather_A)
+                mA_mk = cute.domain_offset((offset, None), mA_mkl)
+            else:
+                # Ragged-for-TMA (zero-fill rows past the sequence end): loads
+                # must use the 2-extra-dim wraparound form (ptr_shift lands the
+                # descriptor base outside mapped memory, store-only).
+                length = params.cu_seqlens_m[batch_idx + 1] - offset
+                mA_mk = copy_utils.offset_ragged_tensor(
+                    mA_mkl,
+                    offset,
+                    length,
+                    ragged_dim=0,
+                    ptr_shift=False,
+                )
         elif const_expr(self.varlen_k):
             offset = params.cu_seqlens_k[batch_idx]
             ragged_rank = const_expr(cute.rank(mA_mkl))

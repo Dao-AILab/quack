@@ -1,6 +1,6 @@
 import cutlass
 
-from quack.epi_ops import ColVecReduce, EpiSmemBytes, RowVecLoad, TileLoad, TileStore
+from quack.epilogue.ops import ColVecReduce, EpiSmemBytes, RowVecLoad, TileLoad, TileStore
 from quack.testing.trace import run_traced
 
 # smem_bytes needs a live MLIR context for cute layout algebra. run_traced,
