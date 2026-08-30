@@ -1023,7 +1023,6 @@ dact_fn_map = {
 
 gate_fn_map = {
     "swiglu": swiglu,
-    "swiglu_clamped": lambda x, y: swiglu(x, y, limit=10.0),
     "swiglu-tanh": swiglu_tanh,
     "swiglu_oai": swiglu_oai,
     "swiglu_oai-tanh": swiglu_oai_tanh,
@@ -1034,7 +1033,6 @@ gate_fn_map = {
 
 dgate_fn_map = {
     "swiglu": dswiglu,
-    "swiglu_clamped": lambda x, y, dout: dswiglu(x, y, dout, limit=10.0),
     "swiglu-tanh": dswiglu_tanh,
     "swiglu_oai": dswiglu_oai,
     "swiglu_oai-tanh": dswiglu_oai_tanh,

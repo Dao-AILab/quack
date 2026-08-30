@@ -31,7 +31,6 @@ Activation = Literal[
     "relu",
     "relu_sq",
     "swiglu",
-    "swiglu_clamped",
     "swiglu-tanh",
     "swiglu_oai",
     "swiglu_oai-tanh",

@@ -93,7 +93,6 @@ act_to_pytorch_fn_map = {
 # Each function takes (gate, up) and returns postact
 gated_to_pytorch_fn_map = {
     "swiglu": lambda gate, up: F.silu(gate) * up,
-    "swiglu_clamped": lambda gate, up: F.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0),
     "swiglu-tanh": lambda gate, up: _silu_tanh(gate) * up,
     "swiglu_oai": lambda gate, up: gate * torch.sigmoid(1.702 * gate) * (up + 1),
     "swiglu_oai-tanh": _swiglu_oai_tanh,
@@ -106,7 +105,6 @@ gated_to_pytorch_fn_map = {
 ActActivation = Literal[None, "silu", "silu-tanh", "relu", "relu_sq", "gelu_tanh_approx", "tanh"]
 GatedActivation = Literal[
     "swiglu",
-    "swiglu_clamped",
     "swiglu-tanh",
     "swiglu_oai",
     "swiglu_oai-tanh",
@@ -123,7 +121,6 @@ Activation = Literal[
     "gelu_tanh_approx",
     "tanh",
     "swiglu",
-    "swiglu_clamped",
     "swiglu-tanh",
     "swiglu_oai",
     "swiglu_oai-tanh",
