@@ -30,13 +30,13 @@ WORLD_SIZES = [4]
 CASES = [
     (4096, 4096, 4096, 1, "relu"),  # baseline
     (1024, 4352, 736, 3, "gelu_tanh_approx"),  # K residue, batched, n_tiles=17
-    (6144, 8192, 4096, 1, "relu"),  # 192 tiles/rank at world 4 (>148 SMs): RS C-load self-deadlock
+    (8192, 8192, 4096, 1, "relu"),  # 256 tiles/rank at world 4: RS C-load self-deadlock (192 did not)
 ]
 # (m, n, k, l) -> test_gemm_sq_reduce x {plain, c} x rs/ar
 SQ_CASES = [
     (4096, 4096, 4096, 1),  # baseline
     (1024, 4352, 736, 3),  # K residue, batched; n_tiles=17 colvec stride
-    (6144, 8192, 4096, 1),  # 192 tiles/rank at world 4 (>148 SMs): RS C-load self-deadlock
+    (8192, 8192, 4096, 1),  # 256 tiles/rank at world 4: RS C-load self-deadlock (192 did not)
 ]
 # (m, n, k, l, act, split_k, split_k_mode) -> test_gemm_act_reduce_split_k x rs/ar,
 # always with all extras (bias + C + colvec) so the C-load path stays in play.
