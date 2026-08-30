@@ -486,7 +486,17 @@ def dsilu_tanh(
 
 
 @dsl_user_op
-def swiglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+def swiglu(
+    x: F32_or_F32x2,
+    y: F32_or_F32x2,
+    limit: float = math.inf,
+    *,
+    loc=None,
+    ip=None,
+) -> F32_or_F32x2:
+    if const_expr(limit != math.inf):
+        x = _minnumf(x, limit, loc=loc, ip=ip)
+        y = _maxnumf(_minnumf(y, limit, loc=loc, ip=ip), -limit, loc=loc, ip=ip)
     if const_expr(not isinstance(x, tuple)):
         return silu(x) * y
     else:
@@ -506,6 +516,7 @@ def dswiglu(
     x: F32_or_F32x2,
     y: F32_or_F32x2,
     dout: F32_or_F32x2,
+    limit: float = math.inf,
     *,
     loc=None,
     ip=None,
@@ -520,6 +531,10 @@ def dswiglu(
     This has been optimized to use fewer instructions (i.e. we expand things out
     to use FFMA instead of FADD and FMUL).
     """
+    x_raw, y_raw = x, y
+    if const_expr(limit != math.inf):
+        x = _minnumf(x, limit, loc=loc, ip=ip)
+        y = _maxnumf(_minnumf(y, limit, loc=loc, ip=ip), -limit, loc=loc, ip=ip)
     if const_expr(not isinstance(x, tuple)):
         sigmoid_x = sigmoid(x)
         silu_x = x * sigmoid_x  # FMUL
@@ -536,7 +551,6 @@ def dswiglu(
         dx = d_silu_x_dout * y  # FMUL
         dy = silu_x_dout
         swiglu_out = silu_x * y  # FMUL
-        return dx, dy, swiglu_out
     else:
         # Compute sigmoid(x) and silu(x)
         sigmoid_x = sigmoid(x)
@@ -552,7 +566,10 @@ def dswiglu(
         dx = cute.arch.mul_packed_f32x2(d_silu_x_dout, y)
         dy = silu_x_dout
         swiglu_out = cute.arch.mul_packed_f32x2(silu_x, y)
-        return dx, dy, swiglu_out
+    if const_expr(limit != math.inf):
+        dx = _where_le(dx, x_raw, limit, loc=loc, ip=ip)
+        dy = _where_abs_le(dy, y_raw, limit, loc=loc, ip=ip)
+    return dx, dy, swiglu_out
 
 
 @dsl_user_op
@@ -1006,6 +1023,7 @@ dact_fn_map = {
 
 gate_fn_map = {
     "swiglu": swiglu,
+    "swiglu_clamped": lambda x, y: swiglu(x, y, limit=10.0),
     "swiglu-tanh": swiglu_tanh,
     "swiglu_oai": swiglu_oai,
     "swiglu_oai-tanh": swiglu_oai_tanh,
@@ -1016,6 +1034,7 @@ gate_fn_map = {
 
 dgate_fn_map = {
     "swiglu": dswiglu,
+    "swiglu_clamped": lambda x, y, dout: dswiglu(x, y, dout, limit=10.0),
     "swiglu-tanh": dswiglu_tanh,
     "swiglu_oai": dswiglu_oai,
     "swiglu_oai-tanh": dswiglu_oai_tanh,

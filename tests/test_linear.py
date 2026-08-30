@@ -517,6 +517,58 @@ def test_gemm_gated(
         assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-5
 
 
+def test_gemm_clamped_swiglu():
+    """Clamped SwiGLU uses min(gate, 10) and clamp(up, -10, 10), including in backward."""
+    device, dtype = "cuda", torch.bfloat16
+    m, k, n = 128, 64, 128
+    pairs = torch.tensor(
+        [
+            [-20.0, -20.0],
+            [-10.0, -11.0],
+            [-1.0, -10.0],
+            [0.0, -9.0],
+            [1.0, 9.0],
+            [9.0, 10.0],
+            [10.0, 11.0],
+            [11.0, 5.0],
+            [20.0, -5.0],
+            [5.0, 20.0],
+            [5.0, -20.0],
+        ],
+        device=device,
+        dtype=dtype,
+    ).flatten()
+    bias = pairs.repeat((2 * n + pairs.numel() - 1) // pairs.numel())[: 2 * n]
+    zeros = torch.zeros((m, k), device=device, dtype=dtype)
+    preact, postact = gemm_gated(
+        zeros,
+        torch.zeros((k, 2 * n), device=device, dtype=dtype),
+        bias=bias,
+        activation="swiglu_clamped",
+        tuned=False,
+    )
+
+    gate = preact[..., ::2].float().detach().requires_grad_()
+    up = preact[..., 1::2].float().detach().requires_grad_()
+    postact_ref = F.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0)
+    torch.testing.assert_close(postact.float(), postact_ref, rtol=2e-2, atol=2e-2)
+
+    dout_input = torch.ones((m, k), device=device, dtype=dtype)
+    weight = torch.full((n, k), 1 / k, device=device, dtype=dtype)
+    dpreact, postact_bwd = gemm_dgated(
+        dout_input,
+        weight.T,
+        preact,
+        activation="swiglu_clamped",
+        tuned=False,
+    )
+    dout = dout_input.float() @ weight.float().T
+    dgate_ref, dup_ref = torch.autograd.grad(postact_ref, (gate, up), dout)
+    dpreact_ref = torch.stack((dgate_ref, dup_ref), dim=-1).flatten(-2)
+    torch.testing.assert_close(dpreact.float(), dpreact_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(postact_bwd.float(), postact_ref, rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("pingpong", [False, True])
 def test_gemm_gated_pingpong_configs(pingpong):
     """Exercise tuned gated dispatch with configs that bypass the public wrapper."""
