@@ -95,7 +95,7 @@ class SpuriousInvalidProbe:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         if const_expr(self.smem_pad_kb > 0):
             smem.allocate_tensor(Int32, cute.make_layout(self.smem_pad_kb * 256), byte_alignment=16)
         resp = smem.allocate_tensor(Int32, cute.make_layout(4), byte_alignment=16)

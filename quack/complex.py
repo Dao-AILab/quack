@@ -231,7 +231,7 @@ def allocate_smem_complex(
 ):
     """Allocate a `Complex64` smem tensor.
 
-    Wraps `cutlass.utils.SmemAllocator.allocate_tensor(Complex64, ...)` and
+    Wraps `cutlass.memory.SmemAllocator.allocate_tensor(Complex64, ...)` and
     re-tags the result so `tensor.element_type is Complex64`. Without the
     re-tag, the JIT-side tensor's element_type is `Float64` (derived from the
     f64 memref) and writes go through `Complex64.to(Float64)` and corrupt the

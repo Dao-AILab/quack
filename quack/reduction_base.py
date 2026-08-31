@@ -68,7 +68,7 @@ class ReductionBase:
         )
 
     def _allocate_reduction_buffer_and_mbar(
-        self, smem: cutlass.utils.SmemAllocator, tv_layout: cute.Layout
+        self, smem: cutlass.memory.SmemAllocator, tv_layout: cute.Layout
     ) -> Tuple[cute.Tensor, Optional[cute.Pointer]]:
         """Single-shot (non-persistent) reduction: full barriers only. Persistent
         kernels use quack.pipeline.PipelineStasAsync instead, which also manages

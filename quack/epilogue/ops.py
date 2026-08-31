@@ -82,7 +82,7 @@ def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
     if stage is None:
         stage = gemm.epi_stage
     dtype = tensor.element_type
-    layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
+    layout = cutlass.tensor_utils.LayoutEnum.from_tensor(tensor)
     utils_cls = blackwell_helpers if gemm.arch >= 100 else sm90_utils
     smem_layout_staged = utils_cls.make_smem_layout_epi(dtype, layout, epi_tile, stage)
     # Ragging-for-TMA is for varlen_m stores that need a per-batch row offset baked
@@ -913,7 +913,7 @@ class TileStore(EpiOp):
 
     def to_params(self, gemm, args):
         tensor = getattr(args, self.name)
-        layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
+        layout = cutlass.tensor_utils.LayoutEnum.from_tensor(tensor)
         if self.gated:
             # The smem store path degrades to a universal SIMT copy for
             # narrow dtypes (get_smem_store_atom / SM100's get_smem_store_op),
@@ -1002,7 +1002,7 @@ class TileStore(EpiOp):
         else:
             return copy_utils.get_smem_store_atom(
                 dtype,
-                transpose=layout != cutlass.utils.LayoutEnum.ROW_MAJOR,
+                transpose=layout != cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
                 major_mode_size=cute.size(getattr(params, self._epi_tile_key()), mode=[1])
                 // gemm.atom_layout_mnk[1],
             )
@@ -1255,7 +1255,7 @@ class TileLoad(EpiOp):
 
     def to_params(self, gemm, args):
         tensor = getattr(args, self.name)
-        setattr(gemm, self._layout_gemm_attr(), cutlass.utils.LayoutEnum.from_tensor(tensor))
+        setattr(gemm, self._layout_gemm_attr(), cutlass.tensor_utils.LayoutEnum.from_tensor(tensor))
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
