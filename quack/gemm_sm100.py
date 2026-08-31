@@ -407,6 +407,11 @@ class GemmSm100(GemmTmaBase):
         return in_row, out_row
 
     def epi_smem_warp_shape_mnk(self):
+        # Under epi_reduce the epilogue runs on the comm warps framed on the stripe,
+        # whose warp layout (set in _setup_attributes) sizes the ops' exchange smem.
+        if self.epi_reduce_mode is not None:
+            assert self.epi_reduce_warp_shape_mnk is not None, "call after _setup_attributes"
+            return self.epi_reduce_warp_shape_mnk
         # Mirrors cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape:
         # the epilogue tmem layout uses two M warps and two N warps when the
         # per-CTA M tile is 64 and the kernel uses 2-CTA instructions.
@@ -604,6 +609,7 @@ class GemmSm100(GemmTmaBase):
         # The epilogue runs framed on the stripe there, so its C/aux tensors are staged
         # per this tile, not per epi_tile.
         self.epi_reduce_tile = None
+        self.epi_reduce_warp_shape_mnk = None
         if const_expr(self.epi_reduce_mode is not None):
             cta_m, cta_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
             atom_num_elements = 128 // self.ws_dtype.width
@@ -612,8 +618,13 @@ class GemmSm100(GemmTmaBase):
             atom_thr_m = total_comm_threads // atom_thr_n
             loop_m = (cta_m // self.num_ranks) // atom_thr_m
             loop_n = (cta_n // atom_num_elements) // atom_thr_n
-            chunk = math.gcd(loop_m, max(1, 4 // loop_n))
+            chunk = math.gcd(loop_m, max(1, 8 // loop_n))
             self.epi_reduce_tile = (chunk * atom_thr_m, cta_n)
+            # Warp layout of that thr_layout: a stripe row of atom_thr_n threads spans
+            # atom_thr_n // 32 warps (cta_n >= 512 puts two warps on one row, so the
+            # N-reduce ops need their inter-warp exchange smem).
+            warps_n = max(1, atom_thr_n // cute.arch.WARP_SIZE)
+            self.epi_reduce_warp_shape_mnk = (self.num_epi_reduce_warps // warps_n, warps_n, 1)
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         prefetch_A_idx = (
@@ -2320,14 +2331,15 @@ class GemmSm100(GemmTmaBase):
                 # hand-off between the reduce and the commit, with the epi ops in
                 # between. Derived from the thread fragment so it divides it exactly
                 # (threads already span the tile's width, so only the M loop can be
-                # split): ~4 128b atoms per thread, enough loads in flight to hide a
+                # split): ~8 128b atoms per thread, the depth-sweep knee (results/
+                # 2026-08-31/gemm_rs_mlp_sweep.md) — enough loads in flight to hide a
                 # switch round trip without buffering the whole stripe in registers.
                 # _setup_attributes derives the same tile for the C/aux staging.
                 frg_crd = thr_copy_comm.partition_S(
                     cute.make_identity_tensor((slice_m, cta_n))
                 )
                 _atom, loop_m, loop_n = frg_crd.shape
-                chunk = math.gcd(loop_m, max(1, 4 // loop_n))
+                chunk = math.gcd(loop_m, max(1, 8 // loop_n))
                 epi_slice_tile = (chunk * atom_thr_m, cta_n)
                 assert epi_slice_tile == self.epi_reduce_tile, (
                     f"comm subtile {epi_slice_tile} != host epi_reduce_tile {self.epi_reduce_tile}"
