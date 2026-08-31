@@ -348,14 +348,9 @@ class MLP(nn.Module):
             if self.gated:
                 if self.concat_layout:
                     gate, up = y.chunk(2, dim=-1)
-                    y = _apply_gated_activation(self.activation, gate, up, self.activation_limit)
                 else:
-                    y = _apply_gated_activation(
-                        self.activation,
-                        y[..., ::2],
-                        y[..., 1::2],
-                        self.activation_limit,
-                    )
+                    gate, up = y[..., ::2], y[..., 1::2]
+                y = _apply_gated_activation(self.activation, gate, up, self.activation_limit)
             else:
                 y = act_to_pytorch_fn_map[self.activation](y)
             return self.fc2(y)

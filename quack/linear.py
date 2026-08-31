@@ -9,10 +9,7 @@ from torch import Tensor
 
 from quack.gemm_interface import gemm, gemm_add_inplace, gemm_act, gemm_dact
 from quack.gemm_interface import gemm_gated, gemm_dgated
-from quack.gemm_interface import (
-    _apply_gated_activation,
-    act_to_pytorch_fn_map,
-)
+from quack.gemm_interface import _apply_gated_activation, act_to_pytorch_fn_map
 
 
 def _ensure_contiguous(t):
