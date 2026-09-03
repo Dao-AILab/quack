@@ -222,13 +222,15 @@ def sr_cvt_copy(
     src: cute.Tensor,
     dst: cute.Tensor,
     seed: Int32,
-    tidx: Int32,
+    offset: Int32,
     *,
     retile: bool = False,
     loc=None,
     ip=None,
 ) -> None:
-    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16/FP16 conversion."""
+    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16/FP16 conversion.
+    ``offset`` (< 2**28) is the caller's linearized rand-stream offset (see
+    quack.rounding.convert_f32_to_bf16_sr)."""
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     from quack.rounding import convert_f32_to_bf16_sr, convert_f32_to_f16_sr
     from cutlass.cute.tensor import TensorSSA
@@ -243,7 +245,7 @@ def sr_cvt_copy(
     )
     src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
     src_vec = src.load()
-    raw_vec = convert_sr(src_vec, seed, tidx, loc=loc, ip=ip)
+    raw_vec = convert_sr(src_vec, seed, offset, loc=loc, ip=ip)
     src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
     src = src_cvt
     if const_expr(retile):
