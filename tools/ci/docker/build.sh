@@ -126,9 +126,9 @@ if [ "$DO_PUSH" = 1 ]; then
     hub_login
 fi
 
-# cu12.9 image pins torch to cu129 wheels now that PyTorch 2.13 ships a cu129
-# wheel. This keeps the cu12.9 image aligned with its CUDA label while still
-# being runnable on driver 575+ unaided.
+# cu12.9 runner image uses cu126 torch wheels because PyTorch 2.14 no longer
+# publishes cu129 wheels. These remain runnable on driver 575+ unaided.
+# cu126 lacks Blackwell support, so B300 CI runs only with the cu13.2 image.
 #
 # cu13.2 image pins torch to cu132 wheels and adds the CUDA 13.x forward-
 # compatibility libs (the `cu13` Dockerfile target). The user-mode
@@ -136,10 +136,10 @@ fi
 # cute-dsl JIT successfully on the H100 runner's 575 kernel driver, so
 # cu13.2 is a fully testable image — not driver-gated. Bonus: torch's cu13
 # wheel bundles all nvidia libs under a single nvidia/cu13/ tree (~1.5 GB
-# smaller than cu129's per-lib layout).
+# smaller than cu126's per-lib layout).
 case "$VARIANT" in
-    cu129)  run_variant cu12.9 cu129 dev base ;;
+    cu129)  run_variant cu12.9 cu126 dev base ;;
     cu132)  run_variant cu13.2 cu132 cu13,dev cu13 ;;
-    all)    run_variant cu12.9 cu129 dev base
+    all)    run_variant cu12.9 cu126 dev base
             run_variant cu13.2 cu132 cu13,dev cu13 ;;
 esac

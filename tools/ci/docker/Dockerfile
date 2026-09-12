@@ -6,7 +6,7 @@ FROM ubuntu:24.04 AS base
 # Defaults match build.sh's cu12.9 invocation so a bare `docker build` (no
 # --build-arg) produces a working image on our cu12.9 runners. Pass
 # --build-arg QUACK_EXTRAS=cu13,dev (plus --target cu13) for the cu13.2 variant.
-ARG TORCH_CUDA=cu129
+ARG TORCH_CUDA=cu126
 ARG QUACK_EXTRAS=dev
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -22,13 +22,13 @@ RUN apt-get update -y && apt-get install -y \
 # (we don't use torch.linalg here), so we drop it in the same RUN to shrink
 # the layer (~hundreds of MB).
 #
-# Note: build.sh pins TORCH_CUDA=cu129 for the cu12.9 image now that PyTorch
-# 2.13 ships cu129 wheels, and TORCH_CUDA=cu132 for the cu13.2 image (matches
+# Note: build.sh pins TORCH_CUDA=cu126 for the cu12.9 image because PyTorch
+# 2.14 has no cu129 wheels, and TORCH_CUDA=cu132 for the cu13.2 image (matches
 # the cu13 cute-dsl backend and the cu13.x compat shim added by the `cu13`
 # target). The cu13 target's compat libcuda.so is what makes cu132 torch
 # runnable on older kernel drivers like 575.x.
 RUN pip install --break-system-packages --no-cache-dir \
-        "torch==2.13.0" \
+        "torch==2.14.0" \
         --index-url https://download.pytorch.org/whl/${TORCH_CUDA} && \
     rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cusolver \
            /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcusolver*.so.*

@@ -7,28 +7,29 @@
 #   compat payloads and broad devel/runtime packages. Starting from Ubuntu lets
 #   us install only the CUDA apt packages needed for kernel work.
 # - Use apt for the latest CUDA compiler/profiler/debugger stack. Python runtime
-#   libraries still come from the official PyTorch cu132 dependency wheel set
-#   until PyTorch publishes cu133 wheels, so normal `pip install ...` inside the
-#   container does not try to repair a hand-pruned no-deps torch install.
+#   libraries come from the official PyTorch cu132 dependency wheel set, so
+#   normal `pip install ...` inside the container keeps a complete CUDA
+#   dependency graph.
 # - Keep this image Apptainer-friendly: no baked-in non-root user, writable
 #   workspaces are expected to be bind-mounted at runtime.
 #
 # Build:
 #   tools/dev/docker/build.sh [--image] [--push] [--sif]   (tags tridao/quack-kernels-dev:YY.MM.DD)
 # or by hand:
-#   docker build -f tools/dev/docker/Dockerfile -t kernel-dev:cu133 .
+#   docker build -f tools/dev/docker/Dockerfile -t kernel-dev:cu134 .
 #
 # Useful build args:
-#   --build-arg CUTLASS_DSL_VERSION=4.7.0
-#   --build-arg TILELANG_VERSION=0.1.13
-#   --build-arg CUDA_APT_SUFFIX=13-3
-#   --build-arg CUDNN_VERSION=9.24.0.43
-#   --build-arg CUDNN_FRONTEND_VERSION=1.27.0
-#   --build-arg CUDA_PYTHON_VERSION=13.3.1
+#   --build-arg CUTLASS_DSL_VERSION=4.7.1
+#   --build-arg TILELANG_VERSION=0.1.14
+#   --build-arg CUDA_APT_SUFFIX=13-4
+#   --build-arg CUDNN_VERSION=9.26.0.51
+#   --build-arg CUDNN_FRONTEND_VERSION=1.28.0
+#   --build-arg CUDA_PYTHON_VERSION=13.4.1
 #   --build-arg MATMUL_HEURISTICS_VERSION=0.1.0.27
 #   --build-arg NSIGHT_PYTHON_VERSION=1.0.0
-#   --build-arg COMPILEIQ_VERSION=1.0.2
+#   --build-arg COMPILEIQ_VERSION=1.0.3
 #   --build-arg UV_VERSION=0.11.22
+#   --build-arg RUFF_VERSION=0.11.13
 #   --build-arg GH_VERSION=2.95.0
 
 ARG BASE_IMAGE=ubuntu:24.04
@@ -41,18 +42,20 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHON_VERSION=3.12
-ARG CUDA_APT_SUFFIX=13-3
+ARG CUDA_APT_SUFFIX=13-4
 ARG TORCH_CUDA=cu132
-ARG TORCH_VERSION=2.13.0
-ARG CUDNN_VERSION=9.24.0.43
-ARG CUDNN_FRONTEND_VERSION=1.27.0
-ARG CUDA_PYTHON_VERSION=13.3.1
+ARG TORCH_VERSION=2.14.0
+ARG CUDNN_VERSION=9.26.0.51
+ARG CUDNN_FRONTEND_VERSION=1.28.0
+ARG CUDA_PYTHON_VERSION=13.4.1
 ARG MATMUL_HEURISTICS_VERSION=0.1.0.27
 ARG NSIGHT_PYTHON_VERSION=1.0.0
-ARG COMPILEIQ_VERSION=1.0.2
+ARG COMPILEIQ_VERSION=1.0.3
 ARG UV_VERSION=0.11.22
-ARG CUTLASS_DSL_VERSION=4.7.0
-ARG TILELANG_VERSION=0.1.13
+# Match .pre-commit-config.yaml and CI to keep local formatting consistent.
+ARG RUFF_VERSION=0.11.13
+ARG CUTLASS_DSL_VERSION=4.7.1
+ARG TILELANG_VERSION=0.1.14
 ARG GH_VERSION=2.95.0
 
 ENV LANG=C.UTF-8 \
@@ -75,6 +78,8 @@ ENV LANG=C.UTF-8 \
 # kernel drivers. Copy only the CUDA 13.1 compat shim so libcuda.so.590 wins
 # under Docker/Apptainer on 575-series hosts, while avoiding newer compat
 # payloads from NVIDIA's CUDA base images.
+# On 595+ hosts, put the host driver libraries ahead of this shim in
+# LD_LIBRARY_PATH (Apptainer: /.singularity.d/libs), as in the gpu-test action.
 COPY --from=cuda131-compat /NGC-DL-CONTAINER-LICENSE /
 COPY --from=cuda131-compat /usr/local/cuda/compat /opt/cuda131-compat
 ENV LD_LIBRARY_PATH=/opt/cuda131-compat:${LD_LIBRARY_PATH}
@@ -183,12 +188,9 @@ ENV PATH=/usr/local/cuda/bin:${PATH}
 
 # Install Python packages in one layer so replaced/stripped files do not remain
 # in lower Docker layers. Torch is installed normally from the official PyTorch
-# cu132 index, including Triton and CUDA wheel dependencies. PyTorch has no
-# cu133 wheels yet, and a no-deps torch install makes later interactive
-# `pip install ...` try to repair the missing CUDA dependency graph. We still
-# override cuDNN to CUDNN_VERSION for
-# newer frontend testing, then patch torch's installed METADATA so pip's resolver
-# and `pip check` treat that cuDNN version as the expected one.
+# cu132 index, including Triton and CUDA wheel dependencies. Override cuDNN to
+# CUDNN_VERSION for newer frontend testing, then patch torch's installed METADATA
+# so pip's resolver and `pip check` treat that cuDNN version as the expected one.
 #
 # Install basic nsight-python, not nsight-python[cu13], so cuda-core[cu13] does
 # not pull an additional CUDA toolkit stack.
@@ -215,7 +217,7 @@ RUN python${PYTHON_VERSION} -m pip install "setuptools<82" wheel packaging "uv==
         pytest-benchmark \
         pytest-timeout \
         pytest-xdist \
-        ruff \
+        "ruff==${RUFF_VERSION}" \
         ty \
         tyro && \
     uv pip install --system \

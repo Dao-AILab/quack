@@ -21,19 +21,25 @@ and on PRs.
 | `cu129` | `tridao/quack-kernels:cu12.9-DATE` | base cute-dsl |
 | `cu132` | `tridao/quack-kernels:cu13.2-DATE` | cute-dsl[cu13] |
 
-The cu12.9 variant uses torch cu129 wheels (CUDA 12.9 PyTorch 2.13 index).
-The cu13.2 variant uses torch cu132 wheels plus the Dockerfile's CUDA 13 forward-
+The cu12.9 variant uses PyTorch 2.14 cu126 wheels because cu129 wheels are no
+longer published. The `cu129` variant name and `cu12.9` image tag are retained
+for the CUDA 12 runner configuration; they do not identify torch's wheel version.
+The cu13.2 variant uses PyTorch 2.14 cu132 wheels plus the Dockerfile's CUDA 13 forward-
 compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 
 ## Test matrix
 
-`_test.yml` runs the full cross product (6 jobs per push):
+`_test.yml` runs 5 jobs per push:
 
 | GPU | Arch override | cu129 | cu132 |
 |-----|----------------|-------|-------|
 | h100 | (none, sm90) | ✓ | ✓ |
-| b300 | (none, sm100) | ✓ | ✓ |
+| b300 | (none, sm100) | — | ✓ |
 | h100 | sm120 | ✓ | ✓ |
+
+The cu126 torch wheels lack Blackwell support, so B300 runs only with cu132.
+The h100/sm120 jobs select QuACK's SM120 implementations with `QUACK_ARCH=120`
+but compile and execute on H100 hardware, so both wheel variants work there.
 
 ## Test strategy
 

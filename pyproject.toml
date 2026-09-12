@@ -10,7 +10,6 @@ dependencies = [
     "nvidia-cutlass-dsl>=4.7",
     "torch",
     "apache-tvm-ffi>=0.1.6,<0.2",
-    "torch-c-dlpack-ext",
     "einops",
 ]
 
@@ -34,13 +33,13 @@ include = ["quack*"]
 version = {attr = "quack.__version__"}
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu130", marker = "extra == 'cu13'" },
+    { index = "pytorch-cu132", marker = "extra == 'cu13'" },
 ]
 
 [tool.pytest.ini_options]

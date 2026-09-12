@@ -16,8 +16,8 @@ on:
 
 env:
   # Bump these when pushing a new image; old SIFs are auto-pruned on the next CI run.
-  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.08.08
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.08.08
+  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.09.12
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.09.12
 
 jobs:
   lint:
@@ -69,9 +69,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The cu129 image uses torch cu126 wheels in PyTorch 2.14, which
+          # lack Blackwell support. B300 must use the cu132 image.
           - { gpu: h100, cuda: cu129 }
           - { gpu: h100, cuda: cu132 }
-          - { gpu: b300, cuda: cu129 }
           - { gpu: b300, cuda: cu132 }
           - { gpu: h100, cuda: cu129, arch: '120' }
           - { gpu: h100, cuda: cu132, arch: '120' }
