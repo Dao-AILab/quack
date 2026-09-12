@@ -102,6 +102,7 @@ def bitonic_topk(
         arr: Array to sort
         k: must be power of 2 and <= 128
         ascending: Sort in ascending order (default False)
+        warp_width: cooperating lane group size (power of 2, <= 32)
     """
     assert arr.element_type in [Float32, Int32]
     n = cute.size(arr.shape)
@@ -118,11 +119,12 @@ def bitonic_topk(
         bitonic_sort(other_vals, ascending=ascending)
         # Merge 2 sorted top-k sequences to get a new top-k sequence
         bitonic_topk_merge(topk_vals, other_vals, ascending=ascending)
-    # TODO: this is not efficient for large k (e.g. >= 16) since threads in the same warps
-    # do duplicate work.
+    lane = cute.arch.lane_idx()
     for i in cutlass.range(int(math.log2(warp_width)), unroll_full=True):
+        offset = 1 << i
         other_vals = cute.make_rmem_tensor(k, arr.element_type)
         for v in cutlass.range(k, unroll_full=True):
-            other_vals[v] = cute.arch.shuffle_sync_bfly(topk_vals[v], offset=1 << i)
-        bitonic_topk_merge(topk_vals, other_vals, ascending=ascending)
+            other_vals[v] = cute.arch.shuffle_sync_bfly(topk_vals[v], offset=offset)
+        if (lane & ((offset << 1) - 1)) == 0:
+            bitonic_topk_merge(topk_vals, other_vals, ascending=ascending)
     return topk_vals
