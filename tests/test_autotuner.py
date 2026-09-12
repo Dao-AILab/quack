@@ -121,3 +121,45 @@ def test_autotune_wedged_pool_falls_back_in_process(monkeypatch):
     tuner(torch.empty(4, device="cuda"))
     assert benched.count(1) == 1  # eventually ran, via suppress_pool
     assert len(tuner.configs_timings) == 2
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="requires CUDA")
+def test_autotuning_does_not_pollute_selective_checkpoint_cache():
+    import torch
+    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+
+    from quack.autotuner import Autotuner
+
+    def matmul(a, b, block=0):
+        return a @ b
+
+    tuner = Autotuner(
+        matmul,
+        key=[],
+        configs=[AutotuneConfig(block=0), AutotuneConfig(block=1)],
+    )
+    saved_matmuls = []
+
+    def policy(context, op, *args, **kwargs):
+        if op == torch.ops.aten.mm.default:
+            if not context.is_recompute:
+                saved_matmuls.append(tuple(args[0].shape))
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    a = torch.randn(32, 32, device="cuda", requires_grad=True)
+    b = torch.randn(32, 32, device="cuda", requires_grad=True)
+    expected = a @ b
+    expected_grads = torch.autograd.grad(expected.sum(), (a, b))
+    actual = checkpoint(
+        tuner,
+        a,
+        b,
+        use_reentrant=False,
+        context_fn=lambda: create_selective_checkpoint_contexts(policy),
+    )
+    assert saved_matmuls == [(32, 32)]
+    actual_grads = torch.autograd.grad(actual.sum(), (a, b))
+    torch.testing.assert_close(actual, expected)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad)
