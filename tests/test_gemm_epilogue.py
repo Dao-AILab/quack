@@ -815,8 +815,10 @@ def _dgated_moe_torch_ref(x, y, dout_scaled, activation):
     if activation == "swiglu":
         out = torch.nn.functional.silu(xg) * yg
     else:  # swiglu_oai (gpt-oss, limit=7): gate clamped above, up two-sided
-        xc = xg.clamp(max=7.0)
-        yc = yg.clamp(-7.0, 7.0)
+        # Zero gradient at equality, matching scalar clamp in PyTorch 2.14+.
+        # Spell it explicitly so the reference also works on older PyTorch.
+        xc = torch.where(xg >= 7.0, 7.0, xg)
+        yc = torch.where(yg <= -7.0, -7.0, torch.where(yg >= 7.0, 7.0, yg))
         out = xc * torch.sigmoid(1.702 * xc) * (yc + 1)
     out.backward(dout_scaled)
     return xg.grad, yg.grad, out.detach()
@@ -850,6 +852,15 @@ def test_epi_mod_dgated_moe(tile_N, activation):
     preact = torch.randn((l, m, 2 * n), device=device, dtype=torch.bfloat16) * preact_scale
     if activation != "swiglu":
         assert (preact.abs() > 7.0).float().mean() > 0.05
+        # Exact clamp bounds and their adjacent BF16 values, with a nonzero
+        # partner so both boundary gradients are exercised deterministically.
+        bounds = torch.tensor(
+            [-7.03125, -7.0, -6.96875, 6.96875, 7.0, 7.03125],
+            device=device,
+            dtype=preact.dtype,
+        )
+        preact[..., :12:2], preact[..., 1:12:2] = bounds, 1.0
+        preact[..., 12:24:2], preact[..., 13:24:2] = 1.0, bounds
     score = torch.rand((l, m), device=device, dtype=torch.float32) + 0.5
     out_mod = torch.empty_like(preact)
     postact = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)

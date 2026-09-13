@@ -642,33 +642,33 @@ def _maxnumf(x: F32_or_F32x2, c: float, *, loc=None, ip=None) -> F32_or_F32x2:
 
 @dsl_user_op
 @cute.jit
-def _where_le(val: F32_or_F32x2, x: F32_or_F32x2, c: float, *, loc=None, ip=None) -> F32_or_F32x2:
-    """val where x <= c else 0, elementwise — the clamp-saturation grad mask
-    (boundary-inclusive, matching torch.clamp backward)."""
+def _where_lt(val: F32_or_F32x2, x: F32_or_F32x2, c: float, *, loc=None, ip=None) -> F32_or_F32x2:
+    """val where x < c else 0, elementwise — the clamp-saturation grad mask
+    (zero at equality, matching scalar torch.clamp backward in PyTorch 2.14+)."""
     if const_expr(not isinstance(val, tuple)):
-        return val if Boolean(x <= c) else Float32(0.0)
+        return val if Boolean(x < c) else Float32(0.0)
     else:
         return (
-            _where_le(val[0], x[0], c, loc=loc, ip=ip),
-            _where_le(val[1], x[1], c, loc=loc, ip=ip),
+            _where_lt(val[0], x[0], c, loc=loc, ip=ip),
+            _where_lt(val[1], x[1], c, loc=loc, ip=ip),
         )
 
 
 @dsl_user_op
 @cute.jit
-def _where_abs_le(
+def _where_abs_lt(
     val: F32_or_F32x2, x: F32_or_F32x2, c: float, *, loc=None, ip=None
 ) -> F32_or_F32x2:
-    """val where |x| <= c else 0 — the two-sided clamp mask as ONE compare +
+    """val where |x| < c else 0 — the two-sided clamp mask as ONE compare +
     one select: FSETP takes an |x| operand modifier, so this beats the naive
-    (x <= c) & (x >= -c) spelling by a setp+sel pair per element. NaN corner:
-    |NaN| <= c is false, so val(NaN) masks to 0 either way."""
+    (x < c) & (x > -c) spelling by a setp+sel pair per element. NaN corner:
+    |NaN| < c is false, so val(NaN) masks to 0 either way."""
     if const_expr(not isinstance(val, tuple)):
-        return val if Boolean(abs(x) <= c) else Float32(0.0)
+        return val if Boolean(abs(x) < c) else Float32(0.0)
     else:
         return (
-            _where_abs_le(val[0], x[0], c, loc=loc, ip=ip),
-            _where_abs_le(val[1], x[1], c, loc=loc, ip=ip),
+            _where_abs_lt(val[0], x[0], c, loc=loc, ip=ip),
+            _where_abs_lt(val[1], x[1], c, loc=loc, ip=ip),
         )
 
 
@@ -750,8 +750,8 @@ def dswiglu_oai(
 
     A finite ``limit`` applies the gpt-oss preact clamp (see swiglu_oai): the
     math runs on the clamped preacts and the grads are zeroed where the clamp
-    saturates (dx where x > limit; dy where |y| > limit), boundary-inclusive
-    like torch.clamp backward.
+    saturates, including equality (dx where x >= limit; dy where |y| >= limit),
+    like scalar torch.clamp backward in PyTorch 2.14+.
     """
     x_raw, y_raw = x, y
     if const_expr(limit != math.inf):
@@ -786,8 +786,8 @@ def dswiglu_oai(
         dy = silu_x_dout
         swiglu_out = cute.arch.fma_packed_f32x2(silu_x, y, silu_x)
     if const_expr(limit != math.inf):
-        dx = _where_le(dx, x_raw, limit, loc=loc, ip=ip)
-        dy = _where_abs_le(dy, y_raw, limit, loc=loc, ip=ip)
+        dx = _where_lt(dx, x_raw, limit, loc=loc, ip=ip)
+        dy = _where_abs_lt(dy, y_raw, limit, loc=loc, ip=ip)
     return dx, dy, swiglu_out
 
 
@@ -837,8 +837,8 @@ def dswiglu_oai_tanh(
         dy = silu_x_dout
         swiglu_out = cute.arch.fma_packed_f32x2(silu_x, y, silu_x)
     if const_expr(limit != math.inf):
-        dx = _where_le(dx, x_raw, limit, loc=loc, ip=ip)
-        dy = _where_abs_le(dy, y_raw, limit, loc=loc, ip=ip)
+        dx = _where_lt(dx, x_raw, limit, loc=loc, ip=ip)
+        dy = _where_abs_lt(dy, y_raw, limit, loc=loc, ip=ip)
     return dx, dy, swiglu_out
 
 
