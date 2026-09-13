@@ -524,7 +524,17 @@ _SR_OPS = (Scalar("sr_seed", dtype=Int32),)
 
 
 @functools.lru_cache(maxsize=None)
-def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False, has_alpha=False):
+def linear_act_mod(
+    activation,
+    *,
+    gated,
+    has_c,
+    has_rowvec,
+    has_colvec,
+    sr=False,
+    has_alpha=False,
+    activation_limit=None,
+):
     """gemm_act/gemm_gated as a mod: D = alpha * acc (+ C + rowvec + colvec),
     aux = act(D). Math order matches apply_linear_epilogue: alpha scales the
     accumulator only (before C / rowvec / colvec), so ``act(alpha * A @ B)``
@@ -555,7 +565,8 @@ def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False
         expr = "x"
     if gated:
         body.append(f"g, u = unpack({expr})")
-        body.append('return {"D": pack(g, u), "mAuxOut": act(g, u)}')
+        act_call = "act(g, u)" if activation_limit is None else "act(g, u, limit=activation_limit)"
+        body.append(f'return {{"D": pack(g, u), "mAuxOut": {act_call}}}')
     elif act is not None:
         body.append(f'return {{"D": {expr}, "mAuxOut": act({expr})}}')
     else:
@@ -564,7 +575,15 @@ def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False
         f"act:{activation}:g{int(gated)}c{int(has_c)}r{int(has_rowvec)}"
         f"v{int(has_colvec)}a{int(has_alpha)}"
     )
-    fn = _gen_epi_fn("linear_act_epi", tag, params, body, {"act": act})
+    if activation_limit is not None:
+        tag += f":l{activation_limit}"
+    fn = _gen_epi_fn(
+        "linear_act_epi",
+        tag,
+        params,
+        body,
+        {"act": act, "activation_limit": activation_limit},
+    )
     ops = _vec_pins(params)
     if has_alpha:
         ops["alpha"] = Scalar("alpha")
@@ -658,7 +677,7 @@ def dact_mod(activation, *, has_scale=False, has_reduce=False):
 
 
 @functools.lru_cache(maxsize=None)
-def dgated_mod(activation, *, has_scale, has_reduce):
+def dgated_mod(activation, *, has_scale, has_reduce, activation_limit=None):
     """gemm_dgated as a mod: acc = dout (per pair), c = packed (x, y) preact.
     Reduce accumulates postact * unscaled dout; postact is scaled after."""
     dgate = dgate_fn_map[activation]
@@ -667,7 +686,12 @@ def dgated_mod(activation, *, has_scale, has_reduce):
         params.append("mColVecBroadcast")
     body.append("x, y = unpack(c)")
     dout = "acc * mColVecBroadcast" if has_scale else "acc"
-    body.append(f"dx, dy, out = dgate(x, y, {dout})")
+    dgate_call = (
+        f"dgate(x, y, {dout})"
+        if activation_limit is None
+        else f"dgate(x, y, {dout}, limit=activation_limit)"
+    )
+    body.append(f"dx, dy, out = {dgate_call}")
     postact = "out * mColVecBroadcast" if has_scale else "out"
     if has_reduce:
         # Scaled reduce: return the factors so the fold is one
@@ -678,7 +702,15 @@ def dgated_mod(activation, *, has_scale, has_reduce):
     else:
         body.append(f'return {{"D": pack(dx, dy), "mAuxOut": {postact}}}')
     tag = f"dgated:{activation}:s{int(has_scale)}r{int(has_reduce)}"
-    fn = _gen_epi_fn("dgated_epi", tag, params, body, {"dgate": dgate})
+    if activation_limit is not None:
+        tag += f":l{activation_limit}"
+    fn = _gen_epi_fn(
+        "dgated_epi",
+        tag,
+        params,
+        body,
+        {"dgate": dgate, "activation_limit": activation_limit},
+    )
     return gemm_epilogue(
         outputs=("mAuxOut",),
         ops=_vec_pins(params),
