@@ -100,8 +100,9 @@ def test_varlen_construction():
     assert args.mCuSeqlensK is None
     assert args.mAIdx is None
     assert args.mCuTilesM is None
+    assert args.mSequsedK is None
     assert hasattr(args, "_fields")
-    assert args._fields == ("mCuSeqlensM", "mCuSeqlensK", "mAIdx", "mCuTilesM")
+    assert args._fields == ("mCuSeqlensM", "mCuSeqlensK", "mAIdx", "mCuTilesM", "mSequsedK")
 
     # Keyword construction
     t = torch.zeros(4, dtype=torch.int32, device="cuda")

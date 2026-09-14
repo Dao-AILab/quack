@@ -23,6 +23,7 @@ class VarlenArguments(NamedTuple):
     # sinks); the tile scheduler's m index is sequence-local, so a batchless
     # per-M-tile buffer needs this offset to keep sequences' rows disjoint.
     mCuTilesM: Optional[cute.Tensor] = None
+    mSequsedK: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -32,6 +33,7 @@ class VarlenManager:
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
         cu_tiles_m: Optional[cute.Tensor] = None
+        seqused_k: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -41,6 +43,7 @@ class VarlenManager:
                 cu_seqlens_k=args.mCuSeqlensK,
                 mAIdx=args.mAIdx,
                 cu_tiles_m=args.mCuTilesM,
+                seqused_k=args.mSequsedK,
             )
 
     def __init__(
@@ -64,6 +67,7 @@ class VarlenManager:
         self.varlen_m = const_expr(params.cu_seqlens_m is not None)
         self.varlen_k = const_expr(params.cu_seqlens_k is not None)
         self.gather_A = const_expr(params.mAIdx is not None)
+        self.has_seqused_k = const_expr(params.seqused_k is not None)
         self._loc = loc
         self._ip = ip
 
@@ -71,6 +75,9 @@ class VarlenManager:
     def to_underlying_arguments(args: VarlenArguments, *, loc=None, ip=None) -> Params:
         assert not (args.mCuSeqlensM is not None and args.mCuSeqlensK is not None), (
             "Only support either varlen_m or varlen_k"
+        )
+        assert args.mSequsedK is None or args.mCuSeqlensK is not None, (
+            "seqused_k requires cu_seqlens_k"
         )
         return VarlenManager.Params.create(args, loc=loc, ip=ip)
 
@@ -99,7 +106,9 @@ class VarlenManager:
             return self._len_m_static
 
     def len_k(self, batch_idx: Int32) -> Int32:
-        if const_expr(self.varlen_k):
+        if const_expr(self.has_seqused_k):
+            return self.params.seqused_k[batch_idx]
+        elif const_expr(self.varlen_k):
             return self.params.cu_seqlens_k[batch_idx + 1] - self.params.cu_seqlens_k[batch_idx]
         else:
             return self._len_k_static
@@ -142,7 +151,10 @@ class VarlenManager:
             if const_expr(ragged_rank == 2):  # Didn't create ragged tensor
                 mA_mk = cute.domain_offset((None, offset), mA_mkl)
             else:
-                length = params.cu_seqlens_k[batch_idx + 1] - offset
+                if const_expr(self.has_seqused_k):
+                    length = params.seqused_k[batch_idx]
+                else:
+                    length = params.cu_seqlens_k[batch_idx + 1] - offset
                 # rank 3 = 1-extra-dim (ptr_shift), rank 4 = 2-extra-dim
                 ptr_shift = const_expr(ragged_rank == 3)
                 mA_mk = copy_utils.offset_ragged_tensor(
@@ -211,7 +223,10 @@ class VarlenManager:
             if const_expr(ragged_rank == 2):  # Didn't create ragged tensor
                 mB_nk = cute.domain_offset((None, offset), mB_nkl)
             else:
-                length = params.cu_seqlens_k[batch_idx + 1] - offset
+                if const_expr(self.has_seqused_k):
+                    length = params.seqused_k[batch_idx]
+                else:
+                    length = params.cu_seqlens_k[batch_idx + 1] - offset
                 ptr_shift = const_expr(ragged_rank == 3)
                 mB_nk = copy_utils.offset_ragged_tensor(
                     mB_nkl,
