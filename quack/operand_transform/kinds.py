@@ -93,7 +93,10 @@ class _StripAux:
         gemm = self.gemm
         box = self._box()
         smem_layout = cute.make_ordered_layout(box, order=(0, 1))
-        return gemm._make_tma_atoms_and_tensors(mAux, smem_layout, box, gemm.cluster_shape_mnk[1])
+        # multicast=False: non-multicast atom (full box per CTA); the copy
+        # site issues it without a multicast mask to match.
+        mcast_dim = gemm.cluster_shape_mnk[1] if self.multicast else 1
+        return gemm._make_tma_atoms_and_tensors(mAux, smem_layout, box, mcast_dim)
 
     def gmem_slice(self, mAux, tile_coord_mnkl, batch_idx):
         # (inner, outer, Gm, RestK, L) -> (inner, outer, RestK)

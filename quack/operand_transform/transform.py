@@ -175,8 +175,9 @@ class AuxKTileStrip(AuxOperandA):
     def make_tma(self, mAux):
         gemm = self.gemm
         sf_smem_layout = cute.make_ordered_layout((self.sf_bytes, self._tm64()), order=(0, 1))
+        mcast_dim = gemm.cluster_shape_mnk[1] if getattr(self, "multicast", True) else 1
         return gemm._make_tma_atoms_and_tensors(
-            mAux, sf_smem_layout, (self.sf_bytes, self._tm64()), gemm.cluster_shape_mnk[1]
+            mAux, sf_smem_layout, (self.sf_bytes, self._tm64()), mcast_dim
         )
 
     def gmem_slice(self, mAux, tile_coord_mnkl, batch_idx):

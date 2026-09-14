@@ -67,6 +67,23 @@ def cluster_idx_from_block_idx(
 
 
 @cute.jit
+def cluster_rem_from_block_idx(
+    cluster_shape_mnk: cutlass.Constexpr[cute.Shape], *, loc=None, ip=None
+) -> Tuple[Int32, Int32]:
+    """blockIdx % cluster_shape (m, n components) with the cluster shape as a
+    compile-time constant: the CTA's offset inside the scheduler's cluster
+    footprint. Under a mixed preferred/fallback launch this differs from
+    cute.arch.block_in_cluster_idx(), which only spans the ACTUAL (possibly
+    fallback-shaped) cluster — a fallback cluster may sit at a non-zero offset
+    within the preferred footprint, and the remainder keeps that offset."""
+    bidx = cute.arch.block_idx()
+    return tuple(
+        Int32(0) if const_expr(s == 1) else Int32(Uint32(b) % s)
+        for b, s in zip(bidx[:2], cluster_shape_mnk[:2])
+    )
+
+
+@cute.jit
 def get_raster_order_from_option(
     raster_order_option: RasterOrderOption, problem_shape_ncluster_mn: cute.Shape, group_size: Int32
 ) -> RasterOrder:
@@ -523,12 +540,26 @@ class TileScheduler:
 
     @cute.jit
     def _cluster_id_to_cta_id(
-        self, cid_m: Int32, cid_n: Int32, *, block_zero_only: bool = False, loc=None, ip=None
+        self,
+        cid_m: Int32,
+        cid_n: Int32,
+        rem_mn: Optional[Tuple[Int32, Int32]] = None,
+        *,
+        block_zero_only: bool = False,
+        loc=None,
+        ip=None,
     ) -> Tuple[Int32, Int32]:
         if const_expr(
             block_zero_only or cute.size(self.params.cluster_shape_mnk, loc=loc, ip=ip) == 1
         ):
             bidx_in_cluster = (Int32(0), Int32(0))
+        elif const_expr(rem_mn is not None):
+            # CLC/NONE decode: the CTA's offset inside the params (preferred)
+            # cluster footprint, computed by the caller as a remainder of the
+            # CTA coordinate. Under a mixed preferred/fallback launch the
+            # runtime block_in_cluster_idx only spans the ACTUAL cluster, which
+            # may sit at a non-zero offset within the preferred footprint.
+            bidx_in_cluster = rem_mn
         else:
             # Get the pid from cluster id
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
@@ -542,6 +573,7 @@ class TileScheduler:
         work_idx: Int32,
         bidz: Optional[Int32] = None,
         is_valid: Optional[Boolean] = None,
+        rem_mn: Optional[Tuple[Int32, Int32]] = None,
         *,
         block_zero_only: bool = False,
         loc=None,
@@ -557,6 +589,17 @@ class TileScheduler:
                 is_valid = (
                     work_idx < cute.size(params.problem_shape_ncluster_mnl) * params.num_split_k
                 )
+        # Initial (blockIdx-derived) tile: the CTA's offset inside the preferred
+        # cluster footprint comes from its own coordinates. Correct under mixed
+        # launches, and identical to block_in_cluster_idx for a pure preferred
+        # launch. Outside the dynamic `if is_valid` so rem_mn has one type on
+        # every path (CLC/NONE only; STATIC/DYNAMIC keep block_in_cluster_idx).
+        if const_expr(
+            rem_mn is None
+            and not block_zero_only
+            and params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]
+        ):
+            rem_mn = cluster_rem_from_block_idx(params.cluster_shape_mnk, loc=loc, ip=ip)
         pid_m, pid_n, batch_idx = Int32(0), Int32(0), Int32(0)
         split_idx = Int32(0) if const_expr(params.num_split_k != 1) else None
         if is_valid:
@@ -613,7 +656,7 @@ class TileScheduler:
             if const_expr(params.ag is not None):
                 cid_m = cid_m + ag_shard * params.ag.nclusters_m_per_shard
             pid_m, pid_n = self._cluster_id_to_cta_id(
-                cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
+                cid_m, cid_n, rem_mn, block_zero_only=block_zero_only, loc=loc, ip=ip
             )
             if const_expr(params.num_split_k == 1):
                 batch_idx = (
@@ -723,13 +766,34 @@ class TileScheduler:
         # needs the slot; freeing it here lets the scheduler warp recycle the stage
         # for the next query while this warp runs the (possibly expensive, e.g.
         # varlen scan) delinearization.
+        # The response carries the FIRST CTA coordinates of the canceled cluster,
+        # whose footprint matches this (requesting) cluster's RUNTIME shape. Under
+        # a mixed preferred/fallback launch that footprint may sit at a non-zero
+        # offset inside a preferred cluster block, while the decode below stays in
+        # preferred-cluster units (params.cluster_shape_mnk). Form this CTA's
+        # virtual coordinate (response + own offset in the actual cluster), divide
+        # by the preferred shape for the work idx, and keep the remainder as the
+        # CTA's offset inside the preferred footprint (mirrors CUTLASS
+        # PersistentTileSchedulerSm100::swizzle_and_rasterize). For a pure
+        # preferred launch the remainder equals block_in_cluster_idx, i.e. the
+        # previous decode.
+        vx, vy = Int32(bidx), Int32(bidy)
+        if const_expr(cute.size(params.cluster_shape_mnk) > 1):
+            bidx_in_cluster = cute.arch.block_in_cluster_idx()
+            vx, vy = vx + bidx_in_cluster[0], vy + bidx_in_cluster[1]
         cluster_idx = (
-            Int32(Uint32(bidx) // params.cluster_shape_mnk[0]),
-            Int32(Uint32(bidy) // params.cluster_shape_mnk[1]),
+            Int32(Uint32(vx) // params.cluster_shape_mnk[0]),
+            Int32(Uint32(vy) // params.cluster_shape_mnk[1]),
             Int32(Uint32(bidz) // params.cluster_shape_mnk[2]),
         )
+        rem_mn = tuple(
+            Int32(0) if const_expr(s == 1) else Int32(Uint32(v) % s)
+            for v, s in zip((vx, vy), params.cluster_shape_mnk[:2])
+        )
         work_idx, batch_idx = self._cluster_idx_to_work_idx_batch(params, cluster_idx)
-        ret = self._delinearize_work_idx(work_idx, batch_idx, Boolean(valid), loc=loc, ip=ip)
+        ret = self._delinearize_work_idx(
+            work_idx, batch_idx, Boolean(valid), rem_mn, loc=loc, ip=ip
+        )
         if Boolean(valid):
             # Track the last GRANTED work index only (bidx of an invalid
             # response is garbage; trusting it fed the drain a bogus
@@ -758,7 +822,15 @@ class TileScheduler:
         self._scheduler_pipeline.producer_acquire(pipeline_state_producer)
         mbar_ptr = self._scheduler_pipeline.producer_get_barrier(pipeline_state_producer)
         lane_idx = cute.arch.lane_idx()
-        if lane_idx < cute.size(params.cluster_shape_mnk):
+        # Arm one full barrier per CTA of the ACTUAL cluster. Under a mixed
+        # preferred/fallback launch this cluster may be fallback-shaped, and
+        # params.cluster_shape_mnk is the (larger) preferred shape — arming a
+        # rank beyond the actual cluster is a mapa to a nonexistent CTA (UB).
+        if const_expr(cute.size(params.cluster_shape_mnk) == 1):
+            num_cluster_ctas = Int32(1)
+        else:
+            num_cluster_ctas = cute.arch.cluster_size()
+        if lane_idx < num_cluster_ctas:
             # Arm each CTA's full barrier: fused arrive (count 1, matching the
             # producer group) + expect_tx(16) for the multicast response.
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, SCHED_SLOT_BYTES, lane_idx)
@@ -845,6 +917,12 @@ class TileScheduler:
         ):
             params = self.params
             grid_total = Int32(Uint32(cute.arch.grid_dim()[0]) // params.cluster_shape_mnk[0])
+            # Budget is in PREFERRED-cluster work-id units. Only preferred-shaped
+            # clusters drain: gemm_sm100 compiles this call out of the fallback
+            # branch, because a fallback grid with several rows breaks the
+            # monotonicity argument below (ids regress at row crossings) and a
+            # drain there could cancel REAL pending clusters. Fallback retirees
+            # skip the drain; excess phantoms launch as cheap empty waves.
             # Remaining tail <= total work indices - the phantom index we drew.
             # Zero budget unless this cluster retired on a DECODED phantom:
             # retiring on an invalid response says NOTHING about the pool
@@ -1204,6 +1282,7 @@ class TriangularTileScheduler(TileScheduler):
         work_idx: Int32,
         bidz: Optional[Int32] = None,
         is_valid: Optional[Boolean] = None,
+        rem_mn: Optional[Tuple[Int32, Int32]] = None,
         *,
         block_zero_only: bool = False,
         loc=None,
@@ -1219,6 +1298,15 @@ class TriangularTileScheduler(TileScheduler):
                     < params.num_clusters_per_problem_fdd.divisor
                     * params.problem_shape_ncluster_mnl[2]
                 )
+        # Initial (blockIdx-derived) tile under a mixed launch: the CTA's offset
+        # inside the preferred footprint comes from its own coords. Outside the
+        # dynamic `if is_valid` so rem_mn has one type on every path.
+        if const_expr(
+            rem_mn is None
+            and not block_zero_only
+            and params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]
+        ):
+            rem_mn = cluster_rem_from_block_idx(params.cluster_shape_mnk, loc=loc, ip=ip)
         pid_m, pid_n, batch_idx = Int32(0), Int32(0), Int32(0)
         if is_valid:
             if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
@@ -1233,7 +1321,7 @@ class TriangularTileScheduler(TileScheduler):
                 cluster_id_in_problem = Int32(cluster_id_in_problem)  # divmod returns IntValue
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
             pid_m, pid_n = self._cluster_id_to_cta_id(
-                cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
+                cid_m, cid_n, rem_mn, block_zero_only=block_zero_only, loc=loc, ip=ip
             )
             batch_idx = bidz_
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
@@ -1440,6 +1528,7 @@ class VarlenMTileScheduler(TileScheduler):
         work_idx: Int32,
         bidz: Optional[Int32] = None,  # not used
         is_valid_: Optional[Boolean] = None,
+        rem_mn: Optional[Tuple[Int32, Int32]] = None,
         *,
         block_zero_only: bool = False,
         loc=None,
@@ -1447,6 +1536,15 @@ class VarlenMTileScheduler(TileScheduler):
     ) -> WorkTileInfo:
         assert bidz is None
         params = self.params
+        # Initial (blockIdx-derived) tile under a mixed launch: the CTA's offset
+        # inside the preferred footprint comes from its own coordinates (CLC/NONE
+        # only; the STATIC/DYNAMIC paths keep the runtime block_in_cluster_idx).
+        if const_expr(
+            rem_mn is None
+            and not block_zero_only
+            and params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]
+        ):
+            rem_mn = cluster_rem_from_block_idx(params.cluster_shape_mnk, loc=loc, ip=ip)
         lane_idx = cute.arch.lane_idx()
         num_batch = self.params.problem_shape_ncluster_mnl[2]
         block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
@@ -1481,6 +1579,20 @@ class VarlenMTileScheduler(TileScheduler):
         )
         if is_valid:
             if need_scan:
+                # The window scan below is FORWARD-only (it resumes from the
+                # cached batch). Work ids are monotone per consumer on a pure
+                # launch (the cluster grid is one row, so CLC grants follow the
+                # raster in work-id order), but under a mixed preferred/fallback
+                # launch a fallback-shaped cluster's grid has pn/fn rows and a
+                # stolen id can REGRESS when the grant raster crosses rows.
+                # Without this reset the stale window produced a negative
+                # cluster_id_in_problem, a wild pid_m, and — through the
+                # ptr_shift D descriptor — an unmapped-VA TMA store (hardware
+                # trap). Backward jumps restart the scan from batch 0; they are
+                # rare (row crossings only), the forward fast path is untouched.
+                if next_tile_idx < problems_end_tile:
+                    batch_idx = Int32(0)
+                    problems_end_tile = Int32(0)
                 while problems_end_tile <= next_tile_idx:
                     num_clusters_m = self._get_num_m_blocks(
                         lane_idx, bidb_start=batch_idx, block_size=block_size
@@ -1531,7 +1643,7 @@ class VarlenMTileScheduler(TileScheduler):
             cluster_id_in_problem = next_tile_idx - num_work_idx_before_cur_batch
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, num_clusters_m, loc=loc, ip=ip)
         pid_m, pid_n = self._cluster_id_to_cta_id(
-            cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
+            cid_m, cid_n, rem_mn, block_zero_only=block_zero_only, loc=loc, ip=ip
         )
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         self._current_batch_idx = batch_idx

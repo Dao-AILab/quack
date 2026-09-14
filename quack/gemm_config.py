@@ -206,14 +206,20 @@ def _get_sm100_configs(
         + [(256, tile_n, (2, 2)) for tile_n in tile_n_vals]
         + [(256, 512, (2, 1))]
     )
+    # Larger cluster shapes for 2SM MMA + CLC only to avoid excessive CGA quant
+    tile_mn_cluster_vals_clc_only = [(256, tile_n, (4, 2)) for tile_n in tile_n_vals] + [
+        (256, tile_n, (2, 4)) for tile_n in tile_n_vals
+    ]
     swap_ab_vals = [False, True]
     if epilogue in ["lse", "gated"]:
         swap_ab_vals = [False]
     GemmConfigCls = partial(
         GemmConfig, pingpong=False, device_capacity=10
     )  # There's no pingpong on Sm100
-    use_clc_vals = [True, False]
     use_tma_gather_vals = [True, False]
+    tile_mn_cluster_clc_vals = [
+        (tmc, use_clc) for tmc in tile_mn_cluster_vals for use_clc in (True, False)
+    ] + [(tmc, True) for tmc in tile_mn_cluster_vals_clc_only]
     return [
         GemmConfigCls(
             tile_m=m,
@@ -225,8 +231,8 @@ def _get_sm100_configs(
             is_dynamic_persistent=use_clc,
             use_tma_gather=use_tma_gather,
         )
-        for (m, n, (cm, cn)), sab, use_clc, use_tma_gather in itertools.product(
-            tile_mn_cluster_vals, swap_ab_vals, use_clc_vals, use_tma_gather_vals
+        for ((m, n, (cm, cn)), use_clc), sab, use_tma_gather in itertools.product(
+            tile_mn_cluster_clc_vals, swap_ab_vals, use_tma_gather_vals
         )
     ]
 

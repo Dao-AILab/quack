@@ -1038,18 +1038,20 @@ class GemmSm90(GemmTmaBase):
                 # PDL: wait for prior kernel before any TMA loads (matches cutlass C++ sm90 mainloop producer)
                 if const_expr(self.use_pdl):
                     prims.griddepcontrol(prims.GridDepAction.WAIT)
-                # block_copy's lowering wants the coordinate held fixed by the
-                # multicast mask: A is same-M across N peers, while B is
-                # same-N across M peers. Degenerate cluster dimensions are
-                # left for the compiler lowering to simplify.
-                a_tma_multicast = {
-                    "cluster_shape": self.cluster_shape_mnk[:2],
-                    "multicast_dim": "M",
-                }
-                b_tma_multicast = {
-                    "cluster_shape": self.cluster_shape_mnk[:2],
-                    "multicast_dim": "N",
-                }
+                # Get mcast mask: A is same-M across N peers, B is same-N
+                # across M peers.
+                cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                block_in_cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+                a_mcast_mask = cute.make_layout_image_mask(
+                    cluster_layout_mnk, block_in_cluster_coord_mnk, mode=1
+                )
+                b_mcast_mask = cute.make_layout_image_mask(
+                    cluster_layout_mnk, block_in_cluster_coord_mnk, mode=0
+                )
+                a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
+                b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
+                a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_mnk, (0, None, 0)).shape)
+                b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape)
 
                 # Persistent tile scheduling loop
                 is_scheduler_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
@@ -1087,11 +1089,13 @@ class GemmSm90(GemmTmaBase):
                     if const_expr(a_owned):
                         # the transform owns A's gmem interpretation
                         gA_owned = self.transform_a.a_gmem_slice(mA_mkl, tile_coord_mnkl, batch_idx)
-                        copy_A = copy_utils.tma_get_block_copy_fn(
+                        copy_A, _, _ = copy_utils.tma_get_copy_fn(
                             tma_atom_a,
+                            cta_coord=block_in_cluster_coord_mnk[1],
+                            cta_layout=a_cta_layout,
                             src_tensor=gA_owned,
                             dst_tensor=sA,
-                            tma_multicast=a_tma_multicast,
+                            mcast_mask=a_mcast_mask,
                         )
                     elif const_expr(not self.gather_A):
                         mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
@@ -1102,11 +1106,13 @@ class GemmSm90(GemmTmaBase):
                             (tile_coord_mnkl[0], None),
                         )
                         #  TMA load A partition_S/D
-                        copy_A = copy_utils.tma_get_block_copy_fn(
+                        copy_A, _, _ = copy_utils.tma_get_copy_fn(
                             tma_atom_a,
+                            cta_coord=block_in_cluster_coord_mnk[1],
+                            cta_layout=a_cta_layout,
                             src_tensor=gA_mk,
                             dst_tensor=sA,
-                            tma_multicast=a_tma_multicast,
+                            mcast_mask=a_mcast_mask,
                         )
                     else:
                         copy_A, prefetch_A = self._make_gather_A_copy(
@@ -1116,17 +1122,27 @@ class GemmSm90(GemmTmaBase):
                     if const_expr(self.aux_a is not None):
                         # aux A-side operand: one box per k-tile alongside A/B
                         gAux = self.aux_a.gmem_slice(mAuxA_mkl, tile_coord_mnkl, batch_idx)
-                        copy_AuxA = copy_utils.tma_get_block_copy_fn(
-                            tma_atom_aux_a,
-                            src_tensor=gAux,
-                            dst_tensor=sAuxA,
-                            # small-box aux operands (e.g. 128 B scale strips)
-                            # may opt out of the A-side multicast: each CTA
-                            # loads its own copy instead of splitting the box
-                            tma_multicast=a_tma_multicast
-                            if const_expr(getattr(self.aux_a, "multicast", True))
-                            else None,
-                        )
+                        # small-box aux operands (e.g. 128 B scale strips)
+                        # may opt out of the A-side multicast: each CTA loads
+                        # its own copy instead of splitting the box (the atom
+                        # is built non-multicast by make_tma in that case)
+                        if const_expr(getattr(self.aux_a, "multicast", True)):
+                            copy_AuxA, _, _ = copy_utils.tma_get_copy_fn(
+                                tma_atom_aux_a,
+                                cta_coord=block_in_cluster_coord_mnk[1],
+                                cta_layout=a_cta_layout,
+                                src_tensor=gAux,
+                                dst_tensor=sAuxA,
+                                mcast_mask=a_mcast_mask,
+                            )
+                        else:
+                            copy_AuxA, _, _ = copy_utils.tma_get_copy_fn(
+                                tma_atom_aux_a,
+                                cta_coord=0,
+                                cta_layout=cute.make_layout(1),
+                                src_tensor=gAux,
+                                dst_tensor=sAuxA,
+                            )
                     # (bN, bK, RestK)
                     gB_nk = cute.local_tile(
                         varlen_manager.offset_batch_B(mB_nkl, batch_idx),
@@ -1134,11 +1150,13 @@ class GemmSm90(GemmTmaBase):
                         (tile_coord_mnkl[1], None),
                     )
                     # TMA load B partition_S/D
-                    copy_B = copy_utils.tma_get_block_copy_fn(
+                    copy_B, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_b,
+                        cta_coord=block_in_cluster_coord_mnk[0],
+                        cta_layout=b_cta_layout,
                         src_tensor=gB_nk,
                         dst_tensor=sB,
-                        tma_multicast=b_tma_multicast,
+                        mcast_mask=b_mcast_mask,
                     )
                     len_k = varlen_manager.len_k(batch_idx)
                     k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
