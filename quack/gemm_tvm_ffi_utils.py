@@ -13,7 +13,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
-from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
+from quack.tile_scheduler import AgSchedulerArguments, RasterOrderOption, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
 
@@ -279,9 +279,44 @@ def make_scheduler_args(
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag=False):
+def make_fake_epi_reduce_args(d_dtype, mode, num_ranks, ws_dtype, d_major="n"):
+    """Fake EpiReduceArguments for epi_reduce_mode compiles (see quack.epi_reduce).
+
+    Comm views are kernel-order (m, n, l): __call__ does not rotate them; their
+    majorness follows D's. mD_mc exists only under all_reduce (reduce_scatter
+    commits to the plain kernel mD).
+    """
+    from quack.epi_reduce import EpiReduceArguments
+
+    mnl_fake = lambda dtype: fake_tensor(
+        dtype,
+        (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+        leading_dim=1 if d_major == "n" else 0,
+        divisibility=128 // dtype.width,  # 16 B
+    )
+    flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+    return EpiReduceArguments(
+        mD_mc=mnl_fake(d_dtype) if mode == "all_reduce" else None,
+        workspace=mnl_fake(ws_dtype),
+        workspace_mc=mnl_fake(ws_dtype),
+        tile_flags=flags(),
+        tile_flags_mc=flags(),
+        tile_flags_per_peer=tuple(flags() for _ in range(num_ranks)),
+    )
+
+
+def make_fake_scheduler_args(
+    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_epi_reduce=False
+):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
+        # Baked at trace time. Heuristic picks AlongM on N>M grids, which under
+        # epi_reduce emits each rank's slab at TPx rate in one GEMM fraction and
+        # collapses the RS overlap (out-405B: TP=2 1.55->1.40, TP=4 0.81->0.70;
+        # TP=8 both 405B shapes +37-45 us under AlongM — worsens as slab shrinks).
+        raster_order=(
+            RasterOrderOption.AlongN if has_epi_reduce else RasterOrderOption.Heuristic
+        ),
         max_swizzle_size=Int32(8),
         tile_count_semaphore=(
             make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_semaphore else None
@@ -494,15 +529,36 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
     )
 
 
-def launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None):
+def launch_gemm(
+    plan,
+    A,
+    B,
+    D,
+    C,
+    epi_args,
+    scheduler_args,
+    varlen_args,
+    SFA=None,
+    SFB=None,
+    epi_reduce_args=None,
+):
     """Invoke the compiled kernel. Kernel signatures uniformly take trailing
     (SFA, SFB) — None unless blockscaled — and the compiled TVM-FFI arg spec
-    bakes the full declared arity, so they are always passed. A layout-owning
+    bakes the full declared arity, so they are always passed; SM100/110
+    signatures take a further trailing epi_reduce_args. A layout-owning
     transform's A is a TransformAOperand bundle — one slot, the host never
     unpacks it."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
-    plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    # getattr: gemm.py / gemm_symmetric.py pass their own plan NamedTuples.
+    if getattr(plan, "epi_reduce_mode", None) is not None:
+        assert epi_reduce_args is not None, "epi_reduce_mode plan launched without epi_reduce_args"
+    if plan.is_sm100_family:
+        plan.compiled_fn(
+            A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, epi_reduce_args
+        )
+    else:
+        plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
 
 
 def make_fake_gemm_tensors(
@@ -699,8 +755,11 @@ def compile_gemm_kernel(
     cd_packed=None,
     a_mma_dtype=None,
     b_mma_dtype=None,
+    epi_reduce=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
+    if epi_reduce is not None:
+        assert device_capacity[0] in [10, 11], "epi_reduce_mode requires SM100/SM110"
     split_k_kwargs = {}
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
@@ -736,6 +795,11 @@ def compile_gemm_kernel(
             )
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
+        er_kwargs = (
+            dict(epi_reduce_mode=epi_reduce[0], num_ranks=epi_reduce[1], rank_id=epi_reduce[2])
+            if epi_reduce is not None
+            else {}
+        )
         GemmCls = partial(
             GemmCls,
             use_clc_persistence=is_dynamic_persistent,
@@ -743,6 +807,7 @@ def compile_gemm_kernel(
             sf_vec_size=sf_vec_size,
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
+            **er_kwargs,
             **split_k_kwargs,
         )
     gemm_obj = GemmCls(
@@ -768,6 +833,19 @@ def compile_gemm_kernel(
     # natively. The compiled TVM-FFI arg spec bakes the full declared arity
     # (defaults included), so they are always passed here and at launch.
     sf_args = (mSFA, mSFB)
+    er_args = ()
+    if epi_reduce is not None:
+        er_args = (
+            make_fake_epi_reduce_args(
+                mD.element_type,
+                epi_reduce[0],
+                epi_reduce[1],
+                torch2cute_dtype_map[epi_reduce[3]],
+                # comm views share D's majorness; the fake mD's static unit
+                # stride carries it (leading_dim at construction)
+                d_major="n" if mD.stride[-1] == 1 else "m",
+            ),
+        )
     return cute.compile(
         gemm_obj,
         mA,
@@ -779,5 +857,6 @@ def compile_gemm_kernel(
         varlen_args,
         stream,
         *sf_args,
+        *er_args,
         options="--enable-tvm-ffi",
     )

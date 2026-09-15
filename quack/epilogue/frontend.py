@@ -164,6 +164,7 @@ from typing import NamedTuple, Optional
 import cutlass.cute as cute
 
 from quack.cute_dsl_utils import get_device_capacity, mlir_namedtuple, torch2cute_dtype_map
+from quack.epi_reduce import validate_epi_reduce_args
 from quack.epilogue.ops import (
     ColVecLoad,
     EpiOp,
@@ -601,6 +602,8 @@ class EpiMod:
         #                               accumulate traffic of C=D). The fn still
         #                               returns the DELTA; requires C=None.
         ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
+        epi_reduce_mode=None,  # "reduce_scatter" | "all_reduce" (see quack.epi_reduce)
+        epi_reduce_args=None,  # EpiReduceArguments over torch tensors
         # A-operand transform (SM90 RS / SM120 warp-MMA mainloop). Value
         # transforms leave the
         # call contract unchanged. Layout-owning (packed-weight) transforms
@@ -695,6 +698,29 @@ class EpiMod:
                 # With swapped slots kernel-A is the caller's B: the AG gate
                 # would gate the wrong operand (and the wrong M geometry).
                 raise ValueError("swap_ab does not support ag_args (AG shards kernel-A along M)")
+        epi_reduce, num_ranks = None, None
+        if epi_reduce_mode is not None:
+            import torch.distributed as dist
+
+            if varlen_m or gather_A or blockscaled or swap_ab or ag_args is not None:
+                raise ValueError("epi_reduce_mode: dense non-blockscaled unswapped only")
+            if self.mode != "element":
+                raise ValueError("epi_reduce_mode supports element-mode epilogues only")
+            if not persistent:
+                raise ValueError("epi_reduce_mode requires the persistent scheduler")
+            if rounding_mode != RoundingMode.RN:
+                # RS under epi_reduce is unspecified: the skip-epi-ops partial store has no
+                # seed wired and the reducer's final convert is round-to-nearest.
+                raise ValueError("epi_reduce_mode requires rounding_mode == RoundingMode.RN")
+            if epi_reduce_args is None or epi_reduce_args.workspace is None:
+                raise ValueError("epi_reduce_mode requires epi_reduce_args with a workspace")
+            epi_reduce = (
+                epi_reduce_mode,
+                dist.get_world_size(),
+                dist.get_rank(),
+                epi_reduce_args.workspace.dtype,
+            )
+            num_ranks = epi_reduce[1]
         # Warm fast path: probe the plan cache on raw-input metadata before any
         # validation or kind inference — a hit is exactly a replay of a
         # previously validated call (the key subsumes everything validation
@@ -733,6 +759,7 @@ class EpiMod:
             int(split_k_mode),
             add_to_output,
             ag_args is not None,
+            epi_reduce,
             transform_key,
             # one slot for the transform's sf-side tensor: the W4 SF strip
             # (owned) or the runtime-operand view (value mods with args)
@@ -765,6 +792,7 @@ class EpiMod:
                     C,
                     epi_args,
                     ag_args=ag_args,
+                    epi_reduce_args=epi_reduce_args,
                     tile_count_semaphore=tile_count_semaphore,
                     cu_seqlens_m=cu_seqlens_m,
                     A_idx=A_idx,
@@ -843,9 +871,30 @@ class EpiMod:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
         # stays caller-oriented (swap-at-trace transposes those at trace).
-        m_i, n_i = (n_gemm, m) if (swap_ab or owned_fmt is not None) else (m, n_gemm)
+        if epi_reduce_mode is not None and m % num_ranks:
+            raise ValueError(f"epi_reduce_mode: m ({m}) must be divisible by world ({num_ranks})")
+        # reduce_scatter: C, D and every epi output/sink are slab-local (m / world) —
+        # the epilogue runs on the owner's slab. all_reduce: full-M (the epilogue runs
+        # at global coordinates, each rank on its stripe of every tile; C/colvec are
+        # the replicated full tensors, outputs are full-M with this rank's rows written).
+        m_epi = m // num_ranks if epi_reduce_mode == "reduce_scatter" else m
+        m_i, n_i = (n_gemm, m) if (swap_ab or owned_fmt is not None) else (m_epi, n_gemm)
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
+        epi_base_shape = _tile_shape(batch, m_epi, n_gemm, varlen_m)
+        if epi_reduce_mode is not None:
+            validate_epi_reduce_args(
+                epi_reduce_args,
+                D,
+                epi_reduce_mode,
+                m,
+                n_gemm,
+                batch if batch is not None else 1,
+                tile_M,
+                tile_N,
+                cluster_M,
+                num_ranks,
+            )
         if packed_c:
             if C.stride(-1) == 1 or varlen_m:
                 packed_shape = _tile_shape(batch, m, 2 * n_gemm, varlen_m)
@@ -871,8 +920,11 @@ class EpiMod:
                     raise ValueError("packed m-major C/D outer strides must permit a f32 view")
                 packed_form = "m"
         else:
-            _require_shape("C", C, base_shape)
-            _require_shape("D", D, base_shape)
+            _require_shape("C", C, epi_base_shape)
+            # reduce_scatter epi_reduce: D is the slab-local output, like C.
+            _require_shape(
+                "D", D, epi_base_shape if epi_reduce_mode == "reduce_scatter" else base_shape
+            )
         for out_name in self.outputs:
             if out_name not in epi_args:
                 raise ValueError(f"missing epilogue output buffer '{out_name}'")
@@ -882,7 +934,7 @@ class EpiMod:
             out_n = n_gemm // 2 if paired_acc else n_gemm
             if aux.dtype == torch.float4_e2m1fn_x2:
                 out_n //= 2  # fp4 values are stored packed, two per byte
-            _require_shape(out_name, aux, _tile_shape(batch, m, out_n, varlen_m))
+            _require_shape(out_name, aux, _tile_shape(batch, m_epi, out_n, varlen_m))
             if paired_acc:
                 # fp8/fp4 gated aux = quantized postact (SM100-only; the
                 # TileStore op asserts the arch at trace time).
@@ -948,7 +1000,7 @@ class EpiMod:
                 expected = (m_i,) if varlen_m else (batch_l, m_i)
                 _require_shape(name, epi_args[name], expected)
             elif visit_kind == "tile":
-                _require_shape(name, epi_args[name], base_shape)
+                _require_shape(name, epi_args[name], epi_base_shape)
             kind_sig.append((name, kind if kind != "pinned" else pins[name].__class__.__name__))
             epi_values[name] = epi_args[name]
         for out_name in self.outputs:
@@ -967,7 +1019,7 @@ class EpiMod:
             if validate is not None:
                 validate(
                     epi_args[sink_name],
-                    m=m,
+                    m=m_epi,  # sinks are slab-local under reduce_scatter epi_reduce
                     n=n_gemm,
                     tile_M=tile_M,
                     tile_N=tile_N,
@@ -985,7 +1037,8 @@ class EpiMod:
                 )
             alloc = getattr(op, "sink_alloc_shape", None)
             if alloc is not None:
-                lead_k = (m,) if varlen_m or batch is None else (batch, m)
+                # sinks are slab-local (m_epi) under reduce_scatter epi_reduce
+                lead_k = (m_epi,) if varlen_m or batch is None else (batch, m_epi)
                 num_seqs_k = (
                     cu_seqlens_m.shape[0] - 1 if varlen_m and getattr(op, "dim", 0) == 1 else None
                 )
@@ -1118,6 +1171,7 @@ class EpiMod:
             gemm_cls_ref=self._class_ref(mint_key),
             packed_cd=packed_form,
             has_ag=ag_args is not None,
+            epi_reduce=epi_reduce,
             split_k=split_k,
             split_k_mode=split_k_mode,
         )
@@ -1131,6 +1185,7 @@ class EpiMod:
                 C,
                 epi_values,
                 ag_args=ag_args,
+                epi_reduce_args=epi_reduce_args,
                 tile_count_semaphore=tile_count_semaphore,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,

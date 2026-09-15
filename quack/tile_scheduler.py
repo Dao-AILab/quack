@@ -1004,6 +1004,37 @@ class TileScheduler:
                     self._throttle_barrier.arrive_and_wait()
                 self._issue_clc_query_multicast(loc=loc, ip=ip)
 
+    @cute.jit
+    def decode_next_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        """Next tile of this CTA's own sequence, decoded locally (the sibling of
+        initial_work_tile_info) instead of taken from the scheduler warp's smem
+        broadcast. For the epi_reduce comm warps, and the reason is load-bearing:
+
+        Comm warps must NOT be scheduler-pipeline consumers. A consumer caps its
+        CTA's producers at O(sched_stage) tiles beyond the comm warp's position,
+        and a reduce_scatter comm warp waits on a flag that needs this rank's OWN
+        producer of a tile up to ~tiles_per_slab * ntile_n / npc positions ahead
+        (the owner remap) — a distance that grows with the problem, so no stage
+        count avoids the self-deadlock (observed: M=8192 TP=2 hangs, M=4096 sat
+        on the boundary). Decoding locally keeps producer progress independent of
+        comm, at zero cost: under STATIC the sequence is a pure function (idx +=
+        resident clusters, same as _fetch_next_work_idx), and sharing the decode
+        is what guarantees the comm walk equals the producer walk, swizzle
+        included.
+
+        STATIC only, also load-bearing: CLC grants are dynamic and a cancelled
+        cluster never launches, so replaying "my own id's tiles" would skip the
+        cancelled clusters' tiles (their flags never consumed -> peers hang);
+        DYNAMIC claims tiles through a semaphore, so there is no local sequence."""
+        params = self.params
+        assert params.persistence_mode == PersistenceMode.STATIC, (
+            "decode_next_work needs a statically assigned tile sequence"
+        )
+        self.num_tiles_executed += Int32(1)
+        stride = Int32(Uint32(cute.arch.grid_dim()[2]) // params.cluster_shape_mnk[2])
+        self._current_work_idx += stride
+        return self._delinearize_work_idx(self._current_work_idx, loc=loc, ip=ip)
+
     def producer_tail(self):
         if const_expr(self._scheduler_pipeline is not None):
             self._scheduler_pipeline.producer_tail(self._producer_state())

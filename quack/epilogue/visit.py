@@ -35,7 +35,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
     _epi_mod_vectorize = None  # False = keep the SM100 loop vectorizer off (escape hatch)
     _extra_param_fields = ()  # the fn is a class attr, not a param
 
-    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+    def epi_to_underlying_arguments(self, args, *, epi_tile=None, loc=None, ip=None):
         self.rounding_mode = self._epi_mod_rounding
         self.epi_needs_acc_prepass = self._epi_mod_prepass_fn is not None
         if self._epi_mod_packed_cd:
@@ -45,7 +45,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
         # Aux-output constraints (gated 16-bit n-major, SM90 tile_N % 32) are
         # asserted by each TileStore op in to_params; the store path itself is
         # the generic ComposableEpiMixin/TileStore one.
-        d = self._epi_ops_to_params_dict(args)
+        d = self._epi_ops_to_params_dict(args, epi_tile=epi_tile)
         for key in getattr(self, "concat_layout", None) or ():
             if key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
