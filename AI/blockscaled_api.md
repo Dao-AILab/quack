@@ -89,7 +89,9 @@ class BlockScaledFormat:
     elem_bits: int               # 8 | 4 | 6
     elems_per_container: int     # legacy positional contract; 2 for fp4x2, else 1
     scale_dtype: torch.dtype     # float8_e8m0fnu | float8_e4m3fn
-    sf_vec_size: int             # 32 | 16 (also the min logical-K divisibility)
+    sf_size_outer_red: Tuple[int, int]  # (outer MN, red K) scale granularity: (1, 32) rowwise,
+                                 # (32, 32) square 2D. A bare int v normalizes to (1, v); the
+                                 # classic sf_vec_size survives as a derived property (= red K).
     has_per_tensor_scale: bool   # nvfp4 only
     storage_layout: str | None   # "packed_lsb_v1" for *_packed fp6; None is legacy
 ```
@@ -177,9 +179,13 @@ class BlockScaledOperand:
 
 The descriptor bundles two orthogonal things: the *element encoding* (qdata
 dtype, bits, packing, DSL type) and the *scale recipe* (scale dtype,
-`sf_vec_size` = the K-extent of a `(1, sf_vec_size)` block grid). The other
-axes — 2D scale grids, physical scale layouts, DSL-typeless formats, per-kind
-sided-ness — are designed in section 9 and stress-tested in section 10; the
+`sf_size_outer_red` = the (outer MN, red K) extents of the scale-block grid;
+`sf_vec_size` is the derived red-K extent). 2D scale grids landed as this
+generalized pair (`mxfp8_*_2d`, square 32x32, row-replicated in the standard
+blocked layout so kernels are oblivious; payoff: `materialize_transposed`
+transposability). The remaining axes — physical scale layouts, DSL-typeless
+formats, per-kind sided-ness — are designed in section 9 and stress-tested
+in section 10; the
 hardenings they justify in this PR (`cutlass_dtype_name` Optional; explicit
 element-class + recipe gates in `mma_kind_for_pair`) are already in place.
 
@@ -457,6 +463,8 @@ but that is the D5 trap again and breaks on the first same-rank layout.
 ### 9.3 Descriptor changes (all defaulted - zero churn for existing formats)
 
 - `sf_block_mn: int = 1` - the MN-extent of the block grid (128 for 2D).
+  SUPERSEDED: landed as the first element of the `sf_size_outer_red` pair
+  (square 32x32 `mxfp8_*_2d` rows; see the callout in 9.8).
 - `sf_vec_size: Optional[int]` - `None` = the full contraction extent
   (rowwise; cuBLASLt `OUTER_VEC`). AMENDED from the first draft: forced by
   w4a8 per-token activation scales and w8a16 per-channel weight scales - a
@@ -532,7 +540,7 @@ no `gather_A` - the kernels' existing asserts, fronted by descriptors).
 gain `bs_layout_{a,b}` strings (same pattern as `bs_format_{a,b}`); autotune
 and compile keys gain the layout tags; kernel flags are derived from operands
 (`sfa_linear = (opA.scale_layout == "linear")`, `kscale_sfb_1d =
-(fmt_b.sf_block_mn == 1)`, ...). The D8 precedent extends: scales needed to
+(fmt_b.sf_size_outer_red[0] == 1)`, ...). The D8 precedent extends: scales needed to
 *interpret an operand's bytes* travel WITH the operand - a forgotten `(N,)`
 per-channel multiply after a W8A16 GEMM is the pts-folding silent-accuracy
 trap again, and the container is what killed that class of bug.
@@ -554,6 +562,15 @@ Precedent: torch.ao prepacked params, TRT-LLM
 
 `sf_vec_size` keeps its name (`sf_block_mn` is the only new recipe field
 besides the full-extent sentinel). MX canonical layout stays blocked.
+
+> **Superseded (2D grids landed):** instead of a separate `sf_block_mn`
+> field, the recipe field was generalized in place — `sf_vec_size: int`
+> became `sf_size_outer_red: Tuple[int, int]` (`(outer MN, red K)`), with a
+> bare int still constructing (normalized to `(1, v)` in `__post_init__`),
+> legacy pickles/pytree contexts migrating, and `sf_vec_size` retained as a
+> derived read-only property. First 2D rows: `mxfp8_e4m3_2d` /
+> `mxfp8_e5m2_2d` (square 32x32 blocks, row-replicated scales — kernels are
+> oblivious; the payoff is `BlockScaledOperand.materialize_transposed`).
 One-sided = plain Tensor. bk=256 rows, ue8m0-scale DeepSeek variants, and all
 registry rows land on first demand, with their consumer kernels
 (sm90kscale / sfcpasync / sm90w4 integration - whichever merges first
@@ -571,7 +588,7 @@ one-line amendments. Executable versions:
 |---|---|---|
 | e3m4 (no DSL type; bundled MLIR has `f8E3M4` but the DSL's reverse dispatch and dtype tables do not) | DSL-typeless elements | `cutlass_dtype_name` Optional + element-class gate (LANDED in this PR) |
 | e0m3 / nvint4 (= int4 element + nvfp4's recipe; MLIR `i4`, DSL `Int4`, torch.int4 all exist) | integer elements | none - int promote via `kind::i8` is a kind, not a descriptor change |
-| DeepSeek 1x128 / 128x128 fp32 scales | recipe: scale dtype + 2D grid | `sf_block_mn` (follow-up field) |
+| DeepSeek 1x128 / 128x128 fp32 scales | recipe: scale dtype + 2D grid | `sf_size_outer_red` (LANDED — generalized from `sf_vec_size`, int-compatible) |
 | kscale bf16 + per-row fp32 K-block scales | full-precision elements; one-sided | vocabulary ("quantized" -> "block-scaled"); sided-ness moved into kind rules |
 | sfcpasync linear SF `(MN, K/vec)` | physical layout | `scale_layout` per-operand tag (follow-up field) |
 | W4A16 nvfp4 weights x bf16 acts | same format, new pairing | none - the SM100 tcgen05 operand and the SM90 upconvert weight are ONE format |

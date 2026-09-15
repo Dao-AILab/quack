@@ -114,6 +114,65 @@ def to_mx_e5m2(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = 
     return to_mx(data_hp, block_size, scaling_mode, elem_dtype=torch.float8_e5m2)
 
 
+def to_mx_2d(
+    data_hp: torch.Tensor,
+    block_size: int = 32,
+    scaling_mode: str = "rceil",
+    elem_dtype: torch.dtype = torch.float8_e4m3fn,
+):
+    """MXFP8 quantization with SQUARE 2D (block_size x block_size) scale
+    blocks: one e8m0 scale per (32, 32) value block instead of per (1, 32)
+    row vector.
+
+    The scale is emitted row-replicated as the standard (M, K // block_size)
+    rowwise tensor, so the blocked-layout packing and every downstream
+    kernel path apply unchanged — at the MMA level a 2D operand is just a
+    rowwise operand whose 32 rows per block happen to share an SF byte. The
+    2D recipe's payoff is transposability: the transpose of a 2D-quantized
+    tensor is the numerically identical quantization (byte-transposed qdata,
+    transposed scale grid) — see ``BlockScaledOperand.materialize_transposed``.
+
+    Scale/cast semantics are exactly :func:`to_mx`'s, applied to each
+    flattened (block_size * block_size)-wide block.
+
+    Args:
+        data_hp: (M, K) bf16 or fp32, M and K % block_size == 0 (2D only —
+            batched inputs would let blocks straddle batch entries).
+    Returns:
+        qdata: (M, K) elem_dtype
+        scale: (M, K // block_size) float8_e8m0fnu, row-replicated per block
+    """
+    assert data_hp.ndim == 2, f"2D block quantization expects (M, K), got {data_hp.ndim}D"
+    M, K = data_hp.shape
+    assert M % block_size == 0 and K % block_size == 0, (
+        f"(M={M}, K={K}) must be divisible by block_size={block_size}"
+    )
+    mb, kb = M // block_size, K // block_size
+    blocks = (
+        data_hp.view(mb, block_size, kb, block_size)
+        .permute(0, 2, 1, 3)
+        .reshape(mb * kb, block_size * block_size)
+        .contiguous()
+    )
+    q_blocks, block_scale = to_mx(blocks, block_size * block_size, scaling_mode, elem_dtype)
+    qdata = (
+        q_blocks.view(mb, kb, block_size, block_size).permute(0, 2, 1, 3).reshape(M, K).contiguous()
+    )
+    scale = (
+        block_scale.view(torch.uint8)
+        .view(mb, 1, kb)
+        .expand(mb, block_size, kb)
+        .reshape(M, kb)
+        .view(torch.float8_e8m0fnu)
+    )
+    return qdata, scale
+
+
+def to_mx_2d_e5m2(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rceil"):
+    """:func:`to_mx_2d` with the e5m2 target."""
+    return to_mx_2d(data_hp, block_size, scaling_mode, elem_dtype=torch.float8_e5m2)
+
+
 def to_mx_dim0(data_hp: torch.Tensor, block_size: int = 32, scaling_mode: str = "rceil"):
     """MXFP8-e4m3 quantization of a 2D tensor along dim 0 ("columnwise").
 
@@ -476,6 +535,8 @@ else:
 
 to_mx_compiled = torch.compile(to_mx, **_COMPILE_KW)
 to_mx_e5m2_compiled = torch.compile(to_mx_e5m2, **_COMPILE_KW)
+to_mx_2d_compiled = torch.compile(to_mx_2d, **_COMPILE_KW)
+to_mx_2d_e5m2_compiled = torch.compile(to_mx_2d_e5m2, **_COMPILE_KW)
 to_mx_dim0_compiled = torch.compile(to_mx_dim0, **_COMPILE_KW)
 to_mxfp4_compiled = torch.compile(to_mxfp4, **_COMPILE_KW)
 to_nvfp4_compiled = torch.compile(to_nvfp4, **_COMPILE_KW)
@@ -494,6 +555,8 @@ to_mxfp6_e3m2_byte_compiled = to_mxfp6_e3m2_compiled
 QUANTIZERS = {
     "mxfp8_e4m3": (to_mx, to_mx_compiled),
     "mxfp8_e5m2": (to_mx_e5m2, to_mx_e5m2_compiled),
+    "mxfp8_e4m3_2d": (to_mx_2d, to_mx_2d_compiled),
+    "mxfp8_e5m2_2d": (to_mx_2d_e5m2, to_mx_2d_e5m2_compiled),
     "mxfp4": (to_mxfp4, to_mxfp4_compiled),
     "mxfp4_byte": (to_mxfp4_byte, to_mxfp4_byte_compiled),
     "mxfp6_e2m3": (to_mxfp6_e2m3, to_mxfp6_e2m3_compiled),
