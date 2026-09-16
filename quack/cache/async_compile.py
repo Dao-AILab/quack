@@ -187,7 +187,7 @@ def _install_gpu_blind_device_attrs() -> None:
     designed); an arch outside the table raises ValueError, which fails the
     worker the same way."""
     from cutlass.base_dsl.runtime import cuda as cuda_helpers
-    from cutlass.utils import get_smem_capacity_in_bytes
+    from cutlass.memory import get_smem_capacity_in_bytes
 
     smem_attr = cuda_helpers.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
     orig = cuda_helpers.get_device_attribute

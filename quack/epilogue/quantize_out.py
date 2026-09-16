@@ -251,7 +251,7 @@ class BlockScaleFactorStore(EpiOp):
             # accumulator columns, so one postact column covers 2 acc columns.
             val_tensor = getattr(args, self.quant_output)
             val_dtype = val_tensor.element_type
-            val_layout = cutlass.utils.LayoutEnum.from_tensor(val_tensor)
+            val_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(val_tensor)
             store = next(
                 op for op in gemm._epi_ops if op.is_tile_store() and op.name == self.quant_output
             )

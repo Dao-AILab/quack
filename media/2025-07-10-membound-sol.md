@@ -117,7 +117,7 @@ The code snippet below is our load implementation in Python CuTe DSL. Here we om
 blkX = ...
 
 # allocate shared memory for the input vectors
-smem = cutlass.utils.SmemAllocator()
+smem = cutlass.memory.SmemAllocator()
 sX   = smem.allocate_tensor(gX.element_type, ...)
 
 # declare the copy atoms which will be used later for memory copy

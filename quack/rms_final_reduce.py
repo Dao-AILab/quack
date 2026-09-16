@@ -78,7 +78,7 @@ class RmsFinalReduce(ReductionBase):
         bidx, _, _ = cute.arch.block_idx()
         tv_layout = tiled_copy.layout_tv_tiled
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         shape = mX.shape

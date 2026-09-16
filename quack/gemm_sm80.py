@@ -120,7 +120,7 @@ class GemmSm80(GemmBase):
         # but this CUTLASS helper build does not accept "sm_87".
         if arch == 87:
             arch = 80
-        return cutlass.utils.get_smem_capacity_in_bytes(f"sm_{arch}")
+        return cutlass.memory.get_smem_capacity_in_bytes(f"sm_{arch}")
 
     def _setup_tiled_mma(self):
         op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
