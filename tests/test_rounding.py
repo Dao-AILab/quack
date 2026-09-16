@@ -286,21 +286,44 @@ N_PER_THREAD = 32
 N_THREADS = 128
 
 
+# Stream offsets: the thread index alone, and the top of the 28-bit offset
+# field (past the old 16-bit field, which aliased such offsets into the
+# batch index). The host model spells the layout with literals on purpose.
+OFFSET_BASES = [0, (1 << 28) - N_THREADS]
+
+
 @cute.kernel
-def _frag_kernel(mX: cute.Tensor, mOut: cute.Tensor, seed: Int32):
+def _frag_kernel(mX: cute.Tensor, mOut: cute.Tensor, seed: Int32, offset_base: Int32):
     tidx, _, _ = cute.arch.thread_idx()
     frag = cute.make_rmem_tensor(cute.make_layout(N_PER_THREAD), Float32)
     for j in cutlass.range_constexpr(N_PER_THREAD):
         frag[j] = mX[tidx * N_PER_THREAD + j]
-    out = convert_f32_frag_sr(frag, cutlass.Float4E2M1FN, seed, tidx)
+    out = convert_f32_frag_sr(frag, cutlass.Float4E2M1FN, seed, offset_base + tidx)
     out_i32 = cute.recast_tensor(out, Int32)
     for j in cutlass.range_constexpr(N_PER_THREAD // 8):
         mOut[tidx * (N_PER_THREAD // 8) + j] = out_i32[j]
 
 
 @cute.jit
-def _frag_launch(mX: cute.Tensor, mOut: cute.Tensor, seed: Int32):
-    _frag_kernel(mX, mOut, seed).launch(grid=(1, 1, 1), block=(N_THREADS, 1, 1))
+def _frag_launch(mX: cute.Tensor, mOut: cute.Tensor, seed: Int32, offset_base: Int32):
+    _frag_kernel(mX, mOut, seed, offset_base).launch(grid=(1, 1, 1), block=(N_THREADS, 1, 1))
+
+
+@cute.kernel
+def _frag_kernel_bf16(mX: cute.Tensor, mOut: cute.Tensor, seed: Int32, offset_base: Int32):
+    tidx, _, _ = cute.arch.thread_idx()
+    frag = cute.make_rmem_tensor(cute.make_layout(N_PER_THREAD), Float32)
+    for j in cutlass.range_constexpr(N_PER_THREAD):
+        frag[j] = mX[tidx * N_PER_THREAD + j]
+    out = convert_f32_frag_sr(frag, cutlass.BFloat16, seed, offset_base + tidx)
+    out_i32 = cute.recast_tensor(out, Int32)
+    for j in cutlass.range_constexpr(N_PER_THREAD // 2):
+        mOut[tidx * (N_PER_THREAD // 2) + j] = out_i32[j]
+
+
+@cute.jit
+def _frag_launch_bf16(mX: cute.Tensor, mOut: cute.Tensor, seed: Int32, offset_base: Int32):
+    _frag_kernel_bf16(mX, mOut, seed, offset_base).launch(grid=(1, 1, 1), block=(N_THREADS, 1, 1))
 
 
 def philox4_py(counter: int, key: int, n_rounds: int = PHILOX_N_ROUNDS_DEFAULT):
@@ -319,21 +342,29 @@ def philox4_py(counter: int, key: int, n_rounds: int = PHILOX_N_ROUNDS_DEFAULT):
     return c0, c1, c2, c3
 
 
+def _sr_counter_py(group: int, offset: int) -> int:
+    assert 0 <= group < 16 and 0 <= offset < (1 << 28)
+    return (group << 28) | offset
+
+
 @pytest.mark.skipif(
     IS_HW_CVT_TARGET, reason="convert_f32_frag_sr dispatches to the hw cvt.rs on this target"
 )
+@pytest.mark.parametrize("offset_base", OFFSET_BASES)
 @pytest.mark.parametrize("seed", [0, 12345])
-def test_e2m1_frag_sr_philox_wiring(seed):
+def test_e2m1_frag_sr_philox_wiring(seed, offset_base):
     """convert_f32_frag_sr(Float4E2M1FN) end to end: Philox counter layout
-    (one word per quad, (group<<16)|tid counter, 4 quads per batch), straight
-    byte mapping, and the packed-nibble vector bitcast, vs a host model."""
+    (one word per quad, (group<<SR_OFFSET_BITS)|offset counter, 4 quads per
+    batch), straight byte mapping, and the packed-nibble vector bitcast, vs a
+    host model. offset_base past 2**16 fails under the old 16-bit offset field."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     n_vals = N_THREADS * N_PER_THREAD
     x = torch.rand(n_vals, generator=gen, device="cuda") * 16 - 8
     x = x.float()
     out = torch.empty(n_vals // 8, dtype=torch.int32, device="cuda")
-    fn = cute.compile(_frag_launch, from_dlpack(x), from_dlpack(out), Int32(seed))
-    fn(from_dlpack(x), from_dlpack(out), Int32(seed))
+    args = (from_dlpack(x), from_dlpack(out), Int32(seed), Int32(offset_base))
+    fn = cute.compile(_frag_launch, *args)
+    fn(*args)
     torch.cuda.synchronize()
     got = out.cpu().numpy().view(np.uint8)  # nibble pairs, little-endian per byte
 
@@ -342,10 +373,47 @@ def test_e2m1_frag_sr_philox_wiring(seed):
     for t in range(N_THREADS):
         for q in range(N_PER_THREAD // 4):
             group, intra = q // 4, q % 4
-            words = philox4_py((group << 16) | t, seed & 0xFFFFFFFF)
+            words = philox4_py(_sr_counter_py(group, offset_base + t), seed & 0xFFFFFFFF)
             word = words[intra]
             for j in range(4):
                 r8 = np.array([(word >> (8 * j)) & 0xFF], dtype=np.uint8)
                 nib_ref[t, 4 * q + j] = ref_e2m1_rs(x_np[t, 4 * q + j : 4 * q + j + 1], r8)[0]
     ref_bytes = (nib_ref[:, 0::2] | (nib_ref[:, 1::2] << 4)).reshape(-1)
     np.testing.assert_array_equal(got, ref_bytes)
+
+
+@pytest.mark.parametrize("hw", [True, False])
+@pytest.mark.parametrize("offset_base", OFFSET_BASES)
+def test_bf16_frag_sr_philox_wiring(monkeypatch, offset_base, hw):
+    """convert_f32_frag_sr(BFloat16) end to end vs a host model: Philox counter
+    (group<<SR_OFFSET_BITS)|offset, one word per PAIR (4 pairs per batch), low
+    rand half to the even element, high half to the odd one, and the cvt.rs
+    rule bits(x) + r16 truncated to bf16 (in-range inputs, so satfinite and
+    NaN handling never engage). bf16 SR is bit-identical on the hw cvt.rs and
+    the sw emulation, so both dispatch paths are checked against the model."""
+    import quack.rounding as rounding
+
+    if hw and not IS_HW_CVT_TARGET:
+        pytest.skip("hw cvt.rs needs an sm_100a/sm_103a compile target")
+    if not hw:
+        monkeypatch.setattr(rounding, "_use_hw_cvt", lambda: False)
+    seed = 0
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    n_vals = N_THREADS * N_PER_THREAD
+    x = (torch.randn(n_vals, generator=gen, device="cuda") * 3).float()
+    out = torch.empty(n_vals // 2, dtype=torch.int32, device="cuda")
+    args = (from_dlpack(x), from_dlpack(out), Int32(seed), Int32(offset_base))
+    fn = cute.compile(_frag_launch_bf16, *args)
+    fn(*args)
+    torch.cuda.synchronize()
+    got = out.cpu().numpy().view(np.uint16).reshape(N_THREADS, N_PER_THREAD)
+
+    bits = x.cpu().numpy().view(np.uint32).reshape(N_THREADS, N_PER_THREAD)
+    ref = np.zeros((N_THREADS, N_PER_THREAD), dtype=np.uint16)
+    for t in range(N_THREADS):
+        for p in range(N_PER_THREAD // 2):
+            group, intra = p // 4, p % 4
+            r = philox4_py(_sr_counter_py(group, offset_base + t), seed & 0xFFFFFFFF)[intra]
+            ref[t, 2 * p] = ((int(bits[t, 2 * p]) + (r & 0xFFFF)) >> 16) & 0xFFFF
+            ref[t, 2 * p + 1] = ((int(bits[t, 2 * p + 1]) + (r >> 16)) >> 16) & 0xFFFF
+    np.testing.assert_array_equal(got, ref)

@@ -110,6 +110,22 @@ PHILOX_ROUND_B = 0xCD9E8D57
 PHILOX_KEY_A = 0x9E3779B9
 PHILOX_KEY_B = 0xBB67AE85
 
+# Philox counter word shared by every SR converter below: the caller's
+# linearized ``offset`` in the low SR_OFFSET_BITS (distinct (seed, offset) pairs
+# are independent rand streams, so callers can linearize e.g. (tile, thread)
+# straight into it), and the converter's per-call batch index in the top
+# SR_GROUP_BITS (one Philox call yields 4 words = 4 pairs or 4 quads).
+SR_OFFSET_BITS = 28
+SR_GROUP_BITS = 32 - SR_OFFSET_BITS
+SR_MAX_GROUPS = 1 << SR_GROUP_BITS
+
+
+def _sr_counter(group_idx: int, offset) -> Uint32:
+    """``(group_idx << SR_OFFSET_BITS) | offset``. ``offset`` must be below
+    2**SR_OFFSET_BITS; any wider would repeat entropy."""
+    assert 0 <= group_idx < SR_MAX_GROUPS
+    return Uint32(group_idx << SR_OFFSET_BITS) | Uint32(offset)
+
 
 @dsl_user_op
 def epilogue_sr_seed(
@@ -1036,7 +1052,7 @@ def _use_hw_cvt() -> bool:
 def convert_f32_to_f8_sr(
     src_vec,
     seed: Int32,
-    tid: Int32,
+    offset: Int32,
     f8_kind: str,
     *,
     loc=None,
@@ -1067,14 +1083,14 @@ def convert_f32_to_f8_sr(
             hi = pair_fn(v2, v3, Uint32(rand) >> 16, loc=loc, ip=ip)
             return cutlass.Int32(Uint32(lo).to(Uint32) | (Uint32(hi).to(Uint32) << 16))
 
-    return _convert_f32_sr_quad_impl(src_vec, seed, tid, cvt_quad, dst_numeric, loc, ip)
+    return _convert_f32_sr_quad_impl(src_vec, seed, offset, cvt_quad, dst_numeric, loc, ip)
 
 
 @dsl_user_op
 def convert_f32_to_e2m1_sr(
     src_vec,
     seed: Int32,
-    tid: Int32,
+    offset: Int32,
     *,
     loc=None,
     ip=None,
@@ -1096,10 +1112,10 @@ def convert_f32_to_e2m1_sr(
         cvt_fn = cvt_f32x4_e2m1x4_rs_direct
     else:
         cvt_fn = cvt_f32x4_e2m1x4_rs_sw
-    return _convert_f32_sr_quad_impl(src_vec, seed, tid, cvt_fn, cutlass.Float4E2M1FN, loc, ip)
+    return _convert_f32_sr_quad_impl(src_vec, seed, offset, cvt_fn, cutlass.Float4E2M1FN, loc, ip)
 
 
-def _convert_f32_sr_quad_impl(src_vec, seed, tid, cvt_quad_fn, dst_numeric, loc, ip):
+def _convert_f32_sr_quad_impl(src_vec, seed, offset, cvt_quad_fn, dst_numeric, loc, ip):
     """Quad-based sibling of _convert_f32_sr_impl for 8/4-bit outputs: the
     converters are x4-only (hw f8x4/e2m1x4 instructions), each value consumes
     8 rbits, so one Philox word covers a quad and one batch covers 4 quads
@@ -1111,6 +1127,11 @@ def _convert_f32_sr_quad_impl(src_vec, seed, tid, cvt_quad_fn, dst_numeric, loc,
         f"8/4-bit stochastic rounding requires num_elems % 4 == 0, got {num_elems}"
     )
     num_quads = num_elems // 4
+    num_groups = -(-num_quads // 4)
+    assert num_groups <= SR_MAX_GROUPS, (
+        f"stochastic rounding converts at most {SR_MAX_GROUPS * 16} 8/4-bit elements "
+        f"per call ({SR_GROUP_BITS} Philox batch-index bits), got {num_elems}"
+    )
 
     dst_vec_type = ir.VectorType.get([num_elems], dst_numeric.mlir_type, loc=loc)
     word_numeric = Int32 if dst_numeric.width == 8 else cutlass.Uint16
@@ -1133,7 +1154,7 @@ def _convert_f32_sr_quad_impl(src_vec, seed, tid, cvt_quad_fn, dst_numeric, loc,
         group_idx = quad_idx // 4
         intra_idx = quad_idx % 4
         if intra_idx == 0:
-            counter = cutlass.Uint32(group_idx << 16) | cutlass.Uint32(tid)
+            counter = _sr_counter(group_idx, offset)
             rand_batch = philox(counter, cutlass.Uint32(seed))
         entropy = rand_batch[intra_idx]
         packed = cvt_quad_fn(*vals, entropy, loc=loc, ip=ip)
@@ -1153,7 +1174,7 @@ def _convert_f32_sr_quad_impl(src_vec, seed, tid, cvt_quad_fn, dst_numeric, loc,
 def convert_f32_to_bf16_sr(
     src_vec,
     seed: Int32,
-    tid: Int32,
+    offset: Int32,
     *,
     loc=None,
     ip=None,
@@ -1163,16 +1184,21 @@ def convert_f32_to_bf16_sr(
     Processes elements in pairs using Philox PRNG for entropy and the hardware
     cvt.rs.satfinite.bf16x2.f32 instruction when compiling for sm_100a/sm_103a,
     or a bit-exact software emulation on any other sm_80+ target.
+
+    ``offset`` (< 2**SR_OFFSET_BITS = 2**28) selects this call's rand stream
+    within ``seed``: the low 28 bits of the Philox counter, with the top 4 bits
+    reserved for the per-call batch index (see _sr_counter). At most
+    SR_MAX_GROUPS * 8 = 128 elements per call.
     """
     cvt_fn = cvt_f32x2_bf16x2_rs if _use_hw_cvt() else cvt_f32x2_bf16x2_rs_sw
-    return _convert_f32_sr_impl(src_vec, seed, tid, cvt_fn, cutlass.BFloat16, loc, ip)
+    return _convert_f32_sr_impl(src_vec, seed, offset, cvt_fn, cutlass.BFloat16, loc, ip)
 
 
 @dsl_user_op
 def convert_f32_to_f16_sr(
     src_vec,
     seed: Int32,
-    tid: Int32,
+    offset: Int32,
     *,
     loc=None,
     ip=None,
@@ -1184,7 +1210,7 @@ def convert_f32_to_f16_sr(
     the same Philox words.
     """
     cvt_fn = cvt_f32x2_f16x2_rs if _use_hw_cvt() else cvt_f32x2_f16x2_rs_sw
-    return _convert_f32_sr_impl(src_vec, seed, tid, cvt_fn, cutlass.Float16, loc, ip)
+    return _convert_f32_sr_impl(src_vec, seed, offset, cvt_fn, cutlass.Float16, loc, ip)
 
 
 # Storage dtypes the epilogue SR convert supports. bf16/f16/e2m1 run
@@ -1199,38 +1225,45 @@ SR_STORE_DTYPES = (
 )
 
 
-def convert_f32_frag_sr(frag: cute.Tensor, dtype, seed: Int32, tid: Int32) -> cute.Tensor:
+def convert_f32_frag_sr(frag: cute.Tensor, dtype, seed: Int32, offset: Int32) -> cute.Tensor:
     """Convert an f32 rmem fragment to ``dtype`` with stochastic rounding.
 
     Same-layout sibling of ``frag.to(dtype)`` for every dtype in
     SR_STORE_DTYPES; dtype is a trace-time constant. Callers derive ``seed``
     per (tile, subtile) via epilogue_sr_seed so rand streams never repeat
-    across the output.
+    across the output, and pass ``offset`` (< 2**SR_OFFSET_BITS = 2**28) to
+    separate streams within a seed: the thread index, or any wider linearized
+    (tile, thread, ...) offset.
     """
     from cutlass.cute.tensor import TensorSSA
 
     assert dtype in SR_STORE_DTYPES, f"no stochastic-rounding converter for {dtype}"
     src_vec = frag.load()
     if dtype is cutlass.BFloat16:
-        raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tid)
+        raw_vec = convert_f32_to_bf16_sr(src_vec, seed, offset)
     elif dtype is cutlass.Float16:
-        raw_vec = convert_f32_to_f16_sr(src_vec, seed, tid)
+        raw_vec = convert_f32_to_f16_sr(src_vec, seed, offset)
     elif dtype is cutlass.Float8E4M3FN:
-        raw_vec = convert_f32_to_f8_sr(src_vec, seed, tid, "e4m3")
+        raw_vec = convert_f32_to_f8_sr(src_vec, seed, offset, "e4m3")
     elif dtype is cutlass.Float8E5M2:
-        raw_vec = convert_f32_to_f8_sr(src_vec, seed, tid, "e5m2")
+        raw_vec = convert_f32_to_f8_sr(src_vec, seed, offset, "e5m2")
     else:
-        raw_vec = convert_f32_to_e2m1_sr(src_vec, seed, tid)
+        raw_vec = convert_f32_to_e2m1_sr(src_vec, seed, offset)
     out = cute.make_rmem_tensor_like(frag, dtype)
     out.store(TensorSSA(raw_vec, src_vec.shape, dtype))
     return out
 
 
-def _convert_f32_sr_impl(src_vec, seed, tid, cvt_fn, dst_numeric, loc, ip):
+def _convert_f32_sr_impl(src_vec, seed, offset, cvt_fn, dst_numeric, loc, ip):
     src_vec_type = ir.VectorType(src_vec.type)
     num_elems = src_vec_type.shape[0]
     assert num_elems % 2 == 0, f"requires even number of elements, got {num_elems}"
     num_pairs = num_elems // 2
+    num_groups = -(-num_pairs // 4)
+    assert num_groups <= SR_MAX_GROUPS, (
+        f"stochastic rounding converts at most {SR_MAX_GROUPS * 8} 16-bit elements "
+        f"per call ({SR_GROUP_BITS} Philox batch-index bits), got {num_elems}"
+    )
     # No num_pairs % 4 requirement for 16-bit outputs.
     # For 8-bit outputs the QUAD is a hard requirement (the hw
     # instruction is f8x4-only)
@@ -1267,7 +1300,7 @@ def _convert_f32_sr_impl(src_vec, seed, tid, cvt_fn, dst_numeric, loc, ip):
         group_idx = pair_idx // 4
         intra_idx = pair_idx % 4
         if intra_idx == 0:
-            counter = cutlass.Uint32(group_idx << 16) | cutlass.Uint32(tid)
+            counter = _sr_counter(group_idx, offset)
             rand_batch = philox(counter, cutlass.Uint32(seed))
 
         entropy = rand_batch[intra_idx]
