@@ -1698,6 +1698,8 @@ class GemmSm100(GemmTmaBase):
 
         # Specialized MMA warp
         if warp_idx == self.mma_warp_id:
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -1856,6 +1858,8 @@ class GemmSm100(GemmTmaBase):
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_increase(self.num_regs_epi)
             # Alloc tensor memory buffer
