@@ -6,8 +6,9 @@ torch references, independent of the variant wrappers."""
 import pytest
 import torch
 
+from quack.cute_dsl_utils import get_device_capacity
 from quack.epilogue.ops import ColVecReduce, RowVecReduce
-from quack.gemm_config import GemmConfig
+from quack.gemm_config import GemmConfig, cta_tile_shape_m
 from quack.epilogue.frontend import gemm_epilogue
 
 torch.manual_seed(0)
@@ -76,12 +77,6 @@ def test_reduce_finalized():
     torch.testing.assert_close(res["sq"], ref_d.square().sum(-1), rtol=1e-3, atol=1e-2)
 
 
-# RowVecReduce requires cluster_M == 1: partials silently corrupt under
-# cluster_M=2 on SM100. NOT the gated (2, 2) aux-store bug — fixing that one
-# left this still failing (strict xfail, so a shared cause would have XPASSed).
-# Own cause: the sink buffer is sized by the MMA tile (config.tile_m) but
-# indexed by a CTA-granular tile_coord_mnkl[0], which 2-CTA halves, so the
-# bounds guard drops the back half of M.
 CFG_CM1 = CFG.__class__(**{**CFG.__dict__, "cluster_m": 1})
 
 
@@ -92,25 +87,170 @@ def test_rowvec_reduce_finalized():
     torch.testing.assert_close(res["colsum"], ref_d.sum(0), rtol=1e-3, atol=1e-1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="RowVecReduce partials corrupt with cluster_M=2 on SM100 — open bug, and "
-    "NOT the gated (2, 2) aux-store bug: that fix landed and this still fails. The "
-    "sink buffer is sized by the MMA tile but indexed per CTA tile, so the back half "
-    "of M is dropped (colsum comes back as the sum over the first half of the rows)",
-)
-def test_rowvec_reduce_cluster_m2():
-    from quack.cute_dsl_utils import get_device_capacity
+# ── Reduce-sink partials are sized by the DEVICE, never by the config tag ──
+# This used to be a strict xfail blamed on the kernel ("the sink buffer is
+# sized by the MMA tile but indexed per CTA tile, so the back half of M is
+# dropped"). That diagnosis was wrong on both counts — there was no kernel
+# defect and nothing was silent. GemmConfig.device_capacity is PROVENANCE
+# ("tuned for this arch"), it defaults to 9, and a caller-supplied config is
+# used verbatim; _alloc_sinks read that tag as if it were the running device:
+#
+#   cta_tile_shape_m(tile_m=128, cluster_m=2, 9)  -> 128  (allocation)
+#   cta_tile_shape_m(tile_m=128, cluster_m=2, 10) ->  64  (validation, kernel)
+#
+# so on SM100 a cluster_m=2 call allocated ceil(M/128) partial rows where the
+# kernel writes ceil(M/64), and EpiMod.gemm raised, loudly, before any launch:
+#   ValueError: colsum must have shape (8, 768), got (4, 768)
+# The kernel-side claim is pinned false by test_rowvec_reduce_cluster_m2_partials.
+# CFG deliberately leaves device_capacity at its default so this call keeps
+# exercising the stale-tag path on SM100.
 
-    # The corruption is observed on SM100/SM110 only; other archs pass this
-    # kernel, which would strict-XPASS. Gate by quack capability (QUACK_ARCH
-    # aware) so the xfail encodes exactly the known-bad configuration.
-    if get_device_capacity(torch.device("cuda"))[0] not in (10, 11):
-        pytest.skip("cluster_M=2 RowVecReduce corruption is an SM100/SM110 bug")
+
+def test_rowvec_reduce_cluster_m2():
     A, B = _inputs()
     res = _colsum(A, B, config=CFG)
     ref_d = A.float() @ B.float()
     torch.testing.assert_close(res["colsum"], ref_d.sum(0), rtol=1e-3, atol=1e-1)
+
+
+def _mismatched_capacity(real_cap, tile_m, cluster_m):
+    """A device_capacity tag that is wrong for the running device AND changes
+    the per-CTA M tile, so any site still reading the tag mis-sizes the sink."""
+    want = cta_tile_shape_m(tile_m, cluster_m, real_cap)
+    return next((cap for cap in (9, 10) if cta_tile_shape_m(tile_m, cluster_m, cap) != want), None)
+
+
+def test_sink_partials_sized_by_device_not_config_tag():
+    """Arch-general form of the bug above: a config whose device_capacity tag
+    disagrees with the running device must not change the sink buffer. Revert
+    the fix and this raises ValueError from EpiMod.gemm on every arch (on
+    SM100 the tag under-counts rows, on SM90/SM120 it over-counts)."""
+    cap = get_device_capacity(torch.device("cuda"))[0]
+    bogus = _mismatched_capacity(cap, CFG.tile_m, CFG.cluster_m)
+    assert bogus is not None and bogus != cap
+    cfg = CFG.__class__(**{**CFG.__dict__, "device_capacity": bogus})
+    A, B = _inputs(m=391)  # ragged against both candidate per-CTA tiles
+    res = _colsum(A, B, config=cfg)
+    ref_d = A.float() @ B.float()
+    torch.testing.assert_close(res["colsum"], ref_d.sum(0), rtol=1e-3, atol=1e-1)
+
+
+def test_rowvec_reduce_cluster_m2_partials():
+    """Pins the kernel half of the old (wrong) diagnosis: under cluster_M=2
+    every raw partial row is exactly its per-CTA M tile's column sum, with a
+    ragged tail. Checked per row, not just through the fold, so a dropped or
+    duplicated M tile cannot cancel out inside the sum."""
+    cap = get_device_capacity(torch.device("cuda"))[0]
+    cta = cta_tile_shape_m(CFG.tile_m, CFG.cluster_m, cap)
+    m, n = 5 * cta + 13, 768
+    A, B = _inputs(m=m, n=n)
+    ref_d = A.float() @ B.float()
+    # caller-owned partials: NaN-filled, so an unwritten row is a failure
+    buf = torch.full((-(-m // cta), n), float("nan"), device="cuda", dtype=torch.float32)
+    _colsum(A, B, config=CFG, colsum=buf)
+    assert not buf.isnan().any(), "kernel left reduce-sink partial rows unwritten"
+    for t in range(buf.shape[0]):
+        torch.testing.assert_close(
+            buf[t], ref_d[t * cta : (t + 1) * cta].sum(0), rtol=1e-3, atol=1e-1
+        )
+
+
+def test_torch_op_sink_partials_sized_by_device(monkeypatch):
+    """Same rule as test_sink_partials_sized_by_device_not_config_tag, for the
+    torch-op route: quack::gemm_epi_f's graph-owned allocation
+    (_alloc_outs_from_meta) and compile_call's caller-owned partials must both
+    size from the device, not cfg["device_capacity"].
+
+    That route is reachable only under torch.compiler.is_compiling(), and the
+    two torch.compile tests that reach it are red on torch 2.11.0 for an
+    unrelated Dynamo defect (obj.__dict__ traces to a GetAttrVariable) — so
+    without this test those lines have no coverage on 2.11 at all. Driving the
+    gate directly keeps the check on every torch version.
+
+    is_compiling is armed for exactly one query: the op body asks again while
+    executing, and a permanently-True gate makes it re-enter compile_call until
+    the stack overflows.
+    """
+    armed = [False]
+
+    def _once():
+        if armed[0]:
+            armed[0] = False
+            return True
+        return False
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", _once)
+    cap = get_device_capacity(torch.device("cuda"))[0]
+    bogus = _mismatched_capacity(cap, CFG.tile_m, CFG.cluster_m)
+    assert bogus is not None and bogus != cap
+    cfg = CFG.__class__(**{**CFG.__dict__, "device_capacity": bogus})
+    m, n = 391, 768  # ragged M; n keeps B's leading stride 16B-aligned
+    A, B = _inputs(m=m, n=n)
+    ref = (A.float() @ B.float()).sum(0)
+
+    armed[0] = True  # -> quack::gemm_epi_f -> _alloc_outs_from_meta
+    res = _colsum(A, B, config=cfg)
+    torch.testing.assert_close(res["colsum"], ref, rtol=1e-3, atol=1e-1)
+
+    armed[0] = True  # out= makes it caller-owned -> compile_call's own alloc
+    out = {"D": torch.empty(m, n, device="cuda", dtype=torch.bfloat16)}
+    res = _colsum(A, B, config=cfg, out=out)
+    torch.testing.assert_close(res["colsum"], ref, rtol=1e-3, atol=1e-1)
+
+
+@gemm_epilogue(reduces={"bfly_sum": RowVecReduce("bfly_sum")})
+def _bfly_sum(acc):
+    return {"D": acc, "bfly_sum": acc}
+
+
+@gemm_epilogue(reduces={"bfly_max": RowVecReduce("bfly_max", combine="max")})
+def _bfly_max(acc):
+    return {"D": acc, "bfly_max": acc}
+
+
+def test_rowvec_butterfly_fallback(monkeypatch):
+    """RowVecReduce has two intra-warp reductions and real layouts only ever
+    compile one of them. Measured over 38 configs (bf16/f16 x tile_m 128/256 x
+    tile_n 128/192/256 x cluster_m 1/2/4 x pingpong, SM90 and SM100): every one
+    took the swap-shuffle path, because E and the M-lane stride are powers of 2
+    in every layout the epilogue builds. The butterfly fallback at
+    RowVecReduce.end_loop_stage is therefore live code that nothing executes.
+
+    _mode_flat_stride -> None makes use_swap_shuffle False on those same real
+    layouts, so the fallback compiles and is checked numerically. Without this,
+    the first epilogue tiler to produce an odd E would be the first time the
+    branch ever ran.
+
+    The epilogue fns are private to this test so the jit cache can only ever
+    hold the forced variant for this key (a shared fn could serve a cubin
+    compiled on the swap path and the check would silently pass).
+    """
+    import quack.epilogue.ops as ops
+
+    traced = {}
+    real_swap = ops.swap_shuffle_reduce
+
+    def _spy_swap(*a, **k):
+        traced["swap"] = True
+        return real_swap(*a, **k)
+
+    monkeypatch.setattr(ops, "swap_shuffle_reduce", _spy_swap)
+    monkeypatch.setattr(ops, "_mode_flat_stride", lambda layout, mode: None)
+
+    cap = get_device_capacity(torch.device("cuda"))[0]
+    cta = cta_tile_shape_m(CFG.tile_m, CFG.cluster_m, cap)
+    m, n = 4 * cta + 13, 704
+    A, B = _inputs(m=m, n=n)
+    ref = A.float() @ B.float()
+    torch.testing.assert_close(
+        _bfly_sum(A, B, config=CFG)["bfly_sum"], ref.sum(0), rtol=1e-3, atol=1e-1
+    )
+    torch.testing.assert_close(
+        _bfly_max(A, B, config=CFG)["bfly_max"], ref.amax(0), rtol=1e-3, atol=1e-2
+    )
+    # A warm jit cache serves the (already forced) cubin without tracing, so the
+    # spy stays silent; it can only ever prove the swap path was NOT taken.
+    assert not traced.get("swap"), "override failed: still compiled the swap-shuffle path"
 
 
 def test_plan_run_matches_eager():

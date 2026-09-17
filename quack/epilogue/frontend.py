@@ -192,6 +192,7 @@ from quack.gemm_config import (
     SplitKMode,
     blockscaled_default_config,
     cta_tile_shape_m,
+    cta_tile_shape_m_for_device,
     default_config,
 )
 from quack.gemm_tvm_ffi_utils import tensor_key
@@ -1193,6 +1194,14 @@ class EpiMod:
         (varlen_m only): dim==1 partials are per-sequence tile-prefix rows."""
         import torch
 
+        # The per-CTA M tile comes from the DEVICE, never from
+        # config.device_capacity: a caller-supplied config is used verbatim and
+        # that field is a provenance tag defaulting to 9, so reading it here
+        # sized SM100 partials with the un-halved MMA tile while validation
+        # (EpiMod.gemm) and the kernel both used the halved one.
+        cta_tile_m = cta_tile_shape_m_for_device(
+            config.tile_m, config.cluster_m, device, blockscaled
+        )
         bufs = {}
         for name, op in self.sinks.items():
             if epi_args.get(name) is not None:
@@ -1200,9 +1209,6 @@ class EpiMod:
             # NOTE: for full-vector sinks (ColVecSelect), rows the kernel
             # never writes (out-of-range select indices) stay uninitialized —
             # callers who care pass the buffer.
-            cta_tile_m = cta_tile_shape_m(
-                config.tile_m, config.cluster_m, config.device_capacity, blockscaled
-            )
             shape = op.sink_alloc_shape(
                 lead,
                 n,

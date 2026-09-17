@@ -39,7 +39,7 @@ from typing import Optional
 import torch
 
 from quack.blockscaled.operand import BlockScaledFormat
-from quack.gemm_config import GemmConfig, cta_tile_shape_m, default_config
+from quack.gemm_config import GemmConfig, cta_tile_shape_m_for_device, default_config
 from quack.gemm_runtime.identity import (
     TORCH_OP_EPI_MODS as _EPI_REGISTRY,
     TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
@@ -52,6 +52,10 @@ from quack.rounding import RoundingMode
 # through its lru_cache'd helpers (which it does with a UserWarning per
 # wrapper). Marks the function object itself; eager calls are unaffected.
 default_config = torch._dynamo.assume_constant_result(default_config)
+# Same treatment for the sink tiling rule: it reads the device capability
+# through the same lru_cache'd helper, and its inputs (the config's tiles plus
+# A.device) are all trace-time constants.
+cta_tile_shape_m_for_device = torch._dynamo.assume_constant_result(cta_tile_shape_m_for_device)
 
 
 def _sf_encode(SF: torch.Tensor) -> torch.Tensor:
@@ -164,8 +168,13 @@ def _alloc_outs_from_meta(digest: str, ins: list, meta: str) -> list:
     if m["sink_names"]:
         cfg, lead = m["config"], mod._lead_shape(A, cu, A_idx)
         n = B.shape[-1] if n_ov is None else n_ov
-        cta_tile_m = cta_tile_shape_m(
-            cfg["tile_m"], cfg["cluster_m"], cfg["device_capacity"], named.get("SFA") is not None
+        # Capability from the device, NOT cfg["device_capacity"] (a provenance
+        # tag defaulting to 9 that a caller-supplied config carries verbatim) —
+        # otherwise these graph-owned partials disagree with the shapes
+        # EpiMod.gemm validates and the kernel writes. Under FakeTensorMode
+        # A.device is still the real device, so the fake and the op body agree.
+        cta_tile_m = cta_tile_shape_m_for_device(
+            cfg["tile_m"], cfg["cluster_m"], A.device, named.get("SFA") is not None
         )
         for name in m["sink_names"]:
             shape = mod.sinks[name].sink_alloc_shape(lead, n, cta_tile_m, cfg["tile_n"])
@@ -286,8 +295,11 @@ def compile_call(
         lead = mod._lead_shape(A, cu_seqlens_m, A_idx)
         n = B.shape[-1] if n_override is None else n_override
         partials = {}
-        cta_tile_m = cta_tile_shape_m(
-            cfg.tile_m, cfg.cluster_m, cfg.device_capacity, SFA is not None
+        # Device, not cfg.device_capacity — see _alloc_outs_from_meta. This
+        # cta_tile_m also feeds the varlen host_finalize_varlen fold below, so a
+        # stale capability would mis-group the per-sequence tile prefix too.
+        cta_tile_m = cta_tile_shape_m_for_device(
+            cfg.tile_m, cfg.cluster_m, A.device, SFA is not None
         )
         num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
         for name in sink_names:
