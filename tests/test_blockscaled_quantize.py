@@ -9,7 +9,26 @@ test_gemm_blockscaled_interface.py.
 import pytest
 import torch
 
-from quack.blockscaled.quantize import F8E4M3_MAX, to_mx, to_mx_dim0
+from quack.blockscaled.quantize import (
+    F8E4M3_MAX,
+    pack_scale_2d_to_blocked_contig,
+    to_mx,
+    to_mx_dim0,
+    unpack_scale_blocked_to_2d,
+)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_unpack_scale_blocked_accepts_unbatched_and_batched_layouts(batched):
+    scale = torch.arange(24, dtype=torch.uint8).reshape(6, 4)
+    blocked = pack_scale_2d_to_blocked_contig(scale)
+    if not batched:
+        blocked = blocked.squeeze(0)
+
+    unpacked = unpack_scale_blocked_to_2d(blocked, *scale.shape)
+
+    assert unpacked.shape == (1, *scale.shape)
+    torch.testing.assert_close(unpacked[0], scale)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
