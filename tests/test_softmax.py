@@ -110,6 +110,30 @@ def test_softmax_numerical_stability(use_compile):
     torch.testing.assert_close(out, out_shifted, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+# N=8192 takes the direct global->register load path (N <= 8192); N=8448 (just over
+# the threshold, and still a multiple of the copy vector size, unlike 8193) falls
+# back to the SMEM cp.async path. Non-power-of-2 small N (760, 3000) forces the
+# non-even-N predicated direct load, whose OOB register lanes must be filled with
+# -inf so the max reduction stays correct (regression for the skip-SMEM change).
+@pytest.mark.parametrize("N", [760, 3000, 8192, 8448])
+def test_softmax_fwd_direct_load(N, input_dtype):
+    """Direct global->register load path (small N) must match the SMEM path."""
+    device = "cuda"
+    atol, rtol = TOLERANCES[input_dtype]
+    torch.random.manual_seed(0)
+    M = 199
+    x = 0.1 * torch.randn(M, N, device=device, dtype=input_dtype)
+    out = softmax_fwd(x)
+    out_ref = F.softmax(x.float(), dim=-1).to(input_dtype)
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+    # Rows must be a valid probability distribution — a corrupted OOB fill would
+    # break normalization or inject NaNs.
+    assert not torch.isnan(out).any()
+    sums = torch.sum(out.float(), dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-3, rtol=1e-3)
+
+
 def test_softmax_fwd_empty():
     """softmax_fwd must handle zero-batch inputs without launching a kernel."""
     N = 4096
