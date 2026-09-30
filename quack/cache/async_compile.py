@@ -420,7 +420,8 @@ class CompilePool:
     def submit(self, sha: str, fn, args: tuple, kwargs: dict, o_path) -> bool:
         """Submit a live jit_cache miss. Returns False if the key can't be
         shipped to a subprocess (unpicklable args, ``<locals>`` qualname,
-        fn defined in ``__main__``, unserializable process-local payloads) —
+        fn defined in ``__main__``, unserializable process-local payloads,
+        or an unavailable executor) —
         the caller should compile in-process instead."""
         if sha in self._futures:
             return True
@@ -439,7 +440,12 @@ class CompilePool:
             )
         except Exception:
             return False
-        self.submit_raw(sha, fn.__module__, fn.__qualname__, key_b64, str(o_path), payloads_b64)
+        try:
+            self.submit_raw(sha, fn.__module__, fn.__qualname__, key_b64, str(o_path), payloads_b64)
+        except RuntimeError:
+            # BrokenProcessPool and submissions after shutdown cannot queue work.
+            # Leave the key unreserved so jit_cache compiles it in-process.
+            return False
         return True
 
     def poll(self, sha: str) -> tuple[str, Optional[str]]:
