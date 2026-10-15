@@ -23,9 +23,10 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - name: Install ruff
         # Pin to the same version as .pre-commit-config.yaml — ruff releases
         # change default rule selection and formatter output (0.16.0 went from
@@ -44,10 +45,11 @@ jobs:
     steps:
       # paths-filter needs git history on push events; for PRs it uses the API.
       - if: github.event_name == 'push'
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@v3
+          persist-credentials: false
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad  # v3
         id: filter
         with:
           filters: |
@@ -59,11 +61,7 @@ jobs:
 
   test:
     needs: changes
-    if: >
-      needs.changes.outputs.code == 'true' &&
-      (github.event_name == 'push' ||
-       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
-       github.event_name == 'pull_request_target')
+    if: needs.changes.outputs.code == 'true'
     environment: ${{ inputs.environment }}
     strategy:
       fail-fast: false
@@ -80,9 +78,10 @@ jobs:
     name: test (${{ matrix.gpu }}${{ matrix.arch && format(' / sm{0}', matrix.arch) || '' }} / ${{ matrix.cuda }})
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - uses: ./.github/actions/gpu-test
         with:
           cuda: ${{ matrix.cuda }}
