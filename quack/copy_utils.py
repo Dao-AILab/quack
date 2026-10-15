@@ -477,7 +477,7 @@ def create_ragged_tensor_for_tma(
         assert rank <= 3, "non-ptr_shift ragged tensor only supports up to 3 dimensions"
         stride_r = T.stride[ragged_dim]
         new_shape = (
-            T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT, MAX_INT)
+            T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (BIG_INT + 1, cute.size(T, mode=[ragged_dim]) + 1)
         )
         new_stride = (
             T.stride[:ragged_dim]
