@@ -447,6 +447,19 @@ class GemmSm100(GemmTmaBase):
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        # SM103 (B300) FP4 "ultra" MMA: kind::mxf4nvf4 with instruction K=96 (vs 64), the
+        # higher-throughput B300 FP4 path. Everything outside the mma warp (smem stages,
+        # TMA, SF layouts, accumulator) keeps the K=64 atom in self.tiled_mma; the mma warp
+        # issues 8 K=96 MMAs per 3 k-tiles of 256 (see mma_sm103_ultra). 2-CTA only: on
+        # 1-CTA tiles (128x128, 128x256) it measured 0.5-6% slower on GB300.
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        self.sm103_ultra = (
+            self.blockscaled
+            and self.use_2cta_instrs
+            and self.a_mma_dtype is cutlass.Float4E2M1FN
+            and self.b_mma_dtype is cutlass.Float4E2M1FN
+            and (arch.major, arch.minor) == (10, 3)
+        )
         if const_expr(self.blockscaled):
             # The SF atom fixed by the tcgen05 MMA (BlockScaledBasicChunk) is 128
             # wide in N and one atom is 512 contiguous gmem bytes (128 N x 4
@@ -642,8 +655,7 @@ class GemmSm100(GemmTmaBase):
         # they alternate the direction of epi tiles (from right to left, then from left to right)
         # to release acc_pipeline early.
         # The two approaches perform about the same.
-        self.overlap_accum_sf = self.blockscaled and self.num_acc_stage == 1
-        if const_expr(self.overlap_accum_sf):
+        if const_expr(self.blockscaled):
             num_sf_tmem_cols = (
                 (
                     cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
@@ -651,7 +663,16 @@ class GemmSm100(GemmTmaBase):
                 )
                 * 4  # 4 cols per stage
                 * (self.mma_inst_shape_mnk[2] // self.sf_vec_size)
+                # sm103_ultra keeps the SFs of the 3 k-tiles of a K=96 MMA group resident
+                * (3 if self.sm103_ultra else 1)
             )
+            if const_expr(
+                self.num_acc_stage == 2
+                and 2 * self.cta_tile_shape_mnk[1] + num_sf_tmem_cols > self.num_tmem_alloc_cols
+            ):
+                self.num_acc_stage = 1
+        self.overlap_accum_sf = self.blockscaled and self.num_acc_stage == 1
+        if const_expr(self.overlap_accum_sf):
             self.iter_acc_early_release = num_sf_tmem_cols // cute.size(self.epi_tile[1])
         else:
             self.iter_acc_early_release = -1
@@ -1211,6 +1232,23 @@ class GemmSm100(GemmTmaBase):
         sA = storage.sA.get_tensor(a_smem_load_layout.outer, swizzle=a_smem_load_layout.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+        sA_u8, sB_u8 = None, None
+        if const_expr(self.sm103_ultra):
+            # Byte views of the A/B stages (per k-tile one 128B SW128 row of 8 16B k-blocks)
+            # for the sm103 K=96 smem descriptors, which start at 16B granularity.
+            u8_atom = tcgen05.make_smem_layout_atom(
+                tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.Uint8
+            )
+            a_u8, b_u8 = [
+                tcgen05.tile_to_mma_shape(
+                    u8_atom,
+                    ((rows // cute.size(tiled_mma.thr_id.shape), 16), 1, 8, self.ab_stage),
+                    order=(0, 1, 2),
+                )
+                for rows in self.mma_tiler[:2]
+            ]
+            sA_u8 = storage.sA.get_tensor(a_u8.outer, swizzle=a_u8.inner, dtype=cutlass.Uint8)
+            sB_u8 = storage.sB.get_tensor(b_u8.outer, swizzle=b_u8.inner, dtype=cutlass.Uint8)
         sAIdx = None
         if const_expr(self.gather_A):
             a_idx_smem_dim = self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
@@ -1733,6 +1771,8 @@ class GemmSm100(GemmTmaBase):
                 tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
                 # Make SFB tmem tensor
                 sfa_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                if const_expr(self.sm103_ultra):
+                    sfa_tmem_col_offset *= 3  # 3 SFA slots, see mma_sm103_ultra
                 sfb_tmem_col_offset = acc_tmem_col_offset + sfa_tmem_col_offset
                 sfb_tmem_base_ptr = acc_tmem_ptr + sfb_tmem_col_offset
                 sfb_tmem_ptr = cute.recast_ptr(sfb_tmem_base_ptr, dtype=self.sf_dtype)
@@ -1779,7 +1819,8 @@ class GemmSm100(GemmTmaBase):
                     # N+64 is element offset 8 = 2 tmem columns).
                     tCtSFB_mma = cute.make_tensor(
                         cute.recast_ptr(
-                            sfb_tmem_base_ptr + Int32((tile_coord_mnkl[1] % 2) * 2),
+                            cute.recast_ptr(tCtSFB.iterator, dtype=Float32)
+                            + Int32((tile_coord_mnkl[1] % 2) * 2),
                             dtype=self.sf_dtype,
                         ),
                         tCtSFB.layout,
@@ -1803,24 +1844,45 @@ class GemmSm100(GemmTmaBase):
                             cute.ceil_div(k_len % self.mma_tiler[2], self.sf_vec_size) % num_insts
                         )
                 iket.range_push("mma")
-                ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
-                    ab_pipeline,
-                    acc_pipeline,
-                    ab_consumer_state,
-                    acc_producer_state,
-                    tiled_mma,
-                    tCrA,
-                    tCrB,
-                    tCtAcc,
-                    k_tile_cnt,
-                    is_leader_cta,
-                    cta_rank_in_cluster,
-                    tCtSFA,
-                    tCtSFB_mma,
-                    copy_s2t_sfa,
-                    copy_s2t_sfb,
-                    sf_valid_insts,
-                )
+                if const_expr(self.sm103_ultra):
+                    ab_consumer_state, acc_producer_state, tiled_mma = self.mma_sm103_ultra(
+                        ab_pipeline,
+                        acc_pipeline,
+                        ab_consumer_state,
+                        acc_producer_state,
+                        tiled_mma,
+                        tCrA,
+                        tCrB,
+                        sA_u8,
+                        sB_u8,
+                        tCtAcc,
+                        k_tile_cnt,
+                        is_leader_cta,
+                        sSFA,
+                        sSFB,
+                        tCtSFA,
+                        tCtSFB,
+                        tCtSFB_mma,
+                    )
+                else:
+                    ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
+                        ab_pipeline,
+                        acc_pipeline,
+                        ab_consumer_state,
+                        acc_producer_state,
+                        tiled_mma,
+                        tCrA,
+                        tCrB,
+                        tCtAcc,
+                        k_tile_cnt,
+                        is_leader_cta,
+                        cta_rank_in_cluster,
+                        tCtSFA,
+                        tCtSFB_mma,
+                        copy_s2t_sfa,
+                        copy_s2t_sfb,
+                        sf_valid_insts,
+                    )
                 if const_expr(self.overlap_accum_sf):
                     # After iter 0, 2, ..., shift tmem ptr by -256.
                     # After iter 1, 3, ..., shift tmem ptr by 256.
@@ -2326,6 +2388,135 @@ class GemmSm100(GemmTmaBase):
         acc_producer_state.advance()
         # If we don't return the tiled_mma, we get compiler error
         # "operand #0 does not dominate this use"
+        return ab_consumer_state, acc_producer_state, tiled_mma
+
+    @cute.jit
+    def mma_sm103_ultra(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        acc_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_consumer_state: cutlass.pipeline.PipelineState,
+        acc_producer_state: cutlass.pipeline.PipelineState,
+        tiled_mma: cute.TiledMma,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        sA_u8: cute.Tensor,
+        sB_u8: cute.Tensor,
+        acc: cute.Tensor,
+        k_tile_cnt: Int32,
+        is_leader_cta: Boolean,
+        sSFA: cute.Tensor,
+        sSFB: cute.Tensor,
+        tCtSFA: cute.Tensor,
+        tCtSFB: cute.Tensor,
+        tCtSFB_mma: cute.Tensor,
+    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState, cute.TiledMma]:
+        """SM103 mainloop: each group of 3 k-tiles (3 x 128B of fp4 per A/B row) runs 8 K=96
+        MMAs. MMA i reads bytes [48i, 48i + 48) of the group, i.e. starts at 16B k-block
+        (3i) % 8 of k-tile 3i // 8 and, for i = 2, 5, continues into the next k-tile's buffer
+        (the smem descriptor's next_src). The 3 k-tiles' SFs go to 3 contiguous tmem slots
+        (the K=768 extension of the per-k-tile SF layout) so an MMA's 96 / sf_vec_size SFs
+        can straddle k-tiles too. Leftover k-tiles (k_tile_cnt % 3) run the K=64 atom."""
+        sf_dtype, vec = self.sf_dtype, self.sf_vec_size
+        tiled_mma_ultra = sm100_utils.sm103_make_blockscaled_trivial_tiled_mma(
+            sf_dtype, vec, self.cta_group, self.mma_inst_shape_mnk[:2]
+        )
+
+        def shifted(t, cols):
+            # tmem ptr arithmetic must be done on a 32-bit type (1 unit = 1 column)
+            ptr = cute.recast_ptr(t.iterator, dtype=Float32) + cols
+            return cute.make_tensor(cute.recast_ptr(ptr, dtype=sf_dtype), t.layout)
+
+        # S2T copy into SF slot j of 3 (slot j at j x the per-k-tile SF tmem columns)
+        copy_sfa, copy_sfb = (
+            [
+                copy_utils.s2t_get_copy_fn(
+                    sSF,
+                    shifted(tCtSF, j * tcgen05.find_tmem_tensor_col_offset(tCtSF)),
+                    self.cta_group,
+                )
+                for j in range(3)
+            ]
+            for sSF, tCtSF in ((sSFA, tCtSFA), (sSFB, tCtSFB))
+        )
+        # K=96 view of the 3 slots, indexed per SF along K
+        mma_tiler_grp = (self.mma_tiler[0], self.mma_tiler[1], 3 * self.mma_tiler[2])
+        sf_k_grp = mma_tiler_grp[2] // vec
+        sf_mn = (self.cta_tile_shape_mnk[0], cute.round_up(self.cta_tile_shape_mnk[1], 128))
+        sfa_iter, sfb_iter = [
+            cute.make_layout(((((32, 4), mn // 128), (vec, 1)), 1, sf_k_grp)) for mn in sf_mn
+        ]
+        tCtSFA_grp = cute.make_tensor(
+            tCtSFA.iterator,
+            blockscaled_utils.make_tmem_layout_sfa(tiled_mma_ultra, mma_tiler_grp, vec, sfa_iter),
+        )
+        tCtSFB_grp = cute.make_tensor(
+            tCtSFB_mma.iterator,
+            blockscaled_utils.make_tmem_layout_sfb(tiled_mma_ultra, mma_tiler_grp, vec, sfb_iter),
+        )
+        sf_per_mma = 96 // vec
+        view = cute.make_layout(1, stride=0)
+
+        if is_leader_cta:
+            acc_pipeline.producer_acquire(acc_producer_state)
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        tiled_mma_ultra.set(tcgen05.Field.ACCUMULATE, False)
+        num_groups = k_tile_cnt // 3
+        for grp in cutlass.range(num_groups, unroll=1):
+            stages = []
+            for j in cutlass.range_constexpr(3):
+                stages.append(ab_consumer_state.clone())
+                ab_consumer_state.advance()
+            if is_leader_cta:
+                for i in cutlass.range_constexpr(8):
+                    j_cur, j_next = (48 * i) // 128, (48 * i + 47) // 128
+                    if const_expr(j_next != (48 * i - 1) // 128):
+                        # First MMA touching k-tile j_next: wait for it, stage its SFs
+                        ab_pipeline.consumer_wait(stages[j_next])
+                        copy_sfa[j_next](stages[j_next].index)
+                        copy_sfb[j_next](stages[j_next].index)
+                    k_blk = (48 * i) % 128 // 16
+                    cur, nxt = stages[j_cur].index, stages[j_next].index
+                    a_desc, b_desc = [
+                        tcgen05.make_umma_smem_desc(
+                            s[None, 0, k_blk, cur].iterator,
+                            s[None, 0, k_blk, cur].layout,
+                            "k",
+                            next_src=s[None, 0, 0, nxt].iterator,
+                        )
+                        for s in (sA_u8, sB_u8)
+                    ]
+                    sf_coord = (None, None, i * sf_per_mma)
+                    tiled_mma_ultra.set(tcgen05.Field.SFA, tCtSFA_grp[sf_coord].iterator)
+                    tiled_mma_ultra.set(tcgen05.Field.SFB, tCtSFB_grp[sf_coord].iterator)
+                    cute.mma_atom_call(
+                        tiled_mma_ultra,
+                        acc[None, 0, 0],
+                        cute.make_tensor(a_desc, view),
+                        cute.make_tensor(b_desc, view),
+                        acc[None, 0, 0],
+                    )
+                    tiled_mma_ultra.set(tcgen05.Field.ACCUMULATE, True)
+                    if const_expr(i == 7 or (48 * (i + 1)) // 128 != j_cur):
+                        # Last MMA reading k-tile j_cur
+                        ab_pipeline.consumer_release(stages[j_cur])
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        for k_tile in cutlass.range(k_tile_cnt - 3 * num_groups, unroll=1):
+            if is_leader_cta:
+                ab_pipeline.consumer_wait(ab_consumer_state)
+                copy_sfa[0](ab_consumer_state.index)
+                copy_sfb[0](ab_consumer_state.index)
+                for k_blk_idx in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
+                    k_blk_coord = (None, None, k_blk_idx, ab_consumer_state.index)
+                    tiled_mma.set(tcgen05.Field.SFA, tCtSFA[None, None, k_blk_idx].iterator)
+                    tiled_mma.set(tcgen05.Field.SFB, tCtSFB_mma[None, None, k_blk_idx].iterator)
+                    cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                ab_pipeline.consumer_release(ab_consumer_state)
+            ab_consumer_state.advance()
+        if is_leader_cta:
+            acc_pipeline.producer_commit(acc_producer_state)
+        acc_producer_state.advance()
         return ab_consumer_state, acc_producer_state, tiled_mma
 
     @cute.jit
