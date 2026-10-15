@@ -296,11 +296,12 @@ def get_sm_count(N: int, device: torch.device) -> int:
 _CTA_THREAD_SIZE = (128, 256)
 # Full launch-knob menu lives here; the per-call pruner in
 # ``prune_invalid_rmsnorm_{fwd,bwd}_configs`` drops layouts that don't fit the
-# current row. The tiny widths (8, 16, 32) are kept for the analytical
-# heuristic's narrow-row safety floor (N <= 512) but are dropped from the
-# autotune search space below since they're only optimal for that floor.
+# current row. The smallest widths (8, 16) are kept only for the analytical
+# heuristic's narrow-row safety floor. Forward also selects 32 threads per row
+# through N=3072, so its autotuner must include that width.
 _THREADS_PER_REDUCTION_DIM = (8, 16, 32, 64, 128, 256)
 _AUTOTUNE_THREADS_PER_REDUCTION_DIM = (64, 128, 256)
+_AUTOTUNE_FWD_THREADS_PER_REDUCTION_DIM = (32, *_AUTOTUNE_THREADS_PER_REDUCTION_DIM)
 # smem_stages=4 doubles the data-buffer footprint vs stages=2 and crashes at
 # launch for fp32 N>=64K on Blackwell (227 KB opt-in smem). Stages=3 still
 # offers a meaningful prefetch depth without that risk.
@@ -418,7 +419,7 @@ def get_all_fwd_configs() -> List[RmsNormFwdConfig]:
     configs: List[RmsNormFwdConfig] = []
     for num_threads, threads_per_row, cluster_n, reload_from, delay_w_load in itertools.product(
         _CTA_THREAD_SIZE,
-        _AUTOTUNE_THREADS_PER_REDUCTION_DIM,
+        _AUTOTUNE_FWD_THREADS_PER_REDUCTION_DIM,
         cluster_vals,
         reload_from_vals,
         delay_w_load_vals,
