@@ -216,7 +216,7 @@ class GemmBase:
                     rotated[name] = layout_utils.select(v, [1, 2, 0])
                 elif append_batch_if_2d and cute.rank(v) == 2:
                     rotated[name] = layout_utils.expand(v, 2, 1)
-                if const_expr(self.cd_transposed) and name in rotated:
+                if const_expr(self.cd_transposed and name in rotated):
                     rotated[name] = layout_utils.select(rotated[name], [1, 0, 2])
             elif name in reduce_fields and append_batch_if_2d and cute.rank(v) == 2:
                 rotated[name] = layout_utils.expand(v, 0, 1)
@@ -721,27 +721,22 @@ class GemmBase:
             finalizer_load_acc = load_acc_and_fold
         else:
             split_k_sem, ws_ptr = None, None
-        # Mixed static/dynamic test (quack.dsl.mixed_constexpr_if): the const_expr
-        # prefix folds at trace time, so split_k == 1 / SEPARATE codegen is a bare
-        # epilogue call with no dynamic if, while SERIAL/PARALLEL non-finalizing
-        # splits commit raw partials and only the last split runs the epilogue.
-        if (
-            const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE)
-            and split_idx < self.split_k - 1
-        ):
-            self.split_k_partial_commit(
-                load_acc_subtile, tRS_rD, epi_tile, ws_ptr, split_k_sem, split_idx, tidx
-            )
-        else:
-            if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
+        # SERIAL/PARALLEL: non-finalizing splits commit raw partials and only the last
+        # split runs the epilogue. split_k == 1 / SEPARATE codegen is a bare epilogue
+        # call with no dynamic if.
+        if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
+            if split_idx < self.split_k - 1:
+                self.split_k_partial_commit(
+                    load_acc_subtile, tRS_rD, epi_tile, ws_ptr, split_k_sem, split_idx, tidx
+                )
+            else:
                 # Finalizer (fixed: the last split, so e.g. the SM100 epi-load warp can
                 # gate C loads statically). Wait for all S-1 sibling commits; the flag
                 # counts committed splits in both modes. The finalizer folds the
                 # workspace with generic loads, so no async-proxy fence is needed
                 # after the acquire.
                 split_k_sem.wait_eq(self.split_k - 1)
-            epi_read_state, epi_producer_state = epi_fn(finalizer_load_acc)
-            if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
+                epi_read_state, epi_producer_state = epi_fn(finalizer_load_acc)
                 # Self-clean the flag (fresh-zeros allocation also works, but this keeps
                 # the tensor reusable if the host ever caches it).
                 split_k_sem.release_store(0)
@@ -754,6 +749,8 @@ class GemmBase:
                 if const_expr(epi_store_pipeline is not None):
                     if is_tma_warp:
                         epi_store_pipeline.producer_tail()
+        else:
+            epi_read_state, epi_producer_state = epi_fn(finalizer_load_acc)
         return epi_read_state, epi_producer_state
 
     def get_scheduler_class(self, varlen_m: bool = False):
