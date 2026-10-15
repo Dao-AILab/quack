@@ -126,7 +126,11 @@ def test_autotune_wedged_pool_falls_back_in_process(monkeypatch):
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="requires CUDA")
 def test_autotuning_does_not_pollute_selective_checkpoint_cache():
     import torch
-    from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        checkpoint,
+        create_selective_checkpoint_contexts,
+    )
 
     from quack.autotuner import Autotuner
 
