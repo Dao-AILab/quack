@@ -186,7 +186,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         if loss_scale is not None:
             dloss = dloss * loss_scale
         if dx is not None:
-            dx.mul_(dloss)
+            dx = dx * dloss
             dx = dx.reshape(*ctx.batch_shape, dx.shape[-1])
         # Complete dw computation: dw = dloss * dw + dloss * (last_dlogits_chunk.T @ last_x_chunk)
         if last_dlogits_chunk is None:
@@ -204,20 +204,15 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
             # Add last chunk's contribution with dloss scaling
             # dw = dloss * dw + dloss * (last_dlogits_chunk.T @ last_x_chunk)
             # We use alpha=dloss, beta=dloss
-            if ctx.weight_dtype == dw.dtype:
-                gemm_add_inplace(
-                    last_dlogits_chunk.T, last_x_chunk, dw, alpha=dloss, beta=dloss, tuned=tuned
-                )
-            else:
-                dw = gemm_add(
-                    last_dlogits_chunk.T,
-                    last_x_chunk,
-                    dw,
-                    alpha=dloss,
-                    beta=dloss,
-                    out_dtype=ctx.weight_dtype,
-                    tuned=tuned,
-                )
+            dw = gemm_add(
+                last_dlogits_chunk.T,
+                last_x_chunk,
+                dw,
+                alpha=dloss,
+                beta=dloss,
+                out_dtype=ctx.weight_dtype,
+                tuned=tuned,
+            )
         return dx, dw, None, None, None, None, None
 
 
@@ -717,12 +712,11 @@ class ScaledExpLinearCrossEntropyFunction(torch.autograd.Function):
     def backward(ctx, dloss):
         dx, dw = ctx.saved_tensors
         if dx is not None:
-            dx = dx[: ctx.num_rows]
-            dx.mul_(dloss)
+            dx = dx[: ctx.num_rows] * dloss
             dx = dx.reshape(*ctx.batch_shape, dx.shape[-1])
         if dw is not None:
             # single downcast from the fp32 accumulator
-            dw = dw.mul_(dloss).to(ctx.weight_dtype)
+            dw = (dw * dloss).to(ctx.weight_dtype)
         return dx, dw, None, None, None, None, None
 
 
