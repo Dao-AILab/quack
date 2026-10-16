@@ -167,6 +167,16 @@ def test_quant_out_random(fmt, alpha, bias, mnk):
     assert not torch.isnan(sf_2d[:, : ceil_div(n, vec)]).any()
 
 
+def test_quant_out_rejects_2d_format():
+    """The SFD epilogue emits one scale per 1 x sf_vec_size vector, so a 2D
+    scale-block out_dtype would mislabel the output (its scales are not
+    block-replicated and materialize_transposed would be silently wrong)."""
+    A = torch.randn(64, 64, dtype=torch.bfloat16, device="cuda")
+    B = torch.eye(64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(NotImplementedError, match="2D scale-block"):
+        gemm(A, B, out_dtype="mxfp8_e4m3_2d", tuned=False)
+
+
 def test_quant_out_batched():
     torch.manual_seed(0)
     l, m, n, k = 2, 256, 256, 128

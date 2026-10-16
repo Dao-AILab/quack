@@ -482,7 +482,9 @@ def test_origin_main_byte_fp6_pickle_migrates_without_reinterpretation():
         ("sf_vec_size", 32),
         ("has_per_tensor_scale", False),
     ):
-        object.__setattr__(old_fmt, name, value)
+        # Write the instance dict directly: it IS the pickled state, and
+        # "sf_vec_size" is a read-only property on the current class.
+        old_fmt.__dict__[name] = value
     assert "storage_layout" not in old_fmt.__dict__
     old_op = BlockScaledOperand.from_parts(
         byte_op.qdata, byte_op.scale, old_fmt, orig_dtype=torch.bfloat16
@@ -497,7 +499,9 @@ def test_origin_main_byte_fp6_pickle_migrates_without_reinterpretation():
     assert "storage_layout" in loaded.format.__dict__
     assert loaded.format.is_byte_container and loaded.shape == (5, 96)
     assert loaded.format == MXFP6_E2M3
-    assert hash(loaded.format) == hash(old_fmt)
+    # (the crafted old-schema instance itself can no longer hash: the current
+    # dataclass hash reads sf_size_outer_red, which old pickles do not carry)
+    assert hash(loaded.format) == hash(MXFP6_E2M3)
     assert torch.equal(loaded.dequantize(torch.float32), byte_op.dequantize(torch.float32))
     migrated = loaded.to_packed()
     assert migrated.format is MXFP6_E2M3_PACKED and migrated.shape == (5, 96)
@@ -538,7 +542,8 @@ def test_feature_head_packed_fp6_pickle_migrates_to_versioned_name():
         ("sf_vec_size", 32),
         ("has_per_tensor_scale", False),
     ):
-        object.__setattr__(feature_fmt, name, value)
+        # Instance-dict write: see test_origin_main_byte_fp6_pickle_migrates_*.
+        feature_fmt.__dict__[name] = value
     assert "elems_per_container" not in feature_fmt.__dict__
     assert "storage_layout" not in feature_fmt.__dict__
 
@@ -775,3 +780,139 @@ def test_future_recipe_examples():
     # NVFP4 operand paired with a plain bf16 tensor; sided-ness is per-kind
     # (a follow-up), so today the interface still requires both-sided SF.
     assert NVFP4.has_per_tensor_scale
+
+
+# -- 2D (square) scale-block formats ------------------------------------------
+
+
+def test_2d_format_registry_property_and_legacy_int_constructor():
+    import pickle
+
+    from quack.blockscaled.operand import MXFP8_E4M3_2D, MXFP8_E5M2_2D
+
+    f2d = BlockScaledFormat.from_name("mxfp8_e4m3_2d")
+    assert f2d is MXFP8_E4M3_2D
+    assert BlockScaledFormat.from_name("mxfp8_e5m2_2d") is MXFP8_E5M2_2D
+    assert f2d.sf_size_outer_red == (32, 32)
+    assert f2d.sf_vec_size == 32  # derived property: the red (K) extent
+    assert MXFP8_E4M3.sf_size_outer_red == (1, 32)
+    # Every pre-pair caller spells the recipe as a bare int; it normalizes.
+    legacy = BlockScaledFormat(
+        "legacy_rowwise", torch.float8_e4m3fn, "Float8E4M3FN", 8, 1, torch.float8_e8m0fnu, 32
+    )
+    assert legacy.sf_size_outer_red == (1, 32)
+    with pytest.raises(TypeError, match="sf_size_outer_red"):
+        BlockScaledFormat(
+            "bad_pair", torch.float8_e4m3fn, "Float8E4M3FN", 8, 1, torch.float8_e8m0fnu, (32,)
+        )
+    assert pickle.loads(pickle.dumps(f2d)) == f2d
+
+
+def test_legacy_sf_vec_size_pickle_state_migrates():
+    """origin/main pickles carry the rowwise K-only "sf_vec_size" int;
+    __setstate__ migrates it to the (outer, red) pair."""
+    revived = BlockScaledFormat.__new__(BlockScaledFormat)
+    revived.__setstate__(
+        {
+            "name": "mxfp8_e4m3",
+            "qdata_dtype": torch.float8_e4m3fn,
+            "cutlass_dtype_name": "Float8E4M3FN",
+            "elem_bits": 8,
+            "elems_per_container": 1,
+            "scale_dtype": torch.float8_e8m0fnu,
+            "sf_vec_size": 32,
+            "has_per_tensor_scale": False,
+            "storage_layout": None,
+        }
+    )
+    assert revived.sf_size_outer_red == (1, 32) and revived == MXFP8_E4M3
+
+
+def test_legacy_sf_vec_size_pytree_context_migrates():
+    from quack.blockscaled.operand import (
+        MXFP8_E4M3_2D,
+        _format_from_context,
+        _format_to_context,
+    )
+
+    ctx = _format_to_context(MXFP8_E4M3_2D)
+    assert ctx["sf_size_outer_red"] == [32, 32] and "sf_vec_size" not in ctx
+    assert _format_from_context(ctx) is MXFP8_E4M3_2D
+    legacy_ctx = dict(_format_to_context(MXFP8_E4M3))
+    legacy_ctx.pop("sf_size_outer_red")
+    legacy_ctx["sf_vec_size"] = 32
+    assert _format_from_context(legacy_ctx) is MXFP8_E4M3
+
+
+def test_materialize_transposed_bitwise_identity():
+    from quack.blockscaled.quantize import unpack_scale_blocked_to_2d
+
+    torch.manual_seed(0)
+    # Per-32x32-block magnitudes spanning 2^-8..2^7 so the e8m0 scale GRID
+    # varies: a uniform-amax input gives one scale everywhere and the test
+    # could not tell a transposed grid from an un-transposed one.
+    block_mag = 2.0 ** torch.randint(-8, 8, (8, 4), device="cuda").float()
+    w = torch.randn(256, 128, device="cuda") * block_mag.repeat_interleave(32, 0).repeat_interleave(
+        32, 1
+    )
+    w = w.to(torch.bfloat16)
+    op = BlockScaledOperand.quantize(w, "mxfp8_e4m3_2d")
+    grid = unpack_scale_blocked_to_2d(op.scale.unsqueeze(0), 256, 4)[0, ::32, :]
+    assert grid.view(torch.uint8).unique().numel() > 8, "scale grid must vary per block"
+    opt = op.materialize_transposed()
+    assert opt.shape == (128, 256) and opt.quant_dim == -1
+    dk = op.dequantize(torch.float32)
+    # The transpose carries the numerically IDENTICAL quantization (byte-
+    # transposed qdata, transposed scale grid), and it round-trips.
+    assert torch.equal(dk.T.contiguous(), opt.dequantize(torch.float32))
+    assert torch.equal(opt.materialize_transposed().dequantize(torch.float32), dk)
+    # A quant_dim=-2 operand (dim=-2 quantize -> .mT view) is already the
+    # transposed-contiguous storage; its transpose is that K-quantized operand.
+    opm = BlockScaledOperand.quantize(w, "mxfp8_e4m3_2d", dim=-2)
+    assert opm.shape == (256, 128) and opm.quant_dim == -2
+    opmt = opm.materialize_transposed()
+    assert opmt.shape == (128, 256) and opmt.quant_dim == -1
+    assert torch.equal(opmt.dequantize(torch.float32), opm.dequantize(torch.float32).T.contiguous())
+    with pytest.raises(ValueError, match="divisible by 32"):
+        BlockScaledOperand.from_parts(
+            op.qdata[:240].contiguous(), op.scale, "mxfp8_e4m3_2d", orig_dtype=w.dtype
+        ).materialize_transposed()
+    # Rowwise (1D) formats cannot transpose: their scale vectors run along K
+    # only (.mT is an orientation view, not a re-blocked transpose).
+    with pytest.raises(ValueError, match="square 2D scale-block"):
+        BlockScaledOperand.quantize(w, "mxfp8_e4m3").materialize_transposed()
+
+
+def test_materialize_transposed_rejects_unreplicated_scale():
+    """A rowwise-quantized operand re-tagged 2D via from_parts dequantizes
+    identically (byte-identical at the MMA level) but has no exact transpose;
+    sampling row 0 of each block would silently return a wrong operand."""
+    from quack.blockscaled.operand import MXFP8_E4M3_2D
+
+    torch.manual_seed(0)
+    w = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
+    rowwise = BlockScaledOperand.quantize(w, "mxfp8_e4m3")
+    mislabeled = BlockScaledOperand.from_parts(
+        rowwise.qdata, rowwise.scale, MXFP8_E4M3_2D, orig_dtype=w.dtype
+    )
+    assert torch.equal(mislabeled.dequantize(), rowwise.dequantize())
+    with pytest.raises(ValueError, match="not replicated"):
+        mislabeled.materialize_transposed()
+
+
+def test_2d_quantize_validation_and_mma_kind():
+    from quack.blockscaled.operand import MXFP8_E4M3_2D, mma_kind_for_pair
+
+    x3 = torch.randn(2, 64, 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="quantizes 2D tensors only"):
+        BlockScaledOperand.quantize(x3, "mxfp8_e4m3_2d")
+    with pytest.raises(AssertionError, match=r"M \(48\)"):
+        BlockScaledOperand.quantize(
+            torch.randn(48, 64, device="cuda", dtype=torch.bfloat16), "mxfp8_e4m3_2d"
+        )
+    # Byte-identical to rowwise MX at the MMA level: same hardware kind, and
+    # dtype-triple identification still resolves to the canonical rowwise row.
+    assert mma_kind_for_pair(MXFP8_E4M3_2D, MXFP8_E4M3_2D) == mma_kind_for_pair(
+        MXFP8_E4M3, MXFP8_E4M3
+    )
+    assert mma_kind_for_pair(MXFP8_E4M3, MXFP8_E4M3_2D) == mma_kind_for_pair(MXFP8_E4M3, MXFP8_E4M3)
