@@ -251,10 +251,24 @@ class _EpiModMixinBase(ComposableEpiMixin):
             # GemmGatedMixin: flat_divide pair views built OUTSIDE the loop so
             # every in-loop access is a plain loop index (the SM100 vectorizer
             # rejects affine indices like 2*i), scalar calls + vectorize=True.
-            aux_shape = cute.recast_layout(2, 1, tRS_rD.layout).shape
-            outs = tuple(
-                cute.make_rmem_tensor(aux_shape, self.acc_dtype) for _ in self._epi_mod_outputs
-            )
+            aux_half_width_shape = cute.recast_layout(2, 1, tRS_rD.layout).shape
+            aux_full_width_shape = tRS_rD.layout.shape
+            # TileStore(gated=False) outputs are full width: the fn's Pair
+            # lands through pair views, like a sink's.
+            outs = []
+            half_width_outs = []
+            full_width_outs = []
+            for name in self._epi_mod_outputs:
+                if const_expr(ops_by_name[name].gated):
+                    frag = cute.make_rmem_tensor(aux_half_width_shape, self.acc_dtype)
+                    half_width_outs.append((name, frag))
+                else:
+                    frag = cute.make_rmem_tensor(aux_full_width_shape, self.acc_dtype)
+                    pair = cute.flat_divide(frag, cute.make_layout(2))
+                    full_width_outs.append((name, (pair[0, ...], pair[1, ...])))
+                outs.append(frag)
+            outs = tuple(outs)
+
             # Sink values span both lanes (full N): collect through pair views.
             # (Scaled sinks are rejected in acc_pair mode at EpiMod init: a
             # tuple return already means the two lanes here.)
@@ -309,8 +323,11 @@ class _EpiModMixinBase(ComposableEpiMixin):
                     for name, kind in self._epi_mod_operands
                 }
                 res = fn(Pair(acc0[i], acc1[i]), **kw)
-                for oname, ofrag in zip(self._epi_mod_outputs, outs):
+                for oname, ofrag in half_width_outs:
                     ofrag[i] = res[oname]
+                for oname, (o0, o1) in full_width_outs:
+                    v = res[oname]
+                    o0[i], o1[i] = v[0], v[1]
                 for (s0, s1), sname in zip(sink_views, self._epi_mod_sinks):
                     v = res[sname]
                     s0[i], s1[i] = v[0], v[1]

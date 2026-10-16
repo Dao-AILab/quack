@@ -40,6 +40,10 @@ def default_cache_dir():
     return os.path.join(get_home_dir(), f".{PACKAGE_NAME}", "cache")
 
 
+def is_autotuning_disallowed():
+    return os.getenv(f"{PACKAGE_NAME.upper()}_DISALLOW_AUTOTUNING", None) == "1"
+
+
 class FileCacheManager(triton.runtime.cache.FileCacheManager):
     def __init__(self, key):
         super().__init__(key)
@@ -134,6 +138,7 @@ class Autotuner:
 
         if len(self.restore_value) > 0:
 
+            @torch.no_grad()
             def _pre_hook(kwargs):
                 self.restore_copies = {name: kwargs[name].clone() for name in self.restore_value}
 
@@ -143,6 +148,7 @@ class Autotuner:
 
         if len(self.restore_value) > 0:
 
+            @torch.no_grad()
             def _post_hook(kwargs, exception):
                 for name in self.restore_value:
                     kwargs[name].copy_(self.restore_copies[name])
@@ -197,12 +203,10 @@ class Autotuner:
         # workload the user actually runs.
         l2_cold_arg_sets = getattr(self, "_l2_cold_arg_sets", None)
         l2_cold_kwarg_sets = getattr(self, "_l2_cold_kwarg_sets", None)
-        has_hooks = self.pre_hook is not None or self.post_hook is not None
         use_l2_cold = (
             self._do_bench is None
             and l2_cold_arg_sets is not None
             and l2_cold_kwarg_sets is not None
-            and not has_hooks
         )
 
         if use_l2_cold:
@@ -225,8 +229,8 @@ class Autotuner:
 
         # Legacy path: triton.testing.do_bench or user-supplied do_bench.
         # Used when (a) a custom do_bench was passed via the decorator's
-        # ``do_bench=`` arg, or (b) pre/post hooks are configured (the
-        # clone/restore inside hooks doesn't work under CUDA graph capture).
+        # ``do_bench=`` arg, or (b) the L2-cold sets could not be cloned (OOM).
+        # It runs on the caller's tensors: the restore_value hooks undo each trial.
         def kernel_call():
             if self.pre_hook is not None:
                 self.pre_hook(full_nargs)
@@ -235,7 +239,7 @@ class Autotuner:
                     *args,
                     **current,
                 )
-            except Exception as e:
+            except BaseException as e:  # CompilePending is a BaseException
                 try:
                     if self.post_hook is not None:
                         self.post_hook(full_nargs, exception=e)
@@ -328,6 +332,13 @@ class Autotuner:
                 @torch.no_grad()  # Don't save benchmark tensors for backward
                 @_disable_current_modes()  # Don't cache benchmark outputs in SAC
                 def benchmark():
+                    # no cached result: raise rather than benchmark
+                    if is_autotuning_disallowed():
+                        raise RuntimeError(
+                            f"{self.fn.__name__}: no cached autotuning result for key {key} and "
+                            f"{PACKAGE_NAME.upper()}_DISALLOW_AUTOTUNING=1; fill the cache first "
+                            f"with {PACKAGE_NAME.upper()}_CACHE_AUTOTUNING=1 set in both runs"
+                        )
                     # Compile/bench overlap via the async compile pool
                     # (quack.cache.async_compile): the bench loop runs inside
                     # pool_scope(). A config whose kernel isn't compiled yet
@@ -353,17 +364,15 @@ class Autotuner:
 
                     bench_start = time.time()
                     verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
-                    has_hooks = self.pre_hook is not None or self.post_hook is not None
                     timings = {}
                     _MAX_ATTEMPTS = 20
                     try:
                         _gpu_warmup()
                         # Pre-allocate cloned (args, kwargs) sets once per
                         # shape; the same sets are reused across all configs
-                        # to avoid ~400x re-cloning. Skipped when hooks are
-                        # present or a custom do_bench was supplied (legacy
-                        # fallback in _bench).
-                        if self._do_bench is None and not has_hooks:
+                        # to avoid ~400x re-cloning. Skipped when a custom
+                        # do_bench was supplied (legacy fallback in _bench).
+                        if self._do_bench is None:
                             try:
                                 n_buffers = _pick_l2_rotate_count(args, kwargs)
                                 arg_sets, kwarg_sets = _clone_l2_rotate_inputs(
@@ -536,6 +545,8 @@ def autotune(
     If the environment variable :code:`{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING` is set to
     :code:`"1"`, we will print a message to stdout after autotuning each
     kernel, including the time spent autotuning and the best configuration.
+    If the environment variable :code:`{PACKAGE_NAME.upper()}_DISALLOW_AUTOTUNING` is set to
+    :code:`"1"`, a cache miss raises an error instead of autotuning.
 
     :param configs: a list of :code:`AutotuneConfig` objects
     :type configs: list[AutotuneConfig]
@@ -546,6 +557,10 @@ def autotune(
         'top_k': number of configs to bench
         'early_config_prune'(optional): a function used to do early prune (eg, num_stages). It takes configs:List[Config] as its input, and returns pruned configs.
     :param restore_value: a list of argument names whose value will be restored after evaluating any configs.
+        Name every argument the function both reads and writes (e.g. an output it
+        accumulates into); each must be a tensor on every call. Only the legacy bench
+        (a custom ``do_bench``, or L2-cold clones that do not fit) runs on the caller's
+        tensors, so only it restores them.
     :type restore_value: list[str]
     :param do_bench: a benchmark function to measure the time of each run.
     :type do_bench: lambda fn, quantiles
