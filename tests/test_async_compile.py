@@ -6,16 +6,99 @@ feature — see quack/cache/async_compile.py and the defer-and-retry loop in
 quack/testing/pytest_plugin.py.
 """
 
+import math
 import os
 import shutil
 import subprocess
 import sys
 import textwrap
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from multiprocessing import get_context
 from pathlib import Path
 
 import pytest
 
 from quack.cache.async_compile import CompilePending, CompilePool, _flock_held_exclusively
+
+
+@pytest.fixture(params=["shutdown", "broken"])
+def unavailable_executor(request):
+    """Exercise real submission failures, not a mocked executor exception."""
+    executor = ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn"))
+    try:
+        if request.param == "shutdown":
+            executor.shutdown()
+        else:
+            assert executor.submit(os.getpid).result(timeout=10) != os.getpid()
+            with pytest.raises(BrokenProcessPool):
+                executor.submit(os._exit, 1).result(timeout=10)
+        yield executor
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_submit_unavailable_executor_falls_back(unavailable_executor, tmp_path):
+    """A dead pool must not reserve a key or prevent in-process compilation."""
+    pool = CompilePool(executor=unavailable_executor)
+    assert not pool.submit("dead-key", math.sqrt, (4.0,), {}, tmp_path / "key.o")
+    assert pool.poll("dead-key") == ("new", None)
+    assert pool.n_submitted == 0
+    assert pool._futures == {}
+
+
+class _HostCompiledScale:
+    """CPU-only compile stand-in; no CuTe compilation or CUDA work is claimed."""
+
+    def __init__(self, scale):
+        self.scale = scale
+
+    def export_to_c(self, object_file_path, function_name):
+        Path(object_file_path).write_bytes(b"host-test-object")
+
+    def __call__(self, value):
+        return self.scale * value
+
+
+def _compile_host_scale(scale):
+    return _HostCompiledScale(scale)
+
+
+def _compile_host_failure(scale):
+    raise RuntimeError("real compilation error")
+
+
+def test_jit_cache_unavailable_executor_compiles_in_process(
+    unavailable_executor, tmp_path, monkeypatch
+):
+    """Follow the actual cold-miss caller through fallback and compare values."""
+    import quack.cache as cache
+    from quack.cache import async_compile
+
+    monkeypatch.setattr(cache, "CACHE_ENABLED", True)
+    monkeypatch.setattr(cache, "CACHE_DIR", str(tmp_path))
+    pool = CompilePool(executor=unavailable_executor)
+    monkeypatch.setattr(async_compile, "_active_pool", pool)
+    compiled = cache.jit_cache(_compile_host_scale)(3)
+    values = [1, -2, 4.5]
+    assert [compiled(value) for value in values] == [3 * value for value in values]
+    assert len(list(tmp_path.rglob("*.o"))) == 1
+    assert pool.n_submitted == 0
+
+
+def test_jit_cache_unavailable_executor_preserves_compile_errors(
+    unavailable_executor, tmp_path, monkeypatch
+):
+    """An executor failure must not swallow the actual fallback's exception."""
+    import quack.cache as cache
+    from quack.cache import async_compile
+
+    monkeypatch.setattr(cache, "CACHE_ENABLED", True)
+    monkeypatch.setattr(cache, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(async_compile, "_active_pool", CompilePool(executor=unavailable_executor))
+    with pytest.raises(RuntimeError, match="^real compilation error$"):
+        cache.jit_cache(_compile_host_failure)(3)
+    assert not list(tmp_path.rglob("*.o"))
 
 
 # ---------------------------------------------------------------------------
