@@ -21,6 +21,7 @@ from quack.bench.bench_utils import (
 
 import torch
 from torch import Tensor
+from torch.utils._python_dispatch import _disable_current_modes
 
 import triton
 
@@ -328,6 +329,8 @@ class Autotuner:
                 pruned_configs = self.prune_configs(kwargs)
 
                 @torch.compiler.disable  # Don't want any tracing here
+                @torch.no_grad()  # Don't save benchmark tensors for backward
+                @_disable_current_modes()  # Don't cache benchmark outputs in SAC
                 def benchmark():
                     # no cached result: raise rather than benchmark
                     if is_autotuning_disallowed():
