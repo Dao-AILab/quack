@@ -3,6 +3,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
 
 from typing import Optional, Type, Tuple, Union, Callable, Literal
+from dataclasses import dataclass
 from functools import partial
 import math
 
@@ -22,8 +23,10 @@ from cutlass.cute.nvgpu.warp import (
     StMatrix16x8x8bOp,
 )
 from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass.cutlass_dsl import if_generate, select_
 from cutlass.utils import LayoutEnum
 from cutlass.cute.experimental import iket
+from cutlass.cute.experimental import is_preferred_cluster
 
 
 from quack.pipeline import (
@@ -89,6 +92,10 @@ This GEMM kernel supports the following features:
     - Implements TMA multicast with cluster to reduce L2 memory traffic
     - Support persistent tile scheduling to better overlap memory load/store with mma between tiles
     - Support warp specialization to avoid explicit pipelining between mainloop load and mma
+    - Mixed preferred/fallback cluster launches under CLC persistence: when the driver cannot
+      co-schedule a full preferred cluster it launches fallback-shaped clusters ((2, 1) for 2-CTA
+      MMA, (1, 1) otherwise) instead of serializing; one kernel body selects the shape-specific
+      load TMA atoms, multicast masks and barrier arrive counts at runtime
 
 This GEMM works as follows:
 1. DMA warp: Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
@@ -120,6 +127,44 @@ Constraints:
 
 # canonical home moved to gemm_base (shared with the SM120 blockscaled path)
 from quack.gemm_base import reinterpret_packed_fp6 as _reinterpret_packed_fp6  # noqa: E402
+
+
+@dataclass(frozen=True)
+class _LoadMcastGeometry:
+    """TMA load geometry of ONE cluster shape: this CTA's coordinate in the cluster
+    layout, the CTA layouts the loads partition over, and the multicast masks."""
+
+    coord_vmnk: tuple
+    a_cta_layout: cute.Layout
+    b_cta_layout: cute.Layout
+    a_mcast_mask: Optional[cutlass.Int16]
+    b_mcast_mask: Optional[cutlass.Int16]
+    sfa_mcast_mask: Optional[cutlass.Int16]
+    sfb_mcast_mask: Optional[cutlass.Int16]
+    sfb_coord_vmnk: Optional[tuple]
+    sfb_cta_layout: Optional[cute.Layout]
+
+
+def _select_copy_fn(
+    is_pref: Boolean, copy_pref: Optional[Callable], copy_fallback: Optional[Callable]
+):
+    """Copy fn that issues the preferred or the fallback atom's copy per the runtime
+    cluster shape. None fallback = the atoms are equivalent, use the preferred one."""
+    if copy_fallback is None:
+        return copy_pref
+
+    def copy_selected(*args, **kwargs):
+        if_generate(
+            is_pref,
+            lambda: copy_pref(*args, **kwargs),
+            lambda: copy_fallback(*args, **kwargs),
+        )
+
+    return copy_selected
+
+
+def _select_i32(pred: Boolean, if_value: int, else_value: int) -> Int32:
+    return Int32(select_(pred, Int32(if_value), Int32(else_value)))
 
 
 class GemmSm100(GemmTmaBase):
@@ -266,6 +311,30 @@ class GemmSm100(GemmTmaBase):
             self.mma_tiler = (*mma_tiler_mnk, 0)
         self.is_persistent = True
         self.use_clc_persistence = use_clc_persistence
+        # Mixed preferred/fallback cluster launch (CLC persistence only): when the
+        # hardware cannot co-schedule a full preferred cluster (SM count not a
+        # multiple of the cluster size, co-tenant kernels, wave tails), the driver
+        # launches fallback-shaped clusters instead of serializing; the kernel
+        # selects per-shape atoms/masks/arrive counts at runtime. The fallback keeps the 2-CTA
+        # MMA pair intact: (2,1) with cta_group=2, else (1,1). No-op when the
+        # preferred cluster already is the fallback shape. The tile scheduler
+        # decode stays in preferred-cluster units for both shapes (CTA-remainder
+        # decode, see tile_scheduler._cluster_id_to_cta_id).
+        fallback_mnk = (2 if self.use_2cta_instrs else 1, 1, 1)
+        self.fallback_cluster_shape_mnk = (
+            fallback_mnk
+            if use_clc_persistence and tuple(cluster_shape_mnk) != fallback_mnk
+            else None
+        )
+        # The driver rejects mixed launches unless the fallback divides the
+        # preferred shape per-dim (CUDA_ERROR_INVALID_CLUSTER_SIZE, opaque); the
+        # derivation guarantees it (fallback_m is 2 only for an even cluster_m).
+        # Test hook: launch the (unchanged) mixed kernel with the preferred launch
+        # shape shrunk to the fallback shape, so every cluster launches
+        # fallback-shaped and the runtime predicate selects the fallback atoms,
+        # masks and arrive counts — the only deterministic way to execute that
+        # path (the driver only falls back under resource pressure).
+        self._force_fallback_branch = False
         self.epi_m_major = True
         self.gather_A = gather_A
         self.concat_layout = concat_layout or ()
@@ -475,6 +544,12 @@ class GemmSm100(GemmTmaBase):
             cute.make_layout(self.cluster_shape_mnk),
             (self.tiled_mma.thr_id.shape,),
         )
+        self.fallback_cluster_layout_vmnk = None
+        if const_expr(self.fallback_cluster_shape_mnk is not None):
+            self.fallback_cluster_layout_vmnk = cute.tiled_divide(
+                cute.make_layout(self.fallback_cluster_shape_mnk),
+                (self.tiled_mma.thr_id.shape,),
+            )
 
         # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
@@ -656,6 +731,158 @@ class GemmSm100(GemmTmaBase):
         else:
             self.iter_acc_early_release = -1
 
+    def _make_load_tma_atoms_and_tensors(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mSFA: Optional[cute.Tensor],
+        mSFB: Optional[cute.Tensor],
+        a_smem_layout,
+        b_smem_layout,
+        sfb_smem_layout,
+        epilogue_args,
+        varlen_m: bool,
+        varlen_k: bool,
+        cluster_shape_mnk,
+        cluster_layout_vmnk,
+    ):
+        """One set of G2S TMA atoms + coordinate tensors for A/B (and SFA/SFB
+        when blockscaled), built for ONE cluster shape: the multicast op choice
+        and the box split (num_multicast) are baked into each atom, so a mixed
+        preferred/fallback launch needs one set per shape (the kernel picks per
+        copy at runtime where they differ)."""
+        tma_atom_a, tma_tensor_a = None, None
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A(cluster_shape_mnk, self.tiled_mma.thr_id)
+        if const_expr(not self.gather_A):
+            # varlen_m + an active M-fold reduce sink: rag A (2-extra-dim
+            # wraparound; loads can't ptr_shift) so rows past the sequence end
+            # zero-fill instead of reading the next sequence — restores the
+            # "OOB accumulator lanes are zero" invariant that the unpredicated
+            # M-fold relies on. Without such a sink, garbage rows are masked at
+            # every store, so plain domain_offset keeps the descriptor 2-D.
+            if const_expr(varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)):
+                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=0, ptr_shift=False)
+            elif const_expr(varlen_k):
+                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1, ptr_shift=False)
+            else:
+                mA_tma = mA
+            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+                a_op,
+                mA_tma,
+                a_smem_layout,
+                self.mma_tiler,
+                self.tiled_mma,
+                cluster_layout_vmnk.shape,
+                # Uint8 internal type + sub-byte gmem element selects the
+                # U4/U6_UNPACK_U8 tensormap (packed gmem -> byte-container smem).
+                internal_type=(
+                    cutlass.Uint8
+                    if const_expr(self.a_unpack)
+                    else (cutlass.TFloat32 if mA.element_type is Float32 else None)
+                ),
+            )
+        elif const_expr(self.use_tma_gather):
+            # gather4 descriptor: box has 1 in the gathered dim, tile size in the contiguous dim.
+            # varlen_m (K-major): box (1, tile_K), gather M rows at K offset
+            # varlen_k (M-major): box (64, 1), gather K cols at M offset
+            tma_smem_layout = quack_sm100_utils.make_smem_layout_atom_tma_gather_a(
+                self.tiled_mma, self.mma_tiler, self.a_dtype, gather_size=1
+            )
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                a_op,
+                mA,
+                tma_smem_layout,
+                tma_smem_layout.shape,
+                internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
+            )
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B(cluster_shape_mnk, self.tiled_mma.thr_id)
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
+            b_smem_layout,
+            self.mma_tiler,
+            self.tiled_mma,
+            cluster_layout_vmnk.shape,
+            internal_type=(
+                cutlass.Uint8
+                if const_expr(self.b_unpack)
+                else (cutlass.TFloat32 if mB.element_type is Float32 else None)
+            ),
+        )
+
+        tma_atom_sfa, tma_tensor_sfa = None, None
+        tma_atom_sfb, tma_tensor_sfb = None, None
+        if const_expr(self.blockscaled):
+            # Setup TMA load for SFA (same M-semantics as A: mcast across N)
+            sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
+                cluster_shape_mnk, self.tiled_mma.thr_id
+            )
+            sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
+                sfa_op,
+                mSFA,
+                sfa_smem_layout,
+                self.mma_tiler,
+                self.tiled_mma,
+                cluster_layout_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+            # Setup TMA load for SFB.
+            # One box per stage covering the tile's SF window at chunk
+            # granularity: (256 Int16 = one 512-B atom-chunk, chunks-per-k-tile,
+            # window atoms). Because the box coordinates are free-form (not
+            # tiler multiples), a tile whose window starts mid-way into the
+            # atom sequence (tile_n=192 advances 1.5 atoms per tile) needs no
+            # layout tricks: the kernel computes first_atom = j*tile_n//128 and
+            # slices there. Tiles start (j*tile_n) % 128 into their first atom;
+            # the mma warp corrects for that via an SFB tmem column offset.
+            # The atom-n dim's extent is the allocated atom count, so a last
+            # tile whose window straddles past it (tile_n=192 with e.g. N=448:
+            # window atoms {3,4}, only 4 allocated) gets the out-of-range atom
+            # hardware-zero-filled — its columns are beyond N, where B is
+            # zero-filled too. This invariant is load-bearing: the previous
+            # overlapped-window remap presented atoms in groups of 4 and
+            # zero-filled past the *presented* extent instead, silently zeroing
+            # the last valid columns (see the N=448 regression test).
+            # SFB is duplicated (not V-split like B) across the 2-CTA MMA
+            # pair, so its multicast group spans every cluster-M CTA including
+            # the pair peer (halving SFB gmem traffic within a pair):
+            # num_multicast = cluster_m, and the box splits across that group.
+            # The op carries cta_group so 2-CTA kernels use cta_group::2
+            # multicast, whose transaction bytes aggregate at the pair
+            # leader's barrier as num_tma_load_bytes expects.
+            sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
+                cluster_shape_mnk, self.tiled_mma.thr_id
+            )
+            # Compact column-major: (chunk, k-chunks, window atoms).
+            sfb_window_layout = cute.make_layout(
+                (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms)
+            )
+            # The chunk view must tile the actual SFB smem stage bytes exactly
+            # (atom-major, k-chunks inner — the order make_smem_layout_sfb
+            # produces).
+            assert cute.cosize(sfb_smem_layout) == 2 * cute.cosize(sfb_window_layout)
+            assert cute.cosize(self.sfb_smem_layout_staged) == (
+                2 * cute.cosize(sfb_window_layout) * self.ab_stage
+            )
+            tma_atom_sfb, tma_tensor_sfb = cpasync.make_tiled_tma_atom(
+                sfb_op,
+                mSFB,
+                sfb_window_layout,
+                sfb_window_layout.shape,
+                num_multicast=cluster_shape_mnk[0],
+            )
+        return (
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            tma_atom_sfa,
+            tma_tensor_sfa,
+            tma_atom_sfb,
+            tma_tensor_sfb,
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -812,132 +1039,53 @@ class GemmSm100(GemmTmaBase):
         # Setup TMA load for A & B
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = None, None
-        a_op = (
-            cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
-            if const_expr(not self.gather_A)
-            else sm100_utils.cluster_shape_to_tma_atom_A(
-                self.cluster_shape_mnk, self.tiled_mma.thr_id
-            )
-        )
-        if const_expr(not self.gather_A):
-            # varlen_m + an active M-fold reduce sink: rag A (2-extra-dim
-            # wraparound; loads can't ptr_shift) so rows past the sequence end
-            # zero-fill instead of reading the next sequence — restores the
-            # "OOB accumulator lanes are zero" invariant that the unpredicated
-            # M-fold relies on. Without such a sink, garbage rows are masked at
-            # every store, so plain domain_offset keeps the descriptor 2-D.
-            if const_expr(varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)):
-                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=0, ptr_shift=False)
-            elif const_expr(varlen_k):
-                mA_tma = copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1, ptr_shift=False)
-            else:
-                mA_tma = mA
-            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-                a_op,
-                mA_tma,
-                a_smem_layout,
-                self.mma_tiler,
-                self.tiled_mma,
-                self.cluster_layout_vmnk.shape,
-                # Uint8 internal type + sub-byte gmem element selects the
-                # U4/U6_UNPACK_U8 tensormap (packed gmem -> byte-container smem).
-                internal_type=(
-                    cutlass.Uint8
-                    if const_expr(self.a_unpack)
-                    else (cutlass.TFloat32 if mA.element_type is Float32 else None)
-                ),
-            )
-        elif const_expr(self.use_tma_gather):
-            # gather4 descriptor: box has 1 in the gathered dim, tile size in the contiguous dim.
-            # varlen_m (K-major): box (1, tile_K), gather M rows at K offset
-            # varlen_k (M-major): box (64, 1), gather K cols at M offset
-            tma_smem_layout = quack_sm100_utils.make_smem_layout_atom_tma_gather_a(
-                self.tiled_mma, self.mma_tiler, self.a_dtype, gather_size=1
-            )
-            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
-                a_op,
-                mA,
-                tma_smem_layout,
-                tma_smem_layout.shape,
-                internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
-            )
-        # block_copy takes compiler-driven multicast metadata at the copy site,
-        # so the TMA atom itself must stay the non-multicast variant here.
-        b_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
-            b_smem_layout,
-            self.mma_tiler,
-            self.tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=(
-                cutlass.Uint8
-                if const_expr(self.b_unpack)
-                else (cutlass.TFloat32 if mB.element_type is Float32 else None)
-            ),
-        )
-
-        tma_atom_sfa, tma_tensor_sfa = None, None
-        tma_atom_sfb, tma_tensor_sfb = None, None
+        sfa_smem_layout, sfb_smem_layout = None, None
         if const_expr(self.blockscaled):
-            # Setup TMA load for SFA
-            sfa_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
             sfa_smem_layout = cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
-            tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
-                sfa_op,
-                mSFA,
-                sfa_smem_layout,
-                self.mma_tiler,
-                self.tiled_mma,
-                self.cluster_layout_vmnk.shape,
-                internal_type=cutlass.Int16,
-            )
-            # Setup TMA load for SFB.
-            # One box per stage covering the tile's SF window at chunk
-            # granularity: (256 Int16 = one 512-B atom-chunk, chunks-per-k-tile,
-            # window atoms). Because the box coordinates are free-form (not
-            # tiler multiples), a tile whose window starts mid-way into the
-            # atom sequence (tile_n=192 advances 1.5 atoms per tile) needs no
-            # layout tricks: the kernel computes first_atom = j*tile_n//128 and
-            # slices there. Tiles start (j*tile_n) % 128 into their first atom;
-            # the mma warp corrects for that via an SFB tmem column offset.
-            # The atom-n dim's extent is the allocated atom count, so a last
-            # tile whose window straddles past it (tile_n=192 with e.g. N=448:
-            # window atoms {3,4}, only 4 allocated) gets the out-of-range atom
-            # hardware-zero-filled — its columns are beyond N, where B is
-            # zero-filled too. This invariant is load-bearing: the previous
-            # overlapped-window remap presented atoms in groups of 4 and
-            # zero-filled past the *presented* extent instead, silently zeroing
-            # the last valid columns (see the N=448 regression test).
-            # SFB is multicast across all cluster-M CTAs (compiler-driven at the
-            # copy site, like B); the op carries cta_group so 2-CTA kernels use
-            # cta_group::2 multicast, whose transaction bytes aggregate at the
-            # pair leader's barrier as num_tma_load_bytes expects. The atom
-            # stays the non-multicast variant with num_multicast=1 (same as
-            # A/B): block_copy's lowering derives the mask and slicing from the
-            # tma_multicast dict.
-            sfb_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
             sfb_smem_layout = cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
-            # Compact column-major: (chunk, k-chunks, window atoms).
-            sfb_window_layout = cute.make_layout(
-                (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms)
-            )
-            # The chunk view must tile the actual SFB smem stage bytes exactly
-            # (atom-major, k-chunks inner — the order make_smem_layout_sfb
-            # produces).
-            assert cute.cosize(sfb_smem_layout) == 2 * cute.cosize(sfb_window_layout)
-            assert cute.cosize(self.sfb_smem_layout_staged) == (
-                2 * cute.cosize(sfb_window_layout) * self.ab_stage
-            )
-            tma_atom_sfb, tma_tensor_sfb = cpasync.make_tiled_tma_atom(
-                sfb_op,
+        # One set of load atoms per cluster shape under a mixed launch (see
+        # _make_load_tma_atoms_and_tensors); mirrors CUTLASS C++ tma_load_a /
+        # tma_load_a_fallback.
+        load_tma = self._make_load_tma_atoms_and_tensors(
+            mA,
+            mB,
+            mSFA,
+            mSFB,
+            a_smem_layout,
+            b_smem_layout,
+            sfb_smem_layout,
+            epilogue_args,
+            varlen_m,
+            varlen_k,
+            self.cluster_shape_mnk,
+            self.cluster_layout_vmnk,
+        )
+        (
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            tma_atom_sfa,
+            tma_tensor_sfa,
+            tma_atom_sfb,
+            tma_tensor_sfb,
+        ) = load_tma
+        fallback_load_tma = None
+        if const_expr(self.fallback_cluster_shape_mnk is not None):
+            fallback_load_tma = self._make_load_tma_atoms_and_tensors(
+                mA,
+                mB,
+                mSFA,
                 mSFB,
-                sfb_window_layout,
-                sfb_window_layout.shape,
+                a_smem_layout,
+                b_smem_layout,
+                sfb_smem_layout,
+                epilogue_args,
+                varlen_m,
+                varlen_k,
+                self.fallback_cluster_shape_mnk,
+                self.fallback_cluster_layout_vmnk,
             )
-
         # Transaction bytes are counted with the GMEM dtype: for unpack operands
         # the layout is byte-domain (cosize == smem footprint bytes) but TMA
         # reports only the packed data bytes it copies (elements x 4 or 6 bits;
@@ -1060,7 +1208,41 @@ class GemmSm100(GemmTmaBase):
 
         self.shared_storage = SharedStorage
 
-        # Launch the kernel synchronously
+        # Launch the kernel synchronously. Mixed preferred/fallback launch: the
+        # DSL lowers cluster= to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION
+        # and fallback_cluster= to the plain cluster dimension when both are set.
+        launch_cluster = self.cluster_shape_mnk
+        fallback_launch_kwargs = {}
+        if const_expr(self.fallback_cluster_shape_mnk is not None):
+            fallback_launch_kwargs = dict(fallback_cluster=list(self.fallback_cluster_shape_mnk))
+            if const_expr(self._force_fallback_branch):
+                # Test hook: plain launch at the fallback shape (no mixed launch),
+                # so is_preferred_cluster() is false in every cluster and the
+                # kernel takes the fallback atoms/masks/arrive counts.
+                launch_cluster = self.fallback_cluster_shape_mnk
+                fallback_launch_kwargs = {}
+        fallback_kernel_tma = None
+        if const_expr(self.fallback_cluster_shape_mnk is not None):
+            (
+                fb_atom_a,
+                fb_tensor_a,
+                fb_atom_b,
+                fb_tensor_b,
+                fb_atom_sfa,
+                fb_tensor_sfa,
+                fb_atom_sfb,
+                fb_tensor_sfb,
+            ) = fallback_load_tma
+            fallback_kernel_tma = (
+                fb_atom_a,
+                fb_tensor_a if const_expr(not self.gather_A or self.use_tma_gather) else mA,
+                fb_atom_b,
+                fb_tensor_b,
+                fb_atom_sfa,
+                fb_tensor_sfa,
+                fb_atom_sfb,
+                fb_tensor_sfb,
+            )
         self.kernel(
             self.tiled_mma,
             tma_atom_a,
@@ -1078,6 +1260,8 @@ class GemmSm100(GemmTmaBase):
             epilogue_params,
             varlen_params,
             self.cluster_layout_vmnk,
+            self.fallback_cluster_layout_vmnk,
+            fallback_kernel_tma,
             self.a_smem_layout_staged,
             self.a_smem_load_layout_staged,
             self.b_smem_layout_staged,
@@ -1091,10 +1275,11 @@ class GemmSm100(GemmTmaBase):
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=self.cluster_shape_mnk,
+            cluster=launch_cluster,
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=self.use_pdl,
+            **fallback_launch_kwargs,
         )
         return
 
@@ -1118,6 +1303,8 @@ class GemmSm100(GemmTmaBase):
         epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_vmnk: cute.Layout,
+        fallback_cluster_layout_vmnk: Optional[cute.Layout],
+        fallback_load_tma: Optional[tuple],
         a_smem_layout: cute.ComposedLayout,
         a_smem_load_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
@@ -1131,7 +1318,35 @@ class GemmSm100(GemmTmaBase):
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
+
+        Mixed preferred/fallback cluster launches (CLC persistence): ONE kernel
+        body serves both cluster shapes, as CUTLASS C++ does with tma_load_a /
+        tma_load_a_fallback. cluster_layout_vmnk (the preferred shape) drives
+        everything static — pipeline construction, this CTA's coordinate, init
+        barriers, elections — which agrees with the fallback shape for the ranks
+        a fallback cluster actually has (the fallback divides the preferred shape
+        along its leading modes). When fallback_load_tma is given,
+        is_preferred_cluster() (runtime cluster_nctaid) selects per cluster: the
+        load TMA atoms whose multicast op / box split differ between the shapes,
+        the AB / sched pipeline consumer arrive counts and the tcgen05.commit
+        release mask, and whether the CLC drain runs.
         """
+        mixed = const_expr(fallback_load_tma is not None)
+        is_pref = None
+        fb_tma_atom_a, fb_mA_mkl, fb_tma_atom_b, fb_mB_nkl = None, None, None, None
+        fb_tma_atom_sfa, fb_mSFA_mkl, fb_tma_atom_sfb, fb_mSFB_chunks = None, None, None, None
+        if const_expr(mixed):
+            is_pref = is_preferred_cluster(self.cluster_shape_mnk)
+            (
+                fb_tma_atom_a,
+                fb_mA_mkl,
+                fb_tma_atom_b,
+                fb_mB_nkl,
+                fb_tma_atom_sfa,
+                fb_mSFA_mkl,
+                fb_tma_atom_sfb,
+                fb_mSFB_chunks,
+            ) = fallback_load_tma
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -1144,7 +1359,7 @@ class GemmSm100(GemmTmaBase):
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # Prefetch Tma desc
+        # Prefetch Tma desc (both load-atom sets under a mixed launch)
         if warp_idx == self.ab_load_warp_id:
             for tma_atom in (
                 tma_atom_a,
@@ -1153,6 +1368,10 @@ class GemmSm100(GemmTmaBase):
                 tma_atom_sfb,
                 tma_atom_d,
                 tma_atom_c,
+                fb_tma_atom_a,
+                fb_tma_atom_b,
+                fb_tma_atom_sfa,
+                fb_tma_atom_sfb,
             ):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
@@ -1177,6 +1396,8 @@ class GemmSm100(GemmTmaBase):
             tiled_mma=tiled_mma,
             cluster_layout_vmnk=cluster_layout_vmnk,
             is_leader_cta=is_leader_cta,
+            fallback_cluster_layout_vmnk=fallback_cluster_layout_vmnk,
+            is_pref=is_pref,
         )
         epi_pipeline = None
         if const_expr(has_epi_load):
@@ -1185,7 +1406,12 @@ class GemmSm100(GemmTmaBase):
         sched_pipeline = None
         sched_data = None
         if const_expr(self.is_persistent):
-            sched_pipeline = self.make_sched_pipeline(self.cluster_shape_mnk, has_C=has_epi_load)
+            sched_pipeline = self.make_sched_pipeline(
+                cluster_layout_vmnk,
+                has_C=has_epi_load,
+                fallback_cluster_layout_vmnk=fallback_cluster_layout_vmnk,
+                is_pref=is_pref,
+            )
             sched_data = storage.sched_data.get_tensor(cute.make_layout((4, self.sched_stage)))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
@@ -1290,6 +1516,30 @@ class GemmSm100(GemmTmaBase):
                 cute.arch.griddepcontrol_wait()
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
+            # Multicast masks + partition coords/layouts for the A/B(/SFA/SFB)
+            # TMA loads, per load-atom set. Under a mixed launch the fallback set
+            # differs from the preferred one only where the multicast extent
+            # differs (op variant + box split): A/SFA on cluster N, B on cluster
+            # M per MMA atom, SFB on cluster M. Only those operands get a second
+            # partition and a runtime pick per copy; the rest reuse the preferred
+            # copy fn (equivalent atom, same multicast rank set).
+            geo = self._load_mcast_geometry(
+                cluster_layout_vmnk, self.cluster_shape_mnk, cta_rank_in_cluster
+            )
+            fb_geo, a_differs, b_differs, sfb_differs = None, False, False, False
+            if const_expr(mixed):
+                fb_geo = self._load_mcast_geometry(
+                    fallback_cluster_layout_vmnk,
+                    self.fallback_cluster_shape_mnk,
+                    cta_rank_in_cluster,
+                )
+                a_differs = cute.size(cluster_layout_vmnk.shape[2]) != cute.size(
+                    fallback_cluster_layout_vmnk.shape[2]
+                )
+                b_differs = cute.size(cluster_layout_vmnk.shape[1]) != cute.size(
+                    fallback_cluster_layout_vmnk.shape[1]
+                )
+                sfb_differs = self.cluster_shape_mnk[0] != self.fallback_cluster_shape_mnk[0]
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
@@ -1324,6 +1574,9 @@ class GemmSm100(GemmTmaBase):
                 # gate landed; surfaced on any cold-cache varlen compile).
                 if const_expr(getattr(tile_sched_params, "ag", None) is not None):
                     iket.range_push("ag_wait")
+                    # Deliberately self.cluster_shape_mnk (the PREFERRED shape),
+                    # not this branch's cluster_shape_mnk: the AG shard/chunk
+                    # geometry in tile_sched_params is preferred-cluster-granular.
                     ag_last_gate = ag_wait_m_tile(
                         tile_sched_params,
                         tile_coord_mnkl[0],
@@ -1337,81 +1590,22 @@ class GemmSm100(GemmTmaBase):
                     tile_coord_mnkl[1],
                     tile_coord_mnkl[3],
                 )
-                gA_mk = None
-                if const_expr(not self.gather_A):
-                    mA_mk = varlen_manager.offset_batch_A(mA_mkl, batch_idx)
-                    # (bM, bK, RestK)
-                    gA_mk = cute.local_tile(
-                        mA_mk,
-                        cute.select(self.mma_tiler, [0, 2]),
-                        (mma_tile_coord_mnl[0], None),
-                    )
-                # (bN, bK, RestK)
-                gB_nk = cute.local_tile(
-                    varlen_manager.offset_batch_B(mB_nkl, batch_idx),
-                    cute.select(self.mma_tiler, [1, 2]),
-                    (mma_tile_coord_mnl[1], None),
-                )
-                if const_expr(self.blockscaled):
-                    # (bM, bK)
-                    # SFA uses the tile-aligned per-batch offset (padded SF layout), not
-                    # the A-data offset — allows varlen_m seqlens that aren't
-                    # multiples of 128.
-                    gSFA_mkl = cute.local_tile(
-                        varlen_manager.offset_batch_SFA(mSFA_mkl, batch_idx),
-                        cute.select(self.mma_tiler, [0, 2]),
-                        (mma_tile_coord_mnl[0], None),
-                    )
-                    # (chunk, chunks-per-k-tile, window-atoms, RestK)
-                    # SFB is chunk-granular: place the tile's SF window at atom
-                    # coordinate j*tile_n/128, as a domain_offset because it is
-                    # free-form, not a tiler multiple (tile_n=64 shares an atom
-                    # between adjacent tiles, tile_n=192 advances 1.5 atoms per
-                    # tile — both are just this one formula).
-                    sfb_first_atom = (mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]) // 128
-                    gSFB_chunks = cute.local_tile(
-                        cute.domain_offset(
-                            (None, None, sfb_first_atom),
-                            varlen_manager.offset_batch_SFB(mSFB_chunks, batch_idx),
-                        ),
-                        (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms),
-                        (0, None, 0),
-                    )
-
-                # Partition global tensor for TiledMMA_A/B/D
-                # Then partition global/shared tensor for TMA load A/B
                 len_k = varlen_manager.len_k(batch_idx)
-                # block_copy's lowering wants the coordinate held fixed by the
-                # multicast mask: A/SFA are same-M across N peers, while B/SFB
-                # are same-N across M peers. Degenerate cluster dimensions are
-                # left for the compiler lowering to simplify.
-                a_tma_multicast = {
-                    "cluster_shape": self.cluster_shape_mnk[:2],
-                    "multicast_dim": "M",
-                }
-                b_tma_multicast = {
-                    "cluster_shape": self.cluster_shape_mnk[:2],
-                    "multicast_dim": "N",
-                }
-                # SFB is duplicated (not V-split like B) across the 2-CTA MMA
-                # pair, so unlike B its multicast group spans every cluster-M
-                # CTA including the pair peer: use_2cta_mma_inst=False makes
-                # the lowering slice/multicast across all of them (halving SFB
-                # gmem traffic within a pair), while the op's cta_group still
-                # aggregates transaction bytes at the pair leader's barrier.
-                sfb_tma_multicast = {
-                    "cluster_shape": self.cluster_shape_mnk[:2],
-                    "multicast_dim": "N",
-                    "use_2cta_mma_inst": False,
-                }
-                copy_A, prefetch_A = None, None
-                if const_expr(not self.gather_A):
-                    # (MMA, MMA_M, MMA_K, RestK)
-                    tCgA = thr_mma.partition_A(gA_mk)
-                    copy_A = copy_utils.tma_get_block_copy_fn(
-                        tma_atom_a, src_tensor=tCgA, dst_tensor=sA, tma_multicast=a_tma_multicast
-                    )
-                else:
+                # TMA partition + copy fns for the PREFERRED atom set (A comes
+                # from _make_gather_A_copy under gather_A).
+                copy_A, copy_B, copy_SFA, copy_SFB = self._make_tma_load_copies(
+                    (tma_atom_a, mA_mkl, tma_atom_b, mB_nkl),
+                    (tma_atom_sfa, mSFA_mkl, tma_atom_sfb, mSFB_chunks),
+                    geo,
+                    varlen_manager,
+                    batch_idx,
+                    mma_tile_coord_mnl,
+                    thr_mma,
+                    (sA, sB, sSFA, sSFB_chunks),
+                    want=(not self.gather_A, True, self.blockscaled, self.blockscaled),
+                )
+                prefetch_A = None
+                if const_expr(self.gather_A):
                     # For varlen_m paths (TMA or cp.async): consume indices from
                     # a_prefetch_pipeline once per work tile.
                     sAIdx_stage = sAIdx
@@ -1433,32 +1627,27 @@ class GemmSm100(GemmTmaBase):
                         a_prefetch_consumer_state.advance()
                     if const_expr(prefetch_A is not None):
                         prefetch_A = partial(prefetch_A, a_prefetch_pipeline)
-                # (MMA, MMA_N, MMA_K, RestK)
-                tCgB = thr_mma.partition_B(gB_nk)
-                if const_expr(self.blockscaled):
-                    # (MMA, MMA_M, MMA_K)
-                    tCgSFA = thr_mma.partition_A(gSFA_mkl)
-                # TMA load B partition_S/D
-                copy_B = copy_utils.tma_get_block_copy_fn(
-                    tma_atom_b, src_tensor=tCgB, dst_tensor=sB, tma_multicast=b_tma_multicast
-                )
-                copy_SFA, copy_SFB = None, None
-                if const_expr(self.blockscaled):
-                    #  TMA load SFA partition_S/D
-                    copy_SFA = copy_utils.tma_get_block_copy_fn(
-                        tma_atom_sfa,
-                        src_tensor=tCgSFA,
-                        dst_tensor=sSFA,
-                        tma_multicast=a_tma_multicast,
+                if const_expr(mixed):
+                    fb_copy_A, fb_copy_B, fb_copy_SFA, fb_copy_SFB = self._make_tma_load_copies(
+                        (fb_tma_atom_a, fb_mA_mkl, fb_tma_atom_b, fb_mB_nkl),
+                        (fb_tma_atom_sfa, fb_mSFA_mkl, fb_tma_atom_sfb, fb_mSFB_chunks),
+                        fb_geo,
+                        varlen_manager,
+                        batch_idx,
+                        mma_tile_coord_mnl,
+                        thr_mma,
+                        (sA, sB, sSFA, sSFB_chunks),
+                        want=(
+                            a_differs and not self.gather_A,
+                            b_differs,
+                            a_differs and self.blockscaled,
+                            sfb_differs and self.blockscaled,
+                        ),
                     )
-                    # SFB multicast: same-N across all cluster-M CTAs (see
-                    # sfb_tma_multicast above).
-                    copy_SFB = copy_utils.tma_get_block_copy_fn(
-                        tma_atom_sfb,
-                        src_tensor=gSFB_chunks,
-                        dst_tensor=sSFB_chunks,
-                        tma_multicast=sfb_tma_multicast,
-                    )
+                    copy_A = _select_copy_fn(is_pref, copy_A, fb_copy_A)
+                    copy_B = _select_copy_fn(is_pref, copy_B, fb_copy_B)
+                    copy_SFA = _select_copy_fn(is_pref, copy_SFA, fb_copy_SFA)
+                    copy_SFB = _select_copy_fn(is_pref, copy_SFB, fb_copy_SFB)
                 k_tile_total = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
                 k_tile_start, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
                     k_tile_total, split_idx
@@ -1540,7 +1729,19 @@ class GemmSm100(GemmTmaBase):
                     # burst spray caused the July 2026 varlen corruption; see
                     # cancel_pending_tail and
                     # AI/clc_spurious_invalid_investigation.md.
-                    tile_scheduler.cancel_pending_tail()
+                    # PREFERRED clusters only: the phantom gate rests on grant
+                    # monotonicity in the work id, which holds when the cluster
+                    # grid is one row (pure launches, and preferred clusters of
+                    # a mixed launch) but NOT for fallback-shaped clusters
+                    # (pn/fn rows; ids regress at row crossings) — a fallback
+                    # drain could cancel REAL pending clusters. Fallback
+                    # retirees skip the drain; excess phantoms just launch as
+                    # cheap empty waves.
+                    if const_expr(not mixed):
+                        tile_scheduler.cancel_pending_tail()
+                    else:
+                        if is_pref:
+                            tile_scheduler.cancel_pending_tail()
 
         # Specialized A-index prefetch warp (gather_A only)
         if const_expr(self.gather_A):
@@ -2029,6 +2230,152 @@ class GemmSm100(GemmTmaBase):
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
 
+    def _load_mcast_geometry(
+        self,
+        cluster_layout_vmnk: cute.Layout,
+        cluster_shape_mnk: Tuple[int, int, int],
+        cta_rank_in_cluster: Int32,
+    ) -> _LoadMcastGeometry:
+        """Multicast masks + partition coords/layouts for the A/B(/SFA/SFB) TMA loads
+        of ONE cluster shape: A/SFA are same-M across N peers, B same-N across M
+        peers, and SFB spans every cluster-M CTA including the 2-CTA MMA pair peer
+        (duplicated, not V-split — halves SFB gmem traffic within a pair)."""
+        num_mcast_ctas_a = cute.size(cluster_layout_vmnk.shape[2])
+        num_mcast_ctas_b = cute.size(cluster_layout_vmnk.shape[1])
+        coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
+        cluster_layout_sfb_vmnk, sfb_coord_vmnk, sfb_cta_layout = None, None, None
+        if const_expr(self.blockscaled):
+            cluster_layout_sfb_vmnk = cute.tiled_divide(
+                cute.make_layout(cluster_shape_mnk), ((1,),)
+            )
+            sfb_coord_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
+            # SFB multicast: same-N across all cluster-M CTAs (the atom's
+            # num_multicast = cluster_m splits the chunk window across the group).
+            sfb_cta_layout = cute.make_layout(
+                cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape
+            )
+        a_mcast_mask, b_mcast_mask, sfa_mcast_mask, sfb_mcast_mask = None, None, None, None
+        if const_expr(num_mcast_ctas_a > 1 or num_mcast_ctas_b > 1 or self.use_2cta_instrs):
+            a_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, coord_vmnk, mcast_mode=2
+            )
+            b_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, coord_vmnk, mcast_mode=1
+            )
+            if const_expr(self.blockscaled):
+                sfa_mcast_mask = a_mcast_mask
+                sfb_mcast_mask = cpasync.create_tma_multicast_mask(
+                    cluster_layout_sfb_vmnk, sfb_coord_vmnk, mcast_mode=1
+                )
+        return _LoadMcastGeometry(
+            coord_vmnk=coord_vmnk,
+            a_cta_layout=cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape),
+            b_cta_layout=cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape),
+            a_mcast_mask=a_mcast_mask,
+            b_mcast_mask=b_mcast_mask,
+            sfa_mcast_mask=sfa_mcast_mask,
+            sfb_mcast_mask=sfb_mcast_mask,
+            sfb_coord_vmnk=sfb_coord_vmnk,
+            sfb_cta_layout=sfb_cta_layout,
+        )
+
+    def _make_tma_load_copies(
+        self,
+        ab_atoms_tensors: tuple,
+        sf_atoms_tensors: tuple,
+        geo: _LoadMcastGeometry,
+        varlen_manager: VarlenManager,
+        batch_idx: Int32,
+        mma_tile_coord_mnl: tuple,
+        thr_mma,
+        smem_tensors: tuple,
+        *,
+        want: Tuple[bool, bool, bool, bool],
+    ):
+        """Per-work-tile gmem tiling, TMA partition and copy fns for ONE load-atom set
+        (preferred or fallback). ``want`` skips operands: A under gather_A, and the
+        operands whose fallback atom is equivalent to the preferred one."""
+        tma_atom_a, mA_mkl, tma_atom_b, mB_nkl = ab_atoms_tensors
+        tma_atom_sfa, mSFA_mkl, tma_atom_sfb, mSFB_chunks = sf_atoms_tensors
+        sA, sB, sSFA, sSFB_chunks = smem_tensors
+        want_a, want_b, want_sfa, want_sfb = want
+        copy_A, copy_B, copy_SFA, copy_SFB = None, None, None, None
+        if const_expr(want_a):
+            # (bM, bK, RestK)
+            gA_mk = cute.local_tile(
+                varlen_manager.offset_batch_A(mA_mkl, batch_idx),
+                cute.select(self.mma_tiler, [0, 2]),
+                (mma_tile_coord_mnl[0], None),
+            )
+            # (MMA, MMA_M, MMA_K, RestK)
+            copy_A, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_a,
+                cta_coord=geo.coord_vmnk[2],
+                cta_layout=geo.a_cta_layout,
+                src_tensor=thr_mma.partition_A(gA_mk),
+                dst_tensor=sA,
+                mcast_mask=geo.a_mcast_mask,
+            )
+        if const_expr(want_b):
+            # (bN, bK, RestK)
+            gB_nk = cute.local_tile(
+                varlen_manager.offset_batch_B(mB_nkl, batch_idx),
+                cute.select(self.mma_tiler, [1, 2]),
+                (mma_tile_coord_mnl[1], None),
+            )
+            # (MMA, MMA_N, MMA_K, RestK)
+            copy_B, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_b,
+                cta_coord=geo.coord_vmnk[1],
+                cta_layout=geo.b_cta_layout,
+                src_tensor=thr_mma.partition_B(gB_nk),
+                dst_tensor=sB,
+                mcast_mask=geo.b_mcast_mask,
+            )
+        if const_expr(want_sfa):
+            # (bM, bK): SFA uses the tile-aligned per-batch offset (padded SF
+            # layout), not the A-data offset — allows varlen_m seqlens that
+            # aren't multiples of 128.
+            gSFA_mkl = cute.local_tile(
+                varlen_manager.offset_batch_SFA(mSFA_mkl, batch_idx),
+                cute.select(self.mma_tiler, [0, 2]),
+                (mma_tile_coord_mnl[0], None),
+            )
+            copy_SFA, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_sfa,
+                cta_coord=geo.coord_vmnk[2],
+                cta_layout=geo.a_cta_layout,
+                src_tensor=thr_mma.partition_A(gSFA_mkl),
+                dst_tensor=sSFA,
+                filter_zeros=True,
+                mcast_mask=geo.sfa_mcast_mask,
+            )
+        if const_expr(want_sfb):
+            # (chunk, chunks-per-k-tile, window-atoms, RestK)
+            # SFB is chunk-granular: place the tile's SF window at atom
+            # coordinate j*tile_n/128, as a domain_offset because it is
+            # free-form, not a tiler multiple (tile_n=64 shares an atom
+            # between adjacent tiles, tile_n=192 advances 1.5 atoms per
+            # tile — both are just this one formula).
+            sfb_first_atom = (mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]) // 128
+            gSFB_chunks = cute.local_tile(
+                cute.domain_offset(
+                    (None, None, sfb_first_atom),
+                    varlen_manager.offset_batch_SFB(mSFB_chunks, batch_idx),
+                ),
+                (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms),
+                (0, None, 0),
+            )
+            copy_SFB, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_sfb,
+                cta_coord=geo.sfb_coord_vmnk[1],
+                cta_layout=geo.sfb_cta_layout,
+                src_tensor=gSFB_chunks,
+                dst_tensor=sSFB_chunks,
+                mcast_mask=geo.sfb_mcast_mask,
+            )
+        return copy_A, copy_B, copy_SFA, copy_SFB
+
     @cute.jit
     def _make_gather_A_copy(
         self,
@@ -2490,6 +2837,9 @@ class GemmSm100(GemmTmaBase):
         self,
         tiled_mma: cute.TiledMma,
         cluster_layout_vmnk: cute.Layout,
+        *,
+        fallback_cluster_layout_vmnk: Optional[cute.Layout] = None,
+        is_pref: Optional[Boolean] = None,
         is_leader_cta: Boolean,
     ) -> pipeline.PipelineAsync:
         # If gather_A and use_2cta_instrs, the cp.async for the non-leader CTA will
@@ -2521,19 +2871,17 @@ class GemmSm100(GemmTmaBase):
             num_ab_load_warps=self.num_ab_load_warps,
         )
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
-        # Each warp will contribute to the arrive count with the number of mcast size
-        mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_arrive_cnt = mcast_size
-        pipeline_checks.check_arrive_count(
-            "sm100 ab_pipeline.consumer",
-            consumer_arrive_cnt,
-            pipeline_checks.mcast_peer_ctas(
-                num_mcast_ctas_a=self.num_mcast_ctas_a,
-                num_mcast_ctas_b=self.num_mcast_ctas_b,
-            ),
-            num_mcast_ctas_a=self.num_mcast_ctas_a,
-            num_mcast_ctas_b=self.num_mcast_ctas_b,
-        )
+        # Each warp will contribute to the arrive count with the number of mcast size:
+        # the CTAs whose tcgen05.commit lands on this CTA's empty barrier. Static for
+        # the preferred shape; under a mixed launch the fallback shape's (smaller)
+        # multicast group is selected at runtime.
+        consumer_arrive_cnt = self._ab_consumer_arrive_cnt(cluster_layout_vmnk)
+        if const_expr(fallback_cluster_layout_vmnk is not None):
+            fb_consumer_arrive_cnt = self._ab_consumer_arrive_cnt(fallback_cluster_layout_vmnk)
+            if const_expr(fb_consumer_arrive_cnt != consumer_arrive_cnt):
+                consumer_arrive_cnt = _select_i32(
+                    is_pref, consumer_arrive_cnt, fb_consumer_arrive_cnt
+                )
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -2555,7 +2903,46 @@ class GemmSm100(GemmTmaBase):
                 cta_layout_vmnk=cluster_layout_vmnk,
                 defer_sync=True,
             )
+        if const_expr(fallback_cluster_layout_vmnk is not None):
+            # The consumer's tcgen05.commit multicasts to the CTAs of its A/B
+            # multicast groups (+ the 2-CTA peer); create() derived that mask from
+            # the preferred layout. A fallback-shaped cluster needs the mask of ITS
+            # layout: self only (bit 0) for a 1-CTA fallback, else its own groups.
+            assert pipeline_ab.consumer_mask is not None, (
+                "mixed launch implies a multi-CTA preferred"
+            )
+            if const_expr(cute.size(fallback_cluster_layout_vmnk) == 1):
+                fb_mask = cutlass.Int16(1)
+            else:
+                fb_mask = pipeline.PipelineTmaUmma._compute_mcast_arrival_mask(
+                    fallback_cluster_layout_vmnk, (1, 1)
+                )
+            # Both are Int16 (create_tma_multicast_mask); tcgen05.commit takes the mask
+            # as-is. Only the consumer side is shape-dependent: the TMA producer's
+            # full-barrier arrive is always local (expect_tx on its own barrier).
+            mask = cutlass.Int16(
+                select_(is_pref, cutlass.Int16(pipeline_ab.consumer_mask), cutlass.Int16(fb_mask))
+            )
+            object.__setattr__(pipeline_ab, "consumer_mask", mask)
         return pipeline_ab
+
+    def _ab_consumer_arrive_cnt(self, cluster_layout_vmnk: cute.Layout) -> int:
+        """Empty-barrier arrive count for one cluster shape: the CTAs in this CTA's
+        A and B multicast groups (self counted once), one tcgen05.commit each."""
+        num_mcast_ctas_a = cute.size(cluster_layout_vmnk.shape[2])
+        num_mcast_ctas_b = cute.size(cluster_layout_vmnk.shape[1])
+        consumer_arrive_cnt = num_mcast_ctas_a + num_mcast_ctas_b - 1
+        pipeline_checks.check_arrive_count(
+            "sm100 ab_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.mcast_peer_ctas(
+                num_mcast_ctas_a=num_mcast_ctas_a,
+                num_mcast_ctas_b=num_mcast_ctas_b,
+            ),
+            num_mcast_ctas_a=num_mcast_ctas_a,
+            num_mcast_ctas_b=num_mcast_ctas_b,
+        )
+        return consumer_arrive_cnt
 
     def make_acc_pipeline(self, cluster_layout_vmnk: cute.Layout) -> pipeline.PipelineAsync:
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -2591,12 +2978,15 @@ class GemmSm100(GemmTmaBase):
 
     def make_sched_pipeline(
         self,
-        cluster_layout_mnk: cute.Layout,
+        cluster_layout_vmnk: cute.Layout,
         has_C: bool = False,
+        *,
+        fallback_cluster_layout_vmnk: Optional[cute.Layout] = None,
+        is_pref: Optional[Boolean] = None,
     ) -> pipeline.PipelineAsync:
         # Threads/warps participating in this pipeline
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        cluster_size = cute.size(cluster_layout_mnk)
+        cluster_size = cute.size(cluster_layout_vmnk)
         # Each warp will contribute 1 to the arrive count
         extra_warp_ids = (self.a_prefetch_warp_id,) if self.gather_A else ()
         warps_per_cta = self.num_ab_load_warps + len(
@@ -2604,19 +2994,20 @@ class GemmSm100(GemmTmaBase):
         )
         if has_C:
             warps_per_cta += 1
-        consumer_arrive_cnt = warps_per_cta * cluster_size
-        # One arrive per consumer warp (elected lane); consumer_mask=0 routes every CTA
-        # in the cluster to CTA 0's barrier. per_warp is bound to elect_one_release below.
+        # One arrive per consumer warp (elected lane) from every CTA of the cluster;
+        # consumer_mask=0 routes every CTA to CTA 0's barrier. Under a mixed launch a
+        # fallback-shaped cluster has fewer CTAs: select its count at runtime (mask 0
+        # stays right — a 1-CTA cluster's rank 0 is itself). per_warp is bound to
+        # elect_one_release below.
         elect_one_release = True
-        pipeline_checks.check_arrive_count(
-            "sm100 sched_pipeline.consumer",
-            consumer_arrive_cnt,
-            pipeline_checks.async_thread_arrives(
-                warps_per_cta, per_warp=elect_one_release, ctas_routed=cluster_size
-            ),
-            warps_per_cta=warps_per_cta,
-            cluster_size=cluster_size,
+        consumer_arrive_cnt = self._sched_consumer_arrive_cnt(
+            warps_per_cta, cluster_size, elect_one_release
         )
+        if const_expr(fallback_cluster_layout_vmnk is not None):
+            fb_consumer_arrive_cnt = self._sched_consumer_arrive_cnt(
+                warps_per_cta, cute.size(fallback_cluster_layout_vmnk), elect_one_release
+            )
+            consumer_arrive_cnt = _select_i32(is_pref, consumer_arrive_cnt, fb_consumer_arrive_cnt)
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -2638,6 +3029,21 @@ class GemmSm100(GemmTmaBase):
             # so every lane's slot read is complete, then one elected lane signals.
             elect_one_release=elect_one_release,
         )
+
+    def _sched_consumer_arrive_cnt(
+        self, warps_per_cta: int, cluster_size: int, per_warp: bool
+    ) -> int:
+        consumer_arrive_cnt = warps_per_cta * cluster_size
+        pipeline_checks.check_arrive_count(
+            "sm100 sched_pipeline.consumer",
+            consumer_arrive_cnt,
+            pipeline_checks.async_thread_arrives(
+                warps_per_cta, per_warp=per_warp, ctas_routed=cluster_size
+            ),
+            warps_per_cta=warps_per_cta,
+            cluster_size=cluster_size,
+        )
+        return consumer_arrive_cnt
 
     @cute.jit
     def make_a_prefetch_pipeline(self) -> pipeline.PipelineAsync:

@@ -586,22 +586,30 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
 # End-to-end: quantized MXFP8 inputs through quack kernel vs cuBLAS vs dequant ref
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "mma_tiler_mn,cluster_shape_mn,m,n,k",
+    "mma_tiler_mn,cluster_shape_mn,m,n,k,use_clc",
     [
         # All supported blockscaled tile_n values (64, 128, 192, 256).
-        ((128, 64), (1, 1), 256, 64, 512),
-        ((128, 128), (1, 1), 256, 256, 256),
-        ((128, 128), (1, 1), 512, 512, 512),
-        ((128, 192), (1, 1), 256, 192, 256),
-        ((128, 256), (1, 1), 256, 256, 256),
-        ((256, 128), (2, 1), 512, 256, 512),
-        ((256, 192), (2, 1), 256, 192, 256),
-        ((256, 192), (2, 1), 256, 384, 256),
-        ((256, 192), (2, 1), 512, 192, 512),
-        ((256, 256), (2, 1), 512, 256, 512),
+        ((128, 64), (1, 1), 256, 64, 512, True),
+        ((128, 128), (1, 1), 256, 256, 256, True),
+        ((128, 128), (1, 1), 512, 512, 512, True),
+        ((128, 192), (1, 1), 256, 192, 256, True),
+        ((128, 256), (1, 1), 256, 256, 256, True),
+        ((256, 128), (2, 1), 512, 256, 512, True),
+        ((256, 192), (2, 1), 256, 192, 256, True),
+        ((256, 192), (2, 1), 256, 384, 256, True),
+        ((256, 192), (2, 1), 512, 192, 512, True),
+        ((256, 256), (2, 1), 512, 256, 512, True),
+        # Size-8 clusters (in the SM100 autotune sweep, CLC only): SFB multicast
+        # across 4 cluster-M CTAs / A+SFA across 4 cluster-N CTAs. Static launch
+        # here — a CLC size-8 mixed launch is excluded from CI for the same
+        # contention-hang reason as tests/test_gemm_fallback_cluster.py.
+        ((256, 256), (4, 2), 1024, 512, 512, False),
+        ((256, 128), (4, 2), 1024, 256, 512, False),
+        ((256, 256), (2, 4), 512, 1024, 512, False),
+        ((256, 128), (2, 4), 512, 512, 512, False),
     ],
 )
-def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
+def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k, use_clc):
     _skip_if_not_sm100()
     l, sf_vec = 1, 32
 
@@ -625,6 +633,7 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
         mD,
         mSFA,
         mSFB,
+        use_clc_persistence=use_clc,
     )
     runner(mA, mB, mD, mSFA, mSFB)
     torch.cuda.synchronize()
