@@ -385,6 +385,8 @@ def test_autotune_disallow_raises_on_cache_miss(monkeypatch, tmp_path):
     monkeypatch.setenv("QUACK_CACHE_DIR", str(tmp_path / "empty"))
     tuner(x)
     assert launches == [2, 2]
+
+
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="requires CUDA")
 def test_autotuning_does_not_pollute_selective_checkpoint_cache():
     import torch
