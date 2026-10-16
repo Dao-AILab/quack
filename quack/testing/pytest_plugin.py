@@ -399,7 +399,7 @@ class _SingleProcDeferLoop:
     #: How long a deferred test may wait on its pool compile before the loop
     #: stops trusting the pool and re-runs it with the pool suppressed
     #: (in-process compile). Guards against a permanently-"pending" sha
-    #: (wedged worker, foreign flock holder that never produces the .o) —
+    #: (wedged worker, foreign lock holder that never produces the .o) —
     #: without it a rotation-only item would spin forever, since attempts
     #: increment only on actual runs.
     _WEDGE_TIMEOUT_S = 600.0
@@ -566,7 +566,7 @@ class _XdistWorkerDefer:
                     # Pool wedged: stop trusting "pending" and force the
                     # remaining items through in-process. force is essential:
                     # a permanently-pending sha (hung pool worker holding the
-                    # flock) is otherwise skipped by _drain_ready forever and
+                    # lock) is otherwise skipped by _drain_ready forever and
                     # the attempts bump alone never takes effect — that
                     # deadlocked every xdist worker until the CI job timeout.
                     wedged = True
