@@ -6,6 +6,7 @@ feature — see quack/cache/async_compile.py and the defer-and-retry loop in
 quack/testing/pytest_plugin.py.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -436,3 +437,67 @@ def test_pool_arch_pin_survives_early_dsl_construction():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0 and "arch-pin-ok" in result.stdout, result.stderr
+
+
+def test_pool_sidecar_imports_the_submitters_quack(tmp_path):
+    """The forkserver sidecar must import the same ``quack`` as the parent.
+
+    Regression: the sidecar is a fresh ``python -c`` interpreter whose
+    ``sys.path`` starts with the cwd, and Python < 3.12 drops the parent's
+    ``sys_path`` on the floor (``forkserver.main`` accepts and ignores it).
+    A benchmark run from a checkout against an installed wheel — or any cwd
+    holding a different ``quack`` — made the sidecar preload *that* package,
+    so every worker compiled the wrong source, exported under its own
+    fingerprint, and every key came back "compile succeeded but .o was not
+    exported" followed by a full in-process recompile. ``_sidecar_import_env``
+    hands the sidecar the parent's path (and PYTHONSAFEPATH on 3.11+ so the
+    cwd cannot shadow it); ``_pool_initializer`` reports a mismatch instead
+    of compiling for nothing.
+    """
+    import quack
+
+    real_pkg = Path(quack.__file__).resolve().parent
+    decoy_root = tmp_path / "decoy"
+    shutil.copytree(real_pkg, decoy_root / "quack", ignore=shutil.ignore_patterns("__pycache__"))
+    (decoy_root / "quack" / "__init__.py").open("a").write("\n# decoy copy\n")
+
+    code = textwrap.dedent(
+        """
+        import json, os, sys, time
+        import quack
+        from quack.cache.async_compile import (
+            CompilePool, _neutral_main, _submitter_pkg_dir, _worker_import_mismatch,
+        )
+
+        pool = CompilePool(jobs=1)
+        try:
+            with _neutral_main():
+                fut = pool._executor.submit(_worker_import_mismatch)
+            print(json.dumps({"parent": _submitter_pkg_dir(), "mismatch": fut.result(timeout=300)}))
+        finally:
+            pool.shutdown()
+        """
+    )
+    env = dict(os.environ)
+    env["QUACK_CACHE_DIR"] = str(tmp_path / "cache")
+    # The parent must resolve ``quack`` from its own path, not the decoy cwd:
+    # -c would put the cwd first, so run the probe as a file next to nothing.
+    probe = tmp_path / "probe.py"
+    probe.write_text(code)
+    result = subprocess.run(
+        [sys.executable, str(probe)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+        cwd=decoy_root,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    assert report["parent"] == str(real_pkg), report
+    if sys.version_info >= (3, 11):
+        assert report["mismatch"] is None, report["mismatch"]
+    else:
+        # 3.10 has no PYTHONSAFEPATH: the decoy still wins, but loudly and
+        # without a wasted compile.
+        assert report["mismatch"] is not None and "decoy" in report["mismatch"], report
