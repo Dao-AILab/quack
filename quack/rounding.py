@@ -18,11 +18,16 @@ for the direct cvt.rn.satfinite.e2m1x2.f32 closer, bit-identically
 Philox-generated random bits, so 16-bit RS output is bitwise identical across
 architectures for a given seed (bf16/f16 probed straight on both sm_100a and
 sm_103a). The x4 narrow converts are NOT: sm_103a's f8x4/e2m1x4 instructions
-permute the rand bytes across values and consume the odd values' bytes
-bit-reversed (see cvt_f32x4_e2m1x4_rs), so fp8 hw output matches the sw
-emulation bitwise on sm_100a only (fp4's sm_100a rand order is unprobed) —
-still unbiased and statistically identical everywhere, but 8/4-bit seeds are
-not bit-portable across sm_100a/sm_103a/sw.
+permute the rand bytes across values, consume the odd values' bytes
+bit-reversed, and read 16 random bits per value — the value's own byte high,
+its pair partner's byte low (see cvt_f32x4_e2m1x4_rs) — while the sw
+emulations read 8 and truncate the rest. fp8 hw output matches the sw
+emulation bitwise on sm_100a only (B200-probed; fp4's sm_100a rand order is
+unprobed). Up to 8 bits below the kept ulp (e.g. bf16 inputs under power-of-two
+scales) sw and sm_103a hw agree in distribution; beyond that (fp32
+accumulators) sw is biased toward zero by up to 1/256 ulp (1/512 on average),
+while sm_103a hw is unbiased to 2^-16 (GB300-probed). 8/4-bit seeds are not
+bit-portable across sm_100a/sm_103a/sw.
 """
 
 from enum import IntEnum
@@ -332,8 +337,9 @@ def cvt_f32x2_bf16x2_rs_sw(
 #
 # PTX .rs semantics: add the K random bits to the mantissa bits discarded by
 # the truncation, as integers; the CARRY OUT of that add rounds the kept
-# value away from zero (P(round away) = discarded/2^K — unbiased, magnitude
-# proportional to how far x sits past the grid point). bf16 shares f32's
+# value away from zero (P(round away) = D_top/2^K, D_top the top K discarded
+# bits — unbiased when nothing sits below those K bits; any lower bits are
+# truncated, a bias toward zero of under 2^-K ulp). bf16 shares f32's
 # exponent width, so for it this is a plain integer add on the f32 bit
 # pattern at a FIXED position (bits + r16, truncate). f16/f8 have narrower
 # exponents, and that breaks in exactly one place: subnormal results, where
@@ -351,7 +357,7 @@ def cvt_f32x2_bf16x2_rs_sw(
 # discarded bits, where the hw aligns its rand too (B200-probed). x's bits
 # BELOW those K (the sub-r residue) cannot change the outcome: D_top + r is
 # an integer and the residue < 1 in its units, so it never bridges
-# D_top + r = 2^K - 1 to a carry.
+# D_top + r = 2^K - 1 to a carry — which is the toward-zero bias above.
 #
 # So we compute  y = fma.rz(rf, sc, x)  with rf = (float)r (exact, K <= 13
 # bits) and sc = +-2^(max(e_x, emin) - S) built integer-side (K = 13 for
@@ -672,9 +678,12 @@ def cvt_f32x4_f8x4_rs(
     rand byte i straight, bitwise identical to the sw pair emulation; on
     sm_103a (B300-probed) v0 <- byte1, v1 <- byte0, v2 <- byte3, v3 <- byte2
     with the odd values' bytes consumed BIT-REVERSED (same quirk as
-    cvt_f32x4_e2m1x4_rs — exhaustive per-byte sweeps still show round-up
-    count == D_top on every slot, so uniform rbits stay unbiased; only
-    bitwise seed portability is lost).
+    cvt_f32x4_e2m1x4_rs). On sm_103a that byte is only the high half: each
+    value reads 16 random bits, with its pair partner's byte (v0/v1 share
+    bytes 0 and 1, v2/v3 share 2 and 3) as the low half. A sweep of one byte
+    with the others at 0 shows round-up count == D_top; over all 65536 byte
+    pairs the count is floor(65536 * frac) (GB300-probed), so uniform rbits
+    give unbiased 16-rbit SR, with the paired values' decisions correlated.
     """
     assert f8_kind in ("e4m3", "e5m2")
     return cutlass.Int32(
@@ -705,12 +714,16 @@ def cvt_f32x4_e2m1x4_rs(
     brace-operand convention as the f8x4 wrapper). The rand mapping is NOT the
     f8x4 byte order (probed exhaustively on B300 sm_103a): v0 <- rand[23:16],
     v1 <- rand[7:0], v2 <- rand[31:24], v3 <- rand[15:8], and the odd values
-    consume their byte BIT-REVERSED (carry iff bitrev(r8) + D_top >= 256,
-    where D_top is the top 8 discarded mantissa bits). Full 256-value sweeps
-    show round-up count == D_top on every slot, so uniform rbits give
-    unbiased 8-rbit SR on all four values; the permutation/bit-reversal only
-    matters if a sw emulation ever needs bitwise parity. Specials follow
-    satfinite (NaN -> 0x7 = +6.0, |x| > 6 incl Inf -> sign|0x7).
+    consume their byte BIT-REVERSED. That byte is only the high half: each
+    value reads 16 random bits, with its pair partner's byte (v0/v1 share
+    bytes 2 and 0, v2/v3 share 3 and 1) as the low half. A 256-value sweep of
+    one byte with the others at 0 shows round-up count == D_top (the top 8
+    discarded mantissa bits); over all 65536 byte pairs the count is
+    floor(65536 * frac) (GB300-probed, tests/test_rounding.py), so uniform
+    rbits give unbiased 16-rbit SR, with the paired values' decisions
+    correlated. The 8-rbit sw emulation differs in distribution once |x| has
+    more than 8 bits below the e2m1 ulp. Specials follow satfinite (NaN ->
+    0x7 = +6.0, |x| > 6 incl Inf -> sign|0x7).
     """
     return cutlass.Uint16(
         _asm(
@@ -905,8 +918,10 @@ def cvt_f32x4_e2m1x4_rs_sw(
     sm_100a f8x4 convention, NOT sm_103a's permuted/bit-reversed e2m1 order
     (see cvt_f32x4_e2m1x4_rs): vs sm_103a the streams differ by construction;
     sm_100a's e2m1 rand order is unprobed, so bit parity there is plausible
-    but unverified. Either way the output is unbiased 8-rbit SR and the sw
-    stream is identical on every non-.rs target.
+    but unverified. Either way the output is 8-rbit add-and-truncate SR —
+    unbiased only when |x| has at most 8 bits below the e2m1 ulp, otherwise
+    biased toward zero by under 1/256 ulp — and the sw stream is identical on
+    every non-.rs target.
 
     43 SASS per quad on sm_90a (~10.75/value, vs the f8 pairs' 19-22/pair;
     was 62 with the retired per-pair shift/mask/clamp extraction — measured
@@ -1049,8 +1064,10 @@ def convert_f32_to_f8_sr(
     software emulation (sm_89+) elsewhere. The sw pair consumes
     rand[7:0]/rand[15:8], so splitting the quad's word as (r, r >> 16)
     matches sm_100a's straight byte order bitwise; sm_103a's hw permutes and
-    bit-reverses its rand consumption (see cvt_f32x4_f8x4_rs), so there the
-    output is statistically identical but not bit-identical to sw.
+    bit-reverses its rand consumption and reads 16 rbits per value (see
+    cvt_f32x4_f8x4_rs), so there the output is not bit-identical to sw and,
+    once x has more than 8 bits below the f8 ulp, not identically
+    distributed either (sw biased toward zero, hw unbiased).
     """
     assert f8_kind in ("e4m3", "e5m2")
     dst_numeric = cutlass.Float8E4M3FN if f8_kind == "e4m3" else cutlass.Float8E5M2

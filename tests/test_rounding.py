@@ -9,8 +9,9 @@ Specials follow satfinite: NaN -> 0x7 (+6.0, sign dropped), |x| > 6 incl Inf
 -> sign|0x7, +-0 keeps its sign. The reference model below encodes exactly
 this rule; the emulation must match it BITWISE, and — independently of the
 model — an exhaustive 256-value rand sweep per grid cell must show round-up
-count == D_top on every quad slot (the unbiasedness probe used against the
-B300 hardware instruction).
+count == D_top on every quad slot: 8-bit add-and-truncate, unbiased only when
+|x| has at most 8 bits below the e2m1 ulp. The sm_103a hardware instruction
+reads 16 random bits per value instead (test_e2m1_rs_hw_reads_16_rbits).
 
 The sw rand mapping is the straight byte order (v_i <- rand[8i+7:8i], the
 sm_100a f8x4 convention), NOT sm_103a's permuted/bit-reversed order. The
@@ -37,6 +38,7 @@ from quack.rounding import (
     PHILOX_ROUND_A,
     PHILOX_ROUND_B,
     convert_f32_frag_sr,
+    cvt_f32x4_e2m1x4_rs,
     cvt_f32x4_e2m1x4_rs_direct,
     cvt_f32x4_e2m1x4_rs_sw,
 )
@@ -83,7 +85,11 @@ def decode_e2m1(nib: np.ndarray) -> np.ndarray:
     return E2M1_VALUES[nib.astype(np.int64)]
 
 
-_QUAD_CVTS = {"sw": cvt_f32x4_e2m1x4_rs_sw, "direct": cvt_f32x4_e2m1x4_rs_direct}
+_QUAD_CVTS = {
+    "sw": cvt_f32x4_e2m1x4_rs_sw,
+    "direct": cvt_f32x4_e2m1x4_rs_direct,
+    "hw": cvt_f32x4_e2m1x4_rs,  # sm_100a/sm_103a only
+}
 # The direct-closer variant needs the sm_100+ e2m1 cvt; bit-identical to "sw"
 # by construction, which these tests prove against the same reference model.
 QUAD_VARIANTS = ["sw"] + (["direct"] if get_compile_target_capacity()[0] >= 10 else [])
@@ -240,11 +246,11 @@ def test_e2m1_rs_sw_specials(variant):
 
 
 @pytest.mark.parametrize("variant", QUAD_VARIANTS)
-def test_e2m1_rs_sw_unbiased_exhaustive(variant):
-    """Model-independent probe (the same one run against the B300 hw): for
-    fixed x, sweep all 256 rand bytes in one quad slot; the round-up count
-    must equal D_top exactly — SR is unbiased at 8-bit granularity and the
-    byte routing per slot is correct. Runs a handful of x per grid cell,
+def test_e2m1_rs_sw_truncation_exhaustive(variant):
+    """Model-independent probe: for fixed x, sweep all 256 rand bytes in one
+    quad slot; the round-up count must equal D_top exactly — the emulation is
+    8-bit add-and-truncate (biased toward zero by the bits of x below the top
+    8) and the byte routing per slot is correct. Runs a handful of x per grid cell,
     including exact grid points (count 0) and cell-edge values (count 255)."""
     rng = np.random.default_rng(0)
     xs = []
@@ -276,6 +282,33 @@ def test_e2m1_rs_sw_unbiased_exhaustive(variant):
         np.testing.assert_array_equal(
             up_count, dtop, err_msg=f"slot {slot}: round-up count != D_top"
         )
+
+
+@pytest.mark.skipif(
+    tuple(get_compile_target_capacity()) != (10, 3), reason="sm_103a hw cvt.rs rand layout"
+)
+def test_e2m1_rs_hw_reads_16_rbits():
+    """sm_103a hw cvt.rs.e2m1x4: each value reads 16 random bits, its own byte
+    high and its pair partner's low (v0/v1 share bytes 2 and 0, v2/v3 share 3
+    and 1). Over all 65536 values of that byte pair the round-up count is
+    floor(65536 * frac) for x with bits below the top 8: unbiased 16-rbit SR,
+    where the 8-rbit sw emulation gives floor(256 * frac) * 256."""
+    rng = np.random.default_rng(0)
+    hi, lo = np.meshgrid(np.arange(256, dtype=np.uint32), np.arange(256, dtype=np.uint32))
+    for slot, (bh, bl) in {0: (2, 0), 1: (0, 2), 2: (3, 1), 3: (1, 3)}.items():
+        r_np = (hi.reshape(-1) << (8 * bh)) | (lo.reshape(-1) << (8 * bl))
+        for c in range(7):
+            x = np.float32(rng.uniform(E2M1_GRID[c], E2M1_GRID[c + 1]))
+            x_np = np.zeros((65536, 4), dtype=np.float32)
+            x_np[:, slot] = x
+            packed = run_quads(
+                torch.from_numpy(x_np.reshape(-1)).cuda(),
+                torch.from_numpy(r_np.view(np.int32)).cuda(),
+                "hw",
+            )
+            up_count = (decode_e2m1((packed >> (4 * slot)) & 0xF) > x).sum()
+            frac = (np.float64(x) - E2M1_GRID[c]) / (E2M1_GRID[c + 1] - E2M1_GRID[c])
+            assert up_count == np.floor(frac * 65536), (slot, c, float(x), up_count)
 
 
 # ---------------------------------------------------------------------------
