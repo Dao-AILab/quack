@@ -215,6 +215,16 @@ def _for_blackwell_bwd(
             sum_bytes=(dtype_width + dout_width) // 8,
             max_cluster=_max_cluster_for(10),  # Blackwell
         )
+        # Cap the per-thread fragment at 128 B. At 256 B/thread (bf16 N=128k
+        # with cluster_n=8, N=256k with cluster_n=16) the x/dout/dx fragments
+        # spill and the kernel drops to ~1 TB/s on B200 — 3.5x slower than the
+        # same row at 128 B/thread. Widen the cluster first (keeps one row per
+        # CTA and the smem tile small), then widen the row's thread count.
+        max_cluster = _max_cluster_for(10)
+        while (N // cluster_n) // threads_per_row * max_bytes > 128 and cluster_n < max_cluster:
+            cluster_n *= 2
+        if (N // cluster_n) // threads_per_row * max_bytes > 128:
+            num_threads, threads_per_row = 256, 256
     elif row_bytes > 16 * 1024:
         # Wider than 128 threads can comfortably handle at cluster_n=1; bump
         # threads/row to keep per-thread fragments small.
@@ -233,8 +243,11 @@ def _for_blackwell_bwd(
     # (dw + db): their 2 * frag/4 registers plus cp.async's per-thread address
     # registers spill at frag >= 64 B/thread (~9x slowdown at bf16 N=8k/16k);
     # TMA frees the address registers and restores full bandwidth.
+    # In the cluster regime TMA only wins while the fragment is <= 64 B/thread;
+    # at 128 B/thread the TMA path is 1.2-2.2x slower than cp.async on B200
+    # (bf16 N=64k..256k), so fall back to cp.async there.
     use_tma = (
-        cluster_n >= 4
+        (cluster_n >= 4 and bytes_per_thread_frag <= 64)
         or (max_bytes >= 4 and row_bytes >= 16 * 1024)
         or (num_acc >= 2 and bytes_per_thread_frag >= 64)
     )
