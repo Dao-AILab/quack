@@ -218,11 +218,21 @@ class SoftmaxBackward(ReductionBase):
         # 1 stage for computing dot product
         super().__init__(dtype, N, stage=1, reduction_dtype=Float32)
 
+    def _wide_row_sm100(self) -> bool:
+        """SM100 16-bit rows above 32k: one 128-thread row per CTA and a wider
+        cluster. The 256-thread row of the generic ladder is 1.2-1.5x slower on
+        B200 at these widths (N=64k: 4.2 -> 6.3 TB/s, 128k: 3.7 -> 5.1, 256k:
+        3.4 -> 4.0), see the ladder in _set_cluster_n."""
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        return arch.major == 10 and self.dtype.width == 16 and self.N > 32 * 1024
+
     def _threads_per_row(self):
         N = self.N
         for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (8192, 128)]:
             if N <= limit:
                 return threads
+        if self._wide_row_sm100():
+            return 128
         return 256
 
     def _set_cluster_n(self):
@@ -237,6 +247,10 @@ class SoftmaxBackward(ReductionBase):
         if arch.major == 12 and const_expr(self.dtype.width >= 32):
             # SM12x 99 KB SMEM: fp32 bwd has 2 SMEM tensors, needs tighter clustering
             thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
+        elif self._wide_row_sm100():
+            # 128 threads per row: 64k rows keep 4 CTAs (256 B/thread beats the
+            # 128 B/thread of 8 CTAs), 128k rows go straight to 16.
+            thresholds = [(64 * 1024, 4), (128 * 1024, 16)]
         elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
@@ -248,6 +262,8 @@ class SoftmaxBackward(ReductionBase):
         self.cluster_n = max_cluster
 
     def _num_threads(self):
+        if self._wide_row_sm100():
+            return 128
         return 128 if self.N <= 8192 else 256
 
     @cute.jit
