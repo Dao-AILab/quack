@@ -3,7 +3,8 @@
 
 Wide rows: the per-thread fragment must stay <= 128 B. At 256 B/thread
 (bf16 N=128k at cluster_n=8, N=256k at cluster_n=16) the kernel spills and
-drops to ~1 TB/s on B200; capping the fragment recovers 3.4-3.6x."""
+drops to ~1 TB/s on B200; capping the fragment recovers 3.4-3.6x. With two
+persistent fp32 accumulators (LayerNorm: dw + db) the cap is 64 B."""
 
 import pytest
 
@@ -75,3 +76,55 @@ def test_bwd_narrow_rows_unchanged():
         256,
         False,
     )
+
+
+@pytest.mark.parametrize("N", [32768, 65536, 98304, 131072])
+def test_bwd_two_accumulators_cap_fragment_at_64_bytes(N):
+    # LayerNorm bwd (dw + db): 128 B/thread is 1.7x slower than 64 B on B200.
+    cfg = _bwd(N, 16, num_acc=2)
+    assert _frag_bytes(cfg, N, 16) <= 64, cfg
+    assert cfg.use_tma, cfg  # cluster + small fragment: TMA path
+
+
+def test_bwd_two_accumulators_wide_rows():
+    # 64k: cluster 8 -> 16 at 128 threads; 128k: cluster maxed, 256 threads.
+    assert (_bwd(65536, 16, num_acc=2).cluster_n, _bwd(65536, 16, num_acc=2).threads_per_row) == (
+        16,
+        128,
+    )
+    cfg = _bwd(131072, 16, num_acc=2)
+    assert (cfg.cluster_n, cfg.threads_per_row) == (16, 256)
+    # 256k: cluster and threads both maxed -> 128 B/thread; the dw+db TMA rule
+    # is a single-CTA rule, so the cluster regime falls back to cp.async.
+    cfg = _bwd(262144, 16, num_acc=2)
+    assert (cfg.cluster_n, cfg.threads_per_row) == (16, 256)
+    assert not cfg.use_tma, cfg
+
+
+@pytest.mark.parametrize("N", [16384, 32768, 65536, 131072])
+def test_bwd_two_accumulators_fp32_unchanged(N):
+    # fp32 rows already sit at <= 32 elements/thread under the 128 B cap.
+    assert repr(_bwd(N, 32, num_acc=2)) == repr(_bwd(N, 32, num_acc=1)), N
+
+
+def test_bwd_widening_below_128_bytes_only_takes_exact_steps():
+    # bf16 80k, dw+db: 16 x 256 threads would be a ragged 20-element tile;
+    # stay at 16 x 128 (40 elements, exact) — 1.6x faster on B200.
+    cfg = _bwd(81920, 16, num_acc=2)
+    assert (cfg.cluster_n, cfg.threads_per_row) == (16, 128), cfg
+    # bf16 40k, dw+db: 8 x 128 is 40 elements (exact); the ragged 16 x 128
+    # step (20 elements) is 18% slower, so keep it.
+    cfg = _bwd(40960, 16, num_acc=2)
+    assert (cfg.cluster_n, cfg.threads_per_row) == (8, 128), cfg
+    # bf16 88k (11 x 8k), single accumulator: 8 x 128 is 176 B (spill regime),
+    # so the ragged step to 16 x 128 (44 elements) is still taken: 1.7x faster.
+    cfg = _bwd(90112, 16)
+    assert (cfg.cluster_n, cfg.threads_per_row) == (16, 128), cfg
+    assert not cfg.use_tma  # ragged tiles never pair with the TMA path
+
+
+def test_bwd_single_cta_two_accumulators_keep_tma():
+    # The pre-existing single-CTA dw+db rule (bf16 N=8k/16k) is untouched.
+    for N in (8192, 16384):
+        cfg = _bwd(N, 16, num_acc=2)
+        assert cfg.cluster_n == 1 and cfg.use_tma, (N, cfg)
