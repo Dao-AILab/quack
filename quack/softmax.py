@@ -219,12 +219,19 @@ class SoftmaxBackward(ReductionBase):
         super().__init__(dtype, N, stage=1, reduction_dtype=Float32)
 
     def _wide_row_sm100(self) -> bool:
-        """SM100 16-bit rows above 32k: one 128-thread row per CTA and a wider
-        cluster. The 256-thread row of the generic ladder is 1.2-1.5x slower on
-        B200 at these widths (N=64k: 4.2 -> 6.3 TB/s, 128k: 3.7 -> 5.1, 256k:
-        3.4 -> 4.0), see the ladder in _set_cluster_n."""
+        """SM100 16-bit power-of-two rows above 32k: one 128-thread row per CTA and
+        a wider cluster. The 256-thread row of the generic ladder is 1.2-1.5x slower
+        on B200 at these widths (N=64k: 4.2 -> 6.3 TB/s, 128k: 3.7 -> 5.1, 256k:
+        3.4 -> 4.0), see the ladder in _set_cluster_n. Rows that are odd multiples
+        of 32k (96k, 192k) gain nothing in bf16 and lose 16-19% in fp16 under this
+        ladder, so they keep the generic one."""
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-        return arch.major == 10 and self.dtype.width == 16 and self.N > 32 * 1024
+        return (
+            arch.major == 10
+            and self.dtype.width == 16
+            and self.N > 32 * 1024
+            and self.N & (self.N - 1) == 0
+        )
 
     def _threads_per_row(self):
         N = self.N
