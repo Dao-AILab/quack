@@ -450,8 +450,8 @@ def _rmsnorm_fwd(
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
 
 
-# Unbounded: one entry per distinct (dtypes, N, flags, config), holding references to the
-# compiled kernels already kept by jit_cache.
+# Memoized so warm calls skip the config and tiling work. Unbounded: entries only reference
+# kernels that jit_cache already holds. Cleared together with _compile_rmsnorm_fwd.
 @functools.lru_cache(maxsize=None)
 def _get_compiled_rmsnorm_fwd(
     dtypes,
@@ -463,14 +463,13 @@ def _get_compiled_rmsnorm_fwd(
     weight_offset=0.0,
     config: Optional[RmsNormFwdConfig] = None,
 ):
-    # Memoized so warm calls skip the config and tiling work; cleared with _compile_rmsnorm_fwd.
     if config is None:
         config = RmsNormFwdConfig.from_analytical_heuristic(
             N, dtypes[0].width, is_layernorm=is_layernorm
         )
     vecsize = math.gcd(N, *(128 // dt.width for dt in dtypes if dt is not None))
     config, tile_N = _fwd_tile_N(N, vecsize, config)
-    # Rows that fill the tile keep a static N; shorter rows share one kernel per tile width.
+    # Rows that fill the tile keep a static N; shorter rows share a kernel.
     return _compile_rmsnorm_fwd(
         *dtypes,
         tile_N,

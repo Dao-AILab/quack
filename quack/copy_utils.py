@@ -385,8 +385,8 @@ def predicate_k(
     tAcA: cute.Tensor, limit: Int32, limit_lower_bound: cutlass.Constexpr[Optional[int]] = None
 ) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-    # limit_lower_bound: a compile-time lower bound on a dynamic limit. Coordinates below it are
-    # in bounds, so the compiler can fold the checks for the blocks known to be in bounds.
+    # limit_lower_bound: compile-time lower bound on a dynamic limit. Comparing against it first
+    # lets the compiler fold the checks it can prove, as with a static limit.
     tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),

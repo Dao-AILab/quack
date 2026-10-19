@@ -514,8 +514,8 @@ def test_rmsnorm_fwd_compile_cache_shares_N_config():
         x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
         weight = torch.randn(N, device=device, dtype=torch.bfloat16)
         out = torch.empty_like(x)
-        dtypes = (torch2cute_dtype_map[torch.bfloat16],) * 2 + (None,)
-        dtypes = dtypes + (torch2cute_dtype_map[torch.bfloat16], None, None)
+        bf16 = torch2cute_dtype_map[torch.bfloat16]
+        dtypes = (bf16, bf16, None, bf16, None, None)  # x, out, res, weight, bias, res_out
         _get_compiled_rmsnorm_fwd(dtypes, N, False, False, False, False, config=config)(
             x, weight, None, None, out, None, None, None, eps
         )
