@@ -6,6 +6,10 @@ import torch
 from quack.cute_dsl_utils import get_device_capacity
 from quack.rmsnorm import (
     _compile_rmsnorm_fwd,
+    layernorm_fwd,
+    layernorm_mean_ref,
+    layernorm_ref,
+    layernorm_rstd_ref,
     rmsnorm,
     rmsnorm_bwd,
     rmsnorm_bwd_ref,
@@ -420,6 +424,42 @@ def test_rmsnorm_compile_cache():
     weight4 = torch.randn(N, device=device, dtype=torch.float32)
     out4 = rmsnorm_fwd(x4, weight4, eps=eps)
     assert _compile_rmsnorm_fwd.cache_info().currsize == 3
+
+
+@pytest.mark.parametrize("is_layernorm", [False, True])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+def test_rmsnorm_fwd_compile_cache_shares_N(input_dtype, is_layernorm):
+    """Row widths covered by the same tiles share one compiled kernel, in either call order."""
+    device = "cuda"
+    M, eps = 37, 1e-6
+    # With 16-byte fp32 weight loads these share a 2176-wide tile; 2176 fills it exactly and
+    # gets its own kernel.
+    Ns = [2056, 2096, 2136, 2168, 2176]
+    for order in (Ns, Ns[::-1]):
+        _compile_rmsnorm_fwd.cache_clear()
+        for N in order:
+            torch.random.manual_seed(N)
+            x = torch.randn(M, N, device=device, dtype=input_dtype)
+            weight = torch.randn(N, device=device, dtype=torch.float32)
+            if is_layernorm:
+                out, rstd, mean = layernorm_fwd(
+                    x, weight, eps=eps, return_rstd=True, return_mean=True
+                )
+                torch.testing.assert_close(
+                    out, layernorm_ref(x, weight, eps=eps), atol=TOLERANCES[input_dtype], rtol=1e-3
+                )
+                torch.testing.assert_close(
+                    rstd, layernorm_rstd_ref(x, eps=eps), atol=1e-4, rtol=1e-3
+                )
+                torch.testing.assert_close(mean, layernorm_mean_ref(x), atol=1e-4, rtol=1e-3)
+            else:
+                out, _, rstd = rmsnorm_fwd(x, weight, eps=eps, store_rstd=True)
+                torch.testing.assert_close(
+                    out, rmsnorm_ref(x, weight, eps=eps), atol=TOLERANCES[input_dtype], rtol=1e-3
+                )
+                rstd_ref = torch.rsqrt(x.float().square().mean(-1) + eps)
+                torch.testing.assert_close(rstd, rstd_ref, atol=1e-4, rtol=1e-3)
+        assert _compile_rmsnorm_fwd.cache_info().currsize == 2
 
 
 @pytest.mark.parametrize("use_compile", [False, True])

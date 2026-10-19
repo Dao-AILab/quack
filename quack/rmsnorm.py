@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import dataclasses
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -36,6 +37,7 @@ from quack.rmsnorm_config import (
     prune_invalid_rmsnorm_bwd_configs,
     prune_invalid_rmsnorm_fwd_configs,
 )
+from quack.rmsnorm_config import _detect_arch_major
 from cutlass.base_dsl.enums import Arch
 
 
@@ -52,6 +54,23 @@ def _bucket_T_hint(T_hint: int) -> int:
     if T_hint <= 0:
         return 0
     return 1 << (T_hint - 1).bit_length()
+
+
+def _fwd_tile_N(N: int, vecsize: int, config: RmsNormFwdConfig) -> Tuple[RmsNormFwdConfig, int]:
+    """Row width covered by the forward kernel's tiles for a row of ``N`` elements.
+
+    The compiled kernel depends on ``N`` only through the config, the vector size and
+    the number of vectors per thread, so every ``N`` with the same tile width can share
+    one binary; the actual ``N`` only bounds the copies and divides the sums. Returns the
+    config with ``cluster_n`` already capped for this ``N`` (see
+    ``ReductionBase._cap_cluster_n``) and the tile width.
+    """
+    arch_major = _detect_arch_major()
+    cluster_n = 1 if arch_major < 9 else min(config.cluster_n, 8 if arch_major == 12 else 16)
+    cluster_n = min(cluster_n, max(1, (N // vecsize) // config.threads_per_row))
+    vecs_per_row = config.threads_per_row * cluster_n
+    tile_N = vecsize * vecs_per_row * -(-(N // vecsize) // vecs_per_row)
+    return dataclasses.replace(config, cluster_n=cluster_n), tile_N
 
 
 def _ensure_contiguous(t):
@@ -71,9 +90,13 @@ class RMSNorm(ReductionBase):
         is_layernorm: bool = False,
         weight_offset: float = 0.0,
         config: Optional["RmsNormFwdConfig"] = None,
+        vecsize: Optional[int] = None,
     ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
+        # When N is the tile width rather than the row width, the vector size must come from
+        # the row width's alignment, so the caller passes it.
+        self.vecsize = vecsize
         # Constant added to the weight in fp32 before scaling (Gemma-style
         # "out = x_hat * (1 + w)" uses weight_offset=1.0). Baked in at compile time.
         self.weight_offset = weight_offset
@@ -123,7 +146,11 @@ class RMSNorm(ReductionBase):
         largest_dtype_width = const_expr(
             max(*(t.element_type.width for t in [mX, mRes, mW, mB, mO, mResO] if t is not None))
         )
-        vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        vecsize = (
+            self.vecsize
+            if const_expr(self.vecsize is not None)
+            else math.gcd(self.N, 128 // largest_dtype_width)
+        )
         self._cap_cluster_n(vecsize)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
@@ -225,7 +252,9 @@ class RMSNorm(ReductionBase):
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        is_even_N = const_expr(
+            cute.is_static(shape[1]) and shape[1] == tiler_mn[1] * self.cluster_n
+        )
         tXpX = (
             copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
             if not is_even_N
@@ -407,13 +436,8 @@ def _rmsnorm_fwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, out, weight, bias, residual, residual_out]
     ]
-    _compile_rmsnorm_fwd(
-        dtype,
-        out_dtype,
-        res_dtype,
-        weight_dtype,
-        bias_dtype,
-        res_out_dtype,
+    _get_compiled_rmsnorm_fwd(
+        (dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype),
         N,
         rstd is not None,
         mean is not None,
@@ -421,6 +445,39 @@ def _rmsnorm_fwd(
         per_head,
         weight_offset,
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
+
+
+def _get_compiled_rmsnorm_fwd(
+    dtypes,
+    N,
+    has_rstd,
+    has_mean,
+    is_layernorm,
+    per_head,
+    weight_offset=0.0,
+    config: Optional[RmsNormFwdConfig] = None,
+):
+    dtype = dtypes[0]
+    if config is None:
+        config = RmsNormFwdConfig.from_analytical_heuristic(
+            N, dtype.width, is_layernorm=is_layernorm
+        )
+    vecsize = math.gcd(N, *(128 // dt.width for dt in dtypes if dt is not None))
+    config, tile_N = _fwd_tile_N(N, vecsize, config)
+    # Rows that fill the tile exactly keep a static N (no predication); shorter rows share
+    # one binary per tile width.
+    return _compile_rmsnorm_fwd(
+        *dtypes,
+        tile_N,
+        vecsize,
+        N == tile_N,
+        has_rstd,
+        has_mean,
+        is_layernorm,
+        per_head,
+        weight_offset,
+        config=config,
+    )
 
 
 @jit_cache
@@ -431,7 +488,9 @@ def _compile_rmsnorm_fwd(
     weight_dtype,
     bias_dtype,
     res_out_dtype,
-    N,
+    tile_N,
+    vecsize,
+    static_N,
     has_rstd,
     has_mean,
     is_layernorm,
@@ -442,20 +501,26 @@ def _compile_rmsnorm_fwd(
     batch_sym = cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
     batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
-    all_dtypes = [dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype]
-    div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
+    N = tile_N if static_N else cute.sym_int(divisibility=vecsize)
     x_cute, out_cute, res_cute, res_out_cute = [
-        fake_tensor(dt, (*batch_shape, N), div)
+        fake_tensor(dt, (*batch_shape, N), vecsize)
         for dt in [dtype, out_dtype, res_dtype, res_out_dtype]
     ]
     weight_shape = (head_sym, N) if per_head else (N,)
     weight_cute, bias_cute = [
-        fake_tensor(dt, weight_shape, div) for dt in [weight_dtype, bias_dtype]
+        fake_tensor(dt, weight_shape, vecsize) for dt in [weight_dtype, bias_dtype]
     ]
     rstd_cute = fake_tensor(Float32, batch_shape) if has_rstd else None
     mean_cute = fake_tensor(Float32, batch_shape) if has_mean else None
     return cute.compile(
-        RMSNorm(dtype, N, is_layernorm=is_layernorm, weight_offset=weight_offset, config=config),
+        RMSNorm(
+            dtype,
+            tile_N,
+            is_layernorm=is_layernorm,
+            weight_offset=weight_offset,
+            config=config,
+            vecsize=vecsize,
+        ),
         x_cute,
         weight_cute,
         bias_cute,
@@ -543,13 +608,8 @@ def rmsnorm_fwd_tuned(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, out, weight, bias, residual, residual_out]
     ]
-    _compile_rmsnorm_fwd(
-        dtype,
-        out_dtype,
-        res_dtype,
-        weight_dtype,
-        bias_dtype,
-        res_out_dtype,
+    _get_compiled_rmsnorm_fwd(
+        (dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype),
         N,
         rstd is not None,
         mean is not None,
