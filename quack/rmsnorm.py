@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import dataclasses
+import functools
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -26,7 +27,7 @@ from quack.pipeline import make_pipeline_state, PipelineStasAsync
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
 from quack.autotuner import autotune, AutotuneConfig
 from quack.rmsnorm_config import (
     RmsNormBwdConfig,
@@ -37,7 +38,6 @@ from quack.rmsnorm_config import (
     prune_invalid_rmsnorm_bwd_configs,
     prune_invalid_rmsnorm_fwd_configs,
 )
-from quack.rmsnorm_config import _detect_arch_major
 from cutlass.base_dsl.enums import Arch
 
 
@@ -57,20 +57,16 @@ def _bucket_T_hint(T_hint: int) -> int:
 
 
 def _fwd_tile_N(N: int, vecsize: int, config: RmsNormFwdConfig) -> Tuple[RmsNormFwdConfig, int]:
-    """Row width covered by the forward kernel's tiles for a row of ``N`` elements.
+    """Cluster size and tile width the forward kernel uses for rows of ``N`` elements.
 
-    The compiled kernel depends on ``N`` only through the config, the vector size and
-    the number of vectors per thread, so every ``N`` with the same tile width can share
-    one binary; the actual ``N`` only bounds the copies and divides the sums. Returns the
-    config with ``cluster_n`` already capped for this ``N`` (see
-    ``ReductionBase._cap_cluster_n``) and the tile width.
+    The kernel only depends on ``N`` through these, so every ``N`` with the same tile width can
+    share it. Uses the kernel's own cluster and tiling rules; ``cluster_n`` in the returned
+    config is already capped for this ``N``.
     """
-    arch_major = _detect_arch_major()
-    cluster_n = 1 if arch_major < 9 else min(config.cluster_n, 8 if arch_major == 12 else 16)
-    cluster_n = min(cluster_n, max(1, (N // vecsize) // config.threads_per_row))
-    vecs_per_row = config.threads_per_row * cluster_n
-    tile_N = vecsize * vecs_per_row * -(-(N // vecsize) // vecs_per_row)
-    return dataclasses.replace(config, cluster_n=cluster_n), tile_N
+    norm = RMSNorm(cutlass.Float32, N, config=config)
+    norm.cluster_n = RMSNorm._max_cluster_n(config.cluster_n, get_compile_target_capacity()[0])
+    norm._cap_cluster_n(vecsize)
+    return dataclasses.replace(config, cluster_n=norm.cluster_n), norm._tile_N(vecsize)
 
 
 def _ensure_contiguous(t):
@@ -91,12 +87,14 @@ class RMSNorm(ReductionBase):
         weight_offset: float = 0.0,
         config: Optional["RmsNormFwdConfig"] = None,
         vecsize: Optional[int] = None,
+        min_N: Optional[int] = None,
     ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
-        # When N is the tile width rather than the row width, the vector size must come from
-        # the row width's alignment, so the caller passes it.
+        # When N is the tile width and the row width is dynamic, the vector size comes from the
+        # row width's alignment, and min_N is the smallest row width sharing this kernel.
         self.vecsize = vecsize
+        self.min_N = min_N
         # Constant added to the weight in fp32 before scaling (Gemma-style
         # "out = x_hat * (1 + w)" uses weight_offset=1.0). Baked in at compile time.
         self.weight_offset = weight_offset
@@ -117,15 +115,16 @@ class RMSNorm(ReductionBase):
     def _threads_per_row(self):
         return self._threads_per_row_val
 
+    @staticmethod
+    def _max_cluster_n(cluster_n: int, arch_major: int) -> int:
+        # SM8x (Ampere/Ada) lacks cluster support, SM12x supports cluster up to 8
+        if arch_major < 9:
+            return 1
+        return min(cluster_n, 8 if arch_major == 12 else 16)
+
     def _set_cluster_n(self):
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-        # SM8x (Ampere/Ada) lacks cluster support
-        if arch < Arch.sm_90:
-            self.cluster_n = 1
-            return
-        # SM12x supports cluster up to 8
-        max_cluster = 8 if arch.major == 12 else 16
-        self.cluster_n = min(self._cluster_n_val, max_cluster)
+        self.cluster_n = self._max_cluster_n(self._cluster_n_val, arch.major)
 
     @cute.jit
     def __call__(
@@ -158,6 +157,8 @@ class RMSNorm(ReductionBase):
             layout_utils.expand(mT, dim=0, size=tiler_mn[0]) if const_expr(mT is not None) else None
             for mT in (mW, mB)
         ]
+        # Broadcast rstd/mean over the row with stride 0; only column 0 writes them, so the
+        # tile width (self.N) works even when the row is shorter.
         mRstd, mMean = [
             layout_utils.expand(mT, dim=cute.rank(mT), size=self.N)
             if const_expr(mT is not None)
@@ -256,7 +257,9 @@ class RMSNorm(ReductionBase):
             cute.is_static(shape[1]) and shape[1] == tiler_mn[1] * self.cluster_n
         )
         tXpX = (
-            copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+            copy_utils.predicate_k(
+                thr_copy_X.partition_S(cX), limit=shape[1], limit_lower_bound=self.min_N
+            )
             if not is_even_N
             else None
         )
@@ -447,6 +450,7 @@ def _rmsnorm_fwd(
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
 
 
+@functools.lru_cache(maxsize=None)
 def _get_compiled_rmsnorm_fwd(
     dtypes,
     N,
@@ -457,15 +461,14 @@ def _get_compiled_rmsnorm_fwd(
     weight_offset=0.0,
     config: Optional[RmsNormFwdConfig] = None,
 ):
-    dtype = dtypes[0]
+    # Memoized so warm calls skip the config and tiling work; cleared with _compile_rmsnorm_fwd.
     if config is None:
         config = RmsNormFwdConfig.from_analytical_heuristic(
-            N, dtype.width, is_layernorm=is_layernorm
+            N, dtypes[0].width, is_layernorm=is_layernorm
         )
     vecsize = math.gcd(N, *(128 // dt.width for dt in dtypes if dt is not None))
     config, tile_N = _fwd_tile_N(N, vecsize, config)
-    # Rows that fill the tile exactly keep a static N (no predication); shorter rows share
-    # one binary per tile width.
+    # Rows that fill the tile keep a static N; shorter rows share one kernel per tile width.
     return _compile_rmsnorm_fwd(
         *dtypes,
         tile_N,
@@ -498,6 +501,12 @@ def _compile_rmsnorm_fwd(
     weight_offset=0.0,
     config: Optional[RmsNormFwdConfig] = None,
 ):
+    # Smallest row width that shares this tile (rows are multiples of vecsize).
+    vecs_per_row = config.threads_per_row * config.cluster_n
+    min_N = tile_N if static_N else tile_N - vecsize * (vecs_per_row - 1)
+    assert config.cluster_n <= max(1, (min_N // vecsize) // config.threads_per_row), (
+        "cluster_n must be capped for every row width sharing the tile"
+    )
     batch_sym = cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
     batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
@@ -520,6 +529,7 @@ def _compile_rmsnorm_fwd(
             weight_offset=weight_offset,
             config=config,
             vecsize=vecsize,
+            min_N=None if static_N else min_N,
         ),
         x_cute,
         weight_cute,
@@ -533,6 +543,17 @@ def _compile_rmsnorm_fwd(
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
+
+
+_clear_compiled_rmsnorm_fwd = _compile_rmsnorm_fwd.cache_clear
+
+
+def _clear_rmsnorm_fwd_caches():
+    _get_compiled_rmsnorm_fwd.cache_clear()
+    _clear_compiled_rmsnorm_fwd()
+
+
+_compile_rmsnorm_fwd.cache_clear = _clear_rmsnorm_fwd_caches
 
 
 def rmsnorm_fwd(

@@ -3,9 +3,10 @@
 import pytest
 import torch
 
-from quack.cute_dsl_utils import get_device_capacity
+from quack.cute_dsl_utils import get_device_capacity, torch2cute_dtype_map
 from quack.rmsnorm import (
     _compile_rmsnorm_fwd,
+    _get_compiled_rmsnorm_fwd,
     layernorm_fwd,
     layernorm_mean_ref,
     layernorm_ref,
@@ -460,6 +461,68 @@ def test_rmsnorm_fwd_compile_cache_shares_N(input_dtype, is_layernorm):
                 rstd_ref = torch.rsqrt(x.float().square().mean(-1) + eps)
                 torch.testing.assert_close(rstd, rstd_ref, atol=1e-4, rtol=1e-3)
         assert _compile_rmsnorm_fwd.cache_info().currsize == 2
+
+
+def test_rmsnorm_fwd_compile_cache_alignment():
+    """Rows with the same tile width but different alignment get separate kernels."""
+    device = "cuda"
+    M, eps = 37, 1e-6
+    _compile_rmsnorm_fwd.cache_clear()
+    # All cover a 2176-wide tile in fp32, with vector sizes 4, 2 and 1.
+    for N in [2168, 2174, 2175, 2168, 2174, 2175]:
+        torch.random.manual_seed(N)
+        x = torch.randn(M, N, device=device, dtype=torch.float32)
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        out, _, _ = rmsnorm_fwd(x, weight, eps=eps)
+        torch.testing.assert_close(out, rmsnorm_ref(x, weight, eps=eps), atol=1e-4, rtol=1e-3)
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 3
+
+
+def test_rmsnorm_fwd_compile_cache_shares_N_residual():
+    """Rows that share a multi-CTA tile, with residual, residual_out and rstd."""
+    device = "cuda"
+    M, eps = 37, 1e-6
+    _compile_rmsnorm_fwd.cache_clear()
+    # Both cover a 20480-wide tile (cluster_n > 1 on SM90+).
+    for N in [20000, 20032]:
+        torch.random.manual_seed(N)
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+        residual = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        out, residual_out, rstd = rmsnorm_fwd(
+            x, weight, residual=residual, residual_dtype=torch.float32, store_rstd=True, eps=eps
+        )
+        out_ref, residual_out_ref = rmsnorm_ref(x, weight, residual=residual.float(), eps=eps)
+        torch.testing.assert_close(out, out_ref, atol=TOLERANCES[torch.bfloat16], rtol=1e-3)
+        torch.testing.assert_close(residual_out, residual_out_ref, atol=1e-5, rtol=1e-5)
+        rstd_ref = torch.rsqrt(residual_out_ref.square().mean(-1) + eps)
+        torch.testing.assert_close(rstd, rstd_ref, atol=1e-4, rtol=1e-3)
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 1
+
+
+def test_rmsnorm_fwd_compile_cache_shares_N_config():
+    """Rows that share a tile under an explicit config with a capped cluster and gmem reload."""
+    device = "cuda"
+    M, eps = 37, 1e-6
+    config = RmsNormFwdConfig(
+        num_threads=128, threads_per_row=128, cluster_n=4, reload_from="gmem", delay_w_load=True
+    )
+    _compile_rmsnorm_fwd.cache_clear()
+    # cluster_n is capped to 2 for both, and both cover a 4096-wide tile.
+    for N in [2056, 3000]:
+        torch.random.manual_seed(N)
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(N, device=device, dtype=torch.bfloat16)
+        out = torch.empty_like(x)
+        dtypes = (torch2cute_dtype_map[torch.bfloat16],) * 2 + (None,)
+        dtypes = dtypes + (torch2cute_dtype_map[torch.bfloat16], None, None)
+        _get_compiled_rmsnorm_fwd(dtypes, N, False, False, False, False, config=config)(
+            x, weight, None, None, out, None, None, None, eps
+        )
+        torch.testing.assert_close(
+            out, rmsnorm_ref(x, weight, eps=eps), atol=TOLERANCES[torch.bfloat16], rtol=1e-3
+        )
+    assert _compile_rmsnorm_fwd.cache_info().currsize == 1
 
 
 @pytest.mark.parametrize("use_compile", [False, True])

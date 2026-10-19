@@ -381,8 +381,12 @@ def tiled_copy_2d(
 
 
 @cute.jit
-def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
+def predicate_k(
+    tAcA: cute.Tensor, limit: Int32, limit_lower_bound: cutlass.Constexpr[Optional[int]] = None
+) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
+    # limit_lower_bound: a compile-time lower bound on a dynamic limit. Coordinates below it are
+    # in bounds, which the compiler can then prove for every column block but the last.
     tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
@@ -392,7 +396,13 @@ def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
     )
     for rest_v in cutlass.range_constexpr(tApA.shape[0]):
         for rest_k in cutlass.range_constexpr(tApA.shape[2]):
-            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+            coord = tAcA[(0, rest_v), 0, rest_k][1]
+            if const_expr(limit_lower_bound is None):
+                tApA[rest_v, 0, rest_k] = cute.elem_less(coord, limit)
+            else:
+                tApA[rest_v, 0, rest_k] = cute.elem_less(coord, limit_lower_bound) | cute.elem_less(
+                    coord, limit
+                )
     return tApA
 
 
