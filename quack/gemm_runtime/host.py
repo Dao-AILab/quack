@@ -38,6 +38,8 @@ from quack.gemm_runtime.identity import (
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
     compute_cu_tiles_m,
+    div_for_dtype,
+    fake_batched,
     launch_gemm,
     make_fake_gemm_tensors,
     make_fake_scheduler_args,
@@ -116,6 +118,7 @@ def _compile_gemm_epi(
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
+    epi_reduce=None,  # (mode, num_ranks, rank, ws_dtype): fused-comm epilogue (see quack.epi_reduce)
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
     # A-operand transform (SM90 RS / SM120 warp-MMA mainloop,
@@ -189,6 +192,25 @@ def _compile_gemm_epi(
             mA = transform_mod.fake_bundle(
                 mA, a_dtype, tile_shape_mn[0], tile_shape_mn[2] if len(tile_shape_mn) == 3 else None
             )
+        if epi_reduce is not None and epi_reduce[0] == "reduce_scatter":
+            # reduce_scatter: epilogue tensors are slab-local (slab_len / world along
+            # the slab axis) — a fresh sym for that axis, untied from the operand's; C
+            # and colvec ride the same syms as the slab-shaped D. all_reduce keeps the
+            # operand extents (C/colvec replicated full tensors, D full-M symmetric).
+            # The slab axis is D's strided axis: n-major D -> M slab, m-major -> N.
+            if d_major == "n":
+                m = cute.sym_int()
+            else:
+                n = cute.sym_int()
+            if mC is not None:
+                c_leading = 1 if c_major == "n" else 0
+                mC = fake_batched(
+                    c_dtype, m, n, l if batched else None, c_leading, div_for_dtype(c_dtype)
+                )
+            d_leading = 1 if d_major == "n" else 0
+            mD = fake_batched(
+                d_dtype, m, n, l if batched else None, d_leading, div_for_dtype(d_dtype)
+            )
     fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab or owned_fmt is not None)
     ops = _ops_by_name(GemmCls)
     fields = {}
@@ -211,7 +233,11 @@ def _compile_gemm_epi(
     epi_args = GemmCls.EpilogueArguments(**fields)
 
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l, has_ag=has_ag
+        (is_dynamic_persistent and device_capacity[0] == 9),
+        False,
+        l,
+        has_ag=has_ag,
+        has_epi_reduce=epi_reduce is not None,
     )
     varlen_args = make_fake_varlen_args(
         varlen_m,
@@ -259,6 +285,7 @@ def _compile_gemm_epi(
         a_transposed=swap_ab,
         cd_transposed=swap_ab or owned_fmt is not None,
         cd_packed=packed_cd,
+        epi_reduce=epi_reduce,
         split_k=split_k,
         split_k_mode=split_k_mode,
     )
@@ -292,6 +319,7 @@ class GemmEpiPlan(NamedTuple):
     # dicts and parsing kwargs.
     call_ops: tuple = ()
     arg_template: dict = {}
+    epi_reduce_mode: Optional[str] = None
     # Split-K (SERIAL/PARALLEL): run allocates the per-call flag/workspace
     # buffers, sized from D and the tile/cluster geometry below.
     split_k: int = 1
@@ -345,6 +373,7 @@ def build_gemm_epi_plan(
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
+    epi_reduce=None,  # (mode, num_ranks, rank, ws_dtype): fused-comm epilogue (see quack.epi_reduce)
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
     # A-operand transform handle (format name / DecodeFormat / a_transform
@@ -452,6 +481,7 @@ def build_gemm_epi_plan(
         post_init_attrs=post_init_attrs,
         packed_cd=packed_cd,
         has_ag=has_ag,
+        epi_reduce=epi_reduce,
         split_k=split_k,
         split_k_mode=split_k_mode,
         transform_a_ref=transform_ref,
@@ -493,6 +523,7 @@ def build_gemm_epi_plan(
         epi_arg_keys=epi_keys,
         tile_M=tile_M,
         cluster_M=cluster_M,
+        epi_reduce_mode=epi_reduce[0] if epi_reduce is not None else None,
         split_k=split_k,
         split_k_mode=split_k_mode,
         tile_N=tile_N,
@@ -515,6 +546,7 @@ def run_gemm_epi_plan(
     epi_values,
     *,
     ag_args=None,  # forwarded to the scheduler (AllGather+GEMM flags contract)
+    epi_reduce_args=None,  # EpiReduceArguments over torch tensors (see quack.epi_reduce)
     tile_count_semaphore=None,
     cu_seqlens_m=None,
     cu_seqlens_k=None,
@@ -554,6 +586,14 @@ def run_gemm_epi_plan(
                 plan.cluster_M,
                 plan.cluster_N,
                 plan.is_sm100_family,
+                # RS epi_reduce: D is slab-shaped (along the slab axis) but the
+                # GEMM tile grid spans the full problem; take extents from A/B.
+                len_m=A.shape[-2]
+                if getattr(plan, "epi_reduce_mode", None) == "reduce_scatter"
+                else None,
+                len_n=B.shape[-2]
+                if getattr(plan, "epi_reduce_mode", None) == "reduce_scatter"
+                else None,
             )
         sem, ws = split_k_buffers
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
@@ -566,4 +606,4 @@ def run_gemm_epi_plan(
         else None
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=cu_tiles_m)
-    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, epi_reduce_args)

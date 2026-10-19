@@ -3,6 +3,7 @@
 import enum
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Type
 
 import cutlass
@@ -15,11 +16,24 @@ from cutlass.utils import LayoutEnum
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils
 import quack.utils as utils
+from cutlass.utils.distributed import (
+    spin_lock_atom_cas_acquire_wait,
+    spin_lock_ld_lt_relaxed_wait,
+)
+
 from quack import pipeline_checks
 from quack.cute_dsl_utils import ParamsBase
 from quack.epilogue.ops import DStore, EpiSmemBytes, TileLoad, TileStore, VecReduce
+from quack.epi_reduce import (
+    EpiReduceArguments,
+    epi_reduce_flag_slot,
+    epi_reduce_slab,
+    signal_tile_broadcast,
+    signal_tile_owner,
+)
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
+from quack.rounding import RoundingMode
 from quack.sync import Semaphore
 from quack.tile_scheduler import (
     PersistenceMode,
@@ -44,6 +58,8 @@ class NamedBarrierGemm(enum.IntEnum):
     # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
     # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
     ClcThrottle = enum.auto()
+    # Reducer warp-group sync under epi_reduce_mode.
+    EpiReduce = enum.auto()
 
 
 def reinterpret_packed_fp6(mT, dtype):
@@ -97,6 +113,8 @@ class GemmBase:
     #   and applies the full epilogue math.
     split_k = 1
     split_k_mode = SplitKMode.SERIAL
+    # Fused epilogue reduction across TP ranks: None | "reduce_scatter" | "all_reduce".
+    epi_reduce_mode = None
     # mB arrives (l, k, n) and is transposed to (n, k, l) at trace time when set
     # (see rotate_batch_last); compile_gemm_kernel sets these per compiled
     # variant. All three are trace-time relabels replacing per-call host
@@ -262,7 +280,7 @@ class GemmBase:
         tRS_rC: Optional[cute.Tensor],
         tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
         tiled_copy_r2s: cute.TiledCopy,
-        tRS_sD: cute.Tensor,
+        tRS_sD: Optional[cute.Tensor],
         tiled_copy_s2r: Optional[cute.ThrCopy],
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
@@ -274,12 +292,27 @@ class GemmBase:
         tile_scheduler,
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
+        # epi_reduce_mode reducer: store D straight from registers, replacing copy_D.
+        commit_D: Optional[Callable] = None,
+        # The tile this epilogue is framed on: the CTA tile unless the caller runs it on
+        # a sub-tile (epi_reduce comm warps: a (cta_m / world, cta_n) stripe). Flows to
+        # the subtile grid, the ops (EpiContext) and the aux-store setup, next to
+        # epi_tile and tile_coord_mnkl, which index within / locate this frame.
+        # Constexpr: a plain tuple kwarg would be staged to runtime Int32s.
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         from cutlass.cute.experimental import iket
 
+        # Resolve at trace time without rebinding the argument (the DSL would stage it).
+        frame_mn = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else self.cta_tile_shape_mnk[:2]
+        )
         has_C = const_expr(tRS_rC is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
+        assert not (copy_D is not None and commit_D is not None), (
+            "copy_D (smem+TMA) and commit_D (register-direct) are alternative D store paths"
+        )
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
         inline_epi_load = const_expr(copy_C is not None)
@@ -301,15 +334,14 @@ class GemmBase:
             tile_coord_mnkl,
             varlen_manager,
             tidx,
+            tile_shape_mn=frame_mn,
         )
         if const_expr(has_D):
             store_ctxs = (
                 (DStore(), self._epi_store_quant("D"), tiled_copy_r2s, tRS_sD, copy_D, None),
             ) + store_ctxs
 
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
         epi_tile_layout = cute.make_ordered_layout(
             epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
         )
@@ -327,6 +359,7 @@ class GemmBase:
             epilogue_barrier,
             tidx,
             tRS_rD.layout,
+            tile_shape_mn=frame_mn,
         )
 
         if const_expr(self.epi_needs_acc_prepass):
@@ -427,6 +460,7 @@ class GemmBase:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn=frame_mn,
             )
             # Quantize (optional per-output codec) + convert each stored
             # output to its storage dtype. The quantize rescales the final
@@ -499,6 +533,8 @@ class GemmBase:
                         if store_pred:
                             copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
+            if const_expr(commit_D is not None):
+                commit_D(tRS_rD, epi_coord)
 
         self.epi_end(
             params,
@@ -509,6 +545,7 @@ class GemmBase:
             tile_coord_mnkl,
             varlen_manager,
             tidx,
+            tile_shape_mn=frame_mn,
         )
 
         return epi_read_state, epi_producer_state
@@ -569,6 +606,69 @@ class GemmBase:
             split_k_sem.release_store(split_idx + 1)
         else:
             split_k_sem.release_add()
+
+    @cute.jit
+    def split_rank_partial_commit(
+        self,
+        load_acc_subtile: Callable,
+        tRS_rD: cute.Tensor,
+        epi_tile: cute.Tile,
+        tiled_copy_r2s: cute.TiledCopy,
+        tRS_sWs: cute.Tensor,
+        copy_ws: Callable,
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
+        epi_read_state: Optional[cutlass.pipeline.PipelineState],
+        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        signal_tile: Callable,
+        is_tma_warp: cutlass.Boolean,
+    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        """Split-rank sibling of split_k_partial_commit: commit this rank's partial
+        into the symmetric workspace, run no epi ops (EVT/C/aux belong to the
+        reducer warps). Unlike split-K's layout-free f32 stripes, the partial is
+        stored in the workspace dtype (default d_dtype; f32 for exact partials)
+        at real (m, n) addresses — the cross-rank multimem contract — through the
+        epilogue's TMA store idiom (register-direct stores measured ~11% slower
+        at comm-bound shapes: the trickle feeding the reducer loses its
+        async-store overlap). Stage cycling restarts at 0 each tile: the
+        per-tile producer_tail below empties the ring, so no cross-tile counter.
+
+        ``signal_tile`` is the sibling of split-K's sem release, called once this
+        tile's TMA stores drain; the caller binds it to the tile's consumer set, so
+        nothing here knows about ranks or multicast.
+
+        Runs where epi_fn would (once per tile, on the local finalizing entity —
+        under local split-K the load_acc_subtile it receives is the
+        workspace-folding wrapper, so the committed partial is the rank's
+        completed local sum). epi_read_state/epi_producer_state are returned
+        unchanged, same convention as the split-K partial-commit branch."""
+        assert self.rounding_mode != RoundingMode.RS, (
+            "split_rank_partial_commit converts partials with round-to-nearest only"
+        )
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        epi_tile_layout = cute.make_ordered_layout(
+            epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
+        )
+        for epi_idx in cutlass.range_constexpr(cute.size(epi_tile_shape)):
+            epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            load_acc_subtile(tRS_rD, epi_coord)
+            if is_tma_warp:
+                epi_store_pipeline.producer_acquire()
+            epilogue_barrier.arrive_and_wait()
+            epi_buffer = epi_idx % self.epi_stage
+            copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sWs[None, None, None, epi_buffer])
+            cute.arch.fence_view_async_shared()
+            epilogue_barrier.arrive_and_wait()
+            if is_tma_warp:
+                copy_ws(src_idx=epi_buffer, dst_idx=epi_coord)
+                epi_store_pipeline.producer_commit()
+        # Drain this tile's TMA stores, then release the flag.
+        if is_tma_warp:
+            epi_store_pipeline.producer_tail()
+            signal_tile()
+        return epi_read_state, epi_producer_state
 
     @cute.jit
     def _frag_stripe_op(
@@ -756,6 +856,171 @@ class GemmBase:
                         epi_store_pipeline.producer_tail()
         return epi_read_state, epi_producer_state
 
+    @cute.jit
+    def epilogue_split_rank(
+        self,
+        params: EpilogueParams,
+        epi_fn: Callable,
+        load_acc_subtile: Callable,
+        tRS_rD: cute.Tensor,
+        epi_tile: cute.Tile,
+        epi_read_state: Optional[cutlass.pipeline.PipelineState],
+        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
+        # Also bound inside epi_fn: the closure is opaque to the protocol layer,
+        # so the shared tail's split-K drain needs the pipeline passed directly.
+        epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
+        tile_coord_mnkl: cute.Coord,
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        tidx: Int32,
+        is_tma_warp: cutlass.Boolean,
+        # Which warp group calls (static, per call site): the producer commits this
+        # rank's partial and signals; the comm warps wait, consume and run epi_fn.
+        is_producer: cutlass.Constexpr[bool] = True,
+        # epi_reduce_mode materials, unused when mode is None: the r2s copy (producer
+        # commit addressing) and the comm bundle — one collective allocation, one
+        # argument (flags, the partials workspace and its mc view). flag_ntile_mn is
+        # the real (unpadded) CTA-tile grid feeding epi_reduce_flag_slot.
+        tiled_copy_r2s: Optional[cute.TiledCopy] = None,
+        # Producer TMA commit pair (copy_D's sibling; passed directly — the epi_fn
+        # closure is opaque, like epi_store_pipeline above)
+        tRS_sWs: Optional[cute.Tensor] = None,
+        copy_ws: Optional[Callable] = None,
+        epi_reduce_args: Optional[EpiReduceArguments] = None,
+        flag_ntile_mn: Optional[Tuple[Int32, Int32]] = None,
+    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        """Split-rank protocol wrapper — the cross-rank sibling of epilogue_split_k.
+        Ranks are one more split of the reduction dim, with SPATIAL roles (warp
+        groups) where split-K's are temporal (split_idx):
+
+          epilogue_split_k                    epilogue_split_rank
+          ----------------                    -------------------
+          non-finalizer: partial_commit       producer warp group (every rank):
+            + sem release                       epilogue_split_k(epi_fn=
+                                                split_rank_partial_commit)
+                                                -> D partial + tile signal
+          finalizer: sem.wait_eq(S-1),        comm warps: wait the tile flag,
+            epi_fn(folding load_acc)            reduce a slice, commit it
+
+        Only the producer group calls this wrapper; the comm warps walk the same
+        tile sequence in their own loop, so their half of the protocol (the flag
+        wait and consume) lives there. ``epi_fn`` is the once-per-tile finalize
+        action, exactly as in epilogue_split_k: here it is the rank's partial
+        commit, and nesting through epilogue_split_k makes local split-K compose
+        (the committed partial is the rank's completed local sum). Like its
+        sibling builds ws_ptr/split_k_sem, this wrapper owns the producer's half of
+        the flag protocol: the CTA-tile flag index, the tile's owner under
+        reduce_scatter, and the TMA commit binding. Without epi_reduce_mode this is
+        a pure passthrough (world of 1 is a trivial rank split)."""
+        if const_expr(self.epi_reduce_mode is None):
+            return self.epilogue_split_k(
+                params,
+                epi_fn,
+                load_acc_subtile,
+                tRS_rD,
+                epi_tile,
+                epi_read_state,
+                epi_producer_state,
+                epi_store_pipeline,
+                tile_coord_mnkl,
+                epilogue_barrier,
+                tidx,
+                is_tma_warp,
+            )
+        assert epi_reduce_args is not None and flag_ntile_mn is not None, (
+            "epi_reduce_mode needs epi_reduce_args and flag_ntile_mn"
+        )
+        # Flag contract, shared by both branches: epi_reduce_flag_slot over the real
+        # tile grid, at the coords of the tile being announced or consumed.
+        tile_id = Int32(
+            epi_reduce_flag_slot(
+                tile_coord_mnkl[0], tile_coord_mnkl[1], tile_coord_mnkl[3], flag_ntile_mn
+            )
+        )
+        flag = epi_reduce_args.tile_flags.iterator + tile_id
+        if const_expr(is_producer):
+            assert tiled_copy_r2s is not None and tRS_sWs is not None and copy_ws is not None, (
+                "producer needs the ws commit pair and tiled_copy_r2s"
+            )
+            # A fully-OOB CTA half (partial MMA tile) stores into the workspace pad
+            # block's dead slot but has no rows to announce — in_bounds keeps its coord
+            # from aliasing the next column's flag.
+            in_bounds = tile_coord_mnkl[0] < flag_ntile_mn[0]
+
+            if const_expr(self.epi_reduce_mode == "all_reduce"):
+                signal_tile = partial(
+                    signal_tile_broadcast, epi_reduce_args.tile_flags_mc, tile_id, in_bounds
+                )
+            else:
+                owner, _ = epi_reduce_slab(
+                    tile_coord_mnkl[0], flag_ntile_mn[0] // self.num_ranks
+                )
+                signal_tile = partial(
+                    signal_tile_owner,
+                    epi_reduce_args.tile_flags_per_peer,
+                    tile_id,
+                    owner,
+                    in_bounds,
+                )
+
+            # The rank's partial commit replaces the epilogue closure as the finalize
+            # action; load_acc_subtile stays the one argument left unbound.
+            epi_fn = partial(
+                self.split_rank_partial_commit,
+                tRS_rD=tRS_rD,
+                epi_tile=epi_tile,
+                tiled_copy_r2s=tiled_copy_r2s,
+                tRS_sWs=tRS_sWs,
+                copy_ws=copy_ws,
+                epi_store_pipeline=epi_store_pipeline,
+                epi_read_state=epi_read_state,
+                epi_producer_state=epi_producer_state,
+                epilogue_barrier=epilogue_barrier,
+                signal_tile=signal_tile,
+                is_tma_warp=is_tma_warp,
+            )
+            # Nesting through epilogue_split_k composes local split-K: the
+            # committed partial is the rank's completed local sum.
+            return self.epilogue_split_k(
+                params,
+                epi_fn,
+                load_acc_subtile,
+                tRS_rD,
+                epi_tile,
+                epi_read_state,
+                epi_producer_state,
+                epi_store_pipeline,
+                tile_coord_mnkl,
+                epilogue_barrier,
+                tidx,
+                is_tma_warp,
+            )
+        else:
+            # Consumer wait — the sibling of split-K's sem.wait_eq(S-1), on the flag
+            # its producers raised. The consumer count differs with the tile's consumer
+            # set: all_reduce gives every rank its own broadcast copy, consumed once, so
+            # an atomic CAS observes world and clears it in one step. reduce_scatter
+            # gives the owner a single copy that its world CTAs share, so each waits for
+            # world and adds one, and the last of them (2 * world - 1) clears it.
+            if tidx == 0:
+                if const_expr(self.epi_reduce_mode == "all_reduce"):
+                    spin_lock_atom_cas_acquire_wait(
+                        lock_ptr=flag,
+                        expected_val=Int32(self.num_ranks),
+                        reset_val=Int32(0),
+                        scope="gpu",
+                    )
+                else:
+                    spin_lock_ld_lt_relaxed_wait(
+                        lock_ptr=flag, expected_val=self.num_ranks, scope="gpu"
+                    )
+                    seen = cute.arch.atomic_add(
+                        flag.llvm_ptr, Int32(1), sem="relaxed", scope="gpu"
+                    )
+                    if seen == 2 * self.num_ranks - 1:
+                        cute.arch.store(flag.llvm_ptr, Int32(0), sem="relaxed", scope="gpu")
+            epilogue_barrier.arrive_and_wait()
+            return epi_fn(load_acc_subtile)
+
     def get_scheduler_class(self, varlen_m: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
         return TileScheduler if not varlen_m else VarlenMTileScheduler
@@ -881,6 +1146,7 @@ class GemmBase:
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
         tRS_rD_layout=None,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> Tuple[cute.Tensor, ...]:
         return ()
 
@@ -921,6 +1187,7 @@ class GemmBase:
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> None:
         pass
 
@@ -935,11 +1202,12 @@ class GemmBase:
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> None:
         pass
 
     def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
+        self, args: EpilogueArguments, *, epi_tile=None, loc=None, ip=None
     ) -> EpilogueParams:
         return self.EpilogueParams()
 
@@ -956,6 +1224,7 @@ class GemmBase:
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
         return ()
 
@@ -987,6 +1256,7 @@ class GemmBase:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn=None,
     ):
         """Return a tuple of ``(op, quant, tiled_copy, tRS_sAuxOut,
         copy_aux_out, store_pred)`` store contexts — one per aux output (see
@@ -1125,6 +1395,7 @@ class GemmTmaBase(GemmBase):
         mC: Optional[cute.Tensor],
         epilogue_args,
         varlen_m: bool,
+        epi_tile_c: Optional[cute.Tile] = None,  # C staging tile (None: self.epi_tile)
     ):
         add_to_output = const_expr(
             hasattr(epilogue_args, "add_to_output") and epilogue_args.add_to_output
@@ -1151,7 +1422,7 @@ class GemmTmaBase(GemmBase):
                 if varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)
                 else mC,
                 self.epi_c_smem_layout_staged,
-                self.epi_tile,
+                epi_tile_c if epi_tile_c is not None else self.epi_tile,
                 op_type="load",
             )
         return (
@@ -1251,16 +1522,22 @@ class GemmTmaBase(GemmBase):
         tx_count: int,
     ):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        # Each warp will contribute 1 to the arrive count
-        consumer_arrive_cnt = self.num_epi_warps
-        # One arrive per epilogue warp (elected lane), CTA-local barrier; per_warp bound
+        # Each warp contributes 1 to the arrive count; under epi_reduce_mode the
+        # C pipeline's consumers are the reducer warps, not the epilogue warps.
+        num_consumer_warps = (
+            self.num_epi_warps
+            if const_expr(self.epi_reduce_mode is None)
+            else self.num_epi_reduce_warps
+        )
+        consumer_arrive_cnt = num_consumer_warps
+        # One arrive per consumer warp (elected lane), CTA-local barrier; per_warp bound
         # to the elect_one_release flag passed to create below.
         elect_one_release = True
         pipeline_checks.check_arrive_count(
             "epi_pipeline.consumer",
             consumer_arrive_cnt,
-            pipeline_checks.async_thread_arrives(self.num_epi_warps, per_warp=elect_one_release),
-            num_epi_warps=self.num_epi_warps,
+            pipeline_checks.async_thread_arrives(num_consumer_warps, per_warp=elect_one_release),
+            num_epi_warps=num_consumer_warps,
         )
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt

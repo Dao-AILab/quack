@@ -433,17 +433,37 @@ class AllGatherRunner:
         """
         return self.bufs[self.last_parity]
 
+    def _capture_id_now(self) -> int:
+        # GetCaptureInfo returns (status, id, graph, deps, edgeData, numDeps);
+        # [1] is the unique capture-sequence id int.
+        _, cap_id, *_ = _check(
+            runtime.cudaStreamGetCaptureInfo(torch.cuda.current_stream(self.device).cuda_stream)
+        )
+        return cap_id
+
+    def _next_parity(self) -> int:
+        """Parity the NEXT gather() call will pick (read-only). Captured calls
+        sequence from the capture-local bit; a new capture seeds it from the
+        eager state; eager calls alternate last_parity."""
+        if torch.cuda.is_current_stream_capturing():
+            in_this_capture = self._capture_id_now() == self._capture_id
+            base = self._capture_parity if in_this_capture else self.last_parity
+        else:
+            base = self.last_parity
+        return base ^ 1
+
     def next_local_slot(self) -> torch.Tensor:
-        """The local-shard slice of the buffer the NEXT gather() will use.
+        """The local-shard slice of the buffer the NEXT gather() will use,
+        eager or inside a capture (same selection as gather()).
 
         Zero-copy producer fusion: have the op producing A write directly into
         this view, then pass it as ``a_shard`` — gather() detects the aliasing
         and skips the staging copy. NOTE: writing here races with lagging peers
         of the PREVIOUS call unless the producer runs after ev_reuse; when in
-        doubt, pass a plain tensor and let gather() stage it. Tracks
-        last_parity (see gathered_a): after graph replays, quiesce() first.
+        doubt, pass a plain tensor and let gather() stage it. After graph
+        replays, quiesce() first (see gathered_a).
         """
-        buf = self.bufs[self.last_parity ^ 1]
+        buf = self.bufs[self._next_parity()]
         return buf[self.rank * self.shard_m : (self.rank + 1) * self.shard_m]
 
     @property
@@ -687,23 +707,15 @@ class AllGatherRunner:
             # quiesce(). Captured parities sequence from a capture-local
             # bit seeded from the eager state, so a capture continues the
             # eager buffer alternation.
+            parity = self._next_parity()  # before _capture_id is updated below
             if torch.cuda.is_current_stream_capturing():
-                # GetCaptureInfo returns (status, id, graph, deps, edgeData,
-                # numDeps); [1] is the unique capture-sequence id int.
-                _, cap_id, *_ = _check(
-                    runtime.cudaStreamGetCaptureInfo(
-                        torch.cuda.current_stream(self.device).cuda_stream
-                    )
-                )
+                cap_id = self._capture_id_now()
                 if cap_id != self._capture_id:  # new capture begins
                     self._capture_id = cap_id
                     self._reuse_in_capture = [False] * len(self.bufs)
-                    self._capture_parity = self.last_parity
-                self._capture_parity ^= 1
-                parity = self._capture_parity
+                self._capture_parity = parity
             else:
-                self.last_parity ^= 1
-                parity = self.last_parity
+                self.last_parity = parity
             buf = self.bufs[parity]
 
             if self.world_size == 1:
