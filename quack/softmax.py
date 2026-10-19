@@ -104,16 +104,22 @@ class Softmax(ReductionBase):
         # slice for CTAs
         gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
 
+        # For small N the row fits in registers and there is no other work to
+        # overlap the load with, so the global->smem->register cp.async round-trip
+        # is pure overhead. Load global->register directly via the synchronous
+        # CopyUniversalOp (ld.global) path instead, skipping SMEM staging.
+        direct_load = const_expr(self.N <= 8192 and self.cluster_n == 1)
+
         smem = cutlass.utils.SmemAllocator()
-        sX = smem.allocate_tensor(
-            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
-        )
+        if const_expr(not direct_load):
+            sX = smem.allocate_tensor(
+                mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+            )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         thr_copy_X = tiled_copy.get_slice(tidx)
 
         tXgX = thr_copy_X.partition_S(gX)
-        tXsX = thr_copy_X.partition_D(sX)
         tXgO = thr_copy_X.partition_D(gO)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
         tXrX, tXrO = [cute.make_rmem_tensor_like(thr) for thr in (tXgX, tXgO)]
@@ -130,15 +136,24 @@ class Softmax(ReductionBase):
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        if tXcX[0][0] < shape[0]:
-            copy(tXgX, tXsX, is_async=True)
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        # Fill OOB values with -inf
-        if const_expr(not is_even_N):
-            utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
-
-        cute.autovec_copy(tXsX, tXrX)
+        if const_expr(direct_load):
+            # Direct global->register load. Predicated-off (OOB) lanes are left
+            # untouched by the copy, so pre-fill with -inf to keep the max
+            # reduction correct.
+            if const_expr(not is_even_N):
+                utils.fill_oob(tXrX, tXpX, -tXrX.element_type.inf)
+            if tXcX[0][0] < shape[0]:
+                copy(tXgX, tXrX, is_async=False)
+        else:
+            tXsX = thr_copy_X.partition_D(sX)
+            if tXcX[0][0] < shape[0]:
+                copy(tXgX, tXsX, is_async=True)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            # Fill OOB values with -inf
+            if const_expr(not is_even_N):
+                utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
+            cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)
         if const_expr(not self.online_softmax):
             max_x = row_reduce(
