@@ -450,6 +450,8 @@ def _rmsnorm_fwd(
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
 
 
+# Unbounded: one entry per distinct (dtypes, N, flags, config), holding references to the
+# compiled kernels already kept by jit_cache.
 @functools.lru_cache(maxsize=None)
 def _get_compiled_rmsnorm_fwd(
     dtypes,
@@ -501,12 +503,16 @@ def _compile_rmsnorm_fwd(
     weight_offset=0.0,
     config: Optional[RmsNormFwdConfig] = None,
 ):
+    """Compile the forward kernel for one tile width.
+
+    Only ``_get_compiled_rmsnorm_fwd`` should build the arguments: with ``static_N=False`` the
+    kernel assumes every row width it sees is at least the tile's smallest width.
+    """
     # Smallest row width that shares this tile (rows are multiples of vecsize).
     vecs_per_row = config.threads_per_row * config.cluster_n
     min_N = tile_N if static_N else tile_N - vecsize * (vecs_per_row - 1)
-    assert config.cluster_n <= max(1, (min_N // vecsize) // config.threads_per_row), (
-        "cluster_n must be capped for every row width sharing the tile"
-    )
+    if config.cluster_n > max(1, (min_N // vecsize) // config.threads_per_row):
+        raise ValueError("cluster_n must be capped for every row width sharing the tile")
     batch_sym = cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
     batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
@@ -545,6 +551,7 @@ def _compile_rmsnorm_fwd(
     )
 
 
+# Clearing the compiled kernels must also clear the front memo, which holds references to them.
 _clear_compiled_rmsnorm_fwd = _compile_rmsnorm_fwd.cache_clear
 
 
