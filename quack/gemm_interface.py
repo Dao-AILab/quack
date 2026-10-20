@@ -548,9 +548,12 @@ def gemm_tuned(
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
     if quant_out:
         # Explicit-config calls skip the autotune prune; re-assert the SFD
-        # constraint set (see _sfd_ok in prune_invalid_gemm_configs).
+        # constraint set (see _sfd_ok in prune_invalid_gemm_configs). The prune
+        # only ever sees configs whose device_capacity tag already equals the
+        # running arch, so the faithful re-assertion branches on the DEVICE —
+        # an explicit config's tag is provenance and defaults to 9.
         assert not config.swap_ab, "Quantized output (SFD) requires an un-swapped config"
-        if config.device_capacity == 12:
+        if get_device_capacity(A.device)[0] == 12:
             if SFDCol is not None:
                 assert config.tile_m % 64 == 0, (
                     "Column-direction quantized output (SFDCol) requires tile_m % 64 == 0"

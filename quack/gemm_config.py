@@ -49,6 +49,14 @@ class GemmConfig:
     swap_ab: bool = False
     # raster_order: int = 1
     max_swizzle_size: int = 8
+    # PROVENANCE, not a device fact: "this config was tuned for this arch". It
+    # exists so per-arch tuning spaces can be filtered against the real device
+    # (gemm_interface.prune_invalid_gemm_configs, gemm_runtime.autotune) and so
+    # structural predicates (config_supports, blockscaled_config_ok) can encode
+    # arch-specific rules. It defaults to 9 and a hand-written config is used
+    # verbatim, so it does NOT track the device a call runs on: anything that
+    # needs the real capability must read it from the device
+    # (cute_dsl_utils.get_device_capacity) — see cta_tile_shape_m_for_device.
     device_capacity: int = 9
     # whether to use TMA gather (vs normal cp.async) for gather_A on SM100
     use_tma_gather: bool = False
@@ -61,11 +69,33 @@ def cta_tile_shape_m(
     SM100/SM103 an even cluster_m with MMA tiler M in {128, 256} ({256} only
     when blockscaled) selects the 2-CTA MMA, which splits tile_m across the
     CTA pair. Tile schedulers, OOB limits, and reduce-sink partial slots all
-    count M in this unit — host-side buffers sized per M tile must use it too."""
+    count M in this unit — host-side buffers sized per M tile must use it too.
+
+    ``device_capacity`` is the capability of the device the kernel will RUN on.
+    Pass ``GemmConfig.device_capacity`` only where the config has already been
+    filtered to the running arch (the autotune paths); everywhere else use
+    ``cta_tile_shape_m_for_device``."""
     if device_capacity not in (10, 11) or cluster_m % 2:
         return tile_m
     valid_2cta_m = (256,) if blockscaled else (128, 256)
     return tile_m // 2 if tile_m in valid_2cta_m else tile_m
+
+
+def cta_tile_shape_m_for_device(
+    tile_m: int, cluster_m: int, device, blockscaled: bool = False
+) -> int:
+    """``cta_tile_shape_m`` for the device a call actually runs on.
+
+    The 2-CTA split is a property of the hardware the kernel is built for, so
+    every host-side buffer sized in per-CTA M tiles must derive the capability
+    from the torch device — never from ``GemmConfig.device_capacity``, which is
+    a provenance tag that defaults to 9 and is used verbatim when a caller
+    passes a config. Reading the tag there let an SM100 call size reduce-sink
+    partials with the un-halved MMA tile while validation and the kernel used
+    the halved one."""
+    from quack.cute_dsl_utils import get_device_capacity
+
+    return cta_tile_shape_m(tile_m, cluster_m, get_device_capacity(device)[0], blockscaled)
 
 
 def blockscaled_config_ok(c: GemmConfig) -> bool:
