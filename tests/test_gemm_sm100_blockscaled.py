@@ -1255,6 +1255,33 @@ def test_mxfp8_split_k(batched, split_k, split_k_mode):
             assert torch.equal(out, out2), "serial split-K is not bitwise deterministic"
 
 
+@pytest.mark.parametrize("fmt,K", [("mxfp8", 288), ("mxfp4", 384), ("nvfp4", 384)])
+def test_blockscaled_split_k_ragged_k(fmt, K):
+    """With a ragged K only the split holding the last k-tile may skip pad-scale MMA
+    instructions; applying the skip to every split's last tile dropped valid K."""
+    _skip_if_not_sm100()
+    from quack.blockscaled.operand import BlockScaledOperand
+    from quack.blockscaled.utils import blockscaled_quantize
+    from quack.gemm_config import SplitKMode
+    from quack.gemm_interface import gemm, gemm_blockscaled_ref
+
+    M, N = 256, 256
+    torch.manual_seed(0)
+    A_q, A_sc = blockscaled_quantize(
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
+    )
+    W_q, W_sc = blockscaled_quantize(
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
+    )
+    A_op = BlockScaledOperand.from_parts(A_q, A_sc, fmt)
+    B_op = BlockScaledOperand.from_parts(W_q, W_sc, fmt).mT
+    ref = gemm_blockscaled_ref(A_op, B_op).float()
+    base = gemm(A_op, B_op, tuned=False).float()
+    out = gemm(A_op, B_op, split_k=2, split_k_mode=SplitKMode.SERIAL, tuned=False).float()
+    base_err = (base - ref).abs().max().item()
+    assert (out - ref).abs().max().item() < 2 * base_err + 5e-3
+
+
 def test_mxfp8_split_k_staged_rejected():
     """SEPARATE needs a block-scaled-reachable reduction kernel (not yet wired); it must
     raise a clear error rather than silently misconfigure."""

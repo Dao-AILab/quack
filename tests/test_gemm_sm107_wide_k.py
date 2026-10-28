@@ -1,10 +1,5 @@
 # Copyright (c) 2026, QuACK team.
-"""Rubin (sm_107) wide-K MMA forms: fp8 K=64 and fp4 K=128 instructions.
-
-GemmSm100 switches to these forms on sm_107 for M128 1-CTA and M256 2-CTA tiles;
-other tiles keep the SM100-K forms. These cases cover both tile families, a tile_n
-that is not a multiple of 128, and a K that ends in the middle of a wide instruction.
-"""
+"""Rubin wide-K MMA selection and ragged-K correctness."""
 
 import math
 
@@ -40,7 +35,7 @@ def _wide_k_selected(ab_dtype, tile, cluster, sf_vec_size=None, tile_k=0, varlen
     gemm_op = GemmDefaultSm100(
         cutlass.Float32, ab_dtype, (*tile, tile_k), (*cluster, 1), sf_vec_size=sf_vec_size
     )
-    gemm_op.a_dtype = gemm_op.b_dtype = gemm_op.a_mma_dtype = gemm_op.b_mma_dtype = ab_dtype
+    gemm_op.a_mma_dtype = gemm_op.b_mma_dtype = ab_dtype
     gemm_op.varlen_k = varlen_k
     if sf_vec_size is None:
         sm100_inst_k = 256 // ab_dtype.width
@@ -52,20 +47,18 @@ def _wide_k_selected(ab_dtype, tile, cluster, sf_vec_size=None, tile_k=0, varlen
 @pytest.mark.parametrize(
     "ab_dtype,sf_vec_size,tile,cluster,tile_k,varlen_k,expected",
     [
-        # M128 1-CTA and M256 2-CTA tiles take the wide forms ...
         (cutlass.Float8E4M3FN, None, (128, 256), (1, 1), 0, False, True),
         (cutlass.Float8E4M3FN, None, (256, 256), (2, 1), 0, False, True),
         (cutlass.Float8E4M3FN, 32, (256, 192), (2, 1), 0, False, True),
         (cutlass.Float4E2M1FN, 16, (128, 64), (1, 1), 0, False, True),
         (cutlass.Float8E4M3FN, None, (256, 256), (2, 1), 256, False, True),
-        # ... M64 1-CTA and M128 2-CTA have no wide fp8/fp4 form on Rubin.
+        # No wide fp8 form at 64 rows per CTA.
         (cutlass.Float8E4M3FN, None, (64, 256), (1, 1), 0, False, False),
         (cutlass.Float8E4M3FN, None, (128, 256), (2, 1), 0, False, False),
-        # An explicit tile K must be a multiple of the wide instruction K.
+        # tile_k=96 is only narrow-instruction aligned.
         (cutlass.Float8E4M3FN, None, (256, 256), (2, 1), 96, False, False),
-        # varlen_k mxfp8 keeps one instruction per scale block; fp4 never runs varlen_k.
+        # Arbitrary pad scales require narrow mxfp8.
         (cutlass.Float8E4M3FN, 32, (256, 256), (2, 1), 0, True, False),
-        # bf16 is unchanged (same per-clock rate as SM100).
         (cutlass.BFloat16, None, (256, 256), (2, 1), 0, False, False),
     ],
 )
@@ -81,7 +74,7 @@ def test_wide_k_selection(ab_dtype, sf_vec_size, tile, cluster, tile_k, varlen_k
         ("mxfp8", 512),
         ("mxfp8", 288),  # ends mid wide instruction
         ("mxfp4", 512),
-        ("mxfp4", 384),  # last k-tile holds one of two wide instructions
+        ("mxfp4", 384),  # One all-pad instruction in the last k-tile.
         ("nvfp4", 512),
         ("nvfp4", 640),
     ],

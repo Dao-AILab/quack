@@ -1296,10 +1296,8 @@ def s2t_get_copy_fn(
 
     :param src_tensor: The source tensor in smem
     :param dst_tensor: The destination tensor in tmem
-    :param explicit_broadcast: Spell the 4x32 copy's SMEM->TMEM replication out in
-        the source layout (``tcgen05.append_s2t_broadcast_mode``, cutlass-dsl 4.8+).
-        Required when one MMA's scale-factor mode spans several SMEM core matrices
-        (Rubin's K=128 nvfp4 instruction holds two); correct but unneeded when it spans one.
+    :param explicit_broadcast: Required for SF modes spanning multiple SMEM core matrices
+        (Rubin K=128 nvfp4 spans two).
     """
     assert src_tensor.element_type == dst_tensor.element_type
     # (MMA, MMA_MN, MMA_K, STAGE)
