@@ -344,6 +344,31 @@ class GemmSm100(GemmTmaBase):
         # Multiple of 4 warps to increase/decrease number of registers
         assert self.threads_per_cta % 128 == 0
 
+    def _use_rubin_wide_k(self, sm100_inst_k: int) -> bool:
+        """Whether to issue Rubin's native-K fp8 (K=64) / fp4 (K=128) MMA forms
+        instead of the SM100-K forms (``sm100_inst_k``), which run at half rate there."""
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        if (arch.major, arch.minor) != (10, 7) or not hasattr(
+            tcgen05, "append_s2t_broadcast_mode"
+        ):  # the Rubin MMA helpers ship with cutlass-dsl 4.8
+            return False
+        fp8 = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+        if self.blockscaled:
+            both_fp4 = sm100_inst_k == 64  # kind::mxf4nvf4, see _blockscaled_mma_inst_k
+            both_fp8 = self.a_mma_dtype in fp8 and self.b_mma_dtype in fp8
+            # A wide fp8 instruction covers two 32-wide scale blocks. varlen_k groups
+            # routinely end on an odd block, where the instruction would read the
+            # group's pad scale (arbitrary in gmem); keep one instruction per block.
+            if not (both_fp4 or (both_fp8 and not self.varlen_k)):
+                return False
+        elif not (self.a_dtype in fp8 and self.b_dtype in fp8):
+            return False
+        # An explicit tile K (0 = default) must hold a whole number of wide instructions.
+        if self.mma_tiler[2] % (2 * sm100_inst_k) != 0:
+            return False
+        # The wide-K forms need M=128 per CTA pair member: M128 1-CTA or M256 2-CTA.
+        return self.mma_tiler[0] == (256 if self.use_2cta_instrs else 128)
+
     def epi_smem_warp_shape_mnk(self):
         # Mirrors cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape:
         # the epilogue tmem layout uses two M warps and two N warps when the
@@ -377,23 +402,18 @@ class GemmSm100(GemmTmaBase):
             mma_inst_k = GemmSm100._blockscaled_mma_inst_k(self.a_dtype, self.b_dtype)
         else:
             mma_inst_k = mma_inst_bits_k // self.a_dtype.width
+        # Rubin (sm_107) doubles the instruction K of the fp8 and fp4 MMA kinds;
+        # the SM100-K forms still run there, but at half the Rubin peak rate.
+        self.rubin_wide_k = self._use_rubin_wide_k(mma_inst_k)
+        if const_expr(self.rubin_wide_k):
+            mma_inst_k *= 2
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
             mma_inst_shape_n,
             mma_inst_k,
         )
         # Configure tiled mma
-        if const_expr(not self.blockscaled):
-            self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.acc_dtype,
-                self.cta_group,
-                self.mma_inst_shape_mnk[:2],
-            )
-        else:
+        if const_expr(self.blockscaled):
             # Per-architecture support gate: each GemmSmXXX owns the asserts for
             # the (A, B, SF, D) dtype combinations it implements.
             assert GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
@@ -409,6 +429,41 @@ class GemmSm100(GemmTmaBase):
                 f"(storage {self.a_dtype}), B={self.b_mma_dtype} (storage {self.b_dtype}), "
                 f"SF={self.sf_dtype}, sf_vec_size={self.sf_vec_size}, D={self.d_dtype}"
             )
+        if const_expr(self.rubin_wide_k):
+            import cutlass.utils.rubin_helpers as sm107_utils
+
+            if const_expr(self.blockscaled):
+                self.tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
+                    self.a_mma_dtype,
+                    self.b_mma_dtype,
+                    self.a_major_mode,
+                    self.b_major_mode,
+                    self.sf_dtype,
+                    self.sf_vec_size,
+                    self.cta_group,
+                    self.mma_inst_shape_mnk,
+                )
+            else:
+                self.tiled_mma = sm107_utils.make_trivial_tiled_mma(
+                    self.a_dtype,
+                    self.b_dtype,
+                    self.a_major_mode,
+                    self.b_major_mode,
+                    self.acc_dtype,
+                    self.cta_group,
+                    self.mma_inst_shape_mnk,
+                )
+        elif const_expr(not self.blockscaled):
+            self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.acc_dtype,
+                self.cta_group,
+                self.mma_inst_shape_mnk[:2],
+            )
+        else:
             # quack's wrapper, not the DSL helper: both-fp4 pairs always run
             # the single kind::mxf4nvf4 atom with the format's scale config.
             self.tiled_mma = quack_sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -436,7 +491,10 @@ class GemmSm100(GemmTmaBase):
             )
             mma_inst_tile_k = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
         else:
-            mma_inst_tile_k = 4
+            # Keep the default k-tile at 128 B per row when Rubin doubles the instruction K:
+            # 4 wide instructions per k-tile ran 10-17% slower on Rubin for mxfp8/nvfp4
+            # 8192^3 (256x256, 2x1 cluster).
+            mma_inst_tile_k = 2 if self.rubin_wide_k else 4
         self.mma_tiler = (
             self.mma_tiler[0],
             self.mma_tiler[1],
@@ -649,8 +707,8 @@ class GemmSm100(GemmTmaBase):
                     cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
                     + cute.ceil_div(self.cta_tile_shape_mnk[1], 128)
                 )
-                * 4  # 4 cols per stage
-                * (self.mma_inst_shape_mnk[2] // self.sf_vec_size)
+                # one column per scale block of the k-tile, per 128 rows of M or N
+                * (self.mma_tiler[2] // self.sf_vec_size)
             )
             self.iter_acc_early_release = num_sf_tmem_cols // cute.size(self.epi_tile[1])
         else:
@@ -1787,8 +1845,12 @@ class GemmSm100(GemmTmaBase):
                 copy_s2t_sfa, copy_s2t_sfb = None, None
                 sf_valid_insts = None
                 if const_expr(self.blockscaled):
-                    copy_s2t_sfa = copy_utils.s2t_get_copy_fn(sSFA, tCtSFA, self.cta_group)
-                    copy_s2t_sfb = copy_utils.s2t_get_copy_fn(sSFB, tCtSFB, self.cta_group)
+                    copy_s2t_sfa = copy_utils.s2t_get_copy_fn(
+                        sSFA, tCtSFA, self.cta_group, explicit_broadcast=self.rubin_wide_k
+                    )
+                    copy_s2t_sfb = copy_utils.s2t_get_copy_fn(
+                        sSFB, tCtSFB, self.cta_group, explicit_broadcast=self.rubin_wide_k
+                    )
                     # Exploits the fact that for mxfp8 the MMA instruction K size
                     # equals the SF vec size (== 32), so one instruction consumes
                     # exactly one SF block and the mma loop can skip the
@@ -1796,11 +1858,17 @@ class GemmSm100(GemmTmaBase):
                     # the comment in self.mma). fp4 has inst_k 64 spanning
                     # multiple SF blocks, but we don't do varlen_k for
                     # mxfp4/nvfp4. Valid instructions in that tile; % maps
-                    # "aligned or full tile" to 0 = nothing to skip.
-                    if const_expr(self.mma_inst_shape_mnk[2] == self.sf_vec_size):
+                    # "aligned or full tile" to 0 = nothing to skip. Rubin's wide-K
+                    # instructions span 2+ SF blocks: only instructions that are
+                    # entirely pad are skipped, so a K that ends mid-instruction
+                    # still reads that instruction's trailing pad scale block.
+                    if const_expr(
+                        self.mma_inst_shape_mnk[2] == self.sf_vec_size or self.rubin_wide_k
+                    ):
                         num_insts = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
                         sf_valid_insts = (
-                            cute.ceil_div(k_len % self.mma_tiler[2], self.sf_vec_size) % num_insts
+                            cute.ceil_div(k_len % self.mma_tiler[2], self.mma_inst_shape_mnk[2])
+                            % num_insts
                         )
                 iket.range_push("mma")
                 ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
@@ -2287,7 +2355,11 @@ class GemmSm100(GemmTmaBase):
                 # NaN-scale products). Instruction issue is a leader-only
                 # decision, so this covers 2-CTA MMA too. fp4 has inst_k 64 (2
                 # SF blocks for mxfp4, 4 for nvfp4), but we don't do varlen_k
-                # for those formats.
+                # for those formats. Rubin's wide-K forms (rubin_wide_k) also span
+                # 2+ SF blocks and skip only all-pad instructions: a dense K ending
+                # mid-instruction reads one pad scale block, which must be finite
+                # (torch/cuBLAS blocked scales zero-pad it); varlen_k mxfp8 keeps
+                # the narrow form and the arbitrary-pad guarantee.
                 # (The set/gemm sequence is duplicated below because the DSL
                 # rejects closures capturing staged values inside a dynamic if.)
                 if const_expr(skip_sf_pad_insts):

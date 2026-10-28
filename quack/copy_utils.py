@@ -1289,12 +1289,17 @@ def s2t_get_copy_fn(
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
     cta_group: tcgen05.CtaGroup,
+    explicit_broadcast: bool = False,
 ) -> Callable:
     """
     Make tiledCopy for smem to tmem load, then return a copy function over stages.
 
     :param src_tensor: The source tensor in smem
     :param dst_tensor: The destination tensor in tmem
+    :param explicit_broadcast: Spell the 4x32 copy's SMEM->TMEM replication out in
+        the source layout (``tcgen05.append_s2t_broadcast_mode``, cutlass-dsl 4.8+).
+        Required when one MMA's scale-factor mode spans several SMEM core matrices
+        (Rubin's K=128 nvfp4 instruction holds two); correct but unneeded when it spans one.
     """
     assert src_tensor.element_type == dst_tensor.element_type
     # (MMA, MMA_MN, MMA_K, STAGE)
@@ -1305,6 +1310,8 @@ def s2t_get_copy_fn(
     copy_atom = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(cta_group), dst_tensor.element_type)
     tiled_copy = tcgen05.make_s2t_copy(copy_atom, dst_compact)
     thr_copy = tiled_copy.get_slice(0)
+    if const_expr(explicit_broadcast):
+        src_compact = tcgen05.append_s2t_broadcast_mode(copy_atom.op, src_compact)
     # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
     src_partition = tcgen05.get_s2t_smem_desc_tensor(tiled_copy, thr_copy.partition_S(src_compact))
     # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
