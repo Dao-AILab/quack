@@ -9,7 +9,7 @@ from cutlass.cutlass_dsl import Numeric, dsl_user_op
 from cutlass import const_expr
 import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 
 from quack.spec import mma as spec_mma
 

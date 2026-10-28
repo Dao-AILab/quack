@@ -10,7 +10,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cutlass_dsl import Numeric
 import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 
 
 @cute.jit
