@@ -42,6 +42,7 @@ def _compile_blockscaled_gemm(
     n,
     k,
     l,
+    **compile_kwargs,
 ):
     a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
     b_ref, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype)
@@ -60,6 +61,7 @@ def _compile_blockscaled_gemm(
         mD,
         mSFA,
         mSFB,
+        **compile_kwargs,
     )
     return (
         compiled,
@@ -531,6 +533,72 @@ def test_blockscaled_correctness(
     err = (d_torch.float() - ref).abs().max().item()
     tol = 5e-3 if d_dtype != cutlass.Float32 else 5e-4
     assert err < tol, f"max_err={err}"
+
+
+@pytest.mark.parametrize(
+    "ab_dtype,sf_dtype,sf_vec_size,mma_tiler_mn,cluster_shape_mn,m,n,k",
+    [
+        # The 2-CTA pair's second half (rows 128..255) is entirely past M.
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, (256, 256), (2, 1), 64, 512, 1280),
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, (256, 256), (2, 1), 128, 256, 128),
+        # The cluster_n peer's N tile is entirely past N.
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, (128, 256), (1, 2), 512, 64, 1280),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16, (128, 256), (1, 2), 128, 256, 512),
+        # K is a single scale block (illegal instruction before).
+        (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32, (128, 256), (1, 1), 128, 576, 32),
+    ],
+)
+def test_blockscaled_problem_smaller_than_cluster_tile(
+    ab_dtype, sf_dtype, sf_vec_size, mma_tiler_mn, cluster_shape_mn, m, n, k
+):
+    """compile_blockscaled_gemm_tvm_ffi compiled dense GEMMs with static extents, which
+    mis-tiles the scale-factor loads when a CTA-pair/cluster peer's tile is out of bounds."""
+    _skip_if_not_sm100()
+    compiled, args, (a_ref, b_ref, sfa_ref, sfb_ref, _) = _compile_blockscaled_gemm(
+        ab_dtype,
+        sf_dtype,
+        sf_vec_size,
+        cutlass.BFloat16,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        m,
+        n,
+        k,
+        1,
+    )
+    _run_blockscaled_gemm(compiled, args)
+    ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
+    err = (args[2].float() - ref).abs().max().item()
+    assert err < ref.abs().max().item() * 2**-7, f"max_err={err}"
+
+
+@pytest.mark.parametrize(
+    "ab_dtype,sf_dtype,sf_vec_size",
+    [
+        (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
+        (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
+    ],
+)
+def test_compile_helper_split_k(ab_dtype, sf_dtype, sf_vec_size):
+    """The helper's split-K runner passed one argument too many to GemmSm100.__call__."""
+    _skip_if_not_sm100()
+    compiled, args, (a_ref, b_ref, sfa_ref, sfb_ref, _) = _compile_blockscaled_gemm(
+        ab_dtype,
+        sf_dtype,
+        sf_vec_size,
+        cutlass.BFloat16,
+        (128, 128),
+        (1, 1),
+        256,
+        256,
+        2048,
+        1,
+        split_k=2,
+    )
+    _run_blockscaled_gemm(compiled, args)
+    ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
+    err = (args[2].float() - ref).abs().max().item()
+    assert err < ref.abs().max().item() * 2**-7, f"max_err={err}"
 
 
 # ---------------------------------------------------------------------------
