@@ -1788,14 +1788,8 @@ class GemmSm100(GemmTmaBase):
                 copy_s2t_sfa, copy_s2t_sfb = None, None
                 sf_valid_insts = None
                 if const_expr(self.blockscaled):
-                    # One instruction's SF mode spans several SMEM core matrices (4 blocks each).
-                    sf_bcast = self.mma_inst_shape_mnk[2] // self.sf_vec_size > 4
-                    copy_s2t_sfa = copy_utils.s2t_get_copy_fn(
-                        sSFA, tCtSFA, self.cta_group, explicit_broadcast=sf_bcast
-                    )
-                    copy_s2t_sfb = copy_utils.s2t_get_copy_fn(
-                        sSFB, tCtSFB, self.cta_group, explicit_broadcast=sf_bcast
-                    )
+                    copy_s2t_sfa = copy_utils.s2t_get_copy_fn(sSFA, tCtSFA, self.cta_group)
+                    copy_s2t_sfb = copy_utils.s2t_get_copy_fn(sSFB, tCtSFB, self.cta_group)
                     # Valid instructions in a ragged-K last tile; the mma loop skips the
                     # all-pad rest (see self.mma). % maps a full tile to 0 (nothing to skip).
                     num_insts = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
