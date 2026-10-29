@@ -43,6 +43,7 @@ from quack.tile_scheduler import (
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
+from quack.cute_dsl_utils import HAS_SM107_MMA
 from quack import layout_utils
 from quack import pipeline_checks
 import quack.copy_utils as copy_utils
@@ -351,7 +352,7 @@ class GemmSm100(GemmTmaBase):
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
         wide = (
             (arch.major, arch.minor) == (10, 7)
-            and hasattr(tcgen05, "append_s2t_broadcast_mode")  # Rubin helpers: cutlass-dsl 4.8+
+            and HAS_SM107_MMA
             and kind in (MmaKind.F8F6F4, MmaKind.MXF8F6F4, MmaKind.MXF4NVF4)
             # varlen_k groups may end mid wide instruction, whose pad scale is arbitrary.
             and not (kind is MmaKind.MXF8F6F4 and self.varlen_k)
