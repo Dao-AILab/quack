@@ -2971,6 +2971,17 @@ class ColVecSelect(EpiOp):
         ).shape[1]
         n_epi = const_expr(cute.size(epi_shape[1]))
         etN = const_expr(ctx.tile_N // n_epi)
+        # step_n is how far this thread's columns move from one N subtile to
+        # the next. It equals the subtile width etN when each subtile is one
+        # range of consecutive columns. On SM100 with tile_M=128, cluster_M=2,
+        # tile_N=256 and no C, a subtile is two ranges. Subtile 0 is columns
+        # 0-31 (epilogue warps 0 and 1) and 128-159 (warps 2 and 3). Subtile 1
+        # is columns 32-63 (warps 0 and 1) and 160-191 (warps 2 and 3). A thread
+        # holding columns 0-31 holds columns 32-63 next, so step_n is 32 while
+        # etN is 64.
+        cols = [cute.crd2idx((0, 0, 0, 0, e), tDcD.layout)[1] for e in range(n_epi)]
+        step_n = const_expr(cols[1] - cols[0] if n_epi > 1 else etN)
+        assert cols == [cols[0] + e * step_n for e in range(n_epi)], f"{cols=}"
         # Per-stripe state for the subtile bitmask: the rebased target
         # per row-slot and the Uint32 hit mask over epi_n subtiles.
         assert n_epi <= 32, "ColVecSelect: > 32 N subtiles per tile needs mask chunking"
@@ -2980,7 +2991,7 @@ class ColVecSelect(EpiOp):
         )
         tMask = cute.make_rmem_tensor(1, Uint32)
         tRel0 = cute.make_rmem_tensor(n_slots, Int32)
-        return (smem_tensor, tDrRef, tDcD, gVec, limit_m, n_off, tMask, tRel0, etN)
+        return (smem_tensor, tDrRef, tDcD, gVec, limit_m, n_off, tMask, tRel0, etN, step_n)
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
@@ -2990,7 +3001,7 @@ class ColVecSelect(EpiOp):
 
     @cute.jit
     def fn_sink_flush(self, gemm, state, frag):
-        sIdx, ref_frag, coords, gVec, limit_m, n_off, tMask, tRel0, etN, epi_coord = state
+        sIdx, ref_frag, coords, gVec, limit_m, n_off, tMask, tRel0, etN, step_n, epi_coord = state
         ref = ref_frag.layout
         frag_g = layout_utils.convert_layout_zero_stride(frag, ref)
         coords_g = layout_utils.convert_layout_zero_stride(coords, ref)
@@ -3021,7 +3032,7 @@ class ColVecSelect(EpiOp):
             # First subtile of this row-stripe (epi_m_major visits new
             # rows every subtile, so it recomputes every time and the
             # mask degenerates to a per-subtile test — still correct).
-            n_base0 = coords_g[0, 0][1] + n_off - epi_n * etN
+            n_base0 = coords_g[0, 0][1] + n_off - epi_n * step_n
             mask = Uint32(0)
             for si in cutlass.range_constexpr(n_slots):
                 offs = [cute.crd2idx((si, j), lay_n) for j in range(n_aliased)]
@@ -3030,8 +3041,8 @@ class ColVecSelect(EpiOp):
                 # bake the row bound in as a value nothing can hit.
                 t_rel = Int32(cutlass.select_(row < limit_m, Int32(sIdx[row]) - n_base0, -1))
                 tRel0[si] = t_rel
-                e = t_rel // etN
-                w = t_rel - e * etN
+                e = t_rel // step_n
+                w = t_rel - e * step_n
                 # w/e >= 0 both checked: safe under floor OR trunc
                 # division semantics for negative t_rel.
                 ok = (w >= 0) & (w <= max(offs)) & (e >= 0) & (e < n_epi)
@@ -3051,7 +3062,7 @@ class ColVecSelect(EpiOp):
                 offs_cur = [cute.crd2idx((si, j), lay_n) for j in range(n_aliased)]
                 row_cur = coords_g[si, 0][0]
                 # +1 bias folded into the immediate (see _select_packed16).
-                ir1_cur = Int32(tRel0[si] - (epi_n * etN - 1))
+                ir1_cur = Int32(tRel0[si] - (epi_n * step_n - 1))
                 self._select_packed16(frag_g, gVec, si, row_cur, ir1_cur, offs_cur, n_aliased)
 
     @cute.jit
