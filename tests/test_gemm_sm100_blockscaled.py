@@ -22,6 +22,7 @@ from quack.blockscaled.operand import (
     NVFP4,
 )
 from quack.gemm_default_epi import GemmDefaultSm100
+from quack.sm100_utils import MmaKind
 from quack.blockscaled.quantize import to_blocked
 
 
@@ -1312,7 +1313,7 @@ def test_mxfp8_split_k_staged_rejected():
 def test_mma_kind_mirrors_kernel_kind():
     """The tcgen05 kind rules are encoded at two layers that key on different
     things: quack.blockscaled.operand.mma_kind_for_pair (format names, torch
-    layer) and GemmSm100._mma_kind (storage cutlass dtypes, kernel layer). Pin
+    layer) and MmaKind.for_operands (storage cutlass dtypes, kernel layer). Pin
     the mirror so they cannot drift apart. Host-only, no GPU needed."""
     from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
     from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -1324,7 +1325,7 @@ def test_mma_kind_mirrors_kernel_kind():
                 kind = mma_kind_for_pair(fmt_a, fmt_b)
             except ValueError:
                 continue  # not hardware-representable; no instruction to agree on
-            kernel_kind = GemmDefaultSm100._mma_kind(
+            kernel_kind = MmaKind.for_operands(
                 torch2cute_dtype_map[fmt_a.qdata_dtype],
                 torch2cute_dtype_map[fmt_b.qdata_dtype],
                 blockscaled=True,

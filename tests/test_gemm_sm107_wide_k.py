@@ -16,7 +16,7 @@ from quack.blockscaled.utils import (
 )
 from quack.gemm import gemm
 from quack.gemm_default_epi import GemmDefaultSm100
-from quack.gemm_sm100 import GemmSm100
+from quack.sm100_utils import MmaKind
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
@@ -37,7 +37,7 @@ def _wide_k_selected(ab_dtype, tile, cluster, sf_vec_size=None, tile_k=0, varlen
     )
     gemm_op.varlen_k = varlen_k
     gemm_op.a_unpack = gemm_op.b_unpack = False
-    kind = GemmSm100._mma_kind(ab_dtype, ab_dtype, sf_vec_size is not None)
+    kind = MmaKind.for_operands(ab_dtype, ab_dtype, sf_vec_size is not None)
     return gemm_op._mma_inst_bits_k(kind) == 512
 
 

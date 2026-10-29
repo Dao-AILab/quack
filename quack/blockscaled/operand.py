@@ -434,7 +434,7 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
     The kind rules are encoded in three places that must stay in sync (this
     function cannot be shared: the kernel layer keys on cutlass dtypes and must
     not import torch-level format descriptors): here (format names), instruction-K
-    kind in ``GemmSm100._mma_kind`` (storage dtypes), and the per-arch
+    kind in ``MmaKind.for_operands`` (storage dtypes), and the per-arch
     subset in ``GemmSm100.is_valid_dtypes_and_scale_factor_vec_size`` (MMA
     dtypes). ``test_mma_kind_mirrors_kernel_kind`` pins the first mirror.
     """

@@ -2,7 +2,6 @@
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
 
-from enum import Enum
 from typing import Optional, Type, Tuple, Union, Callable, Literal
 from functools import partial
 import math
@@ -48,6 +47,7 @@ from quack import layout_utils
 from quack import pipeline_checks
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
+from quack.sm100_utils import MmaKind
 from quack.epilogue.quantize_out import active_row_sfd_reqs
 from quack.layout_utils import tile_atom_to_shape_SF_strided
 
@@ -121,21 +121,6 @@ Constraints:
 
 # canonical home moved to gemm_base (shared with the SM120 blockscaled path)
 from quack.gemm_base import reinterpret_packed_fp6 as _reinterpret_packed_fp6  # noqa: E402
-
-
-class MmaKind(Enum):
-    """tcgen05 MMA kinds issued by GemmSm100 (PTX ``kind::<value>``)."""
-
-    F16 = "f16"
-    TF32 = "tf32"
-    F8F6F4 = "f8f6f4"
-    MXF8F6F4 = "mxf8f6f4"
-    MXF4NVF4 = "mxf4nvf4"
-
-    @property
-    def k_element_bits(self) -> int:
-        # mxf8f6f4 reads fp4/fp6 operands from byte containers.
-        return {"f16": 16, "tf32": 32, "mxf4nvf4": 4}.get(self.value, 8)
 
 
 class GemmSm100(GemmTmaBase):
@@ -377,54 +362,6 @@ class GemmSm100(GemmTmaBase):
         )
         return 512 if wide else 256
 
-    def _make_tiled_mma(self) -> cute.TiledMma:
-        kind, inst_mnk = self.mma_kind, self.mma_inst_shape_mnk
-        if const_expr(self.mma_inst_bits_k == 512):
-            import cutlass.utils.rubin_helpers as sm107_utils
-
-            if const_expr(kind is MmaKind.F8F6F4):
-                return sm107_utils.make_trivial_tiled_mma(
-                    self.a_dtype,
-                    self.b_dtype,
-                    self.a_major_mode,
-                    self.b_major_mode,
-                    self.acc_dtype,
-                    self.cta_group,
-                    inst_mnk,
-                )
-            return sm107_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_mma_dtype,
-                self.b_mma_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.cta_group,
-                inst_mnk,
-            )
-        if const_expr(not self.blockscaled):
-            return sm100_utils.make_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.acc_dtype,
-                self.cta_group,
-                inst_mnk[:2],
-            )
-        # quack's wrapper, not the DSL helper: both-fp4 pairs always run
-        # the single kind::mxf4nvf4 atom with the format's scale config.
-        return quack_sm100_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_mma_dtype,
-            self.b_mma_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            inst_mnk[:2],
-        )
-
     def epi_smem_warp_shape_mnk(self):
         # Mirrors cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape:
         # the epilogue tmem layout uses two M warps and two N warps when the
@@ -475,7 +412,18 @@ class GemmSm100(GemmTmaBase):
                 f"(storage {self.a_dtype}), B={self.b_mma_dtype} (storage {self.b_dtype}), "
                 f"SF={self.sf_dtype}, sf_vec_size={self.sf_vec_size}, D={self.d_dtype}"
             )
-        self.tiled_mma = self._make_tiled_mma()
+        self.tiled_mma = quack_sm100_utils.make_tiled_mma(
+            self.mma_kind,
+            self.mma_inst_shape_mnk,
+            self.a_mma_dtype,
+            self.b_mma_dtype,
+            self.a_major_mode,
+            self.b_major_mode,
+            self.cta_group,
+            acc_dtype=self.acc_dtype,
+            sf_dtype=self.sf_dtype,
+            sf_vec_size=self.sf_vec_size,
+        )
 
         # Compute mma/cluster/tile shapes
         if self.mma_tiler[2] > 0:
@@ -794,7 +742,7 @@ class GemmSm100(GemmTmaBase):
         # a/b_mma_dtype. The Uint8-typed smem tensor feeds make_fragment_A/B
         # directly: the smem descriptor is built from width x stride products,
         # and the byte layout is the convention kind::mxf8f6f4 expects.
-        self.mma_kind = GemmSm100._mma_kind(self.a_dtype, self.b_dtype, self.blockscaled)
+        self.mma_kind = MmaKind.for_operands(self.a_dtype, self.b_dtype, self.blockscaled)
         self.a_unpack = self.mma_kind is MmaKind.MXF8F6F4 and self.a_dtype.width < 8
         self.b_unpack = self.mma_kind is MmaKind.MXF8F6F4 and self.b_dtype.width < 8
         self.a_smem_dtype = cutlass.Uint8 if self.a_unpack else self.a_dtype
@@ -2972,22 +2920,6 @@ class GemmSm100(GemmTmaBase):
         if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             is_valid = False
         return is_valid
-
-    @staticmethod
-    def _mma_kind(a_copy_dtype, b_copy_dtype, blockscaled: bool) -> MmaKind:
-        """kind::mxf4nvf4 is ONE atom for both-packed-fp4 pairs, parameterized by the
-        format's scale config (vec 32 e8m0 = mxfp4, vec 16 = nvfp4); every other
-        blockscaled pair (mixed, fp6) is kind::mxf8f6f4 with sub-byte operands
-        TMA-unpacked into byte-container smem. Mirrors
-        quack.blockscaled.operand.mma_kind_for_pair; test_mma_kind_mirrors_kernel_kind
-        pins the correspondence.
-        """
-        if blockscaled:
-            both_packed_fp4 = (
-                a_copy_dtype is cutlass.Float4E2M1FN and b_copy_dtype is cutlass.Float4E2M1FN
-            )
-            return MmaKind.MXF4NVF4 if both_packed_fp4 else MmaKind.MXF8F6F4
-        return {8: MmaKind.F8F6F4, 16: MmaKind.F16}.get(a_copy_dtype.width, MmaKind.TF32)
 
     @staticmethod
     def is_valid_dtypes_and_scale_factor_vec_size(
