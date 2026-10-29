@@ -39,13 +39,17 @@ class ReductionBase:
         max_cluster_n = max(1, (self.N // vecsize) // self._threads_per_row())
         self.cluster_n = min(self.cluster_n, max_cluster_n)
 
+    def _tile_N(self, vecsize: int) -> int:
+        """Row width covered by the tiles of all ``cluster_n`` CTAs."""
+        vecs_per_row = self._threads_per_row() * self.cluster_n
+        return vecsize * vecs_per_row * cute.ceil_div(self.N // vecsize, vecs_per_row)
+
     def _get_tiled_copy(self, vecsize: int = 1):
         assert self.N % vecsize == 0, f"Input N {self.N} is not divisible by vector size {vecsize}"
         threads_per_row = self._threads_per_row()
         num_threads = self._num_threads()
         assert num_threads % cute.arch.WARP_SIZE == 0
-        num_blocks_N = cute.ceil_div(self.N // vecsize, threads_per_row * self.cluster_n)
-        tiler_mn = (num_threads // threads_per_row, vecsize * num_blocks_N * threads_per_row)
+        tiler_mn = (num_threads // threads_per_row, self._tile_N(vecsize) // self.cluster_n)
         tiled_copy = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, num_threads, vecsize)
         return tiled_copy, tiler_mn, threads_per_row
 
