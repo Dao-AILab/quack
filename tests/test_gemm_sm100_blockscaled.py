@@ -1309,17 +1309,14 @@ def test_mxfp8_split_k_staged_rejected():
         )
 
 
-def test_mma_kind_mirrors_kernel_inst_k():
+def test_mma_kind_mirrors_kernel_kind():
     """The tcgen05 kind rules are encoded at two layers that key on different
     things: quack.blockscaled.operand.mma_kind_for_pair (format names, torch
-    layer) and GemmSm100._blockscaled_mma_inst_k (storage cutlass dtypes,
-    kernel layer). Pin the mirror so they cannot drift apart: every
-    hardware-representable pair must get the instruction K of its kind
-    (mxf4/mxf4nvf4 -> 64, mxf8f6f4 -> 32). Host-only, no GPU needed."""
+    layer) and GemmSm100._mma_kind (storage cutlass dtypes, kernel layer). Pin
+    the mirror so they cannot drift apart. Host-only, no GPU needed."""
     from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
     from quack.cute_dsl_utils import torch2cute_dtype_map
 
-    kind_inst_k = {"mxf4": 64, "mxf4nvf4": 64, "mxf8f6f4": 32}
     fmts = list(BLOCKSCALED_FORMAT_REGISTRY.values())
     for fmt_a in fmts:
         for fmt_b in fmts:
@@ -1327,11 +1324,12 @@ def test_mma_kind_mirrors_kernel_inst_k():
                 kind = mma_kind_for_pair(fmt_a, fmt_b)
             except ValueError:
                 continue  # not hardware-representable; no instruction to agree on
-            inst_k = GemmDefaultSm100._blockscaled_mma_inst_k(
+            kernel_kind = GemmDefaultSm100._mma_kind(
                 torch2cute_dtype_map[fmt_a.qdata_dtype],
                 torch2cute_dtype_map[fmt_b.qdata_dtype],
+                blockscaled=True,
             )
-            assert inst_k == kind_inst_k[kind], (
-                f"{fmt_a.name} x {fmt_b.name}: kind {kind} implies inst_k "
-                f"{kind_inst_k[kind]}, kernel derives {inst_k}"
+            # PTX spells the vec-32 instantiation of kind::mxf4nvf4 as kind::mxf4.
+            assert kernel_kind.value == {"mxf4": "mxf4nvf4"}.get(kind, kind), (
+                f"{fmt_a.name} x {fmt_b.name}: kind {kind}, kernel derives {kernel_kind}"
             )

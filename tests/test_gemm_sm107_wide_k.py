@@ -35,13 +35,10 @@ def _wide_k_selected(ab_dtype, tile, cluster, sf_vec_size=None, tile_k=0, varlen
     gemm_op = GemmDefaultSm100(
         cutlass.Float32, ab_dtype, (*tile, tile_k), (*cluster, 1), sf_vec_size=sf_vec_size
     )
-    gemm_op.a_mma_dtype = gemm_op.b_mma_dtype = ab_dtype
     gemm_op.varlen_k = varlen_k
-    if sf_vec_size is None:
-        sm100_inst_k = 256 // ab_dtype.width
-    else:
-        sm100_inst_k = GemmSm100._blockscaled_mma_inst_k(ab_dtype, ab_dtype)
-    return gemm_op._use_rubin_wide_k(sm100_inst_k)
+    gemm_op.a_unpack = gemm_op.b_unpack = False
+    kind = GemmSm100._mma_kind(ab_dtype, ab_dtype, sf_vec_size is not None)
+    return gemm_op._mma_inst_bits_k(kind) == 512
 
 
 @pytest.mark.parametrize(
