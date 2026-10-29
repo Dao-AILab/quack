@@ -103,20 +103,6 @@ def _make_compile_tensor_like(
     return compile_tensor
 
 
-def _make_fake_compact_tensor(
-    shape: Tuple[int, ...], dtype: Type[cutlass.Numeric], leading_dim: int
-) -> cute.Tensor:
-    logical_shape = list(shape)
-    if dtype == cutlass.Float4E2M1FN:
-        logical_shape[leading_dim] *= 2
-    return fake_tensor(
-        dtype,
-        tuple(logical_shape),
-        leading_dim=leading_dim,
-        divisibility=div_for_dtype(dtype),
-    )
-
-
 def _fp4_e2m1fn_value_table(device: torch.device) -> torch.Tensor:
     return torch.tensor(FP4_E2M1FN_VALUES, dtype=torch.float32, device=device)
 
@@ -842,15 +828,25 @@ def compile_blockscaled_gemm_tvm_ffi(
         # Detect each operand's leading (stride-1) dim so m-major A / n-major B
         # are accepted along with the default k-major. Fakes are batch-first to
         # match the kernel's calling convention (see docstring).
-        mA_bf, mB_bf, mD_bf = _batch_first(mA), _batch_first(mB), _batch_first(mD)
-        fake_mA = _make_fake_compact_tensor(
-            mA_bf.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mA_bf)
+        m_sym, n_sym, l_sym = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        k_sym = cute.sym_int(divisibility=div_for_dtype(ab_dtype) if ab_dtype.width < 8 else 1)
+        fake_mA = fake_tensor(
+            ab_dtype,
+            (l_sym, m_sym, k_sym),
+            leading_dim=_leading_dim_from_stride(_batch_first(mA)),
+            divisibility=div_for_dtype(ab_dtype),
         )
-        fake_mB = _make_fake_compact_tensor(
-            mB_bf.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mB_bf)
+        fake_mB = fake_tensor(
+            ab_dtype,
+            (l_sym, n_sym, k_sym),
+            leading_dim=_leading_dim_from_stride(_batch_first(mB)),
+            divisibility=div_for_dtype(ab_dtype),
         )
-        fake_mD = _make_fake_compact_tensor(
-            mD_bf.shape, d_dtype, leading_dim=_leading_dim_from_stride(mD_bf)
+        fake_mD = fake_tensor(
+            d_dtype,
+            (l_sym, m_sym, n_sym),
+            leading_dim=_leading_dim_from_stride(_batch_first(mD)),
+            divisibility=div_for_dtype(d_dtype),
         )
 
     if split_k_compile:
@@ -868,7 +864,7 @@ def compile_blockscaled_gemm_tvm_ffi(
             stream,
         ):
             epi = compile_epi_args._replace(split_k_semaphore=sem, split_k_workspace=ws)
-            gemm(a, b, d, None, epi, scheduler_args, varlen_args, stream, sfa, sfb, None)
+            gemm(a, b, d, None, epi, scheduler_args, varlen_args, stream, sfa, sfb)
 
         compiled = cute.compile(
             runner,
