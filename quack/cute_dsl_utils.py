@@ -4,6 +4,7 @@ from typing import Tuple, get_origin
 from functools import lru_cache
 from dataclasses import dataclass, fields
 
+import importlib.util
 import os
 import re
 
@@ -19,6 +20,20 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, Float16, BFloat16, Float32, Float8E4M3FN, Float8E5M2
 from cutlass.base_dsl.tvm_ffi_builder import spec
 from cutlass.cutlass_dsl import NumericMeta
+from cutlass.cute.nvgpu import tcgen05
+
+
+# cutlass-dsl 4.8 adds Rubin (sm_107) tcgen05 helpers (cutlass.utils.rubin_helpers) and
+# tcgen05.append_s2t_broadcast_mode. Remove these shims once QuACK requires 4.8.
+HAS_SM107_MMA = importlib.util.find_spec("cutlass.utils.rubin_helpers") is not None
+
+
+def append_s2t_broadcast_mode(op, smem_tensor):
+    """tcgen05.append_s2t_broadcast_mode where available. On older DSLs, return the tensor
+    unchanged: they lack the broadcast metadata, and only sm_107 K=128 nvfp4 needs it."""
+    if hasattr(tcgen05, "append_s2t_broadcast_mode"):
+        return tcgen05.append_s2t_broadcast_mode(op, smem_tensor)
+    return smem_tensor
 
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))

@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
+from enum import Enum
 from typing import Type, Union
 
 import cutlass
@@ -39,19 +40,75 @@ class MmaMXF4NVF4Op(tcgen05.MmaMXF4NVF4Op):
         self._verify()
 
 
-def make_blockscaled_trivial_tiled_mma(
-    a_dtype, b_dtype, a_major, b_major, sf_dtype, sf_vec_size, cta_group, mma_tiler_mn
+class MmaKind(Enum):
+    """tcgen05 MMA kinds (PTX ``kind::<value>``)."""
+
+    F16 = "f16"
+    TF32 = "tf32"
+    F8F6F4 = "f8f6f4"
+    MXF8F6F4 = "mxf8f6f4"
+    MXF4NVF4 = "mxf4nvf4"
+
+    @property
+    def k_element_bits(self) -> int:
+        """Bits per K element as the instruction reads it; mxf8f6f4 reads fp4/fp6
+        operands from byte containers."""
+        return {
+            MmaKind.F16: 16,
+            MmaKind.TF32: 32,
+            MmaKind.F8F6F4: 8,
+            MmaKind.MXF8F6F4: 8,
+            MmaKind.MXF4NVF4: 4,
+        }[self]
+
+    @staticmethod
+    def for_operands(a_dtype, b_dtype, blockscaled: bool) -> "MmaKind":
+        """kind::mxf4nvf4 is one atom for both-packed-fp4 pairs (vec 32 e8m0 = mxfp4,
+        vec 16 = nvfp4); other blockscaled pairs (mixed, fp6) are kind::mxf8f6f4. Mirrors
+        quack.blockscaled.operand.mma_kind_for_pair; test_mma_kind_mirrors_kernel_kind
+        pins the correspondence."""
+        if blockscaled:
+            both_fp4 = a_dtype is cutlass.Float4E2M1FN and b_dtype is cutlass.Float4E2M1FN
+            return MmaKind.MXF4NVF4 if both_fp4 else MmaKind.MXF8F6F4
+        return {8: MmaKind.F8F6F4, 16: MmaKind.F16, 32: MmaKind.TF32}[a_dtype.width]
+
+
+def make_tiled_mma(
+    kind: MmaKind,
+    inst_mnk,
+    a_dtype,
+    b_dtype,
+    a_major,
+    b_major,
+    cta_group,
+    acc_dtype=cutlass.Float32,
+    sf_dtype=None,
+    sf_vec_size=None,
 ) -> cute.TiledMma:
-    """Like the DSL helper, but both-fp4 pairs always run the single
-    kind::mxf4nvf4 atom with the format's scale config (the DSL helper splits
-    them into MmaMXF4Op / MmaMXF4NVF4Op by vec size)."""
-    if a_dtype is cutlass.Float4E2M1FN and b_dtype is cutlass.Float4E2M1FN:
-        op = MmaMXF4NVF4Op(
-            sf_dtype, sf_vec_size, (*mma_tiler_mn, 64), cta_group, tcgen05.OperandSource.SMEM
+    """tcgen05 tiled MMA for one instruction shape (M, N, K). K, in operand bits, selects
+    the form: 256 on SM10x, 512 for sm_107's fp8/fp4 forms."""
+    k_bits = inst_mnk[2] * kind.k_element_bits
+    if k_bits == 512:
+        import cutlass.utils.rubin_helpers as rubin_helpers  # cutlass-dsl 4.8+
+
+        if kind is MmaKind.F8F6F4:
+            return rubin_helpers.make_trivial_tiled_mma(
+                a_dtype, b_dtype, a_major, b_major, acc_dtype, cta_group, inst_mnk
+            )
+        return rubin_helpers.make_blockscaled_trivial_tiled_mma(
+            a_dtype, b_dtype, a_major, b_major, sf_dtype, sf_vec_size, cta_group, inst_mnk
         )
+    assert k_bits == 256, f"no tcgen05 kind::{kind.value} form with {k_bits}-bit K"
+    if kind is MmaKind.MXF4NVF4:
+        # One atom for both scale configs; the DSL helper splits it by vec size.
+        op = MmaMXF4NVF4Op(sf_dtype, sf_vec_size, inst_mnk, cta_group, tcgen05.OperandSource.SMEM)
         return cute.make_tiled_mma(cute.make_mma_atom(op))
-    return sm100_utils_og.make_blockscaled_trivial_tiled_mma(
-        a_dtype, b_dtype, a_major, b_major, sf_dtype, sf_vec_size, cta_group, mma_tiler_mn
+    if kind is MmaKind.MXF8F6F4:
+        return sm100_utils_og.make_blockscaled_trivial_tiled_mma(
+            a_dtype, b_dtype, a_major, b_major, sf_dtype, sf_vec_size, cta_group, inst_mnk[:2]
+        )
+    return sm100_utils_og.make_trivial_tiled_mma(
+        a_dtype, b_dtype, a_major, b_major, acc_dtype, cta_group, inst_mnk[:2]
     )
 
 

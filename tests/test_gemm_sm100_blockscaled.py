@@ -22,6 +22,7 @@ from quack.blockscaled.operand import (
     NVFP4,
 )
 from quack.gemm_default_epi import GemmDefaultSm100
+from quack.sm100_utils import MmaKind
 from quack.blockscaled.quantize import to_blocked
 
 
@@ -1255,6 +1256,33 @@ def test_mxfp8_split_k(batched, split_k, split_k_mode):
             assert torch.equal(out, out2), "serial split-K is not bitwise deterministic"
 
 
+@pytest.mark.parametrize("fmt,K", [("mxfp8", 288), ("mxfp4", 384), ("nvfp4", 384)])
+def test_blockscaled_split_k_ragged_k(fmt, K):
+    """With a ragged K only the split holding the last k-tile may skip pad-scale MMA
+    instructions; applying the skip to every split's last tile dropped valid K."""
+    _skip_if_not_sm100()
+    from quack.blockscaled.operand import BlockScaledOperand
+    from quack.blockscaled.utils import blockscaled_quantize
+    from quack.gemm_config import SplitKMode
+    from quack.gemm_interface import gemm, gemm_blockscaled_ref
+
+    M, N = 256, 256
+    torch.manual_seed(0)
+    A_q, A_sc = blockscaled_quantize(
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
+    )
+    W_q, W_sc = blockscaled_quantize(
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
+    )
+    A_op = BlockScaledOperand.from_parts(A_q, A_sc, fmt)
+    B_op = BlockScaledOperand.from_parts(W_q, W_sc, fmt).mT
+    ref = gemm_blockscaled_ref(A_op, B_op).float()
+    base = gemm(A_op, B_op, tuned=False).float()
+    out = gemm(A_op, B_op, split_k=2, split_k_mode=SplitKMode.SERIAL, tuned=False).float()
+    base_err = (base - ref).abs().max().item()
+    assert (out - ref).abs().max().item() < 2 * base_err + 5e-3
+
+
 def test_mxfp8_split_k_staged_rejected():
     """SEPARATE needs a block-scaled-reachable reduction kernel (not yet wired); it must
     raise a clear error rather than silently misconfigure."""
@@ -1282,17 +1310,14 @@ def test_mxfp8_split_k_staged_rejected():
         )
 
 
-def test_mma_kind_mirrors_kernel_inst_k():
+def test_mma_kind_mirrors_kernel_kind():
     """The tcgen05 kind rules are encoded at two layers that key on different
     things: quack.blockscaled.operand.mma_kind_for_pair (format names, torch
-    layer) and GemmSm100._blockscaled_mma_inst_k (storage cutlass dtypes,
-    kernel layer). Pin the mirror so they cannot drift apart: every
-    hardware-representable pair must get the instruction K of its kind
-    (mxf4/mxf4nvf4 -> 64, mxf8f6f4 -> 32). Host-only, no GPU needed."""
+    layer) and MmaKind.for_operands (storage cutlass dtypes, kernel layer). Pin
+    the mirror so they cannot drift apart. Host-only, no GPU needed."""
     from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
     from quack.cute_dsl_utils import torch2cute_dtype_map
 
-    kind_inst_k = {"mxf4": 64, "mxf4nvf4": 64, "mxf8f6f4": 32}
     fmts = list(BLOCKSCALED_FORMAT_REGISTRY.values())
     for fmt_a in fmts:
         for fmt_b in fmts:
@@ -1300,11 +1325,12 @@ def test_mma_kind_mirrors_kernel_inst_k():
                 kind = mma_kind_for_pair(fmt_a, fmt_b)
             except ValueError:
                 continue  # not hardware-representable; no instruction to agree on
-            inst_k = GemmDefaultSm100._blockscaled_mma_inst_k(
+            kernel_kind = MmaKind.for_operands(
                 torch2cute_dtype_map[fmt_a.qdata_dtype],
                 torch2cute_dtype_map[fmt_b.qdata_dtype],
+                blockscaled=True,
             )
-            assert inst_k == kind_inst_k[kind], (
-                f"{fmt_a.name} x {fmt_b.name}: kind {kind} implies inst_k "
-                f"{kind_inst_k[kind]}, kernel derives {inst_k}"
+            # PTX spells the vec-32 instantiation of kind::mxf4nvf4 as kind::mxf4.
+            assert kernel_kind.value == {"mxf4": "mxf4nvf4"}.get(kind, kind), (
+                f"{fmt_a.name} x {fmt_b.name}: kind {kind}, kernel derives {kernel_kind}"
             )

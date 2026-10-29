@@ -43,10 +43,12 @@ from quack.tile_scheduler import (
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
+from quack.cute_dsl_utils import HAS_SM107_MMA
 from quack import layout_utils
 from quack import pipeline_checks
 import quack.copy_utils as copy_utils
 import quack.sm100_utils as quack_sm100_utils
+from quack.sm100_utils import MmaKind
 from quack.epilogue.quantize_out import active_row_sfd_reqs
 from quack.layout_utils import tile_atom_to_shape_SF_strided
 
@@ -344,6 +346,23 @@ class GemmSm100(GemmTmaBase):
         # Multiple of 4 warps to increase/decrease number of registers
         assert self.threads_per_cta % 128 == 0
 
+    def _mma_inst_bits_k(self, kind: MmaKind) -> int:
+        """Operand bits per tcgen05 instruction along K: 256 on SM10x. sm_107 adds 512-bit
+        forms of the fp8/fp4 kinds at twice the rate, legal at 128 rows per CTA."""
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        wide = (
+            (arch.major, arch.minor) == (10, 7)
+            and HAS_SM107_MMA
+            and kind in (MmaKind.F8F6F4, MmaKind.MXF8F6F4, MmaKind.MXF4NVF4)
+            # varlen_k groups may end mid wide instruction, whose pad scale is arbitrary.
+            and not (kind is MmaKind.MXF8F6F4 and self.varlen_k)
+            # TMA-unpacked fp4/fp6 operands give wrong results with the 512-bit forms.
+            and not (self.a_unpack or self.b_unpack)
+            and self.mma_tiler[0] == (256 if self.use_2cta_instrs else 128)
+            and self.mma_tiler[2] % (512 // kind.k_element_bits) == 0
+        )
+        return 512 if wide else 256
+
     def epi_smem_warp_shape_mnk(self):
         # Mirrors cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape:
         # the epilogue tmem layout uses two M warps and two N warps when the
@@ -370,30 +389,15 @@ class GemmSm100(GemmTmaBase):
         self.epi_m_major = self.resolve_epi_m_major(epilogue_args)
 
         # Compute mma instruction shapes
-        mma_inst_bits_k = 256
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
         mma_inst_shape_n = self.mma_tiler[1] if self.mma_tiler[1] <= 256 else self.mma_tiler[1] // 2
-        if const_expr(self.blockscaled):
-            mma_inst_k = GemmSm100._blockscaled_mma_inst_k(self.a_dtype, self.b_dtype)
-        else:
-            mma_inst_k = mma_inst_bits_k // self.a_dtype.width
+        self.mma_inst_bits_k = self._mma_inst_bits_k(self.mma_kind)
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
             mma_inst_shape_n,
-            mma_inst_k,
+            self.mma_inst_bits_k // self.mma_kind.k_element_bits,
         )
-        # Configure tiled mma
-        if const_expr(not self.blockscaled):
-            self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
-                self.a_dtype,
-                self.b_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.acc_dtype,
-                self.cta_group,
-                self.mma_inst_shape_mnk[:2],
-            )
-        else:
+        if const_expr(self.blockscaled):
             # Per-architecture support gate: each GemmSmXXX owns the asserts for
             # the (A, B, SF, D) dtype combinations it implements.
             assert GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
@@ -409,18 +413,18 @@ class GemmSm100(GemmTmaBase):
                 f"(storage {self.a_dtype}), B={self.b_mma_dtype} (storage {self.b_dtype}), "
                 f"SF={self.sf_dtype}, sf_vec_size={self.sf_vec_size}, D={self.d_dtype}"
             )
-            # quack's wrapper, not the DSL helper: both-fp4 pairs always run
-            # the single kind::mxf4nvf4 atom with the format's scale config.
-            self.tiled_mma = quack_sm100_utils.make_blockscaled_trivial_tiled_mma(
-                self.a_mma_dtype,
-                self.b_mma_dtype,
-                self.a_major_mode,
-                self.b_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                self.cta_group,
-                self.mma_inst_shape_mnk[:2],
-            )
+        self.tiled_mma = quack_sm100_utils.make_tiled_mma(
+            self.mma_kind,
+            self.mma_inst_shape_mnk,
+            self.a_mma_dtype,
+            self.b_mma_dtype,
+            self.a_major_mode,
+            self.b_major_mode,
+            self.cta_group,
+            acc_dtype=self.acc_dtype,
+            sf_dtype=self.sf_dtype,
+            sf_vec_size=self.sf_vec_size,
+        )
 
         # Compute mma/cluster/tile shapes
         if self.mma_tiler[2] > 0:
@@ -436,7 +440,8 @@ class GemmSm100(GemmTmaBase):
             )
             mma_inst_tile_k = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
         else:
-            mma_inst_tile_k = 4
+            # Default k-tile: 128 bytes of K per operand row.
+            mma_inst_tile_k = 128 * 8 // self.mma_inst_bits_k
         self.mma_tiler = (
             self.mma_tiler[0],
             self.mma_tiler[1],
@@ -649,8 +654,8 @@ class GemmSm100(GemmTmaBase):
                     cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
                     + cute.ceil_div(self.cta_tile_shape_mnk[1], 128)
                 )
-                * 4  # 4 cols per stage
-                * (self.mma_inst_shape_mnk[2] // self.sf_vec_size)
+                # One column per scale block per 128 rows of M or N.
+                * (self.mma_tiler[2] // self.sf_vec_size)
             )
             self.iter_acc_early_release = num_sf_tmem_cols // cute.size(self.epi_tile[1])
         else:
@@ -738,14 +743,9 @@ class GemmSm100(GemmTmaBase):
         # a/b_mma_dtype. The Uint8-typed smem tensor feeds make_fragment_A/B
         # directly: the smem descriptor is built from width x stride products,
         # and the byte layout is the convention kind::mxf8f6f4 expects.
-        if const_expr(self.blockscaled):
-            both_packed_fp4 = (
-                self.a_dtype is cutlass.Float4E2M1FN and self.b_dtype is cutlass.Float4E2M1FN
-            )
-            self.a_unpack = self.a_dtype.width < 8 and not both_packed_fp4
-            self.b_unpack = self.b_dtype.width < 8 and not both_packed_fp4
-        else:
-            self.a_unpack, self.b_unpack = False, False
+        self.mma_kind = MmaKind.for_operands(self.a_dtype, self.b_dtype, self.blockscaled)
+        self.a_unpack = self.mma_kind is MmaKind.MXF8F6F4 and self.a_dtype.width < 8
+        self.b_unpack = self.mma_kind is MmaKind.MXF8F6F4 and self.b_dtype.width < 8
         self.a_smem_dtype = cutlass.Uint8 if self.a_unpack else self.a_dtype
         self.b_smem_dtype = cutlass.Uint8 if self.b_unpack else self.b_dtype
         self.d_dtype = mD.element_type if mD is not None else None
@@ -1763,7 +1763,9 @@ class GemmSm100(GemmTmaBase):
                 batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
                 k_len = varlen_manager.len_k(batch_idx)
                 k_tile_total = cute.ceil_div(k_len, self.mma_tiler[2])
-                _, k_tile_cnt = tile_scheduler.get_split_k_tile_range(k_tile_total, split_idx)
+                k_tile_start, k_tile_cnt = tile_scheduler.get_split_k_tile_range(
+                    k_tile_total, split_idx
+                )
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
                 acc_stage_idx = (
@@ -1789,19 +1791,16 @@ class GemmSm100(GemmTmaBase):
                 if const_expr(self.blockscaled):
                     copy_s2t_sfa = copy_utils.s2t_get_copy_fn(sSFA, tCtSFA, self.cta_group)
                     copy_s2t_sfb = copy_utils.s2t_get_copy_fn(sSFB, tCtSFB, self.cta_group)
-                    # Exploits the fact that for mxfp8 the MMA instruction K size
-                    # equals the SF vec size (== 32), so one instruction consumes
-                    # exactly one SF block and the mma loop can skip the
-                    # instructions for SF pad blocks on a ragged-K last tile (see
-                    # the comment in self.mma). fp4 has inst_k 64 spanning
-                    # multiple SF blocks, but we don't do varlen_k for
-                    # mxfp4/nvfp4. Valid instructions in that tile; % maps
-                    # "aligned or full tile" to 0 = nothing to skip.
-                    if const_expr(self.mma_inst_shape_mnk[2] == self.sf_vec_size):
-                        num_insts = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
-                        sf_valid_insts = (
-                            cute.ceil_div(k_len % self.mma_tiler[2], self.sf_vec_size) % num_insts
-                        )
+                    # Valid instructions in a ragged-K last tile; the mma loop skips the
+                    # all-pad rest (see self.mma). % maps a full tile to 0 (nothing to skip).
+                    num_insts = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
+                    sf_valid_insts = Int32(
+                        cute.ceil_div(k_len % self.mma_tiler[2], self.mma_inst_shape_mnk[2])
+                        % num_insts
+                    )
+                    # Only the split holding the global last k-tile is ragged.
+                    if k_tile_start + k_tile_cnt != k_tile_total:
+                        sf_valid_insts = Int32(0)
                 iket.range_push("mma")
                 ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
                     ab_pipeline,
@@ -2287,7 +2286,8 @@ class GemmSm100(GemmTmaBase):
                 # NaN-scale products). Instruction issue is a leader-only
                 # decision, so this covers 2-CTA MMA too. fp4 has inst_k 64 (2
                 # SF blocks for mxfp4, 4 for nvfp4), but we don't do varlen_k
-                # for those formats.
+                # for those formats. Wide forms skip only all-pad instructions; a dense K ending
+                # mid-instruction reads one pad scale block, which must be finite.
                 # (The set/gemm sequence is duplicated below because the DSL
                 # rejects closures capturing staged values inside a dynamic if.)
                 if const_expr(skip_sf_pad_insts):
@@ -2915,21 +2915,6 @@ class GemmSm100(GemmTmaBase):
         if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
             is_valid = False
         return is_valid
-
-    @staticmethod
-    def _blockscaled_mma_inst_k(a_copy_dtype, b_copy_dtype) -> int:
-        """Instruction K is a property of the MMA kind: kind::mxf4nvf4 (both
-        operands packed fp4 - ONE atom parameterized by the format's scale
-        config: vec 32 e8m0 = mxfp4, vec 16 = nvfp4) consumes 64 elements per
-        instruction; kind::mxf8f6f4 (everything else - mixed A/B pairs and fp6,
-        with sub-byte operands TMA-unpacked into byte-container smem) consumes
-        32. Mirrors quack.blockscaled.operand.mma_kind_for_pair; keep the two in
-        sync. test_mma_kind_mirrors_kernel_inst_k pins the correspondence.
-        """
-        both_packed_fp4 = (
-            a_copy_dtype is cutlass.Float4E2M1FN and b_copy_dtype is cutlass.Float4E2M1FN
-        )
-        return 64 if both_packed_fp4 else 32
 
     @staticmethod
     def is_valid_dtypes_and_scale_factor_vec_size(

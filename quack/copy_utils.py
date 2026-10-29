@@ -21,6 +21,7 @@ from cutlass.experimental import primitives as prims
 
 from quack import layout_utils
 from quack.utils import make_vector
+from quack.cute_dsl_utils import append_s2t_broadcast_mode
 
 
 Sm100MmaPeerBitMask = 0xFEFFFFFF
@@ -1305,6 +1306,8 @@ def s2t_get_copy_fn(
     copy_atom = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(cta_group), dst_tensor.element_type)
     tiled_copy = tcgen05.make_s2t_copy(copy_atom, dst_compact)
     thr_copy = tiled_copy.get_slice(0)
+    # Make the copy's SMEM->TMEM replication explicit in the source layout.
+    src_compact = append_s2t_broadcast_mode(copy_atom.op, src_compact)
     # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
     src_partition = tcgen05.get_s2t_smem_desc_tensor(tiled_copy, thr_copy.partition_S(src_compact))
     # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
