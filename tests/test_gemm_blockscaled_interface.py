@@ -25,6 +25,10 @@ from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
 from quack.blockscaled.utils import blockscaled_quantize_dim0
 from quack.gemm_interface import (
+    _fold_per_tensor_scales,
+    _prep_blockscaled,
+    _sf_batch_canonicalize,
+    _unpack_operand,
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
     gemm,
@@ -37,7 +41,10 @@ from quack.gemm_interface import (
     gemm_norm_act,
     gemm_rms,
     gemm_symmetric,
+    gemm_tuned,
+    prune_invalid_gemm_configs,
 )
+from quack.gemm_config import GemmConfig
 
 
 def _skip_if_not_sm100():
@@ -556,6 +563,161 @@ def test_blockscaled_gemm_tuned(fmt):
     ref = gemm_blockscaled_ref(A, B)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"{fmt} tuned: rel_err={rel}"
+
+
+def _gemm_with_config(A, B, config, bias=None, C=None):
+    """gemm's blockscaled operand prep, then a pinned-config launch."""
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    SFA, SFB, fmt_a, fmt_b = _prep_blockscaled(opA, opB)
+    batched = opA.data.ndim == 3
+    SFA, SFB = _sf_batch_canonicalize(SFA, SFB, batched)
+    m, n = opA.data.shape[-2], opB.data.shape[-1]
+    out = torch.empty(*opA.data.shape[:-2], m, n, device="cuda", dtype=torch.bfloat16)
+    gemm_tuned.fn(
+        opA.data,
+        opB.data,
+        out,
+        C,
+        bias=bias,
+        alpha=_fold_per_tensor_scales(1.0, opA, opB),
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=fmt_a,
+        bs_format_b=fmt_b,
+        config=config,
+    )
+    return out
+
+
+_SWAP_TILES = [(128, 64, 1), (256, 64, 2), (128, 128, 1)]
+
+
+@pytest.mark.parametrize("tile_m,tile_n,cluster_m", _SWAP_TILES)
+@pytest.mark.parametrize(
+    "fmt,k", [("mxfp8", 512), ("mxfp8", 288), ("mxfp4", 384), ("nvfp4", 512), ("nvfp4", 384)]
+)
+@pytest.mark.parametrize(
+    "m,n",
+    [
+        (1, 320),
+        (16, 512),
+        (40, 448),  # ragged tokens and weight rows
+        (64, 384),
+        (100, 200),  # tokens span two 64-wide token tiles
+    ],
+)
+def test_blockscaled_gemm_swap_ab(m, n, fmt, k, tile_m, tile_n, cluster_m):
+    """swap_ab computes D^T = B^T A^T: SFA/SFB must swap with their operands."""
+    _skip_if_not_sm100()
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    config = GemmConfig(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        cluster_m=cluster_m,
+        cluster_n=1,
+        pingpong=False,
+        swap_ab=True,
+        device_capacity=10,
+    )
+    out = _gemm_with_config(A, B, config)
+    assert _rel_err(out, gemm_blockscaled_ref(A, B)) < 5e-3
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("m,n,k", [(16, 512, 512), (40, 448, 384), (128, 256, 512)])
+def test_blockscaled_gemm_swap_ab_matches_unswapped(fmt, m, n, k):
+    """The swapped and un-swapped GEMMs sum the same scaled products per output element."""
+    _skip_if_not_sm100()
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    base = dict(tile_m=128, cluster_m=1, cluster_n=1, pingpong=False, device_capacity=10)
+    out = _gemm_with_config(A, B, GemmConfig(tile_n=128, swap_ab=False, **base))
+    out_swap = _gemm_with_config(A, B, GemmConfig(tile_n=64, swap_ab=True, **base))
+    torch.testing.assert_close(
+        out_swap, out, atol=out.float().abs().max().item() * 2**-7, rtol=2**-7
+    )
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
+def test_blockscaled_gemm_swap_ab_bias_and_c(fmt):
+    """Under swap_ab the row bias and C still land on the right axes."""
+    _skip_if_not_sm100()
+    m, n, k = 24, 320, 512
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=64,
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        swap_ab=True,
+        device_capacity=10,
+    )
+    ref = gemm_blockscaled_ref(A, B).float()
+    out = _gemm_with_config(A, B, config, bias=bias)
+    assert _rel_err(out, ref + bias.float()) < 5e-3
+    out = _gemm_with_config(A, B, config, C=C)
+    assert _rel_err(out, ref + C.float()) < 5e-3
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
+def test_blockscaled_gemm_swap_ab_batched(fmt):
+    _skip_if_not_sm100()
+    A, B = _quantized_operands(fmt, 24, 320, 512, batched=True)
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=64,
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        swap_ab=True,
+        device_capacity=10,
+    )
+    out = _gemm_with_config(A, B, config)
+    assert _rel_err(out, gemm_blockscaled_ref(A, B)) < 5e-3
+
+
+def test_nvfp4_swap_ab_per_tensor_scale():
+    """Per-tensor scales fold into alpha identically under swap_ab."""
+    _skip_if_not_sm100()
+    torch.manual_seed(0)
+    m, n, k = 16, 512, 512
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 30.0
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 30.0
+    xq = BlockScaledOperand.quantize(
+        x, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(x.float().abs().amax())
+    )
+    wq = BlockScaledOperand.quantize(
+        w, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(w.float().abs().amax())
+    )
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=64,
+        cluster_m=1,
+        cluster_n=1,
+        pingpong=False,
+        swap_ab=True,
+        device_capacity=10,
+    )
+    out = _gemm_with_config(xq, wq.mT, config)
+    assert _rel_err(out, gemm_blockscaled_ref(xq, wq.mT)) < 5e-3
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
+def test_blockscaled_gemm_tuned_small_m(fmt):
+    """The autotuned space keeps blockscaled swap_ab configs, except for mixed formats."""
+    _skip_if_not_sm100()
+    A, B = _quantized_operands(fmt, 16, 512, 512, batched=False)
+    opA, opB = _unpack_operand(A), _unpack_operand(B)
+    SFA, SFB, fmt_a, fmt_b = _prep_blockscaled(opA, opB)
+    named = dict(A=opA.data, B=opB.data, SFA=SFA, SFB=SFB, bs_format_a=fmt_a, bs_format_b=fmt_b)
+    kept = prune_invalid_gemm_configs(gemm_tuned.configs, named)
+    assert any(c.kwargs["config"].swap_ab for c in kept)
+    mixed = prune_invalid_gemm_configs(gemm_tuned.configs, {**named, "bs_format_b": "mxfp4"})
+    assert not any(c.kwargs["config"].swap_ab for c in mixed)
+    out = gemm(A, B, tuned=True)
+    assert _rel_err(out, gemm_blockscaled_ref(A, B)) < 5e-3
 
 
 def test_blockscaled_gemm_training_orientations():
