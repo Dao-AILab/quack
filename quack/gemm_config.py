@@ -76,14 +76,13 @@ def blockscaled_config_ok(c: GemmConfig) -> bool:
         # SM120 warp-MMA blockscaled (MXFP8): the SF smem layouts and fragment
         # partition helpers are whole-128-tile granular.
         return (
-            not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
+            not c.swap_ab  # blockscaled swap_ab is untested on SM120
             and c.tile_k is None  # tile_k is derived from the SF atom column
             and c.tile_m in (128, 256)
             and c.tile_n in (128, 256)
         )
     return (
         c.device_capacity in (10, 11)
-        and not c.swap_ab  # untested with blockscaled; SFA/SFB would swap too
         and c.tile_k is None  # tile_k is derived from the MMA instruction
         and c.tile_m in (128, 256)
         # SF tmem datapath is 64-N granular; tcgen05 MMA N is capped at 256

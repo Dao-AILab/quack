@@ -189,7 +189,12 @@ def _prune_for_mod(mod, transform_a, configs, named_args, **kwargs):
         if blockscaled and not blockscaled_config_ok(c):
             continue
         if c.swap_ab and (
-            not b_kn_call or varlen_or_gather or has_concat or mod.mode != "element" or mod.sinks
+            not b_kn_call
+            or varlen_or_gather
+            or has_concat
+            or blockscaled
+            or mod.mode != "element"
+            or mod.sinks
         ):
             continue
         if mod.mode == "acc_pair":

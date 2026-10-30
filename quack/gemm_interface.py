@@ -413,6 +413,9 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         configs = [conf for conf in configs if not conf.kwargs["config"].use_tma_gather]
     if kwargs.get("SFA", None) is not None:  # blockscaled (SM100 tcgen05 MMA constraints)
         configs = [conf for conf in configs if blockscaled_config_ok(conf.kwargs["config"])]
+        if kwargs.get("bs_format_a") != kwargs.get("bs_format_b"):
+            # Mixed pairs are implemented per A/B side; keep them un-swapped.
+            configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if (
         kwargs.get("SFD", None) is not None or kwargs.get("SFDCol", None) is not None
     ):  # quantized output (SM100 SFD epilogue)
@@ -540,7 +543,11 @@ def gemm_tuned(
     if blockscaled:
         assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
-        assert not config.swap_ab, "Blockscaled GEMM does not support swap_ab yet"
+        if config.swap_ab:
+            assert config.device_capacity in (10, 11), (
+                "Blockscaled swap_ab is only supported on SM100/SM110"
+            )
+            assert bs_format_a == bs_format_b, "Blockscaled swap_ab needs equal A/B formats"
     if gather_A:
         assert varlen, "gather_A requires either varlen_m or varlen_k"
         assert config.cluster_n == 1, "gather_A requires cluster_n=1"
@@ -712,10 +719,15 @@ def _gemm_execute(
             if bias is not None:
                 bias = _concat_interleave_bias(bias)
     # When swap_ab, A↔B (out/C stay, but .mT flips their strides so the kernel
-    # auto-detects the correct non-contiguous dim).
+    # auto-detects the correct non-contiguous dim). Blocked scale factors are
+    # per-operand (SFA over M rows, SFB over N rows), so they and the formats
+    # swap with their operands.
     swap = config.swap_ab
     A_d = A if not swap else B
     B_d = B if not swap else A
+    if swap:
+        SFA, SFB = SFB, SFA
+        bs_format_a, bs_format_b = bs_format_b, bs_format_a
     out_d = out if not swap else out.mT
     C_d = (C if not swap else C.mT) if C is not None else None
     rowvec_d = bias if not swap else None
