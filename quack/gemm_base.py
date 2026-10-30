@@ -1179,7 +1179,7 @@ class GemmTmaBase(GemmBase):
             (sD, tDgD_for_tma_partition) if is_s2g else (tDgD_for_tma_partition, sD)
         )
         # NOTE(l2-hints, tried July 2026): a cache_policy kwarg (PTX
-        # createpolicy Int64) flows through tma_get_copy_fn -> block_copy ->
+        # createpolicy Int64) flows through tma_get_copy_fn ->
         # cute.copy if ever needed — we wired D stores as evict_first here and
         # B loads as evict_last in the mainloop and measured a net REGRESSION
         # (-0.9% plain / -3.5% AG at TP4 16384x4096x8192 settled). Don't
@@ -1317,10 +1317,17 @@ class GemmTmaBase(GemmBase):
         16U4_ALIGN8B tensormap (SM120 mixed fp4 x fp8): each 16-element group
         lands as 8 packed-nibble bytes + 8 pad bytes of smem footprint, ready
         for the ldsm.b4x16_p64 unpacking ldmatrix."""
-        # block_copy takes compiler-driven multicast metadata at the copy site,
-        # so the TMA atom itself must stay the non-multicast variant here.
-        op = cpasync.CopyBulkTensorTileG2SOp()
+        op = (
+            cpasync.CopyBulkTensorTileG2SOp()
+            if mcast_dim == 1
+            else cpasync.CopyBulkTensorTileG2SMulticastOp()
+        )
         tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op, tensor, smem_layout, smem_tile, internal_type=internal_type
+            op,
+            tensor,
+            smem_layout,
+            smem_tile,
+            num_multicast=mcast_dim,
+            internal_type=internal_type,
         )
         return tma_atom, tma_tensor
