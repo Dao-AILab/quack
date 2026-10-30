@@ -51,25 +51,20 @@ def test_compile_pending_is_base_exception():
 
 
 def test_flock_probe_detects_exclusive_holder(tmp_path):
-    """The external-compile probe: exclusive flock held => True, free => False.
+    """The external-compile probe: exclusive lock held => True, free => False.
 
     This is what lets one xdist worker defer on a key that another worker's
     pool is already compiling, instead of burning a pool slot on a duplicate
-    compile that would just block on the same flock.
+    compile that would just block on the same lock.
     """
-    import fcntl
+    from filelock import FileLock
 
     lock_path = tmp_path / "key.lock"
     assert not _flock_held_exclusively(str(lock_path))  # nonexistent -> free
 
-    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with FileLock(str(lock_path)):
         assert _flock_held_exclusively(str(lock_path))
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        assert not _flock_held_exclusively(str(lock_path))
-    finally:
-        os.close(fd)
+    assert not _flock_held_exclusively(str(lock_path))
 
 
 def test_pool_poll_external_lifecycle(tmp_path):
@@ -80,7 +75,7 @@ def test_pool_poll_external_lifecycle(tmp_path):
     compiler would leave every waiter deferring forever (until the wedge
     deadline force-synced them one by one).
     """
-    import fcntl
+    from filelock import FileLock
 
     pool = CompilePool.__new__(CompilePool)  # skip executor spawn: bookkeeping only
     pool._futures = {}
@@ -91,9 +86,7 @@ def test_pool_poll_external_lifecycle(tmp_path):
     o_path = tmp_path / f"{sha}.o"
     lock_path = tmp_path / f"{sha}.lock"
 
-    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with FileLock(str(lock_path)):
         pool.mark_external(sha, str(o_path), str(lock_path))
         assert pool.poll(sha) == ("pending", None)  # locked, no .o yet
 
@@ -106,11 +99,9 @@ def test_pool_poll_external_lifecycle(tmp_path):
         o2 = tmp_path / f"{sha2}.o"
         pool.mark_external(sha2, str(o2), str(lock_path))
         assert pool.poll(sha2) == ("pending", None)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        assert pool.poll(sha2) == ("new", None)  # forgotten -> resubmittable
-        assert sha2 not in pool._external
-    finally:
-        os.close(fd)
+    # Released without producing a .o: the waiter must fall back to "new".
+    assert pool.poll(sha2) == ("new", None)  # forgotten -> resubmittable
+    assert sha2 not in pool._external
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +221,7 @@ _WEDGED_POOL_CONFTEST_SRC = textwrap.dedent(
 
     def pytest_configure(config):
         # Simulate a wedged pool: submissions succeed but poll never resolves
-        # — exactly what a hung pool worker (still holding the per-key flock)
+        # — exactly what a hung pool worker (still holding the per-key lock)
         # looks like to every waiter. Shrink the drain wedge deadline so the
         # escape path runs quickly.
         from quack.cache import async_compile as ac
