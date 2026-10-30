@@ -6,7 +6,14 @@ fn frontend must produce the same math the mixin produces.
 """
 
 import pytest
-from quack.epilogue.ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
+from quack.epilogue.ops import (
+    ColVecReduce,
+    OnlineLSEReduce,
+    RowVecReduce,
+    Scalar,
+    TileLoad,
+    TileStore,
+)
 from quack.epilogue.frontend import gemm_epilogue, pack, unpack
 from quack.gemm_config import cta_tile_shape_m
 from quack.gemm_runtime.host import resolve_gemm_class
@@ -36,7 +43,7 @@ from quack.epilogue.rotary import (
     rope_table_ldg_epi,
     xpos_posfreq_epi,
 )
-from quack.activation import dswiglu_oai_tanh
+from quack.activation import dswiglu_oai_tanh, swiglu
 from quack.epilogue.library import (
     amax_epi,
     dgelu_dbias_mod,
@@ -692,6 +699,60 @@ def test_epi_mod_gated_operands_and_d(cluster_M):
     gate, up = x[..., 0::2], x[..., 1::2]
     _rel_check(postact, torch.nn.functional.silu(gate) * up, "postact")
     _rel_check(D, x, "D writeback")
+
+
+@pytest.mark.parametrize("cluster_M", [1, 2])
+def test_epi_mod_gated_full_width_output(cluster_M):
+    """GemmGated as a mod plus a full-width TileStore(gated=False) output: the fn
+    returns the raw acc Pair, stored interleaved like D, and postact is unchanged."""
+
+    # preact first: outputs keep declaration order, not grouped by width
+    @gemm_epilogue(outputs=(TileStore("preact", gated=False), "postact"), mode="acc_pair")
+    def swiglu_preact_mod(acc):
+        gate, up = unpack(acc)
+        return {"D": acc * 2.0, "postact": swiglu(gate, up), "preact": acc}
+
+    device = "cuda"
+    torch.random.manual_seed(6)
+    l, m, N, k = 2, 512, 2048, 736
+    A = torch.randn((l, m, k), dtype=torch.bfloat16, device=device) / math.sqrt(k) * 4
+    B = torch.randn((l, N, k), dtype=torch.bfloat16, device=device) / math.sqrt(k) * 4
+    D = torch.empty((l, m, N), dtype=torch.bfloat16, device=device)
+    postact = torch.empty((l, m, N // 2), dtype=torch.bfloat16, device=device)
+    preact = torch.empty((l, m, N), dtype=torch.bfloat16, device=device)
+
+    swiglu_preact_mod.gemm(
+        A,
+        B,
+        D,
+        epi_args=dict(postact=postact, preact=preact),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=cluster_M,  # see cluster_M note on test_epi_mod_gated_swiglu
+        cluster_N=1,
+    )
+
+    x = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
+    gate, up = x[..., 0::2], x[..., 1::2]
+    ref = torch.nn.functional.silu(gate) * up
+    # D is 2 * acc, so a preact store that reused D's registers would not match
+    assert torch.equal(D, preact * 2)
+    _rel_check(preact, x, "preact")
+    _rel_check(postact, ref, "postact")
+
+    postact2 = torch.empty_like(postact)
+    swiglu_mod.gemm(
+        A,
+        B,
+        None,
+        epi_args=dict(postact=postact2),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=cluster_M,
+        cluster_N=1,
+    )
+    # The full-width output leaves postact untouched.
+    assert torch.equal(postact, postact2)
 
 
 def _dswiglu_torch_ref(x, y, dout):
