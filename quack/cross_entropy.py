@@ -77,6 +77,7 @@ class CrossEntropy(ReductionBase):
         mLSE: Optional[cute.Tensor],  # (M,)
         mdX: Optional[cute.Tensor],  # (M, N) - if provided, compute gradient
         mWeight: Optional[cute.Tensor],
+        mTokenWeights: Optional[cute.Tensor],
         ignore_index: Int32,  # Index to ignore in loss computation
         stream: cuda.CUstream,
     ):
@@ -100,6 +101,7 @@ class CrossEntropy(ReductionBase):
             mLSE,
             mdX,
             mWeight,
+            mTokenWeights,
             ignore_index,
             tiler_mn,
             tiled_copy,
@@ -121,6 +123,7 @@ class CrossEntropy(ReductionBase):
         mLSE: Optional[cute.Tensor],  # (M,)
         mdX: Optional[cute.Tensor],  # (M, N) - if provided, compute gradient
         mWeight: Optional[cute.Tensor],
+        mTokenWeights: Optional[cute.Tensor],
         ignore_index: Int32,  # Index to ignore in loss computation
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
@@ -170,6 +173,9 @@ class CrossEntropy(ReductionBase):
                     target_weight = Float32(mWeight[target])
             else:
                 target_weight = 1.0
+            if const_expr(mTokenWeights is not None):
+                if target != ignore_index:
+                    target_weight *= Float32(mTokenWeights[row])
 
         if row < shape[0]:
             copy(tXgX, tXsX, is_async=True)
@@ -259,7 +265,7 @@ class CrossEntropy(ReductionBase):
             if not should_ignore:
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                     tXrdX_f32[i] = tXrdX_f32[i] if tXcFull[i][1] != target else tXrdX_f32[i] - 1.0
-            if const_expr(mWeight is not None):
+            if const_expr(mWeight is not None or mTokenWeights is not None):
                 tXrdX_f32.store(tXrdX_f32.load() * target_weight)
             tXrdX = tXrdX_f32.to(tXgdX.element_type)
             if row < shape[0]:
@@ -276,6 +282,7 @@ class CrossEntropy(ReductionBase):
         has_dx,
         weight_dtype,
         target_logit_ndim,
+        token_weights_dtype=None,
     ):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
@@ -294,6 +301,11 @@ class CrossEntropy(ReductionBase):
         loss_cute = fake_tensor(Float32, (batch_sym,))
         lse_cute = fake_tensor(Float32, (batch_sym,)) if has_lse else None
         weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
+        token_weights_cute = (
+            fake_tensor(token_weights_dtype, (batch_sym,))
+            if token_weights_dtype is not None
+            else None
+        )
         # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
         return cute.compile(
             CrossEntropy(dtype, N, online_softmax=not has_dx),
@@ -304,6 +316,7 @@ class CrossEntropy(ReductionBase):
             lse_cute,
             dx_cute,
             weight_cute,
+            token_weights_cute,
             Int32(0),  # ignore_index, just for compilation
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
@@ -320,6 +333,7 @@ def cross_entropy_fwd_out(
     dx: Optional[Tensor],
     weight: Optional[Tensor],
     ignore_index: int = -100,
+    token_weights: Optional[Tensor] = None,
 ) -> None:
     """Cross entropy forward pass.
 
@@ -333,6 +347,7 @@ def cross_entropy_fwd_out(
         dx: Optional output gradient tensor of shape (M, N)
         weight: Optional weight vector of shape (N,)
         ignore_index: Index to ignore in loss computation
+        token_weights: Optional nondifferentiated row weights of shape (M,).
 
     Returns:
         None (mutates loss, lse, and optionally dx in-place)
@@ -343,6 +358,11 @@ def cross_entropy_fwd_out(
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
     if target_logit is not None:
         assert target_logit.dtype in [torch.float16, torch.bfloat16, torch.float32]
+    if token_weights is not None:
+        assert token_weights.shape == target.shape
+        assert token_weights.device == x.device
+        assert token_weights.dtype in [torch.float16, torch.bfloat16, torch.float32]
+        assert token_weights.is_contiguous()
     if x.size(0) == 0:
         return
     N = x.size(1)
@@ -362,7 +382,8 @@ def cross_entropy_fwd_out(
         dx is not None,
         weight_dtype,
         target_logit_ndim,
-    )(x, target, target_logit, loss, lse, dx, weight, Int32(ignore_index))
+        torch2cute_dtype_map[token_weights.dtype] if token_weights is not None else None,
+    )(x, target, target_logit, loss, lse, dx, weight, token_weights, Int32(ignore_index))
 
 
 def cross_entropy_fwd(

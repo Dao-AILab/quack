@@ -15,6 +15,7 @@ from quack.cross_entropy import cross_entropy, cross_entropy_fwd_out
 from quack.epilogue.scaled_exp import scaled_exp_target_epi
 from quack.epilogue.library import identity_epi, lse_target_epi
 from quack.epilogue.frontend import gemm_epilogue
+from quack.epilogue.ops import ColVecLoad
 from quack.gemm_interface import gemm, gemm_add, gemm_add_inplace
 from quack.linear import linear_fwd_convert_type
 from quack.operand_transform import a_transform
@@ -57,6 +58,7 @@ def chunked_linear_cross_entropy_fwd(
     tuned: bool = True,
     need_dx: bool = True,
     need_dw: bool = True,
+    token_weights: Optional[Tensor] = None,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """
     Chunked forward pass for linear cross entropy.
@@ -110,6 +112,9 @@ def chunked_linear_cross_entropy_fwd(
             dx=dlogits_chunk,
             weight=None,
             ignore_index=ignore_index,
+            token_weights=token_weights[i * chunk_size : i * chunk_size + chunk_len]
+            if token_weights is not None
+            else None,
         )
         if need_dx:
             # Compute dx for this chunk: dlogits @ weight
@@ -143,6 +148,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         reduction: Literal["mean", "sum"] = "mean",
         chunk_size: int = 4096,
         tuned: bool = True,
+        token_weights: Optional[Tensor] = None,
     ):
         """
         Forward pass computes loss and stores dx and dw for backward.
@@ -162,6 +168,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
             tuned=tuned,
             need_dx=need_dx,
             need_dw=need_dw,
+            token_weights=token_weights.reshape(-1) if token_weights is not None else None,
         )
         loss_sum = loss.sum()
         loss_scale = None if reduction == "sum" else 1.0 / (target != ignore_index).sum().float()
@@ -218,7 +225,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
                     out_dtype=ctx.weight_dtype,
                     tuned=tuned,
                 )
-        return dx, dw, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None
 
 
 # ── scaled-exp fused backward ─────────────────────────────────────
@@ -257,7 +264,7 @@ def _lce_dw_scale(x, u):
     return x * u
 
 
-@gemm_epilogue()
+@gemm_epilogue(ops={"v": ColVecLoad("v")})
 def _lce_vscale_epi(acc, v):
     """Per-row fp32 v = grad_scale * 2^{k_r} e^{-L}, fused into the dx store."""
     return {"D": acc * v}
@@ -280,6 +287,7 @@ def _lce_glue_row(
     v_ptr,
     xs_ptr,
     scale_ptr,
+    token_weights_ptr,
     M,
     T,
     D,
@@ -288,6 +296,7 @@ def _lce_glue_row(
     ignore_index,
     TILE_N1: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    HAS_TOKEN_WEIGHTS: tl.constexpr,
     WRITE_XS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -301,17 +310,20 @@ def _lce_glue_row(
     L = k_r * _LN2 + tl.log(tl.sum(se * tl.exp2(k - k_r), 0))
     y = tl.load(target_ptr + i)
     valid = y != ignore_index
+    token_weight = 1.0
+    if HAS_TOKEN_WEIGHTS:
+        token_weight = tl.load(token_weights_ptr + i, mask=valid, other=0.0).to(tl.float32)
     # exact target logit emitted by the gemm1 epilogue (ColVecSelect): the
     # same fp32 accumulator value E was computed from. Never written (and
     # never read) for ignored rows.
     Zy = tl.load(zy_ptr + i, mask=valid, other=0.0)
-    tl.store(loss_ptr + i, tl.where(valid, L - Zy, 0.0))
+    tl.store(loss_ptr + i, tl.where(valid & (token_weight != 0.0), token_weight * (L - Zy), 0.0))
     tl.store(kr_ptr + i, k_r)
     # target fix: E[i, y] = (p_y - 1) / s, cancellation in fp32
     ky = tl.load(max_log2_ptr + i * T + y // TILE_N1, mask=valid, other=0.0)
     fix = (tl.exp(Zy - L) - 1.0) * tl.exp(L - ky * _LN2)
     tl.store(E_ptr + i * V + y, fix.to(tl.bfloat16), mask=valid)
-    v = tl.where(valid, tl.exp(k_r * _LN2 - L), 0.0)
+    v = tl.where(valid & (token_weight != 0.0), token_weight * tl.exp(k_r * _LN2 - L), 0.0)
     if HAS_SCALE:
         v = v * tl.load(scale_ptr)
     tl.store(v_ptr + i, v)
@@ -369,6 +381,7 @@ def lce_glue(
     tile_n1,
     ignore_index=-100,
     grad_scale=None,
+    token_weights=None,
 ):
     """Fused Triton glue between gemm1 and the two strip-transform grad GEMMs.
     Per chunk of M rows it turns the epilogue's raw emissions — the k offsets
@@ -376,11 +389,14 @@ def lce_glue(
     the exact fp32 target logits Zy (ColVecSelect) — into everything the grad
     GEMMs consume:
 
-      loss[i] = L_i - Zy_i                       (0 for ignored rows)
+      loss[i] = a_i * (L_i - Zy_i)                       (0 for ignored rows)
       E[i, y_i] = (e^{Zy-L} - 1) * e^{L - k_y ln2}   (the target fix, in place)
       strip[v64, i] = 2^(k[i, v64 // REP] - k_r[i])  (exact pow2)
-      v[i] = grad_scale * 2^{k_r} * e^{-L}       (0 for ignored rows)
+      v[i] = a_i * grad_scale * 2^{k_r} * e^{-L}       (0 for ignored rows)
       xs = bf16(v) * x                           (the dw GEMM's B operand)
+
+    a_i is token_weights[i] when supplied, otherwise 1. It is independent
+    of grad_scale; ignored rows never load a token weight.
 
     Exactness: k and Zy are READ from the epilogue, not re-derived — there is
     no rounding convention to match, and the target-fix term uses the same
@@ -414,6 +430,7 @@ def lce_glue(
         v_row,
         xs if xs is not None else v_row,
         grad_scale if grad_scale is not None else v_row,
+        token_weights if token_weights is not None else v_row,
         M,
         T,
         D,
@@ -422,6 +439,7 @@ def lce_glue(
         ignore_index,
         TILE_N1=tile_n1,
         HAS_SCALE=grad_scale is not None,
+        HAS_TOKEN_WEIGHTS=token_weights is not None,
         WRITE_XS=xs is not None,
         BLOCK_T=triton.next_power_of_2(T),
         BLOCK_D=256,
@@ -487,6 +505,7 @@ def scaled_exp_linear_cross_entropy_fwd(
     need_dw: bool = True,
     grad_scale: Optional[Tensor] = None,  # fp32 scalar folded into dx/dw (e.g. 1/num_valid)
     tile_n1: Optional[int] = None,
+    token_weights: Optional[Tensor] = None,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """Chunked scaled-exp forward. Returns (loss, dx, dw) over M_pad >= M rows
     (the last chunk is padded to a 128 multiple with ignored rows: their x is
@@ -524,7 +543,7 @@ def scaled_exp_linear_cross_entropy_fwd(
     if strips and num_chunks > 1 and r_pad != chunk_size:
         strip_last = torch.empty(rk, r_pad, device=device, dtype=x.dtype)
     xs = torch.empty(cs, d, device=device, dtype=x.dtype) if need_dw else None
-    x_last, target_last = None, None
+    x_last, target_last, token_weights_last = None, None, None
     if r_pad != r:
         # Pad rows are exact by construction: x = 0 keeps gemm1/E/strip finite
         # (acc 0 -> k 0, E 1, strip 1) and target = ignore_index zeroes their
@@ -533,6 +552,9 @@ def scaled_exp_linear_cross_entropy_fwd(
         x_last[:r].copy_(x[M - r :])
         target_last = torch.full((r_pad,), ignore_index, device=device, dtype=target.dtype)
         target_last[:r].copy_(target[M - r :])
+        if token_weights is not None:
+            token_weights_last = torch.zeros(r_pad, device=device, dtype=token_weights.dtype)
+            token_weights_last[:r].copy_(token_weights[M - r :])
 
     g1_pingpong = tile_n1 <= 208  # pingpong hides the two-phase epilogue
     tile_n2 = 192 if d % 192 == 0 else 256  # dx/dw strip GEMM tile_N over d
@@ -542,9 +564,13 @@ def scaled_exp_linear_cross_entropy_fwd(
         n_rows = r_pad if last else chunk_size
         if last and x_last is not None:
             x_c, target_c = x_last, target_last
+            token_weights_c = token_weights_last
         else:
             x_c = x[start : start + n_rows]
             target_c = target[start : start + n_rows]
+            token_weights_c = (
+                token_weights[start : start + n_rows] if token_weights is not None else None
+            )
         mE = E[:n_rows]
         sum_exp_c, kk_c, zy_c, v_c = sum_exp[:n_rows], kk[:n_rows], zy[:n_rows], v_row[:n_rows]
         strip_c = strip_last if last else strip
@@ -580,6 +606,7 @@ def scaled_exp_linear_cross_entropy_fwd(
             tile_n1,
             ignore_index=ignore_index,
             grad_scale=grad_scale,
+            token_weights=token_weights_c,
         )
         if need_dx:
             bundle = transform_a_operand(_lce_dx_scale, mE, {"u": strip_c}, 128, 64)
@@ -626,6 +653,7 @@ def _lce_scaled_exp_fwd_op(
     need_dw: bool,
     grad_scale: Optional[Tensor],
     tile_n1: Optional[int],
+    token_weights: Optional[Tensor] = None,
 ) -> list[Tensor]:
     """The whole chunked scaled-exp forward as ONE custom op, so torch.compile
     records a single graph node instead of tracing the host chunk loop
@@ -641,13 +669,23 @@ def _lce_scaled_exp_fwd_op(
         need_dw=need_dw,
         grad_scale=grad_scale,
         tile_n1=tile_n1,
+        token_weights=token_weights,
     )
     return [loss] + ([dx] if need_dx else []) + ([dw] if need_dw else [])
 
 
 @_lce_scaled_exp_fwd_op.register_fake
 def _lce_scaled_exp_fwd_fake(
-    x, weight, target, chunk_size, ignore_index, need_dx, need_dw, grad_scale, tile_n1
+    x,
+    weight,
+    target,
+    chunk_size,
+    ignore_index,
+    need_dx,
+    need_dw,
+    grad_scale,
+    tile_n1,
+    token_weights=None,
 ):
     # Mirrors scaled_exp_linear_cross_entropy_fwd's padding arithmetic exactly.
     M, d = x.shape
@@ -663,13 +701,24 @@ def _lce_scaled_exp_fwd_fake(
     return outs
 
 
-def _scaled_exp_lce_loss_only(x: Tensor, weight: Tensor, target: Tensor, ignore_index: int):
+def _scaled_exp_lce_loss_only(
+    x: Tensor,
+    weight: Tensor,
+    target: Tensor,
+    ignore_index: int,
+    token_weights: Optional[Tensor] = None,
+):
     # D-less eval: the logits are never materialized — lse_target_epi emits
     # online-LSE partials (host-finalized) and the exact target logit only.
     # Ignored rows' target_logit is never written (ColVecSelect skips
     # out-of-range indices); torch.where discards the uninitialized lanes.
     res = lse_target_epi(x, weight.mT, store_d=False, target=target, tuned=False)
-    return torch.where(target != ignore_index, res["lse"] - res["target_logit"], 0.0)
+    loss = torch.where(target != ignore_index, res["lse"] - res["target_logit"], 0.0)
+    if token_weights is not None:
+        loss = torch.where(
+            (target != ignore_index) & (token_weights != 0), loss * token_weights, 0.0
+        )
+    return loss
 
 
 class ScaledExpLinearCrossEntropyFunction(torch.autograd.Function):
@@ -684,6 +733,7 @@ class ScaledExpLinearCrossEntropyFunction(torch.autograd.Function):
         reduction: Literal["mean", "sum"] = "mean",
         chunk_size: int = 4096,
         tile_n1: Optional[int] = None,
+        token_weights: Optional[Tensor] = None,
     ):
         ctx.weight_dtype = weight.dtype
         # read before the autocast convert: the converted tensors are non-leaves
@@ -701,7 +751,16 @@ class ScaledExpLinearCrossEntropyFunction(torch.autograd.Function):
         if reduction == "mean":
             inv_count = (target != ignore_index).sum().float().reciprocal()
         outs = torch.ops.quack.lce_scaled_exp_fwd(
-            x, weight, target, chunk_size, ignore_index, need_dx, need_dw, inv_count, tile_n1
+            x,
+            weight,
+            target,
+            chunk_size,
+            ignore_index,
+            need_dx,
+            need_dw,
+            inv_count,
+            tile_n1,
+            token_weights,
         )
         loss = outs[0]
         dx = outs[1] if need_dx else None
@@ -723,7 +782,7 @@ class ScaledExpLinearCrossEntropyFunction(torch.autograd.Function):
         if dw is not None:
             # single downcast from the fp32 accumulator
             dw = dw.mul_(dloss).to(ctx.weight_dtype)
-        return dx, dw, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None
 
 
 def scaled_exp_linear_cross_entropy(
@@ -734,22 +793,37 @@ def scaled_exp_linear_cross_entropy(
     ignore_index: int = -100,
     reduction: Literal["mean", "sum"] = "mean",
     tile_n1: Optional[int] = None,
+    token_weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Linear cross entropy through the scaled-exp fused-backward pipeline
     (see the section comment above). Same contract as
-    chunked_linear_cross_entropy; eligibility via scaled_exp_lce_supported."""
+    chunked_linear_cross_entropy; eligibility via scaled_exp_lce_supported.
+    token_weights is nondifferentiated and has the target shape. It multiplies
+    each token loss and gradient; mean divides by the nonignored token count."""
+    if token_weights is not None:
+        if token_weights.shape != target.shape:
+            raise ValueError("token_weights must have the same shape as target")
+        if token_weights.device != x.device or token_weights.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError("token_weights must be an fp16/bf16/fp32 tensor on the input device")
+        token_weights = token_weights.detach().reshape(-1).contiguous()
     if reduction not in ["mean", "sum"]:
         raise ValueError(f"Invalid reduction: {reduction}")
     if not torch.is_grad_enabled() or not (x.requires_grad or weight.requires_grad):
         x, weight = linear_fwd_convert_type(x, weight)
         target = target.reshape(-1)
-        loss = _scaled_exp_lce_loss_only(x.reshape(-1, x.shape[-1]), weight, target, ignore_index)
+        loss = _scaled_exp_lce_loss_only(
+            x.reshape(-1, x.shape[-1]), weight, target, ignore_index, token_weights
+        )
         loss_sum = loss.sum()
         if reduction == "sum":
             return loss_sum
         return loss_sum / (target != ignore_index).sum().float()
     return ScaledExpLinearCrossEntropyFunction.apply(
-        x, weight, target, ignore_index, reduction, chunk_size, tile_n1
+        x, weight, target, ignore_index, reduction, chunk_size, tile_n1, token_weights
     )
 
 
@@ -762,6 +836,7 @@ def chunked_linear_cross_entropy(
     reduction: Literal["mean", "sum"] = "mean",
     tuned: bool = True,
     use_scaled_exp: Optional[bool] = None,
+    token_weights: Optional[Tensor] = None,
 ) -> Tensor:
     """
     Chunked linear cross entropy with automatic differentiation support.
@@ -778,6 +853,9 @@ def chunked_linear_cross_entropy(
             None (default) auto-selects it when eligible (SM90, bf16, V % 128
             == 0, ...; see scaled_exp_lce_supported); True asserts
             eligibility inside; False forces the base pipeline.
+        token_weights: Optional fp16/bf16/fp32 tensor with the target shape.
+            Multiplies each token loss and gradient without being differentiated.
+            Mean divides by the nonignored count, not the sum of weights.
 
     Returns:
         Loss tensor with specified reduction
@@ -788,8 +866,24 @@ def chunked_linear_cross_entropy(
         use_scaled_exp = scaled_exp_lce_supported(x, weight, chunk_size, reduction)
     if use_scaled_exp:
         return scaled_exp_linear_cross_entropy(
-            x, weight, target, chunk_size, ignore_index, reduction
+            x,
+            weight,
+            target,
+            chunk_size,
+            ignore_index,
+            reduction,
+            token_weights=token_weights,
         )
+    if token_weights is not None:
+        if token_weights.shape != target.shape:
+            raise ValueError("token_weights must have the same shape as target")
+        if token_weights.device != x.device or token_weights.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError("token_weights must be an fp16/bf16/fp32 tensor on the input device")
+        token_weights = token_weights.detach().reshape(-1).contiguous()
     if not torch.is_grad_enabled() or not (x.requires_grad or weight.requires_grad):
         # eval / inference: loss only — no dx/dw GEMMs, no fp32 (V, d) accumulator
         x, weight = linear_fwd_convert_type(x, weight)
@@ -802,13 +896,14 @@ def chunked_linear_cross_entropy(
             tuned=tuned,
             need_dx=False,
             need_dw=False,
+            token_weights=token_weights,
         )
         loss_sum = loss.sum()
         if reduction == "sum":
             return loss_sum
         return loss_sum / (target != ignore_index).sum().float()
     loss = ChunkedLinearCrossEntropyFunction.apply(
-        x, weight, target, ignore_index, reduction, chunk_size, tuned
+        x, weight, target, ignore_index, reduction, chunk_size, tuned, token_weights
     )
     return loss
 
