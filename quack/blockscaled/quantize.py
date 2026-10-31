@@ -663,7 +663,14 @@ def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_scale_blocked_to_2d(blocked: torch.Tensor, mn: int, sf_k: int) -> torch.Tensor:
-    """Unswizzle (l, rm, rk, 32, 4, 4) blocked scale factors to (l, mn, sf_k)."""
+    """Unswizzle blocked scale factors to ``(l, mn, sf_k)``.
+
+    Accept both the unbatched ``(rm, rk, 32, 4, 4)`` and batched
+    ``(l, rm, rk, 32, 4, 4)`` layouts accepted by
+    :func:`check_blocked_scale_atom`.
+    """
+    if blocked.dim() == 5:
+        blocked = blocked.unsqueeze(0)
     l, rm, rk = blocked.shape[:3]
     assert tuple(blocked.shape[3:]) == (32, 4, 4)
     orig_dtype = blocked.dtype
