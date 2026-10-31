@@ -1179,6 +1179,9 @@ class GemmSm90(GemmTmaBase):
 
         if warp_idx < self.ab_load_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_mma)
+            # PDL: the scheduler below reads varlen metadata from gmem
+            if const_expr(self.use_pdl):
+                prims.griddepcontrol(prims.GridDepAction.WAIT)
             is_tma_warp = Boolean(
                 (not self.pingpong and warp_idx == 0)
                 or (self.pingpong and (warp_idx == 0 or warp_idx == 4))
