@@ -124,6 +124,56 @@ def test_scaled_exp_linear_cross_entropy_batched():
     assert (weight.grad.float() - weight_ref.grad).abs().max() < 1e-2
 
 
+@pytest.mark.parametrize("use_scaled_exp", [False, True])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+@pytest.mark.parametrize("B_L", [128, 384])  # single chunk / deferred last chunk
+@pytest.mark.parametrize("frozen", [None, "x", "weight"])
+def test_chunked_linear_cross_entropy_retain_graph(
+    use_scaled_exp, weight_dtype, reduction, B_L, frozen
+):
+    """Retained backward must not scale or accumulate into saved gradients."""
+    torch.random.manual_seed(0)
+    d, V, chunk_size = 512, 2048, 256
+    x = (torch.randn(B_L, d, device="cuda", dtype=weight_dtype) * 0.1).requires_grad_(frozen != "x")
+    weight = (torch.randn(V, d, device="cuda", dtype=weight_dtype) / (d**0.5)).requires_grad_(
+        frozen != "weight"
+    )
+    target = torch.randint(0, V, (B_L,), device="cuda")
+    target[::7] = -100
+    x_ref = x.detach().float().requires_grad_(x.requires_grad)
+    weight_ref = weight.detach().float().requires_grad_(weight.requires_grad)
+    loss_ref = linear_cross_entropy_func_ref(x_ref, weight_ref, None, target, reduction=reduction)
+    # FP32 parameters with BF16 autocast also exercise the FP32 dw accumulator
+    # without a downcast, including the deferred last-chunk accumulation.
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if use_scaled_exp:
+            _require_scaled_exp(x, weight, chunk_size, reduction)
+        loss = chunked_linear_cross_entropy(
+            x,
+            weight,
+            target,
+            chunk_size=chunk_size,
+            reduction=reduction,
+            tuned=False,
+            use_scaled_exp=use_scaled_exp,
+        )
+    torch.testing.assert_close(loss, loss_ref, atol=1e-3, rtol=1e-3)
+    inputs = tuple(t for t in (x, weight) if t.requires_grad)
+    references = tuple(t for t in (x_ref, weight_ref) if t.requires_grad)
+    first_grads = first_values = None
+    for scale in (2.0, -0.5):
+        grad_output = torch.full_like(loss, scale)
+        grads = torch.autograd.grad(loss, inputs, grad_output, retain_graph=True)
+        refs = torch.autograd.grad(loss_ref, references, grad_output, retain_graph=True)
+        for grad, ref in zip(grads, refs):
+            torch.testing.assert_close(grad.float(), ref, atol=2e-3, rtol=3e-2)
+        if first_grads is None:
+            first_grads, first_values = grads, tuple(g.clone() for g in grads)
+    for grad, original in zip(first_grads, first_values):
+        torch.testing.assert_close(grad, original, atol=0, rtol=0)
+
+
 def test_chunked_linear_cross_entropy_torch_compile_dispatch():
     """Under torch.compile the scaled-exp path records the single
     quack::lce_scaled_exp_fwd custom op — the host chunk loop (mod.gemm plan
