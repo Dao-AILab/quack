@@ -1330,7 +1330,11 @@ def gemm_out(
     batch_idx_permute: Optional[Tensor] = None,  # (L,) permutation of batch indices for scheduler
     dynamic_scheduler: bool = False,
     tuned: bool = True,
-    rounding_mode: int = RoundingMode.RN,
+    # Enum defaults are passed as plain ints in every custom-op signature:
+    # torch.library renders int defaults with str(), and on Python 3.10
+    # str(IntEnum) is "RoundingMode.RN" (3.11+ prints the value), which makes
+    # the schema unparseable and the whole module unimportable.
+    rounding_mode: int = int(RoundingMode.RN),
     sr_seed: int = 0,
     sr_seed_tensor: Optional[Tensor] = None,
     concat_layout: Optional[str] = None,
@@ -1344,7 +1348,7 @@ def gemm_out(
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,
-    split_k_mode: int = SplitKMode.SERIAL,
+    split_k_mode: int = int(SplitKMode.SERIAL),
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
@@ -1410,7 +1414,7 @@ def gemm_quant_out(
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
-    rounding_mode: int = RoundingMode.RN,
+    rounding_mode: int = int(RoundingMode.RN),
     sr_seed: int = 0,
     sr_seed_tensor: Optional[Tensor] = None,
 ) -> None:
@@ -1715,7 +1719,7 @@ def gemm_add_out(
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,
-    split_k_mode: int = SplitKMode.SERIAL,
+    split_k_mode: int = int(SplitKMode.SERIAL),
 ) -> None:
     """GEMM with addition and pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
@@ -2089,7 +2093,7 @@ def gemm_add_inplace_op(
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
     split_k: Optional[int] = 1,
-    split_k_mode: int = SplitKMode.SERIAL,
+    split_k_mode: int = int(SplitKMode.SERIAL),
 ) -> None:
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = _merge_tensor(alpha, alpha_tensor)
