@@ -226,7 +226,9 @@ def _pin_dsl_arch(cute_dsl_arch: Optional[str]) -> None:
         pass
 
 
-def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
+def _pool_initializer(
+    quack_arch: Optional[str], cute_dsl_arch: Optional[str], pkg_dir: Optional[str] = None
+):
     # GPU-blind compilation: hide devices and pin the target arch via the
     # same overrides the CPU-only compile workflow uses. Forked workers must
     # never initialize CUDA (fork-safety), and spawned workers save the
@@ -240,6 +242,22 @@ def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
     # forkserver: the preload already imported it before the fork).
     import quack.cache  # noqa: F401
 
+    if pkg_dir is not None:
+        # A worker compiling a different ``quack`` than the submitter can only
+        # produce a .o under a different source fingerprint (or for different
+        # code): say so once per key instead of compiling it for nothing.
+        got = _submitter_pkg_dir()
+        if got != pkg_dir:
+            import sys
+
+            global _IMPORT_MISMATCH
+            _IMPORT_MISMATCH = (
+                f"pool worker imported quack from {got} but the submitter uses {pkg_dir} "
+                f"(Python {sys.version_info.major}.{sys.version_info.minor} forkserver "
+                "resolves imports from the cwd, not the parent's sys.path); run from a "
+                "directory that does not shadow the installed package"
+            )
+
     # The import above may have constructed the DSL singleton before the env
     # pinning (spawn: no; forkserver: yes, in the sidecar) — re-latch either
     # way, it is idempotent.
@@ -251,10 +269,77 @@ def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
         _install_gpu_blind_device_attrs()
 
 
+# Set by _pool_initializer when the worker's ``quack`` is not the submitter's
+# (see _sidecar_import_env); every _pool_worker call then fails fast with it.
+_IMPORT_MISMATCH: Optional[str] = None
+
+
+def _submitter_pkg_dir() -> str:
+    """Directory of the ``quack`` package the submitting process imported."""
+    import quack
+
+    return os.path.realpath(os.path.dirname(quack.__file__))
+
+
+def _worker_import_mismatch() -> Optional[str]:
+    """Probe (run inside a worker): the import-mismatch error, or None."""
+    return _IMPORT_MISMATCH
+
+
+@contextlib.contextmanager
+def _sidecar_import_env():
+    """Make the forkserver sidecar import ``quack`` from where the parent did.
+
+    The sidecar is a fresh ``python -c`` interpreter spawned (once per
+    process, lazily, inside the first ``executor.submit``) with the parent's
+    environment. Python < 3.12 ignores the ``sys_path`` the parent hands it
+    (``forkserver.main`` accepts and drops it; 3.12 applies it), so the
+    sidecar's ``sys.path`` is ``['', $PYTHONPATH..., site]`` — the cwd first,
+    and nothing from the parent's own path. Two ways that diverges from the
+    parent, both silent until now:
+
+    * the parent imported ``quack`` via ``sys.path[0]`` (a script next to the
+      package, or an uninstalled checkout) — the sidecar can't import it at
+      all; preload swallows the ImportError and every worker dies at init;
+    * the cwd holds a *different* ``quack`` (benchmark run from a checkout
+      against an installed wheel, a second worktree, ...) — the sidecar
+      imports that one, the worker compiles the wrong source and exports
+      under its own fingerprint, and every key comes back "compile succeeded
+      but .o was not exported" + a full in-process recompile.
+
+    Scoped to the submit that spawns the sidecar: PYTHONPATH gets the
+    parent's ``sys.path`` (cwd-relative entries resolved), and on 3.11+
+    PYTHONSAFEPATH drops the implicit cwd entry so it can't shadow. Forked
+    workers inherit the sidecar's (already-resolved) modules, so the env
+    never matters to them. ``_pool_initializer`` verifies the outcome.
+    """
+    import sys
+
+    saved = {k: os.environ.get(k) for k in ("PYTHONPATH", "PYTHONSAFEPATH")}
+    entries = []
+    for entry in sys.path:
+        entry = entry or os.getcwd()  # '' is "the cwd at import time"
+        if entry not in entries:
+            entries.append(entry)
+    os.environ["PYTHONPATH"] = os.pathsep.join(entries)
+    if sys.version_info >= (3, 11):
+        os.environ["PYTHONSAFEPATH"] = "1"
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def _pool_worker(
     mod_name: str, qualname: str, key_b64: str, o_path: str, payloads_b64: str = ""
 ) -> Optional[str]:
     """Compile one key. Returns None on success, error string on failure."""
+    if _IMPORT_MISMATCH is not None:
+        return _IMPORT_MISMATCH
     try:
         # Honor the submitter's cache root: the jit_cache wrapper recomputes
         # its export path from the live CACHE_DIR, and this worker (forked
@@ -310,7 +395,7 @@ def _make_executor(jobs: int) -> ProcessPoolExecutor:
         max_workers=jobs,
         mp_context=ctx,
         initializer=_pool_initializer,
-        initargs=_detect_arch_env(),
+        initargs=(*_detect_arch_env(), _submitter_pkg_dir()),
     )
 
 
@@ -353,8 +438,9 @@ def _neutral_main():
     forked subprocess". Executor workers are spawned synchronously inside
     ``executor.submit`` (``_adjust_process_count``), so masking ``__main__``
     with an empty stub for the duration of the submit is sufficient and
-    scoped. Single-threaded callers only (pytest defer loop, autotune bench
-    loop).
+    scoped. The same window spawns the forkserver sidecar, so it also
+    carries :func:`_sidecar_import_env`. Single-threaded callers only
+    (pytest defer loop, autotune bench loop).
     """
     import sys
     import types
@@ -362,7 +448,8 @@ def _neutral_main():
     real_main = sys.modules.get("__main__")
     sys.modules["__main__"] = types.ModuleType("__main__")  # no __file__/__spec__
     try:
-        yield
+        with _sidecar_import_env():
+            yield
     finally:
         if real_main is not None:
             sys.modules["__main__"] = real_main
