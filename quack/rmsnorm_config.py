@@ -215,6 +215,41 @@ def _for_blackwell_bwd(
             sum_bytes=(dtype_width + dout_width) // 8,
             max_cluster=_max_cluster_for(10),  # Blackwell
         )
+        # Cap the per-thread fragment at 128 B. At 256 B/thread (bf16 N=128k
+        # with cluster_n=8, N=256k with cluster_n=16) the x/dout/dx fragments
+        # spill and the kernel drops to ~1 TB/s on B200 — 3.5x slower than the
+        # same row at 128 B/thread. Widen the cluster first (keeps one row per
+        # CTA and the smem tile small), then widen the row's thread count.
+        # With two persistent fp32 row accumulators (LayerNorm's dw + db) the
+        # budget is 32 elements rather than 128 B: at 64 elements/thread
+        # (bf16 128 B) LayerNorm bwd bf16 N=64k/128k runs 1.7x slower than at
+        # 32 on B200, while fp32 rows (32 elements = 128 B) are fine as is.
+        # A widening step whose tile is not a whole number of vector blocks
+        # (N not divisible by cluster_n * threads_per_row * vecsize) adds a
+        # predicated tail block, which costs more than it saves unless the
+        # fragment is in the spill regime: bf16 N=80k, dw+db, is 1.6x slower
+        # at 16 x 256 threads (20 elements, ragged) than at 16 x 128 (40).
+        # So below 128 B only take exact steps.
+        frag_cap = min(128, 32 * max_bytes) if num_acc >= 2 else 128
+        max_cluster = _max_cluster_for(10)
+        vec = 16 // max_bytes  # elements per 16 B vector copy
+
+        def frag(cn, tpr):
+            return (N // cn) // tpr * max_bytes
+
+        def exact(cn, tpr):
+            return (N // cn) % (tpr * vec) == 0
+
+        while (
+            frag(cluster_n, threads_per_row) > frag_cap
+            and cluster_n < max_cluster
+            and (frag(cluster_n, threads_per_row) > 128 or exact(2 * cluster_n, threads_per_row))
+        ):
+            cluster_n *= 2
+        if frag(cluster_n, threads_per_row) > frag_cap and (
+            frag(cluster_n, threads_per_row) > 128 or exact(cluster_n, 256)
+        ):
+            num_threads, threads_per_row = 256, 256
     elif row_bytes > 16 * 1024:
         # Wider than 128 threads can comfortably handle at cluster_n=1; bump
         # threads/row to keep per-thread fragments small.
@@ -233,10 +268,14 @@ def _for_blackwell_bwd(
     # (dw + db): their 2 * frag/4 registers plus cp.async's per-thread address
     # registers spill at frag >= 64 B/thread (~9x slowdown at bf16 N=8k/16k);
     # TMA frees the address registers and restores full bandwidth.
+    # In the cluster regime TMA only wins while the fragment is <= 64 B/thread;
+    # at 128 B/thread the TMA path is 1.2-2.2x slower than cp.async on B200
+    # (bf16 N=64k..256k, with or without the second accumulator), so fall
+    # back to cp.async there — the dw+db rule above is a single-CTA rule.
     use_tma = (
-        cluster_n >= 4
+        (cluster_n >= 4 and bytes_per_thread_frag <= 64)
         or (max_bytes >= 4 and row_bytes >= 16 * 1024)
-        or (num_acc >= 2 and bytes_per_thread_frag >= 64)
+        or (cluster_n == 1 and num_acc >= 2 and bytes_per_thread_frag >= 64)
     )
     # reload_x: wide end of the cluster ladder, plus fp32-class single-CTA
     # cases where the wider X fragments crowd registers across the row
