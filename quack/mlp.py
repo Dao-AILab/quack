@@ -14,8 +14,9 @@ from quack.linear import linear_fwd_convert_type
 from quack.linear import _recompute_act_postact, _recompute_gated_postact
 from quack.activation import gate_fn_map
 from quack.gemm_interface import (
+    _apply_gated_activation,
+    _validate_activation_limit,
     act_to_pytorch_fn_map,
-    gated_to_pytorch_fn_map,
     gemm,
     gemm_add_inplace,
     gemm_gated,
@@ -108,17 +109,23 @@ class MLPRecomputeFunc(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight1, weight2, activation, fuse_grad_accum, ops):
+    def forward(ctx, x, weight1, weight2, activation, fuse_grad_accum, ops, activation_limit):
         x, weight1, weight2 = linear_fwd_convert_type(x, weight1, weight2)
         with torch.amp.autocast("cuda", enabled=False):
             ctx.weight_dtype = weight1.dtype
             ctx.fuse_grad_accum = fuse_grad_accum
             ctx.activation = activation
+            ctx.activation_limit = activation_limit
             ctx.ops = ops
             weight1_og, weight2_og = weight1, weight2
             batch_shape = x.shape[:-1]
             x_flat = x.reshape(-1, x.shape[-1])
-            _preact, postact = ops.matmul_fwd_act(x_flat, weight1.T, activation=activation)
+            _preact, postact = ops.matmul_fwd_act(
+                x_flat,
+                weight1.T,
+                activation=activation,
+                activation_limit=activation_limit,
+            )
             out = ops.matmul_fwd(postact, weight2.T)
             # Save only x and weights — no preact (the whole point of recompute)
             needs_input_grad = ctx.needs_input_grad
@@ -153,12 +160,16 @@ class MLPRecomputeFunc(torch.autograd.Function):
                 preact = recompute_fwd(x_flat, weight1.T)
                 # gemm_dact computes: dpreact = d_act(dout @ W2, preact) AND recomputes postact
                 dpreact, postact = ops.matmul_bwd_dact(
-                    dout, weight2, preact, activation=ctx.activation
+                    dout,
+                    weight2,
+                    preact,
+                    activation=ctx.activation,
+                    activation_limit=ctx.activation_limit,
                 )
             elif any_grad:
                 # Only dW2 needed: recompute postact from preact cheaply (no gemm_dact)
                 preact = recompute_fwd(x_flat, weight1.T)
-                postact = ops.recompute_postact(preact, ctx.activation)
+                postact = ops.recompute_postact(preact, ctx.activation, ctx.activation_limit)
                 dpreact = None
             else:
                 dpreact, postact = None, None
@@ -190,7 +201,7 @@ class MLPRecomputeFunc(torch.autograd.Function):
                 dw1_inplace_fn,
                 ctx.needs_input_grad[1],
             )
-            return dx, dweight1, dweight2, None, None, None
+            return dx, dweight1, dweight2, None, None, None, None
 
 
 def _compute_weight_grad(ctx, dout, x, weight_og, matmul_fn, matmul_inplace_fn, needs_grad):
@@ -217,8 +228,10 @@ def mlp_func(
     tuned=True,
     recompute=False,
     concat_layout=False,
+    activation_limit=None,
 ):
     gated = activation in gate_fn_map
+    _validate_activation_limit(activation, activation_limit)
     if concat_layout:
         assert gated, "concat_layout is only supported for gated MLP"
     if recompute:
@@ -228,7 +241,9 @@ def mlp_func(
             ops = _MLPGatedOps if tuned else _MLPGatedUntunedOps
         else:
             ops = _MLPOps if tuned else _MLPUntunedOps
-        return MLPRecomputeFunc.apply(x, weight1, weight2, activation, fuse_grad_accum, ops)
+        return MLPRecomputeFunc.apply(
+            x, weight1, weight2, activation, fuse_grad_accum, ops, activation_limit
+        )
     fc1_fn = linear_gated_func if gated else linear_act_func
     fc2_fn = gated_linear_func if gated else act_linear_func
     preact, postact = fc1_fn(
@@ -240,6 +255,7 @@ def mlp_func(
         fuse_grad_accum=fuse_grad_accum,
         tuned=tuned,
         **({"concat_layout": concat_layout} if concat_layout and gated else {}),
+        **({"activation_limit": activation_limit} if gated else {}),
     )
     out = fc2_fn(
         preact,
@@ -249,6 +265,7 @@ def mlp_func(
         bias=bias2,
         fuse_grad_accum=fuse_grad_accum,
         tuned=tuned,
+        **({"activation_limit": activation_limit} if gated else {}),
     )
     return out
 
@@ -269,11 +286,14 @@ class MLP(nn.Module):
         tuned: bool = True,
         recompute: bool = False,
         concat_layout: bool = False,
+        activation_limit: float | None = None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         out_features = out_features if out_features is not None else in_features
         self.activation = activation
+        _validate_activation_limit(activation, activation_limit)
+        self.activation_limit = activation_limit
         self.gated = activation in gate_fn_map
         assert not concat_layout or self.gated, "concat_layout is only supported for gated MLP"
         if hidden_features is None:
@@ -321,15 +341,16 @@ class MLP(nn.Module):
                 tuned=self.tuned,
                 recompute=self.recompute,
                 concat_layout=self.concat_layout,
+                activation_limit=self.activation_limit,
             )
         else:
             y = self.fc1(input)
             if self.gated:
                 if self.concat_layout:
                     gate, up = y.chunk(2, dim=-1)
-                    y = gated_to_pytorch_fn_map[self.activation](gate, up)
                 else:
-                    y = gated_to_pytorch_fn_map[self.activation](y[..., ::2], y[..., 1::2])
+                    gate, up = y[..., ::2], y[..., 1::2]
+                y = _apply_gated_activation(self.activation, gate, up, self.activation_limit)
             else:
                 y = act_to_pytorch_fn_map[self.activation](y)
             return self.fc2(y)

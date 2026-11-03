@@ -36,7 +36,7 @@ from quack.epilogue.rotary import (
     rope_table_ldg_epi,
     xpos_posfreq_epi,
 )
-from quack.activation import dswiglu_oai_tanh
+from quack.activation import dswiglu, dswiglu_oai_tanh, swiglu
 from quack.epilogue.library import (
     amax_epi,
     dgelu_dbias_mod,
@@ -617,6 +617,85 @@ def test_epi_mod_rms_fused(tile_N):
     _rel_check(D, D2.float(), "D vs handwritten", tol=1e-3)
     _rel_check(premult, premult2.float(), "premult vs handwritten", tol=1e-3)
     _rel_check(sqsum, sqsum2, "sqsum vs handwritten", tol=1e-4)
+
+
+@gemm_epilogue(outputs=("postact",), mode="acc_pair")
+def _swiglu_limit_mod(acc):
+    gate, up = unpack(acc)
+    return {"postact": swiglu(gate, up, limit=10.0)}
+
+
+@gemm_epilogue(outputs=("postact",), mode="packed_cd_b16x2")
+def _dswiglu_limit_mod(acc, c):
+    gate, up = unpack(c)
+    dgate, dup, out = dswiglu(gate, up, acc, limit=10.0)
+    return {"D": pack(dgate, dup), "postact": out}
+
+
+def test_swiglu_limit():
+    """A finite limit clamps SwiGLU preacts and zeros saturated gradients."""
+    device, dtype = "cuda", torch.bfloat16
+    m, k, n = 128, 64, 128
+    pairs = torch.tensor(
+        [
+            [-20.0, -20.0],
+            [-10.0, -11.0],
+            [-1.0, -10.0],
+            [0.0, -9.0],
+            [1.0, 9.0],
+            [9.0, 10.0],
+            [10.0, 11.0],
+            [11.0, 5.0],
+            [20.0, -5.0],
+            [5.0, 20.0],
+            [5.0, -20.0],
+        ],
+        device=device,
+        dtype=dtype,
+    ).flatten()
+    values = pairs.repeat((2 * n + pairs.numel() - 1) // pairs.numel())[: 2 * n]
+    preact = values.expand(m, -1).contiguous()
+    A = torch.zeros((m, k), device=device, dtype=dtype)
+    A[:, 0] = 1
+    B = torch.zeros((2 * n, k), device=device, dtype=dtype)
+    B[:, 0] = values
+    postact = torch.empty((m, n), device=device, dtype=dtype)
+    _swiglu_limit_mod.gemm(
+        A,
+        B,
+        None,
+        epi_args={"postact": postact},
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    gate = preact[..., ::2].float().detach().requires_grad_()
+    up = preact[..., 1::2].float().detach().requires_grad_()
+    postact_ref = torch.nn.functional.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0)
+    torch.testing.assert_close(postact.float(), postact_ref, rtol=2e-2, atol=2e-2)
+
+    dout_input = torch.ones((m, k), device=device, dtype=dtype)
+    weight = torch.full((n, k), 1 / k, device=device, dtype=dtype)
+    dpreact = torch.empty_like(preact)
+    postact_bwd = torch.empty_like(postact)
+    _dswiglu_limit_mod.gemm(
+        dout_input,
+        weight,
+        dpreact,
+        preact,
+        epi_args={"postact": postact_bwd},
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    dout = dout_input.float() @ weight.float().T
+    dgate_ref, dup_ref = torch.autograd.grad(postact_ref, (gate, up), dout)
+    dpreact_ref = torch.stack((dgate_ref, dup_ref), dim=-1).flatten(-2)
+    torch.testing.assert_close(dpreact.float(), dpreact_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(postact_bwd.float(), postact_ref, rtol=2e-2, atol=2e-2)
 
 
 # cluster_M=2 with tile_M=128 gives cta_tile_m=64 + 2-CTA on SM100, i.e. the

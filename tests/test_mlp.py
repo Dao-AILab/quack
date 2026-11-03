@@ -10,6 +10,100 @@ from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
 torch._dynamo.config.cache_size_limit = 64
 
 
+def _clamped_swiglu_ref(preact, limit):
+    gate, up = preact[..., ::2], preact[..., 1::2]
+    return F.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_mlp_swiglu_activation_limit(use_compile, recompute):
+    """MLP must preserve the SwiGLU limit through fused fwd, bwd, and recompute."""
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    batch, dim, hidden, limit = 128, 64, 128, 2.0
+    mlp = MLP(
+        dim,
+        hidden,
+        activation="swiglu",
+        activation_limit=limit,
+        device=device,
+        dtype=dtype,
+        tuned=False,
+        recompute=recompute,
+    )
+    values = torch.tensor(
+        [-4.0, -4.0, -2.0, -3.0, -1.0, -2.0, 0.0, -1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, -4.0],
+        device=device,
+        dtype=dtype,
+    ).repeat(2 * hidden // 16)
+    with torch.no_grad():
+        mlp.fc1.weight.zero_()
+        mlp.fc1.weight[:, 0] = values
+    w1_ref = mlp.fc1.weight.detach().float().requires_grad_()
+    w2_ref = mlp.fc2.weight.detach().float().requires_grad_()
+    x = torch.zeros((batch, dim), device=device, dtype=dtype)
+    x[:, 0] = 1
+    x.requires_grad_()
+    x_ref = x.detach().float().requires_grad_()
+
+    preact_ref = F.linear(x_ref, w1_ref)
+    assert (preact_ref[..., ::2] > limit).any()
+    assert (preact_ref[..., 1::2].abs() > limit).any()
+    out_ref = F.linear(_clamped_swiglu_ref(preact_ref, limit), w2_ref)
+
+    fn = torch.compile(mlp, fullgraph=True) if use_compile else mlp
+    out = fn(x)
+    torch.testing.assert_close(out.float(), out_ref, rtol=2e-2, atol=2e-2)
+
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    out_ref.backward(dout.float())
+    torch.testing.assert_close(x.grad.float(), x_ref.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(mlp.fc1.weight.grad.float(), w1_ref.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(mlp.fc2.weight.grad.float(), w2_ref.grad, rtol=3e-2, atol=3e-2)
+
+
+def test_mlp_swiglu_activation_limit_fallback():
+    """The PyTorch fallback must apply the same SwiGLU clamp as fused kernels."""
+    device, dtype = "cuda", torch.bfloat16
+    batch, dim, hidden, limit = 4, 7, 5, 2.0
+    mlp = MLP(
+        dim,
+        hidden,
+        activation="swiglu",
+        activation_limit=limit,
+        device=device,
+        dtype=dtype,
+    )
+    values = torch.tensor(
+        [-4.0, -4.0, -2.0, -3.0, 0.0, -1.0, 2.0, 2.0, 4.0, 4.0],
+        device=device,
+        dtype=dtype,
+    )
+    with torch.no_grad():
+        mlp.fc1.weight.zero_()
+        mlp.fc1.weight[:, 0] = values
+    x = torch.zeros((batch, dim), device=device, dtype=dtype)
+    x[:, 0] = 1
+    x.requires_grad_()
+    x_ref = x.detach().clone().requires_grad_()
+    w1_ref = mlp.fc1.weight.detach().clone().requires_grad_()
+    w2_ref = mlp.fc2.weight.detach().clone().requires_grad_()
+
+    out = mlp(x)
+    preact_ref = F.linear(x_ref, w1_ref)
+    out_ref = F.linear(_clamped_swiglu_ref(preact_ref, limit), w2_ref)
+    torch.testing.assert_close(out, out_ref)
+
+    dout = torch.randn_like(out)
+    out.backward(dout)
+    out_ref.backward(dout)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(mlp.fc1.weight.grad, w1_ref.grad)
+    torch.testing.assert_close(mlp.fc2.weight.grad, w2_ref.grad)
+
+
 @pytest.mark.parametrize("use_compile", [False, True])
 @pytest.mark.parametrize("activation", ["gelu_tanh_approx", "relu", "swiglu", "reglu", "geglu"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
