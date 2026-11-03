@@ -15,6 +15,9 @@ in the branch where the dynamic remainder matters.  Three layers:
 """
 
 import ast
+import importlib.util
+import inspect
+import sys
 
 import pytest
 import torch
@@ -25,7 +28,14 @@ from cutlass import Int32, const_expr
 from cutlass.base_dsl.ast_preprocessor import DSLPreprocessor
 from cutlass.cute.runtime import from_dlpack
 
-from quack.dsl.mixed_constexpr_if import _rewrite_elif_chain, rewrite_mixed_constexpr_if
+from quack.dsl.mixed_constexpr_if import (
+    OPT_IN_FLAG,
+    _rewrite_elif_chain,
+    rewrite_mixed_constexpr_if,
+)
+
+# This module is not part of the quack package, so opt in to the rewrite (#217).
+__quack_mixed_constexpr_if__ = True
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +181,13 @@ def _preproc_elif(out: cute.Tensor, d: Int32, flag: cutlass.Constexpr[bool]):
 
 
 def preprocess(fn) -> str:
+    # @cute.jit / @cute.kernel return a functools.wraps wrapper defined inside
+    # CUTLASS, whose __globals__ are CUTLASS's.  The DSL preprocesses the
+    # wrapped function with its own module globals, so do the same here.
+    raw = inspect.unwrap(fn)
     pre = DSLPreprocessor(["cutlass"])
     with pre.get_session() as session:
-        tree = session.transform(fn, dict(fn.__globals__))
+        tree = session.transform(raw, dict(raw.__globals__))
     return ast.unparse(tree)
 
 
@@ -217,6 +231,119 @@ def test_preprocessed_elif_is_rewritten_despite_create_if_function_recursion():
     # chain up front.  The constexpr if must survive into the elif's region.
     src = preprocess(_preproc_elif)
     then_src, else_src = constexpr_branches(src)
+    assert "if_selector" in then_src
+    assert else_src == "val = Int32(3)"
+
+
+# ---------------------------------------------------------------------------
+# 2b. Scope (#217): importing quack must not change how other libraries'
+#     kernels are lowered.  The rewrite applies to quack's own modules and to
+#     modules that opt in with ``__quack_mixed_constexpr_if__ = True``.
+# ---------------------------------------------------------------------------
+
+_SCOPE_SRC = """
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32, const_expr
+
+
+@cute.jit
+def mixed_and(out: cute.Tensor, d: Int32, flag: cutlass.Constexpr[bool]):
+    val = Int32(2)
+    if const_expr(flag) and d == 1:
+        val = Int32(1)
+    else:
+        val = Int32(3)
+    out[0] = val
+
+
+@cute.kernel
+def kv_loader(
+    out: cute.Tensor, kv_left: Int32, kv_right: Int32, MAY_BE_EMPTY: cutlass.Constexpr[bool]
+):
+    # Shape of cuDNN frontend's SM100 FP8 attention loader from #217.  Stock DSL
+    # keeps kv_row_base branch-local; the rewrite made the loop carry it, None on
+    # one path -> TYPE_UNSTABLE_JOIN.
+    if const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
+        pass
+    else:
+        kv_row_base = kv_left * 4
+        out[0] = kv_row_base
+    if const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
+        pass
+    else:
+        for kv_loop in cutlass.range(kv_left, kv_right, 1):
+            kv_row_base = kv_loop * 4
+            out[1] = kv_row_base
+
+
+@cute.jit
+def launch_kv_loader(
+    out: cute.Tensor, kv_left: Int32, kv_right: Int32, MAY_BE_EMPTY: cutlass.Constexpr[bool]
+):
+    kv_loader(out, kv_left, kv_right, MAY_BE_EMPTY).launch(grid=(1, 1, 1), block=(1, 1, 1))
+"""
+
+
+def load_scope_module(tmp_path, monkeypatch, module_name: str, extra_src: str = ""):
+    """Import _SCOPE_SRC from a real file under ``module_name`` (source must be inspectable)."""
+    path = tmp_path / f"{module_name.replace('.', '_')}.py"
+    path.write_text(_SCOPE_SRC + extra_src)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def num_constexpr_flag_ifs(src: str) -> int:
+    return sum(
+        isinstance(node, ast.If) and ast.unparse(node.test) == "const_expr(flag)"
+        for node in ast.walk(ast.parse(src))
+    )
+
+
+def loop_carried_names(src: str) -> list[str]:
+    """Names every lowered ``cutlass.range`` loop carries (its ``write_args_names``)."""
+    names = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("loop_selector"):
+            for kw in node.keywords:
+                if kw.arg == "write_args_names":
+                    names += ast.literal_eval(kw.value)
+    return names
+
+
+def test_issue_217_loop_does_not_carry_branch_local_name(tmp_path, monkeypatch):
+    # The reported failure mode, checked at the preprocessor level (no GPU):
+    # outside quack the loop must not carry kv_row_base.  On main it did.
+    module = load_scope_module(tmp_path, monkeypatch, "third_party_kernels")
+    carried = loop_carried_names(preprocess(module.kv_loader))
+    assert carried, "expected a lowered cutlass.range loop"
+    assert "kv_row_base" not in carried
+
+
+def test_rewrite_skips_modules_outside_quack(tmp_path, monkeypatch):
+    module = load_scope_module(tmp_path, monkeypatch, "third_party_kernels")
+    src = preprocess(module.mixed_and)
+    # Stock DSL lowering: the whole BoolOp test is one dynamic if-region, so no
+    # `if const_expr(flag):` survives and the else branch is not duplicated.
+    assert num_constexpr_flag_ifs(src) == 0
+    assert "if_selector" in src
+
+
+def test_rewrite_applies_to_opted_in_module(tmp_path, monkeypatch):
+    module = load_scope_module(
+        tmp_path, monkeypatch, "user_opt_in_kernels", f"\n{OPT_IN_FLAG} = True\n"
+    )
+    then_src, else_src = constexpr_branches(preprocess(module.mixed_and))
+    assert "if_selector" in then_src
+    assert else_src == "val = Int32(3)"
+
+
+def test_rewrite_applies_to_quack_modules(tmp_path, monkeypatch):
+    module = load_scope_module(tmp_path, monkeypatch, "quack._scope_test_kernels")
+    then_src, else_src = constexpr_branches(preprocess(module.mixed_and))
     assert "if_selector" in then_src
     assert else_src == "val = Int32(3)"
 
@@ -349,3 +476,22 @@ def test_kernel_all_static(flag1, flag2):
 def test_kernel_trailing_constexpr_fallback(flag, d):
     expected = 1 if (d == 1 or flag) else 2
     assert run_kernel(_kernel_trailing_constexpr, d, flag) == expected
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "kv_left,kv_right,expected", [(1, 3, [4, 8]), (3, 3, [0, 0]), (2, 4, [8, 12])]
+)
+def test_issue_217_third_party_kernel_compiles_after_import_quack(
+    tmp_path, monkeypatch, kv_left, kv_right, expected
+):
+    # quack is imported by this test module.  On main this compile failed with
+    # TYPE_UNSTABLE_JOIN for kv_row_base; outside quack it must lower as stock.
+    module = load_scope_module(tmp_path, monkeypatch, "third_party_kernels")
+    out = torch.zeros(2, dtype=torch.int32, device="cuda")
+    fn = cute.compile(
+        module.launch_kv_loader, from_dlpack(out), Int32(kv_left), Int32(kv_right), True
+    )
+    fn(from_dlpack(out), Int32(kv_left), Int32(kv_right))
+    torch.cuda.synchronize()
+    assert out.tolist() == expected

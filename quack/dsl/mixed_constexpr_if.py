@@ -55,14 +55,30 @@ Like flash-attention's block-sparse loop patch, this intentionally
 monkey-patches the installed CuTe DSL at import time rather than editing
 site-packages; ``quack.dsl.__init__`` installs it before any quack kernel is
 preprocessed.
+
+Scope: the patched ``visit_If`` is process-wide, but the rewrite only fires for
+functions defined in quack's own modules (``quack`` / ``quack.*``).  Other
+libraries' kernels in the same process (e.g. under vLLM / SGLang, which import
+quack) keep stock DSL semantics: the rewrite copies ``orelse`` trees, which
+changes which names a later dynamic region carries and can break code that
+compiles fine on the stock DSL (#217).  Code outside quack that wants the
+rewrite opts in per module with a module-level ``__quack_mixed_constexpr_if__ =
+True``.
 """
 
 import ast
+import os
 from copy import deepcopy
 
 import cutlass.base_dsl.ast_preprocessor as ast_preprocessor
 
-__all__ = ["rewrite_mixed_constexpr_if"]
+__all__ = ["OPT_IN_FLAG", "rewrite_mixed_constexpr_if"]
+
+# Module-level flag that opts a non-quack module into the rewrite.
+OPT_IN_FLAG = "__quack_mixed_constexpr_if__"
+
+# .../quack, the package directory (this file is .../quack/dsl/mixed_constexpr_if.py).
+_QUACK_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _is_constexpr_call(node: ast.expr) -> bool:
@@ -132,6 +148,39 @@ def _rewrite_elif_chain(node: ast.If) -> ast.If:
     return rewrite_mixed_constexpr_if(node) or node
 
 
+def _is_quack_module(module_name: str) -> bool:
+    return module_name == "quack" or module_name.startswith("quack.")
+
+
+def _is_under_quack_dir(file_name: str) -> bool:
+    try:
+        path = os.path.abspath(file_name)
+        return os.path.commonpath([path, _QUACK_PKG_DIR]) == _QUACK_PKG_DIR
+    except ValueError:  # different drives, empty path, ...
+        return False
+
+
+def _rewrite_enabled(preprocessor) -> bool:
+    """Whether the function being preprocessed belongs to quack or opted in.
+
+    ``DSLPreprocessor.transform`` records the function's module globals (and its
+    source file) on the session for the duration of the transform; nested
+    regions of the same function see the same session data.
+    """
+    try:
+        session = preprocessor.session_data
+    except (AssertionError, AttributeError):  # no active session
+        return False
+    fn_globals = getattr(session, "function_globals", None)
+    if fn_globals is not None:
+        if _is_quack_module(fn_globals.get("__name__") or ""):
+            return True
+        return fn_globals.get(OPT_IN_FLAG, False) is True
+    # Globals not recorded (older / unusual entry points): fall back to the
+    # source file of the function being transformed.
+    return _is_under_quack_dir(getattr(session, "file_name", "") or "")
+
+
 def _install_mixed_constexpr_if_ast_patch() -> None:
     preprocessor_cls = ast_preprocessor.DSLPreprocessor
     if getattr(preprocessor_cls, "_quack_mixed_constexpr_if_patch", False):
@@ -140,6 +189,9 @@ def _install_mixed_constexpr_if_ast_patch() -> None:
     original_visit_if = preprocessor_cls.visit_If
 
     def visit_if(self, node: ast.If):
+        # Leave every other library's kernels on stock DSL semantics (#217).
+        if not _rewrite_enabled(self):
+            return original_visit_if(self, node)
         # The DSL recurses into elifs via create_if_function, which bypasses
         # visit_If, so normalize the whole chain while we still hold its head.
         # Work tail-first: rewriting an earlier mixed elif duplicates its
