@@ -1,20 +1,23 @@
 name: CI (PR)
 
+# Fork PRs run under pull_request (read-only token, no secrets), never
+# pull_request_target: that trigger hands PR code a write token and the base
+# repo's secrets and caches. Fork runs wait for workflow approval, and the GPU
+# jobs additionally wait for the gpu-ci environment reviewers.
 on:
   pull_request:
     branches: [main]
-  pull_request_target:
-    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read  # dorny/paths-filter lists PR files via the API
 
 concurrency:
-  # github.ref is per-PR for pull_request events but collapses to refs/heads/main
-  # for pull_request_target — keying on the PR number keeps both unique per PR.
-  group: ci-pr-${{ github.event.pull_request.number || github.ref }}
+  group: ci-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   test:
     uses: ./.github/workflows/_test.yml
     with:
-      ref: ${{ github.event.pull_request.head.sha }}
       environment: gpu-ci
