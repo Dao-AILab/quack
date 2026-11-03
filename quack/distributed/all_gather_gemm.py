@@ -798,9 +798,13 @@ class AllGatherRunner:
                 #   A/B.
                 compute_stream = torch.cuda.current_stream(self.device)
                 if not self.capture_lockstep:
-                    _, _, _, deps, _, num_deps = _check(
+                    # cuda-bindings >= 12.9 returns 5 values (edgeData removed);
+                    # older versions return 6. Star-unpack so both work.
+                    _, _, _, deps, *rest = _check(
                         runtime.cudaStreamGetCaptureInfo(compute_stream.cuda_stream)
                     )
+                    # 5-val: rest=(num_deps,); 6-val: rest=(edgeData, num_deps)
+                    num_deps = rest[-1] if rest else 0
                 self._ev_join.record(self.push_stream)
                 compute_stream.wait_event(self._ev_join)
                 self._ev_join.record(self.barrier_stream)
