@@ -50,6 +50,22 @@ JAX bindings are also available for some kernels (see [docs/jax.md](docs/jax.md)
 from quack.softmax_jax import softmax
 ```
 
+### Distributed autotuning
+
+When all ranks of the default process group tune the same shapes, long cold
+autotunes can accumulate rank skew and time out a subsequent collective. Set
+`QUACK_AUTOTUNE_DIST_BARRIER=1` on every rank to synchronize after each autotuner
+in-memory cache miss, whether it benchmarks configurations or loads a result
+from disk. The setting is disabled by default and requires an initialized
+`torch.distributed` process group. In-memory cache hits add no synchronization.
+
+Only enable this when all ranks encounter the same sequence of in-memory cache
+misses in the same order. Matching shapes alone is insufficient if ranks have
+different cache histories. Rank-dependent tuning or subgroup-only execution can
+leave barriers unmatched and hang until the process-group timeout. The timeout
+must accommodate the slowest rank's tuning at each barrier; this setting does
+not reduce cold autotuning time.
+
 ## Documentations
 
 - [JAX interface](docs/jax.md) — optional `jax` + `jax-tvm-ffi` bindings, see `quack/softmax_jax.py` for an example.

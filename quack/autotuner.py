@@ -32,6 +32,35 @@ PACKAGE_NAME = "quack"
 VERSION = __version__
 
 
+def _sync_ranks_after_autotune():
+    """Re-align distributed ranks after a cold autotune, if requested.
+
+    A cold autotune sweep can take minutes for large GEMMs and its duration
+    differs per GPU, so ranks of a distributed job leave it at different times.
+    Consecutive sweeps without a collective in between add up those
+    differences, and the next collective with a device-side timeout (for
+    example DeepEP intranode kernels, about 100 s) can trap on the early ranks.
+
+    Set ``QUACK_AUTOTUNE_DIST_BARRIER=1`` to make every rank of the default
+    process group wait here after each cold tuning (a benchmark sweep or a
+    disk-cache load) until all ranks have finished it. In-memory cache hits
+    are not affected. Only enable it when every rank encounters the same
+    sequence of in-memory cache misses. Matching shapes alone is insufficient
+    if ranks have different cache histories; unmatched barrier calls hang
+    until the process-group timeout.
+    """
+    if os.getenv(f"{PACKAGE_NAME.upper()}_AUTOTUNE_DIST_BARRIER", "0") != "1":
+        return
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
 def get_home_dir():
     return os.getenv(f"{PACKAGE_NAME.upper()}_HOME", Path.home())
 
@@ -448,6 +477,7 @@ class Autotuner:
                     self.check_disk_cache(key, pruned_configs, benchmark)
                 else:
                     benchmark()
+                _sync_ranks_after_autotune()
 
             config = self.cache[key]
         else:
