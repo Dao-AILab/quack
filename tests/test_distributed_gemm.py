@@ -18,6 +18,28 @@ import torch
 NUM_ITERS = 6  # exercises epoch monotonicity + double-buffer reuse
 
 
+@pytest.mark.parametrize(
+    "capture_info",
+    [
+        ("status", 1, "graph", "deps", 2),
+        ("status", 1, "graph", "deps", "edge_data", 2),
+    ],
+)
+def test_capture_dependencies_cuda_binding_compatibility(capture_info):
+    """CUDA 12.x and 13.x capture-info payloads must produce the same dependencies."""
+    from quack.distributed.all_gather_gemm import _capture_dependencies
+
+    assert _capture_dependencies(capture_info) == ("deps", 2)
+
+
+def test_capture_dependencies_rejects_unknown_payload():
+    """Unexpected binding signatures must fail with a useful error."""
+    from quack.distributed.all_gather_gemm import _capture_dependencies
+
+    with pytest.raises(RuntimeError, match="unexpected payload with 4 values"):
+        _capture_dependencies(("status", 1, "graph", "deps"))
+
+
 def _ag_gemm(runner, a_shard, b, d=None):
     """Plain AG+GEMM (D = A_full @ B^T) through the gather() context."""
     from quack.gemm import gemm as quack_gemm
