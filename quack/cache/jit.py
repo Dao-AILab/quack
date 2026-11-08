@@ -16,7 +16,10 @@ bench loop) retries once the ``.o`` lands.
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    from quack import _filelock as fcntl
 import functools
 import hashlib
 import os

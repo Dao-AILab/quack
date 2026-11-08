@@ -40,10 +40,14 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    from quack import _filelock as fcntl
 import importlib
 import os
 import pickle
+import sys
 from concurrent.futures import Future, ProcessPoolExecutor
 from multiprocessing import get_context
 from typing import NamedTuple, Optional
@@ -302,7 +306,8 @@ def _make_executor(jobs: int) -> ProcessPoolExecutor:
     test pool, the autotuner's) fork from the same warm sidecar. Opt out
     with QUACK_ASYNC_COMPILE_START=spawn.
     """
-    start_method = os.environ.get("QUACK_ASYNC_COMPILE_START", "forkserver")
+    default_start = "spawn" if sys.platform == "win32" else "forkserver"
+    start_method = os.environ.get("QUACK_ASYNC_COMPILE_START", default_start)
     ctx = get_context(start_method)
     if start_method == "forkserver":
         ctx.set_forkserver_preload(["quack.cache._pool_preload"])

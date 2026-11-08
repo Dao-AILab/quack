@@ -9,6 +9,7 @@ requires-python = ">=3.10"
 dependencies = [
     "nvidia-cutlass-dsl>=4.7",
     "torch",
+    "triton-windows; sys_platform == 'win32'",
     "apache-tvm-ffi>=0.1.6,<0.2",
     "einops",
 ]
