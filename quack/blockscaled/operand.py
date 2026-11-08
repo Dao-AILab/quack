@@ -50,6 +50,8 @@ __all__ = [
     "mma_kind_for_pair",
     "MXFP8_E4M3",
     "MXFP8_E5M2",
+    "MXFP8_E4M3_2D",
+    "MXFP8_E5M2_2D",
     "MXFP4",
     "MXFP4_BYTE",
     "NVFP4",
@@ -84,12 +86,25 @@ class BlockScaledFormat:
     # selected explicitly by storage_layout below.
     elems_per_container: int
     scale_dtype: torch.dtype
-    sf_vec_size: int  # logical K elements per scale factor (== min logical-K divisibility)
+    # Scale-factor granularity as an (outer, red) pair: logical elements
+    # sharing one scale factor along the outer (MN) dim and the reduction (K)
+    # dim. The red entry is the classic sf_vec_size (min logical-K
+    # divisibility; still exposed as the `sf_vec_size` property). (1, 32) =
+    # rowwise MX; (32, 32) = SQUARE 2D blocks, stored row-replicated in the
+    # standard blocked layout so kernels are oblivious and transposing
+    # (BlockScaledOperand.materialize_transposed) is free. The constructor is
+    # int-compatible: a bare int v normalizes to (1, v) in __post_init__.
+    sf_size_outer_red: Tuple[int, int]
     has_per_tensor_scale: bool = False
     # None is intentionally the legacy default: old pickles do not carry this
     # field and must retain elems_per_container semantics. packed_lsb_v1 is a
     # dense little-endian bit stream (currently canonical packed fp6).
     storage_layout: Optional[str] = None
+
+    @property
+    def sf_vec_size(self) -> int:
+        """SF elements along the reduction (K) dim."""
+        return self.sf_size_outer_red[1]
 
     def __setstate__(self, state):
         """Load both current and pre-storage-layout dataclass pickles.
@@ -120,6 +135,17 @@ class BlockScaledFormat:
                 raise ValueError("cannot infer elems_per_container from serialized format state")
         values.setdefault("has_per_tensor_scale", False)
         values.setdefault("storage_layout", None)
+        # Legacy pickles carry the rowwise K-only "sf_vec_size" int; migrate
+        # it (and the short-lived interim "sf_block_rows" spelling) to the
+        # (outer, red) pair.
+        if "sf_size_outer_red" not in values and "sf_vec_size" in values:
+            values["sf_size_outer_red"] = (
+                values.pop("sf_block_rows", 1),
+                values.pop("sf_vec_size"),
+            )
+        else:
+            values.pop("sf_vec_size", None)
+            values.pop("sf_block_rows", None)
         if values["storage_layout"] == "packed_lsb_v1":
             values["name"] = {
                 "mxfp6_e2m3": "mxfp6_e2m3_packed",
@@ -132,7 +158,7 @@ class BlockScaledFormat:
             "elem_bits",
             "elems_per_container",
             "scale_dtype",
-            "sf_vec_size",
+            "sf_size_outer_red",
             "has_per_tensor_scale",
             "storage_layout",
         ):
@@ -164,12 +190,21 @@ class BlockScaledFormat:
             )
         if not isinstance(self.scale_dtype, torch.dtype):
             raise TypeError(f"scale_dtype must be a torch.dtype, got {self.scale_dtype!r}")
+        if isinstance(self.sf_size_outer_red, int) and not isinstance(self.sf_size_outer_red, bool):
+            # Legacy int spelling: v scale-factor elements along K, rowwise.
+            object.__setattr__(self, "sf_size_outer_red", (1, self.sf_size_outer_red))
         if (
-            not isinstance(self.sf_vec_size, int)
-            or isinstance(self.sf_vec_size, bool)
-            or self.sf_vec_size <= 0
+            not isinstance(self.sf_size_outer_red, tuple)
+            or len(self.sf_size_outer_red) != 2
+            or any(
+                not isinstance(v, int) or isinstance(v, bool) or v <= 0
+                for v in self.sf_size_outer_red
+            )
         ):
-            raise TypeError(f"sf_vec_size must be a positive int, got {self.sf_vec_size!r}")
+            raise TypeError(
+                f"sf_size_outer_red must be a positive int (legacy rowwise spelling) or an "
+                f"(outer, red) pair of positive ints, got {self.sf_size_outer_red!r}"
+            )
         if not isinstance(self.has_per_tensor_scale, bool):
             raise TypeError("has_per_tensor_scale must be bool")
         if self.storage_layout not in (None, "container_v1", "packed_lsb_v1"):
@@ -268,6 +303,8 @@ class BlockScaledFormat:
             if (
                 fmt.cutlass_dtype_name is not None  # DSL-typeless formats can't match
                 and not fmt.is_byte_container  # dtype triples select kernel-ready storage
+                and fmt.sf_size_outer_red[0] == 1  # 2D recipes are byte-identical at the
+                # MMA level; dtype triples resolve to the canonical rowwise row
                 and fmt.to_cutlass_dtype() == ab_dtype
                 and torch2cute_dtype_map[fmt.scale_dtype] == sf_dtype
                 and fmt.sf_vec_size == sf_vec_size
@@ -283,6 +320,19 @@ MXFP8_E4M3 = BlockScaledFormat(
 )
 MXFP8_E5M2 = BlockScaledFormat(
     "mxfp8_e5m2", torch.float8_e5m2, "Float8E5M2", 8, 1, torch.float8_e8m0fnu, 32
+)
+# Square 2D (32x32) scale-block MXFP8: one e8m0 scale per 32x32 value block,
+# stored row-replicated in the standard blocked layout — byte-identical to a
+# rowwise operand at the kernel/MMA level (kind::mxf8f6f4, e8m0, vec 32), so
+# every consumer runs unchanged. The recipe's payoff is transposability: the
+# transpose carries the numerically identical quantization
+# (materialize_transposed), e.g. ONE weight quantization serving both a
+# linear's forward (contract K) and dgrad (contract N).
+MXFP8_E4M3_2D = BlockScaledFormat(
+    "mxfp8_e4m3_2d", torch.float8_e4m3fn, "Float8E4M3FN", 8, 1, torch.float8_e8m0fnu, (32, 32)
+)
+MXFP8_E5M2_2D = BlockScaledFormat(
+    "mxfp8_e5m2_2d", torch.float8_e5m2, "Float8E5M2", 8, 1, torch.float8_e8m0fnu, (32, 32)
 )
 MXFP4 = BlockScaledFormat(
     "mxfp4", torch.float4_e2m1fn_x2, "Float4E2M1FN", 4, 2, torch.float8_e8m0fnu, 32
@@ -358,6 +408,8 @@ BLOCKSCALED_FORMAT_REGISTRY = {
     for fmt in (
         MXFP8_E4M3,
         MXFP8_E5M2,
+        MXFP8_E4M3_2D,
+        MXFP8_E5M2_2D,
         MXFP4,
         NVFP4,
         MXFP6_E2M3,
@@ -393,9 +445,10 @@ BLOCKSCALED_FORMAT_REGISTRY = {
 #
 # NVFP4 weight-only (W4A16) needs NO new row: the same NVFP4 format pairs with
 # a plain bf16 activation tensor and dispatches to an upconvert kernel per
-# arch. Still-missing axes (added with their first consumer): sf_block_mn (2D
-# 128x128 grids), a full-extent sf_vec_size sentinel (rowwise / cuBLASLt
-# OUTER_VEC), per-operand scale layouts ("linear"), and per-L batch scales.
+# arch. Still-missing axes (added with their first consumer): a full-extent
+# sf_vec_size sentinel (rowwise / cuBLASLt OUTER_VEC), per-operand scale
+# layouts ("linear"), and per-L batch scales. 2D scale blocks landed as
+# sf_size_outer_red (the square 32x32 mxfp8 rows below).
 
 # Legacy short names used by blockscaled_quantize / BLOCKSCALED_FORMATS (the
 # inverse is derived - this dict is the single source of the aliasing).
@@ -458,7 +511,8 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
     # Gate BOTH axes explicitly rather than falling through: a format whose
     # elements no tcgen05 kind can consume (no DSL type, or a non-fp8/6/4 one),
     # or whose scale RECIPE the SF hardware cannot represent (kind::mxf8f6f4 is
-    # e8m0 / vec-32 only — fp32 scales, vec 128, 2D grids are software recipes),
+    # e8m0 / vec-32 only — fp32 scales and vec 128 are software recipes; the
+    # row-replicated square 2D rows are byte-identical to rowwise and pass),
     # must fail HERE with the reason, not at the per-arch gate later. Software
     # kinds (blockwise promotion: fp32-scale fp8, one-sided bf16, int4) are a
     # follow-up with their own kind names — see AI/blockscaled_api.md section 9.
@@ -759,6 +813,14 @@ class BlockScaledOperand:
         assert x.shape[-1] % fmt.sf_vec_size == 0, (
             f"K ({x.shape[-1]}) must be divisible by {fmt.sf_vec_size} for {fmt.name}"
         )
+        sf_outer = fmt.sf_size_outer_red[0]
+        if sf_outer > 1:
+            # 2D scale blocks span sf_outer rows; batching would let blocks
+            # straddle batch entries.
+            assert x.ndim == 2, f"{fmt.name} quantizes 2D tensors only"
+            assert x.shape[0] % sf_outer == 0, (
+                f"M ({x.shape[0]}) must be divisible by {sf_outer} for {fmt.name}"
+            )
         # Under dynamo, call the raw quantizer: the torch.compile'd wrapper would
         # nest compilation; the raw fn traces into the enclosing graph.
         fn = quantizer[0] if torch.compiler.is_compiling() else quantizer[1]
@@ -781,6 +843,78 @@ class BlockScaledOperand:
         if not batched:
             sf = sf.squeeze(0)
         return _construct(q, sf, fmt, pts, x.dtype, -1)
+
+    def materialize_transposed(self) -> "BlockScaledOperand":
+        """The (K, M) K-major operand carrying THIS operand's exact quantization.
+
+        Legal only for SQUARE 2D scale-block formats (``sf_size_outer_red = (v, v)``):
+        each scale covers a square value block, so the transpose is the byte-transpose
+        of ``qdata`` with the transposed scale grid — dequantization is bit-identical
+        in either orientation (this is what lets one weight quantization serve a
+        linear's forward and dgrad). Rowwise (1D) formats cannot transpose: their
+        scale vectors run along K only (``.mT`` gives an orientation VIEW, not a
+        re-blocked transpose).
+
+        Returns a new operand with copied (transposed-contiguous) storage.
+        """
+        from quack.blockscaled.quantize import (
+            pack_scale_2d_to_blocked_contig,
+            unpack_scale_blocked_to_2d,
+        )
+
+        fmt = self.format
+        sf_outer, sf_red = fmt.sf_size_outer_red
+        if sf_outer != sf_red or sf_outer == 1:
+            raise ValueError(
+                f"materialize_transposed requires a square 2D scale-block format "
+                f"(sf_size_outer_red = (v, v) with v > 1); {fmt.name} has "
+                f"{fmt.sf_size_outer_red}"
+            )
+        if self.qdata.ndim != 2:
+            raise ValueError(
+                f"materialize_transposed expects an unbatched (M, K) operand, got shape "
+                f"{tuple(self.shape)}"
+            )
+        if self.quant_dim == -2:
+            # A quant_dim=-2 operand is the .mT view of a K-quantized (K, M)
+            # operand whose storage is already the transposed-contiguous layout.
+            return self.mT
+        M, K = self.shape
+        bs = fmt.sf_vec_size
+        if M % bs or K % bs:
+            raise ValueError(
+                f"materialize_transposed needs M and K divisible by {bs} for {fmt.name}, "
+                f"got ({M}, {K})"
+            )
+        # blocked (rm, rk, 32, 4, 4) -> per-row (M, K/32) -> block grid
+        # (M/32, K/32) -> transpose -> re-replicate rows -> re-pack.
+        rows_scale = unpack_scale_blocked_to_2d(self.scale.unsqueeze(0), M, K // bs)
+        blocks = rows_scale[0].view(torch.uint8).reshape(M // bs, bs, K // bs)
+        # The 2D label is only as good as its invariant: a rowwise-quantized
+        # operand re-tagged 2D (from_parts, or a per-1xK SF epilogue) dequantizes
+        # identically but has NO exact transpose — refuse rather than sample row 0.
+        if not torch.equal(blocks, blocks[:, :1, :].expand_as(blocks)):
+            raise ValueError(
+                f"{fmt.name} operand's scales are not replicated across each {bs}-row "
+                f"block: it was quantized rowwise and mislabeled 2D, so no exact "
+                f"transpose exists"
+            )
+        grid = blocks[:, 0, :].contiguous()
+        t_rows = (
+            grid.T.contiguous()
+            .view(K // bs, 1, M // bs)
+            .expand(K // bs, bs, M // bs)
+            .reshape(K, M // bs)
+            .view(torch.float8_e8m0fnu)
+        )
+        t_scale = pack_scale_2d_to_blocked_contig(t_rows.view(1, K, M // bs)).squeeze(0)
+        return type(self).from_parts(
+            self.qdata.T.contiguous(),
+            t_scale,
+            fmt,
+            per_tensor_scale=self.per_tensor_scale,
+            orig_dtype=self.orig_dtype,
+        )
 
     def to_packed(self) -> "BlockScaledOperand":
         """Migrate a deprecated byte-container operand to canonical packed storage.
@@ -979,7 +1113,7 @@ def _format_to_context(fmt: BlockScaledFormat) -> dict:
         "elem_bits": fmt.elem_bits,
         "elems_per_container": fmt.elems_per_container,
         "scale_dtype": _dtype_to_context(fmt.scale_dtype),
-        "sf_vec_size": fmt.sf_vec_size,
+        "sf_size_outer_red": list(fmt.sf_size_outer_red),
         "has_per_tensor_scale": fmt.has_per_tensor_scale,
         "storage_layout": getattr(fmt, "storage_layout", None),
     }
@@ -988,6 +1122,14 @@ def _format_to_context(fmt: BlockScaledFormat) -> dict:
 def _format_from_context(context: dict) -> BlockScaledFormat:
     if not isinstance(context, dict):
         raise TypeError(f"invalid serialized BlockScaledFormat context {context!r}")
+    # Legacy contexts carry the rowwise K-only "sf_vec_size" int; migrate it
+    # to the (outer, red) pair exactly as __setstate__ does for old pickles.
+    if "sf_size_outer_red" in context:
+        sf_size_outer_red = tuple(context["sf_size_outer_red"])
+    elif "sf_vec_size" in context:
+        sf_size_outer_red = (1, context["sf_vec_size"])
+    else:
+        raise ValueError("serialized BlockScaledFormat context is missing 'sf_size_outer_red'")
     fmt = BlockScaledFormat(
         name=context["name"],
         qdata_dtype=_dtype_from_context(context["qdata_dtype"]),
@@ -995,7 +1137,7 @@ def _format_from_context(context: dict) -> BlockScaledFormat:
         elem_bits=context["elem_bits"],
         elems_per_container=context["elems_per_container"],
         scale_dtype=_dtype_from_context(context["scale_dtype"]),
-        sf_vec_size=context["sf_vec_size"],
+        sf_size_outer_red=sf_size_outer_red,
         has_per_tensor_scale=context["has_per_tensor_scale"],
         storage_layout=context.get("storage_layout"),
     )

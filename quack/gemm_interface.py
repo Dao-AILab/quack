@@ -263,10 +263,21 @@ def _resolve_blockscaled_out(out_dtype) -> Optional[BlockScaledFormat]:
     """``out_dtype`` naming a BlockScaledFormat requests a quantized (blockscaled)
     output; returns the descriptor, or None for plain-dtype outputs."""
     if isinstance(out_dtype, BlockScaledFormat):
-        return out_dtype
-    if isinstance(out_dtype, str):
-        return BlockScaledFormat.from_name(out_dtype)
-    return None
+        fmt = out_dtype
+    elif isinstance(out_dtype, str):
+        fmt = BlockScaledFormat.from_name(out_dtype)
+    else:
+        return None
+    if fmt.sf_size_outer_red[0] != 1:
+        # The SFD epilogue emits one scale per 1 x sf_vec_size vector. Tagging
+        # that output with a 2D scale-block format would mislabel it: the scales
+        # are not block-replicated, so materialize_transposed would be wrong.
+        raise NotImplementedError(
+            f"quantized output does not support 2D scale-block format {fmt.name} "
+            f"(sf_size_outer_red={fmt.sf_size_outer_red}); quantize the output with "
+            f"BlockScaledOperand.quantize instead"
+        )
+    return fmt
 
 
 def _alloc_blockscaled_out(out_shape, fmt: BlockScaledFormat, device, num_varlen_batches=None):
