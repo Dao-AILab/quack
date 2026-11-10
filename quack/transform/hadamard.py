@@ -689,7 +689,7 @@ class HadamardTransform:
         row_in_cta = 0 if const_expr(plan.rows_per_block == 1) else cute.arch.thread_idx()[1]
         block_row, _, _ = cute.arch.block_idx()
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         shape = mX.shape
         # Each CTA, per iteration, processes a (rows_per_block, N_padded) tile starting at

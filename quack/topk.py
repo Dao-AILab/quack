@@ -361,7 +361,7 @@ class TopKBackward(ReductionBase):
         ]
 
         # Allocate smem for output gradients
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sdX = smem.allocate_tensor(
             mdX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
         )

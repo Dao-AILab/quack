@@ -29,7 +29,7 @@ This is trace-time-only machinery (no monkey-patching of the DSL).
 from types import SimpleNamespace
 
 import cutlass.cute as cute
-from cutlass.utils import SmemPartition
+from cutlass.memory import SmemPartition
 
 
 class Reserved:
