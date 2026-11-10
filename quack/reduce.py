@@ -11,7 +11,7 @@ from cutlass.base_dsl.enums import Arch
 from cutlass.experimental import primitives as prims
 
 import quack.utils as utils
-from quack.pipeline import mbarrier_acquire_cluster
+from quack.pipeline import mbarrier_wait_acquire_cluster
 
 
 _operator_max = getattr(operator, "max", None)
@@ -149,10 +149,9 @@ def cluster_reduce(
                 mbar_ptr,
                 peer_cta_rank_in_cluster=lane_idx,
             )
-    cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
-    # The peers' st.async complete-tx release at cluster scope; the wait above
-    # acquires at CTA scope only.
-    mbarrier_acquire_cluster(mbar_ptr, phase if phase is not None else 0)
+    # The peers' st.async complete-tx release at cluster scope; a plain
+    # mbarrier_wait acquires at CTA scope only.
+    mbarrier_wait_acquire_cluster(mbar_ptr, phase if phase is not None else 0)
     results = []
     num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
     for buf in bufs:
@@ -343,10 +342,9 @@ def online_softmax_reduce(
                         mbar_ptr,
                         peer_cta_rank_in_cluster=lane_idx,
                     )
-                cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
-                # The peers' st.async complete-tx release at cluster scope; the
-                # wait above acquires at CTA scope only.
-                mbarrier_acquire_cluster(mbar_ptr, phase if phase is not None else 0)
+                # The peers' st.async complete-tx release at cluster scope; a
+                # plain mbarrier_wait acquires at CTA scope only.
+                mbarrier_wait_acquire_cluster(mbar_ptr, phase if phase is not None else 0)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
                 max_x_single_warp = cute.make_rmem_tensor(num_iter, Float32)
                 max_x_single_warp.fill(-Float32.inf)
