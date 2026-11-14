@@ -32,6 +32,7 @@ PACKAGE_NAME = "quack"
 VERSION = __version__
 
 
+@torch.compiler.disable
 def _sync_ranks_after_autotune():
     """Re-align distributed ranks after a cold autotune, if requested.
 
