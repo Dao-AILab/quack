@@ -16,7 +16,6 @@ bench loop) retries once the ``.o`` lands.
 
 from __future__ import annotations
 
-import fcntl
 import functools
 import hashlib
 import os
@@ -28,6 +27,11 @@ import warnings
 from collections import namedtuple
 from getpass import getuser
 from pathlib import Path
+
+if sys.platform == "win32":
+    from quack import _filelock as fcntl
+else:
+    import fcntl
 
 import cutlass
 import cutlass.cute as cute

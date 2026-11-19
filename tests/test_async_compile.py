@@ -57,7 +57,7 @@ def test_flock_probe_detects_exclusive_holder(tmp_path):
     pool is already compiling, instead of burning a pool slot on a duplicate
     compile that would just block on the same flock.
     """
-    import fcntl
+    from quack.cache.async_compile import fcntl
 
     lock_path = tmp_path / "key.lock"
     assert not _flock_held_exclusively(str(lock_path))  # nonexistent -> free
@@ -80,7 +80,7 @@ def test_pool_poll_external_lifecycle(tmp_path):
     compiler would leave every waiter deferring forever (until the wedge
     deadline force-synced them one by one).
     """
-    import fcntl
+    from quack.cache.async_compile import fcntl
 
     pool = CompilePool.__new__(CompilePool)  # skip executor spawn: bookkeeping only
     pool._futures = {}
