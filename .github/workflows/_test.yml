@@ -37,6 +37,48 @@ jobs:
       - name: Ruff format
         run: ruff format --check quack/ tests/
 
+  build:
+    name: Wheel / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, architecture: x64, python: '3.13.17'}
+          - {os: windows-latest, architecture: x64, python: '3.13.17'}
+          - {os: windows-11-arm, architecture: arm64, python: '3.13.17'}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.architecture }}
+      - name: Verify native ARM64 Python
+        if: matrix.architecture == 'arm64'
+        shell: python
+        run: |
+          import platform, struct, sys
+          assert platform.machine().upper() == 'ARM64', platform.machine()
+          with open(sys.executable, 'rb') as image:
+              image.seek(60)
+              image.seek(struct.unpack('<I', image.read(4))[0])
+              assert image.read(4) == b'PE\0\0'
+              assert struct.unpack('<H', image.read(2))[0] == 0xAA64
+      - name: Install build and test tools
+        run: python -m pip install build pytest
+      - name: Build regular wheel
+        run: python -m build --wheel
+      - name: Test packaged source and platform locks
+        run: python -m pytest --confcutdir=tests/packaging tests/packaging -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quack-wheel-${{ matrix.os }}
+          path: dist/*.whl
+          if-no-files-found: error
+
   changes:
     runs-on: ubuntu-24.04
     outputs:
@@ -59,7 +101,9 @@ jobs:
 
   test:
     needs: changes
+    # Forks without matching self-hosted runners can explicitly disable GPU CI.
     if: >
+      vars.QUACK_GPU_CI != 'false' &&
       needs.changes.outputs.code == 'true' &&
       (github.event_name == 'push' ||
        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||

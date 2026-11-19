@@ -4,25 +4,76 @@ on:
   push:
     tags:
       - 'v*'
+  # Validate release builds without creating a release or uploading to PyPI.
+  workflow_dispatch:
 
 jobs:
-  build-and-publish:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, architecture: x64, python: '3.13.17'}
+          - {os: windows-latest, architecture: x64, python: '3.13.17'}
+          - {os: windows-11-arm, architecture: arm64, python: '3.13.17'}
     steps:
     - uses: actions/checkout@v6
 
     - name: Set up Python
       uses: actions/setup-python@v6
       with:
-        python-version: '3.9'
+        python-version: ${{ matrix.python }}
+        architecture: ${{ matrix.architecture }}
+
+    - name: Verify native ARM64 Python
+      if: matrix.architecture == 'arm64'
+      shell: python
+      run: |
+        import platform, struct, sys
+        assert platform.machine().upper() == 'ARM64', platform.machine()
+        with open(sys.executable, 'rb') as image:
+            image.seek(60)
+            image.seek(struct.unpack('<I', image.read(4))[0])
+            assert image.read(4) == b'PE\0\0'
+            assert struct.unpack('<H', image.read(2))[0] == 0xAA64
 
     - name: Install build dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install build twine
+        pip install build pytest
 
     - name: Build package
       run: python -m build
+
+    - name: Test packaged source and platform locks
+      run: python -m pytest --confcutdir=tests/packaging tests/packaging -q
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: quack-release-${{ matrix.os }}
+        path: dist/*
+        if-no-files-found: error
+
+  build-and-publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.13.17'
+
+    # All platforms validate the universal wheel; publish one copy with the sdist.
+    - uses: actions/download-artifact@v5
+      with:
+        name: quack-release-ubuntu-latest
+        path: dist
+
+    - name: Install publishing dependencies
+      run: python -m pip install twine
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v3
