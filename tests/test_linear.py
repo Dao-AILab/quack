@@ -106,6 +106,35 @@ def test_gemm(m, k, n, input_dtype, A_major, B_major, out_major, swap_ab):
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-5
 
 
+@pytest.mark.parametrize("split_k", [1, 2])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, None])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 4096, 512), (16, 1504, 1024), (40, 8192, 736), (64, 2048, 1024)]
+)
+def test_gemm_fp8_small_m_default(m, n, k, has_bias, out_dtype, split_k):
+    """tuned=False at decode-size M takes the SM100 swap_ab default (narrow token tile)."""
+    if get_device_capacity(torch.device("cuda"))[0] not in (10, 11):
+        pytest.skip("SM100/SM110 small-M swap_ab default")
+    torch.random.manual_seed(0)
+    A = torch.randn((m, k), device="cuda").to(torch.float8_e4m3fn)
+    B = (torch.randn((n, k), device="cuda") / math.sqrt(k)).to(torch.float8_e4m3fn).mT
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16) if has_bias else None
+    if out_dtype is None and has_bias:
+        pytest.skip("bias is covered with bf16 output")
+    out = gemm(A, B, bias=bias, out_dtype=out_dtype, tuned=False, split_k=split_k)
+    out_ref = A.float() @ B.float() + (bias.float() if has_bias else 0)
+    if out_dtype is None:  # fp8 output: compare against the fp8-rounded reference
+        assert out.dtype == torch.float8_e4m3fn
+        out_ref = out_ref.to(torch.float8_e4m3fn).float()
+        tol = 2**-3
+    else:
+        tol = 2**-7
+    torch.testing.assert_close(
+        out.float(), out_ref, atol=out_ref.abs().max().item() * tol, rtol=1e-2
+    )
+
+
 @pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize("out_major", ["m", "n"])
 @pytest.mark.parametrize("B_major", ["k", "n"])

@@ -25,6 +25,7 @@ from quack.gemm_config import (
     cta_tile_shape_m,
     default_config,
     get_all_configs,
+    small_m_swap_config,
 )
 
 from quack.autotuner import autotune, AutotuneConfig
@@ -368,6 +369,25 @@ def nvmmh_config(A, B, device_capacity):
         return None
 
 
+def _small_m_swap_default(A, B, *, blockscaled, same_formats, swap_ok) -> Optional[GemmConfig]:
+    """Untuned decode-size default: swap_ab with a narrow token tile (see
+    small_m_swap_config). Only where swap_ab is legal; blockscaled only for
+    equal A/B formats (mixed pairs keep their implemented A/B sides). Dense
+    covers fp8 inputs, the measured case."""
+    if not swap_ok or (blockscaled and not same_formats):
+        return None
+    if not blockscaled and A.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return None
+    device_capacity = get_device_capacity(A.device)[0]
+    if device_capacity not in (10, 11):
+        return None
+    sm_count = torch.cuda.get_device_properties(A.device).multi_processor_count
+    l = A.shape[0] if A.ndim == 3 else 1
+    return small_m_swap_config(
+        A.shape[-2], B.shape[-1], sm_count, device_capacity, blockscaled=blockscaled, l=l
+    )
+
+
 def _expand_split_k_configs(configs, A, B, device_capacity, blockscaled=False):
     """Add split_k > 1 variants of each surviving config for occupancy-starved shapes.
 
@@ -509,6 +529,18 @@ def gemm_tuned(
     if blockscaled:
         SFA, SFB = _sf_decode(SFA, bs_format_a), _sf_decode(SFB, bs_format_b)
     quant_out = SFD is not None or SFDCol is not None
+    if config is None:
+        config = _small_m_swap_default(
+            A,
+            B,
+            blockscaled=blockscaled,
+            same_formats=bs_format_a == bs_format_b,
+            swap_ok=cu_seqlens_m is None
+            and cu_seqlens_k is None
+            and A_idx is None
+            and not concat_layout
+            and not quant_out,
+        )
     if config is None:
         if blockscaled:
             m = A.shape[-2]

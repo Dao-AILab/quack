@@ -313,6 +313,56 @@ def blockscaled_default_config(m: int, n: int, device_capacity: int = 10) -> Gem
     return _blockscaled_config(tile_m, tile_n, cluster)
 
 
+# Largest token count (GEMM M) that takes the swap-AB default on SM100/SM110.
+SMALL_M_SWAP_MAX_M = 64
+
+
+def small_m_swap_config(
+    m: int, n: int, sm_count: int, device_capacity: int, blockscaled: bool = False, l: int = 1
+) -> Optional[GemmConfig]:
+    """Swap-AB default for decode-size M on SM100/SM110, or None.
+
+    With M <= SMALL_M_SWAP_MAX_M the tokens cannot fill a 128-row tcgen05 tile.
+    Swapping puts the weights' N on the kernel M (128 rows per CTA) and the
+    tokens on the narrowest legal kernel tile_n that covers them. Only when the
+    weight tiles alone fill at most a quarter of the SMs are the tokens split
+    further (the smallest token tile that keeps one wave): more CTAs then
+    stream the weights, while for larger N the re-read of each weight tile
+    per token tile costs more than the added parallelism. A 64-wide token
+    tile uses the 2-CTA MMA. Blockscaled tile_n must be a multiple of 64 (the
+    SF tmem datapath is 64-N granular), so it always uses 64.
+    Measured on sm_107 over Llama-3 8B/70B linear shapes at M = 16..64:
+    1.2-1.7x geomean over the previous untuned default for fp8, mxfp8, mxfp4 and nvfp4.
+    test_small_m_swap_selection pins the rule.
+    """
+    if device_capacity not in (10, 11) or m > SMALL_M_SWAP_MAX_M:
+        return None
+    token_tiles = (64,) if blockscaled else (16, 32, 64)
+    weight_tiles = -(-n // 128) * l
+    tile_n = next((t for t in token_tiles if t >= m), token_tiles[-1])
+    if 4 * weight_tiles <= sm_count:
+        tile_n = next(
+            (t for t in token_tiles if t <= tile_n and weight_tiles * -(-m // t) <= sm_count),
+            tile_n,
+        )
+    tile_m, cluster = (256, (2, 1)) if tile_n == 64 else (128, (1, 1))
+    return _swap_config(tile_m, tile_n, cluster)
+
+
+@lru_cache(maxsize=None)
+def _swap_config(tile_m, tile_n, cluster):
+    return GemmConfig(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        cluster_m=cluster[0],
+        cluster_n=cluster[1],
+        pingpong=False,
+        is_dynamic_persistent=True,
+        swap_ab=True,
+        device_capacity=10,  # SM110 shares the SM100 config space
+    )
+
+
 @lru_cache(maxsize=None)
 def _blockscaled_config(tile_m, tile_n, cluster, device_capacity=10, pingpong=False):
     return GemmConfig(

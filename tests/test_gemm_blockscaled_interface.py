@@ -44,7 +44,7 @@ from quack.gemm_interface import (
     gemm_tuned,
     prune_invalid_gemm_configs,
 )
-from quack.gemm_config import GemmConfig
+from quack.gemm_config import GemmConfig, blockscaled_config_ok, small_m_swap_config
 
 
 def _skip_if_not_sm100():
@@ -704,6 +704,20 @@ def test_nvfp4_swap_ab_per_tensor_scale():
     assert _rel_err(out, gemm_blockscaled_ref(xq, wq.mT)) < 5e-3
 
 
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 4096, 512), (16, 1024, 1024), (48, 448, 384), (64, 2048, 512)]
+)
+def test_blockscaled_gemm_small_m_default(fmt, m, n, k):
+    """tuned=False at decode-size M takes the swap_ab default, with and without a bias."""
+    _skip_if_not_sm100()
+    A, B = _quantized_operands(fmt, m, n, k, batched=False)
+    ref = gemm_blockscaled_ref(A, B).float()
+    assert _rel_err(gemm(A, B, tuned=False), ref) < 5e-3
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    assert _rel_err(gemm(A, B, bias=bias, tuned=False), ref + bias.float()) < 5e-3
+
+
 @pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
 def test_blockscaled_gemm_tuned_small_m(fmt):
     """The autotuned space keeps blockscaled swap_ab configs, except for mixed formats."""
@@ -718,6 +732,43 @@ def test_blockscaled_gemm_tuned_small_m(fmt):
     assert not any(c.kwargs["config"].swap_ab for c in mixed)
     out = gemm(A, B, tuned=True)
     assert _rel_err(out, gemm_blockscaled_ref(A, B)) < 5e-3
+
+
+@pytest.mark.parametrize(
+    "m,n,blockscaled,expected",
+    [
+        # The narrowest token tile covering M; 64 uses the 2-CTA MMA.
+        (1, 28672, False, (128, 16, 1)),
+        (16, 28672, False, (128, 16, 1)),
+        (32, 8192, False, (128, 32, 1)),
+        (64, 8192, False, (256, 64, 2)),
+        (64, 14336, False, (256, 64, 2)),
+        # Few weight tiles (at most a quarter of 148 SMs): split tokens up to one wave.
+        (32, 4096, False, (128, 16, 1)),
+        (64, 4096, False, (128, 16, 1)),
+        (64, 6144, False, (256, 64, 2)),  # 48 weight tiles > 148 / 4: no split
+        # Blockscaled token tiles are 64-N granular.
+        (1, 4096, True, (256, 64, 2)),
+        (64, 28672, True, (256, 64, 2)),
+        # M > 64 keeps the un-swapped defaults.
+        (65, 4096, False, None),
+        (128, 4096, True, None),
+    ],
+)
+def test_small_m_swap_selection(m, n, blockscaled, expected):
+    c = small_m_swap_config(m, n, 148, 10, blockscaled=blockscaled)
+    if (m, n, blockscaled) == (32, 4096, False):
+        # A batch of 2 doubles the weight tiles past a quarter of the SMs: no token split.
+        c2 = small_m_swap_config(m, n, 148, 10, blockscaled=blockscaled, l=2)
+        assert (c2.tile_m, c2.tile_n, c2.cluster_m) == (128, 32, 1)
+    if expected is None:
+        assert c is None
+        return
+    assert c.swap_ab and (c.tile_m, c.tile_n, c.cluster_m) == expected
+    if blockscaled:
+        assert blockscaled_config_ok(c)
+    assert small_m_swap_config(m, n, 148, 9, blockscaled=blockscaled) is None
+    assert small_m_swap_config(m, n, 148, 12, blockscaled=blockscaled) is None
 
 
 def test_blockscaled_gemm_training_orientations():
