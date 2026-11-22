@@ -86,6 +86,22 @@ def _key_to_hash(key: tuple) -> str:
     return hashlib.sha256(pickle.dumps(key)).hexdigest()
 
 
+def _arch_key() -> tuple:
+    """Return (dispatch arch, ptxas target) for the disk cache key.
+
+    The same args compile to different object files for different archs: the
+    dispatch arch (``QUACK_ARCH`` or the GPU) selects what gets traced, and the
+    target (``CUTE_DSL_ARCH`` or the GPU) is what ptxas emits. Without them in
+    the key, one cache dir shared by two archs loads ``.o`` files built for the
+    other one (cudaErrorNoKernelImageForDevice). These are the values that
+    async-compile workers get pinned to, so a worker computes the same key as
+    the process that submitted the compile.
+    """
+    from quack.cache.async_compile import _detect_arch_env
+
+    return _detect_arch_env()
+
+
 # ---------------------------------------------------------------------------
 # File locking
 # ---------------------------------------------------------------------------
@@ -131,7 +147,8 @@ def jit_cache(fn):
     """Decorator that caches compiled CuTe DSL kernels in-memory and on disk.
 
     The decorated function should return a compiled kernel (i.e. call cute.compile).
-    The disk cache key is (fn.__qualname__, *args, **sorted_kwargs).
+    The disk cache key is (fn.__qualname__, arch, *args, **sorted_kwargs), where
+    arch is the dispatch arch and the ptxas target (see ``_arch_key``).
 
     Concurrency model
     -----------------
@@ -177,7 +194,7 @@ def jit_cache(fn):
             cache[cache_key] = compiled_fn
             return compiled_fn
 
-        sha = _key_to_hash((fn.__qualname__,) + cache_key)
+        sha = _key_to_hash((fn.__qualname__, _arch_key()) + cache_key)
         cache_path = get_cache_path() / _compute_source_fingerprint()
         cache_path.mkdir(parents=True, exist_ok=True)
         o_path = cache_path / f"{sha}.o"

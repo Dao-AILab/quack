@@ -206,6 +206,51 @@ def test_jit_cache_lock_serializes_redundant_compiles(tmp_path):
     )
 
 
+def test_jit_cache_disk_key_includes_arch(tmp_path, monkeypatch):
+    """One cache dir shared by several archs keeps one ``.o`` per arch.
+
+    The same key compiled for another dispatch arch (``QUACK_ARCH``) or another
+    ptxas target (``CUTE_DSL_ARCH``) is a different object file. Loading the
+    one built for another arch fails with cudaErrorNoKernelImageForDevice, so
+    each (dispatch arch, target) pair must compile and export its own ``.o``.
+    """
+    from pathlib import Path
+
+    import cutlass.cute as cute
+
+    import quack.cache
+    from quack.cache import jit as _jit
+
+    monkeypatch.setattr(quack.cache, "CACHE_ENABLED", True)
+    monkeypatch.setattr(quack.cache, "CACHE_DIR", str(tmp_path / "cache"))
+    # The .o files written below are placeholders; a disk hit must not try to load them.
+    monkeypatch.setattr(
+        cute.runtime, "load_module", lambda path, enable_tvm_ffi=True: {"func": None}
+    )
+
+    compiled = []
+
+    class _Compiled:
+        def export_to_c(self, object_file_path, function_name):
+            Path(object_file_path).write_bytes(b"placeholder-o")
+
+    @quack.cache.jit_cache
+    def _compile_stub(key):
+        compiled.append(key)
+        return _Compiled()
+
+    archs = [("90", "sm_90a"), ("100", "sm_100a"), ("103", "sm_103a"), ("120", "sm_90a")]
+    for quack_arch, target in archs:
+        monkeypatch.setenv("QUACK_ARCH", quack_arch)
+        monkeypatch.setenv("CUTE_DSL_ARCH", target)
+        _compile_stub.cache_clear()  # in-memory cache: force the disk path
+        _compile_stub("same-key")
+
+    assert len(compiled) == len(archs), f"compiled {len(compiled)}x for {len(archs)} archs"
+    o_files = list(_jit.get_cache_path().rglob("*.o"))
+    assert len(o_files) == len(archs), o_files
+
+
 # ---------------------------------------------------------------------------
 # R4: register_fake schema-split is auto-derived from the eager signature
 # ---------------------------------------------------------------------------
