@@ -328,7 +328,7 @@ def _max_dynamic_smem_bytes() -> int:
 
     if os.environ.get("QUACK_ARCH") is None and not torch.cuda.is_available():
         return 0
-    from cutlass.utils import SmemAllocator
+    from cutlass.memory import SmemAllocator
 
     from quack.cute_dsl_utils import get_device_capacity
 

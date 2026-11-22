@@ -44,7 +44,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 import cutlass.utils.blackwell_helpers as sm100_utils
 
 

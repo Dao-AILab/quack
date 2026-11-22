@@ -34,6 +34,7 @@ from typing import NamedTuple, Optional
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Float32, Int32, const_expr
+from cutlass.tensor_utils import LayoutEnum
 
 from quack.epilogue.ops import EpiOp, EpiSmemBytes, _get_lane_warp_layouts
 from quack.gemm_tvm_ffi_utils import make_fake_sf_tensor
@@ -251,7 +252,7 @@ class BlockScaleFactorStore(EpiOp):
             # accumulator columns, so one postact column covers 2 acc columns.
             val_tensor = getattr(args, self.quant_output)
             val_dtype = val_tensor.element_type
-            val_layout = cutlass.utils.LayoutEnum.from_tensor(val_tensor)
+            val_layout = LayoutEnum.from_tensor(val_tensor)
             store = next(
                 op for op in gemm._epi_ops if op.is_tile_store() and op.name == self.quant_output
             )

@@ -10,7 +10,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 
 import quack.copy_utils as copy_utils
 import quack.layout_utils as layout_utils

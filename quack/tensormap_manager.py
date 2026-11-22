@@ -6,13 +6,13 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, const_expr, Int32
-from cutlass.utils import TensorMapUpdateMode, TensorMapManager
+from cutlass.tensor_utils import TensorMapUpdateMode, TensorMapManager
 
 
 @dataclass(frozen=True)
 class TensorMapManagerSm90(TensorMapManager):
     """
-    We have to subclass cutlass.utils.TensorMapManager bc it takes in warp_id and only
+    We have to subclass cutlass.tensor_utils.TensorMapManager bc it takes in warp_id and only
     perform the operation if warp_id matches the current warp.
     But for Hopper pingpong gemm we want to call it with warp_id 0 and 4.
     So we take in a boolean `is_manager_warp` to determine whether to perform the operation or not.

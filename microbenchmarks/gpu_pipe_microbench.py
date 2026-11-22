@@ -317,7 +317,7 @@ class PipeBench:
         f7 = Float32(tidx) + Float32(113.0)
 
         if const_expr(self.uses_smem):
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             s = smem.allocate_tensor(
                 Int32, cute.make_layout(self.smem_int32), byte_alignment=ALIGN_BYTES
             )

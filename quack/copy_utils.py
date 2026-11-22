@@ -9,10 +9,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 
 from cutlass import Int32, Int16, Boolean, const_expr
 from cutlass.base_dsl.enums import Arch
+from cutlass.block import block_copy
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.utils import LayoutEnum, block_copy
+from cutlass.tensor_utils import LayoutEnum
 import cutlass.pipeline
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -560,7 +561,7 @@ def partition_S_position_independent(thr_copy: cute.ThrCopy, tensor: cute.Tensor
 
 @dsl_user_op
 def sm90_get_smem_load_op(
-    layout_c: cutlass.utils.LayoutEnum,
+    layout_c: LayoutEnum,
     elem_ty_c: Type[cutlass.Numeric],
     *,
     loc=None,
