@@ -7,7 +7,7 @@ name = "quack-kernels"
 dynamic = ["version"]
 requires-python = ">=3.11"
 dependencies = [
-    "nvidia-cutlass-dsl>=4.7",
+    "nvidia-cutlass-dsl[cu13]>=4.8.1",
     "numpy",
     "torch",
     "apache-tvm-ffi>=0.1.6,<0.2",
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7"]
+cu13 = []  # Backward compatibility: CUDA 13 is now the default.
 heuristics = ["nvidia-matmul-heuristics"]
 jax = ["jax", "jax-tvm-ffi"]
 bench = ["pandas", "tyro"]
@@ -32,16 +32,6 @@ include = ["quack*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "quack.__version__"}
-
-[[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
-explicit = true
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu132", marker = "extra == 'cu13'" },
-]
 
 [tool.pytest.ini_options]
 # Disable pytest plugins we don't need. These add per-test hook dispatch and

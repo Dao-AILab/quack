@@ -28,8 +28,6 @@ There is no separate build step; CuTe DSL JIT-compiles the kernel on first use.
 Use the normal repo dev environment:
 
     pip install -e '.[dev]'
-    # For CUDA 13.x wheels, if needed:
-    pip install -e '.[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
 
 Quick smoke run:
 

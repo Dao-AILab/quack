@@ -4,16 +4,8 @@ Kernels are written in the [CuTe-DSL](https://docs.nvidia.com/cutlass/latest/med
 
 ## Installation
 
-``` bash
-# For CUDA 12.9:
+```bash
 pip install quack-kernels
-
-# For CUDA 13.x:
-pip install 'quack-kernels[cu13]' --extra-index-url https://download.pytorch.org/whl/cu132
-
-# Do not use uv for CUDA 13.x installs yet: it can race/install
-# nvidia-cutlass-dsl[cu13] in the wrong order (NVIDIA/cutlass#3259):
-# https://github.com/NVIDIA/cutlass/issues/3259
 
 # Optional: install NVIDIA matmul heuristics for better untuned GEMM configs
 pip install 'quack-kernels[heuristics]'
@@ -22,10 +14,13 @@ pip install 'quack-kernels[heuristics]'
 pip install 'quack-kernels[jax]'
 ```
 
+QuACK supports **CUDA 13 only**. CUDA 12 is not supported.
+The `[cu13]` extra is accepted for backward compatibility but adds no dependencies.
+
 ## Requirements
 
 - H100, B200/B300, or RTX 50 GPU
-- CUDA toolkit 12.9+
+- CUDA toolkit 13.x
 - Python 3.12
 
 ## Kernels 🐥
@@ -77,10 +72,4 @@ To set up the development environment:
 ```bash
 pip install -e '.[dev]'
 pre-commit install
-
-# For CUDA 13.x:
-pip install 'quack-kernels[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu132
-
-# Do not use uv for CUDA 13.x installs yet; use pip instead.
-# See https://github.com/NVIDIA/cutlass/issues/3259
 ```
