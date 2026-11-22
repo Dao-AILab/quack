@@ -218,9 +218,10 @@ class TopK:
     def compile(dtype, N, k, softmax):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
+        div_k = math.gcd(128 // dtype.width, k)
         x_cute = fake_tensor(dtype, (batch_sym, N), div)
-        values_cute = fake_tensor(dtype, (batch_sym, k), div)
-        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
+        values_cute = fake_tensor(dtype, (batch_sym, k), div_k)
+        indices_cute = fake_tensor(Int32, (batch_sym, k), math.gcd(128 // Int32.width, k))
         return cute.compile(
             TopK(dtype, N, k, softmax=softmax),
             x_cute,
@@ -318,7 +319,8 @@ class TopKBackward(ReductionBase):
                 *(t.element_type.width for t in [mdValues, mValues, mIndices, mdX] if t is not None)
             )
         )
-        vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        # The same copy also reads the (M, k) inputs, so the vector must divide k too.
+        vecsize = math.gcd(self.N, self.k, 128 // largest_dtype_width)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(self.N, vecsize=vecsize)
         num_threads = tiled_copy.size
         self.kernel(
@@ -443,9 +445,12 @@ class TopKBackward(ReductionBase):
     def compile(dtype, val_dtype, dx_dtype, N, k, softmax):
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
-        dvalues_cute = fake_tensor(dtype, (batch_sym, k), div)
-        values_cute = fake_tensor(val_dtype, (batch_sym, k), div) if val_dtype is not None else None
-        indices_cute = fake_tensor(Int32, (batch_sym, k), div)
+        div_k = math.gcd(128 // dtype.width, k)
+        dvalues_cute = fake_tensor(dtype, (batch_sym, k), div_k)
+        values_cute = (
+            fake_tensor(val_dtype, (batch_sym, k), div_k) if val_dtype is not None else None
+        )
+        indices_cute = fake_tensor(Int32, (batch_sym, k), math.gcd(128 // Int32.width, k))
         dx_cute = fake_tensor(dx_dtype, (batch_sym, N), div)
         return cute.compile(
             TopKBackward(dtype, N, k, softmax=softmax),
