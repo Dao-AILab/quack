@@ -1,23 +1,15 @@
 name: GPU Test
-description: Pull SIF from Docker Hub (cached by tag), compile and run tests
+description: >-
+  Fetch the image from Docker Hub (cached by tag), compile and run tests — through
+  Slurm/Pyxis on runners that have it, in an Apptainer SIF elsewhere
 inputs:
   cuda:
-    description: cu129 or cu132 — selects which image to run for this job
-    required: true
-  gpu:
     description: >-
-      Runner GPU label (h100, b300). Used to pick driver-version-specific
-      apptainer flags — the cu13.2 image bundles a CUDA 13.1 libcuda.so.590
-      compat shim that's needed on the h100 runner's 575 kernel driver but
-      mismatches the b300 runner's 595 kernel driver (CUDA error 803). On
-      b300 we override LD_LIBRARY_PATH so apptainer's host-injected libcuda
-      wins instead.
+      Image variant label (cu132). Names the job and suffixes the per-leg cache
+      directories; it does not select the image.
     required: true
-  image_cu129:
-    description: Docker image for the cu129 variant (e.g. tridao/quack-kernels:cu12.9-DATE)
-    required: true
-  image_cu132:
-    description: Docker image for the cu132 variant (e.g. tridao/quack-kernels:cu13.2-DATE)
+  image:
+    description: Docker image to test in (e.g. tridao/quack-kernels:cu13.2-DATE)
     required: true
   arch:
     description: >-
@@ -41,118 +33,133 @@ inputs:
     description: Seconds between GPU availability checks.
     required: false
     default: '15'
+  slurm_gpus:
+    description: >-
+      GPUs to request per job on Slurm runners. The suite runs one xdist worker
+      per GPU; several workers cannot share a GPU because the largest tests
+      need most of its memory.
+    required: false
+    default: '4'
 
 runs:
   using: composite
   steps:
-    - name: Pull SIF (cached) and prune stale variants
+    - name: Fetch image (cached) and prune stale variants
       shell: bash
       env:
-        CUDA: ${{ inputs.cuda }}
-        IMAGE_CU129: ${{ inputs.image_cu129 }}
-        IMAGE_CU132: ${{ inputs.image_cu132 }}
+        IMAGE: ${{ inputs.image }}
       run: |
         WORK_DIR="${CI_WORK_DIR:-$HOME}"
-        mkdir -p "$WORK_DIR/apptainer_cache" /tmp/apptainer_tmp
+        mkdir -p "$WORK_DIR"
 
-        sif_path() { echo "$WORK_DIR/$(echo "$1" | tr '/: ' '---').sif"; }
-        SIF_CU129=$(sif_path "$IMAGE_CU129")
-        SIF_CU132=$(sif_path "$IMAGE_CU132")
-
-        if [ "$CUDA" = "cu129" ]; then
-          ACTIVE_IMAGE="$IMAGE_CU129"; ACTIVE_SIF="$SIF_CU129"
+        # Slurm clusters with Pyxis run the image through
+        # `srun --container-image` from an Enroot SquashFS, which must sit on
+        # storage every node sees. Every other runner uses an Apptainer SIF.
+        # (grep without -q: it must read all of srun's output, or srun dies of
+        # SIGPIPE and pipefail turns a match into "no Pyxis".)
+        if command -v srun >/dev/null 2>&1 && srun --help 2>&1 | grep -- '--container-image' >/dev/null; then
+          MODE=slurm; EXT=sqsh
         else
-          ACTIVE_IMAGE="$IMAGE_CU132"; ACTIVE_SIF="$SIF_CU132"
+          MODE=apptainer; EXT=sif
         fi
 
-        if [ ! -f "$ACTIVE_SIF" ]; then
-          echo "Pulling docker://$ACTIVE_IMAGE → $ACTIVE_SIF"
-          # Pull to .tmp and rename atomically so an interrupted pull doesn't
-          # leave a partial SIF that the next run would silently reuse.
-          APPTAINER_TMPDIR="/tmp/apptainer_tmp" \
-          APPTAINER_CACHEDIR="$WORK_DIR/apptainer_cache" \
-            apptainer pull "$ACTIVE_SIF.tmp" "docker://$ACTIVE_IMAGE"
-          mv "$ACTIVE_SIF.tmp" "$ACTIVE_SIF"
-        else
-          echo "Using cached SIF: $ACTIVE_SIF"
-        fi
+        ACTIVE_IMAGE="$IMAGE"
+        ACTIVE_FILE="$WORK_DIR/$(echo "$IMAGE" | tr '/: ' '---').$EXT"
 
-        # Cleanup: delete *only* old quack-kernels SIFs left from previous image
-        # bumps. Match a strict prefix so unrelated SIFs sharing $WORK_DIR (when
-        # CI_WORK_DIR is unset and $WORK_DIR == $HOME, the runner user's personal
-        # SIFs) are never touched.
-        find "$WORK_DIR" -maxdepth 1 -name "*quack-kernels*.sif" \
-          ! -name "$(basename "$SIF_CU129")" \
-          ! -name "$(basename "$SIF_CU132")" \
-          -delete
+        # One fetch at a time per image: runners sharing $WORK_DIR would otherwise
+        # race on the same download. Re-check under the lock, pull to a unique
+        # temporary name and rename atomically, so neither an interrupted pull
+        # nor a second runner can leave a partial image that later runs reuse.
+        (
+          flock 9
+          if [ -f "$ACTIVE_FILE" ]; then
+            touch -m "$ACTIVE_FILE"  # mtime tracks the last CI use, not the import date
+            echo "Using cached image: $ACTIVE_FILE"
+            exit 0
+          fi
+          echo "Pulling docker://$ACTIVE_IMAGE → $ACTIVE_FILE"
+          TMP_FILE=$(mktemp -u "$ACTIVE_FILE.tmp.XXXXXXXX")
+          trap 'rm -f "$TMP_FILE"' EXIT
+          if [ "$MODE" = slurm ]; then
+            # Download + mksquashfs is CPU-heavy: run it as a job, not on the
+            # login node the runner lives on.
+            source tools/docker/sqsh.env
+            srun --job-name=quack-ci-import --cpus-per-task=8 --mem=16G --time=30 \
+              enroot import --output "$TMP_FILE" "docker://$ACTIVE_IMAGE"
+          else
+            mkdir -p "$WORK_DIR/apptainer_cache" /tmp/apptainer_tmp
+            APPTAINER_TMPDIR="/tmp/apptainer_tmp" \
+            APPTAINER_CACHEDIR="$WORK_DIR/apptainer_cache" \
+              apptainer pull "$TMP_FILE" "docker://$ACTIVE_IMAGE"
+          fi
+          mv "$TMP_FILE" "$ACTIVE_FILE"
+        ) 9> "$ACTIVE_FILE.lock"
 
-        echo "QUACK_SIF=$ACTIVE_SIF" >> "$GITHUB_ENV"
+        # Keep other tags for a week after last use. Check age under the fetch
+        # lock so pruning can't race a runner refreshing an old tag for a queued job.
+        REPO_SLUG=$(echo "${IMAGE%%:*}" | tr '/ ' '--')
+        for file in "$WORK_DIR/$REPO_SLUG-"*."$EXT"; do
+          [[ -f "$file" && "$file" != "$ACTIVE_FILE" ]] || continue
+          (
+            flock -n 9 || exit 0
+            [[ -f "$file" ]] || exit 0
+            find "$file" -maxdepth 0 -type f -mtime +6 -delete
+          ) 9> "$file.lock"
+        done
+
+        echo "QUACK_IMAGE_FILE=$ACTIVE_FILE" >> "$GITHUB_ENV"
+        echo "QUACK_CI_MODE=$MODE" >> "$GITHUB_ENV"
+        echo "QUACK_CI_HOME=$WORK_DIR/container-home" >> "$GITHUB_ENV"
 
     - name: Compile and run tests
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
         CUDA: ${{ inputs.cuda }}
-        GPU: ${{ inputs.gpu }}
         GPU_WAIT_SECONDS: ${{ inputs.gpu_wait_seconds }}
         GPU_POLL_SECONDS: ${{ inputs.gpu_poll_seconds }}
+        SLURM_GPUS: ${{ inputs.slurm_gpus }}
       run: |
-        if ! [[ "$GPU_WAIT_SECONDS" =~ ^[0-9]+$ && "$GPU_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-          echo "::error::gpu_wait_seconds must be non-negative and gpu_poll_seconds must be positive"
-          exit 2
-        fi
-
-        # Runner placement checks the host before the listener starts, but a
-        # tenant can allocate memory between that check and job assignment.
-        # Absorb short races here instead of immediately failing the CI leg.
-        # 50000 MiB covers the measured ~45 GiB peak of the largest fp32
-        # forward/backward RMSNorm case with a small safety margin.
-        GPU_DEADLINE=$(( $(date +%s) + GPU_WAIT_SECONDS ))
-        while :; do
-          FREE_GPUS=$(
-            nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null |
-              awk -F', ' '$2 >= 50000 {print $1}' |
-              paste -sd,
-          ) || true
-          if [ -n "$FREE_GPUS" ]; then
-            break
+        if [ "$QUACK_CI_MODE" != slurm ]; then
+          if ! [[ "$GPU_WAIT_SECONDS" =~ ^[0-9]+$ && "$GPU_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::gpu_wait_seconds must be non-negative and gpu_poll_seconds must be positive"
+            exit 2
           fi
 
-          NOW=$(date +%s)
-          if (( NOW >= GPU_DEADLINE )); then
-            echo "::error::No GPUs with >= 50GB free memory after waiting ${GPU_WAIT_SECONDS}s"
-            nvidia-smi --query-gpu=index,memory.used,memory.free \
-              --format=csv,noheader,nounits || true
-            exit 1
-          fi
-          REMAINING=$(( GPU_DEADLINE - NOW ))
-          echo "No GPU has >= 50GB free; retrying in ${GPU_POLL_SECONDS}s (${REMAINING}s remaining)"
-          sleep "$GPU_POLL_SECONDS"
-        done
+          # Runner placement checks the host before the listener starts, but a
+          # tenant can allocate memory between that check and job assignment.
+          # Absorb short races here instead of immediately failing the CI leg.
+          # 50000 MiB covers the measured ~45 GiB peak of the largest fp32
+          # forward/backward RMSNorm case with a small safety margin.
+          GPU_DEADLINE=$(( $(date +%s) + GPU_WAIT_SECONDS ))
+          while :; do
+            FREE_GPUS=$(
+              nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null |
+                awk -F', ' '$2 >= 50000 {print $1}' |
+                paste -sd,
+            ) || true
+            if [ -n "$FREE_GPUS" ]; then
+              break
+            fi
 
-        NUM_GPUS=$(tr ',' '\n' <<< "$FREE_GPUS" | wc -l)
-        echo "Running tests on GPUs: $FREE_GPUS"
+            NOW=$(date +%s)
+            if (( NOW >= GPU_DEADLINE )); then
+              echo "::error::No GPUs with >= 50GB free memory after waiting ${GPU_WAIT_SECONDS}s"
+              nvidia-smi --query-gpu=index,memory.used,memory.free \
+                --format=csv,noheader,nounits || true
+              exit 1
+            fi
+            REMAINING=$(( GPU_DEADLINE - NOW ))
+            echo "No GPU has >= 50GB free; retrying in ${GPU_POLL_SECONDS}s (${REMAINING}s remaining)"
+            sleep "$GPU_POLL_SECONDS"
+          done
 
-        # The cu13.2 image's Dockerfile bakes LD_LIBRARY_PATH=/usr/local/cuda/compat
-        # so its libcuda.so.590 forward-compat shim wins over apptainer's
-        # host-injected libcuda in /.singularity.d/libs. That's correct on h100
-        # (driver 575, CUDA 12.9 — needs the 590 shim to run cu13 cute-dsl) but
-        # wrong on b300 (driver 595, CUDA 13.2 — the 590 shim is OLDER than the
-        # kernel module and triggers CUDA error 803). Override so b300 uses the
-        # host libcuda instead. cu129 image doesn't set LD_LIBRARY_PATH, so the
-        # override is a harmless no-op there.
-        EXTRA_APPTAINER_ENV=""
-        if [ "$GPU" = "b300" ]; then
-          EXTRA_APPTAINER_ENV="--env LD_LIBRARY_PATH=/.singularity.d/libs"
+          NUM_GPUS=$(tr ',' '\n' <<< "$FREE_GPUS" | wc -l)
+          echo "Running tests on GPUs: $FREE_GPUS"
         fi
-        # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
-        # this Python inside the SIF picks up packages from the runner user's
-        # ~/.local/lib/python3.12/site-packages, shadowing the SIF's copies.
-        apptainer exec --nv --writable-tmpfs \
-          --env PYTHONNOUSERSITE=1 \
-          --env FREE_GPUS="$FREE_GPUS" \
-          --env NUM_GPUS="$NUM_GPUS" \
-          $EXTRA_APPTAINER_ENV "$QUACK_SIF" bash -c "
+
+        # The script that runs inside the container, shared by both launchers.
+        INNER="
           # Editable-install over the container's baked-in quack so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
@@ -202,3 +209,39 @@ runs:
           # \"--compile-only then real run\" strategy.
           CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24
         "
+
+        if [ "$QUACK_CI_MODE" = slurm ]; then
+          if ! [[ "$SLURM_GPUS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::slurm_gpus must be a positive integer"
+            exit 2
+          fi
+          # Slurm picks and reserves the GPUs, so there is no free-memory polling
+          # and its CUDA_VISIBLE_DEVICES is used as given: one xdist worker per
+          # GPU, 8 CPUs each. Enroot only injects the driver into images that
+          # ask for it, hence NVIDIA_VISIBLE_DEVICES (the image sets it too).
+          #
+          # The runner account's real home is NOT mounted: the tests run code
+          # from the checkout, and that home holds the runner's credentials. The
+          # container sees only the checkout and a dedicated directory that
+          # serves as its HOME (kernel/Inductor/Triton caches persist there).
+          mkdir -p "$QUACK_CI_HOME"
+          NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+          srun --job-name="quack-ci-$CUDA${ARCH:+-sm$ARCH}" --nodes=1 \
+            --gres="gpu:$SLURM_GPUS" --cpus-per-task=$(( 8 * SLURM_GPUS )) --time=30 \
+            --container-image="$QUACK_IMAGE_FILE" --container-writable \
+            --no-container-mount-home \
+            --container-mounts="$PWD:$PWD,$QUACK_CI_HOME:$QUACK_CI_HOME" \
+            --container-workdir="$PWD" bash -c "
+            export HOME='$QUACK_CI_HOME' PYTHONNOUSERSITE=1 FREE_GPUS=\$CUDA_VISIBLE_DEVICES
+            export NUM_GPUS=\$(tr ',' '\n' <<< \"\$FREE_GPUS\" | wc -l)
+            $INNER"
+        else
+          # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
+          # this Python inside the SIF picks up packages from the runner user's
+          # ~/.local/lib/python3.12/site-packages, shadowing the SIF's copies.
+          apptainer exec --nv --writable-tmpfs \
+            --env PYTHONNOUSERSITE=1 \
+            --env FREE_GPUS="$FREE_GPUS" \
+            --env NUM_GPUS="$NUM_GPUS" \
+            "$QUACK_IMAGE_FILE" bash -c "$INNER"
+        fi

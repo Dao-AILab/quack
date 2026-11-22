@@ -150,6 +150,13 @@ def _is_oom(exc_type, exc_val):
         return True
     if issubclass(exc_type, RuntimeError) and "out of memory" in str(exc_val).lower():
         return True
+    # Kernel-side allocations fail outside torch's allocator. cutlass-dsl >= 4.8
+    # reports them as CUDADialectError ("cudaErrorMemoryAllocation ... CUDA out of
+    # memory error"), which derives from Exception, not RuntimeError. Match that
+    # class by name (no cutlass import here) rather than any exception whose text
+    # mentions memory, so e.g. an AssertionError quoting captured output is not retried.
+    if any(c.__name__ in ("CUDADialectError", "DSLCudaRuntimeError") for c in exc_type.__mro__):
+        return "out of memory" in str(exc_val).lower()
     return False
 
 

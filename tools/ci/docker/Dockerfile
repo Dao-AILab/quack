@@ -1,40 +1,88 @@
+# syntax=docker/dockerfile:1.7
 # All CUDA runtime libs come from torch's pip wheels (under
 # /usr/local/lib/python3.12/dist-packages/nvidia/), and ptxas comes from triton.
 # A plain ubuntu base is ~3-7 GB smaller than the nvidia/cuda:*-runtime/-devel bases.
-FROM ubuntu:24.04 AS base
+#
+# CUDA 13 only. No forward-compat libcuda is bundled, so the runner's driver
+# must itself support CUDA 13.
 
-# Defaults match build.sh's cu12.9 invocation so a bare `docker build` (no
-# --build-arg) produces a working image on our cu12.9 runners. Pass
-# --build-arg QUACK_EXTRAS=cu13,dev (plus --target cu13) for the cu13.2 variant.
-ARG TORCH_CUDA=cu126
-ARG QUACK_EXTRAS=dev
+# Build-time helpers, bind-mounted into the RUN steps below; never part of the image.
+FROM scratch AS helpers
+COPY --chmod=755 tools/ci/docker/mkstub.sh /mkstub
+COPY --chmod=755 <<'BASH' /strip-elf
+#!/bin/bash
+# strip-elf PATH...: drop debug symbols from every shared object under each
+# directory and from each named binary. Paths that do not exist are skipped.
+set -euo pipefail
+for path in "$@"; do
+    if [ -d "$path" ]; then
+        find -H "$path" -type f \( -name '*.so' -o -name '*.so.*' \) -print0
+    elif [ -f "$path" ]; then
+        printf '%s\0' "$path"
+    fi
+done | xargs -0 -r -P"$(nproc)" -n 16 sh -c '
+    for f in "$@"; do
+        strip --strip-unneeded "$f" 2>/dev/null || true
+    done
+' _
+BASH
 
-ENV DEBIAN_FRONTEND=noninteractive
+FROM ubuntu:24.04
 
-RUN apt-get update -y && apt-get install -y \
-        python3 python3.12 python3.12-dev python3.12-venv python3-pip \
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        python3 python3.12 python3.12-dev python3-pip \
         git ca-certificates gcc && \
     rm -rf /var/lib/apt/lists/*
+
+ARG TORCH_VERSION=2.15.0
+# The wheel index pyproject.toml's `cu13` extra and the README install line use.
+ARG TORCH_CUDA=cu132
 
 # Install pinned stable torch from the matching cu wheel index. Torch's wheel
 # brings cublas/cudnn/cudart/etc. and triton brings ptxas — together these are
 # everything cute-dsl needs to JIT. cusolver isn't linked from libtorch_cuda
 # (we don't use torch.linalg here), so we drop it in the same RUN to shrink
-# the layer (~hundreds of MB).
+# the layer (~hundreds of MB). Also dropped: Triton's static profiler archives
+# and its AMD code generator (only the library; Triton imports every backend's
+# Python modules at start-up and loads this library lazily), and nvJitLink.
 #
-# Note: build.sh pins TORCH_CUDA=cu126 for the cu12.9 image because PyTorch
-# 2.14 has no cu129 wheels, and TORCH_CUDA=cu132 for the cu13.2 image (matches
-# the cu13 cute-dsl backend and the cu13.x compat shim added by the `cu13`
-# target). The cu13 target's compat libcuda.so is what makes cu132 torch
-# runnable on older kernel drivers like 575.x.
-RUN pip install --break-system-packages --no-cache-dir \
-        "torch==2.14.0" \
+# Libraries libtorch_cuda hard-links but the suite never calls are replaced by
+# stubs (see mkstub.sh): cuDNN (whose engine libraries, ~850 MB, are deleted),
+# cuSPARSE, cuSPARSELt, cuFFT, NCCL, nvshmem. Calling into one of them kills
+# the process with SIGILL. Kept real: cuBLAS (tests use torch matmul as their
+# reference) and nvrtc (torch JIT-compiles ops such as torch.exp2 with it).
+# Consequence: the multi-GPU tests (test_distributed_gemm.py,
+# test_blockscaled_distributed_gemm.py) cannot run in this image. CI never runs
+# them: each xdist worker sees one GPU, so their two-GPU guard skips.
+#
+# Bytecode (.pyc) is intentionally kept so worker startup stays fast.
+RUN --mount=type=bind,from=helpers,source=/strip-elf,target=/usr/local/bin/strip-elf \
+    --mount=type=bind,from=helpers,source=/mkstub,target=/usr/local/bin/mkstub \
+    pip install --break-system-packages --no-cache-dir \
+        "torch==${TORCH_VERSION}" \
         --index-url https://download.pytorch.org/whl/${TORCH_CUDA} && \
-    rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cusolver \
-           /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcusolver*.so.*
+    cd /usr/local/lib/python3.12/dist-packages && \
+    rm -rf nvidia/cu13/lib/libcusolver*.so.* \
+           nvidia/cu13/lib/libnvJitLink.so.* \
+           nvidia/cudnn/lib/libcudnn_*.so.* \
+           triton/backends/nvidia/lib/cupti*/*_static.a \
+           triton/backends/amd/lib \
+           nvidia/cu13/lib/libcufftw.so.* \
+           nvidia/nvshmem/lib/*.bc nvidia/nvshmem/lib/*.a && \
+    strip-elf "$PWD" \
+              "$PWD/torch/bin/protoc" "$PWD"/torch/bin/protoc-* \
+              "$PWD/triton/FileCheck" && \
+    hardlink -t -s 4MiB triton/backends/nvidia/lib && \
+    mkstub nvidia/cu13/lib/libcusparse.so.12 nvidia/cusparselt/lib/libcusparseLt.so.0 \
+           nvidia/cu13/lib/libcufft.so.12 nvidia/nccl/lib/libnccl.so.2 \
+           nvidia/nvshmem/lib/libnvshmem_host.so.3 nvidia/cudnn/lib/libcudnn.so.9 && \
+    python3 -c "import torch; print('torch', torch.__version__, 'imports with stubs')"
 
 # Install quack-kernels' transitive dependencies. The package itself is
 # overwritten at run time by an editable install from the mounted repo.
+# Install only the test runner here; lint runs in its own workflow job.
 #
 # Note on cu13 install order: nvidia-cutlass-dsl-libs-cu13 is an OVERLAY on top
 # of -libs-base — both wheels write the same nvidia_cutlass_dsl/lib/*.so paths,
@@ -43,38 +91,25 @@ RUN pip install --break-system-packages --no-cache-dir \
 # dependencies before dependents, so -libs-cu13 (which depends on -libs-base)
 # is guaranteed to install last and its files deterministically overlay -libs-base.
 # Switching to uv pip here re-introduces non-deterministic install order.
-COPY pyproject.toml /tmp/quack/pyproject.toml
-COPY quack/ /tmp/quack/quack/
-RUN pip install --break-system-packages --no-cache-dir "/tmp/quack[${QUACK_EXTRAS}]"
+#
+# cutlass-dsl always installs its CUDA 12 flavour next to cu13; this image is
+# CUDA 13 only, so remove it (both the IR module and its cu12/ runtime dir, or
+# the loader reports an incomplete install).
+RUN --mount=type=bind,from=helpers,source=/strip-elf,target=/usr/local/bin/strip-elf \
+    --mount=type=bind,source=pyproject.toml,target=/tmp/src/pyproject.toml \
+    --mount=type=bind,source=quack,target=/tmp/src/quack \
+    cp -r /tmp/src /tmp/quack && \
+    pip install --break-system-packages --no-cache-dir '/tmp/quack[cu13]' pytest pytest-xdist && \
+    rm -rf /tmp/quack && \
+    cd /usr/local/lib/python3.12/dist-packages && \
+    rm -rf nvidia_cutlass_dsl/cu12 \
+           nvidia_cutlass_dsl/dsl_packages/cutlass/_mlir/_mlir_libs/_cutlass_ir.cu12.* \
+           nvidia_cutlass_dsl/dsl_packages/cutlass/_mlir/_mlir_libs/_cutlass_ir_version_cu12.py && \
+    strip-elf "$PWD/nvidia_cutlass_dsl" "$PWD"/numpy* "$PWD/tvm_ffi"
+
+# Enroot/Pyxis (and Docker's nvidia runtime) only inject the GPU driver into
+# images that ask for it; Apptainer's --nv ignores these.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 CMD ["/bin/bash"]
-
-# ---------------------------------------------------------------------------
-# cu13 variant: layer CUDA 13.x forward-compatibility libs on top of base.
-#
-# `cute-dsl[cu13]`'s runtime checks whether the loaded user-mode libcuda.so
-# advertises CUDA 13.x; the kernel-mode driver only needs to be a matching
-# (or newer) tier. CUDA forward compatibility is exactly that arrangement:
-# a user-mode libcuda.so.590.* shim talking down to an older kernel driver
-# (e.g. 575). Without these libs cu13 cute-dsl errors out at first JIT with
-# `cudaErrorInsufficientDriver` even though kernels would run fine.
-#
-# We pull `/usr/local/cuda/compat/` from nvidia/cuda:13.1.0-base-ubuntu24.04
-# (~100 MB, mostly libcuda.so.590) and prepend it to ld.so.conf so it wins
-# over the host's libcuda.so. Only the cu13 build target gets this, keeping
-# the cu12.9 image slim.
-# ---------------------------------------------------------------------------
-FROM base AS cu13
-
-COPY --from=nvidia/cuda:13.1.0-base-ubuntu24.04 /usr/local/cuda/compat /usr/local/cuda/compat
-RUN echo "/usr/local/cuda/compat" > /etc/ld.so.conf.d/000-cuda-compat.conf && ldconfig
-
-# Under `docker run --gpus`, the host driver libs are bind-mounted under
-# /usr/lib/x86_64-linux-gnu/ and ld.so.conf's `/usr/local/cuda/compat` entry
-# above is what wins. Under `apptainer exec --nv`, however, the host's libcuda
-# is dropped into /.singularity.d/libs and that dir is prepended to
-# LD_LIBRARY_PATH, which would beat ld.so.conf. Setting LD_LIBRARY_PATH here
-# in the image puts the compat dir FIRST; apptainer then appends
-# /.singularity.d/libs to it, so /usr/local/cuda/compat/libcuda.so.590.* still
-# wins. Harmless for `docker run` (libcuda.so.590.* would have won anyway).
-ENV LD_LIBRARY_PATH=/usr/local/cuda/compat

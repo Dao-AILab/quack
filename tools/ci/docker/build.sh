@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build/push the quack CI docker images and their Apptainer SIFs.
+# Build/push the quack CI docker image (CUDA 13) and import it for Apptainer or Enroot.
 #
-# Usage: build.sh [cu129|cu132|all] [--image] [--push] [--sif]
+# Usage: build.sh [--image] [--push] [--sif] [--sqsh]
 #
 # Step flags select what to produce, in pipeline order (default: --image):
 #   --image  docker-build the image locally (quack-kernels:<tag>-<date>)
@@ -15,19 +15,17 @@
 #            the image exists there, else pulled from Docker Hub — so on a
 #            docker-less runner (e.g. the b300 machine) `build.sh --sif` alone
 #            pre-warms the CI cache from an already-pushed image.
+#   --sqsh   import the same image as an Enroot SquashFS into
+#            ${SQSH_DIR:-${CI_WORK_DIR:-$HOME}} for use with Pyxis.
 #
 # Typical invocations:
-#   build.sh                       # build both images (build box)
-#   build.sh --image --push --sif  # full pipeline on the h100 runner
-#   DATE=26.08.07 build.sh --sif   # pre-warm SIFs on the b300 runner
+#   build.sh                       # build the image (build box)
+#   build.sh --image --push --sif  # full pipeline on a runner with Apptainer
+#   DATE=26.08.07 build.sh --sif   # pre-warm the SIF on the b300 runner
+#   DATE=26.08.07 build.sh --sqsh  # pre-build the image on an Enroot host
 #
-# DATE (YY.MM.DD) defaults to today; override it when the images were built or
+# DATE (YY.MM.DD) defaults to today; override it when the image was built or
 # pushed on an earlier day.
-#
-# Note: the gpu-test action prunes any *quack-kernels*.sif that does not match
-# the tags pinned in .github/workflows/_test.yml. If you pre-build SIFs before
-# the pin bump lands on the branch CI runs on, append .hold to the filenames
-# (mv x.sif x.sif.hold) and strip it once the bump is pushed.
 set -e
 
 DATE="${DATE:-$(date +%y.%m.%d)}"
@@ -40,37 +38,37 @@ fi
 
 DOCKERHUB_USER="${DOCKERHUB_USER:-tridao}"
 REGISTRY_REPO="${REGISTRY_REPO:-${DOCKERHUB_USER}/quack-kernels}"
+ZSTD_LEVEL="${ZSTD_LEVEL:-9}"
 
 DO_IMAGE=0
 DO_PUSH=0
 DO_SIF=0
-VARIANT=all
+DO_SQSH=0
 for arg in "$@"; do
     case "$arg" in
-        --image)           DO_IMAGE=1 ;;
-        --push)            DO_PUSH=1 ;;
-        --sif)             DO_SIF=1 ;;
-        cu129|cu132|all)   VARIANT=$arg ;;
-        *)  echo "Unknown argument: $arg (expected cu129|cu132|all, --image, --push, --sif)" >&2
+        --image)  DO_IMAGE=1 ;;
+        --push)   DO_PUSH=1 ;;
+        --sif)    DO_SIF=1 ;;
+        --sqsh)   DO_SQSH=1 ;;
+        *)  echo "Unknown argument: $arg (expected --image, --push, --sif, --sqsh)" >&2
             exit 1 ;;
     esac
 done
 # No step flags = build the image.
-if [ $((DO_IMAGE + DO_PUSH + DO_SIF)) -eq 0 ]; then
+if [ $((DO_IMAGE + DO_PUSH + DO_SIF + DO_SQSH)) -eq 0 ]; then
     DO_IMAGE=1
 fi
 
 run_variant() {
-    local tag=$1 torch_cuda=$2 quack_extras=$3 target=$4
+    local tag=$1 torch_cuda=$2
     local image="quack-kernels:${tag}-${DATE}"
     local remote_image="${REGISTRY_REPO}:${tag}-${DATE}"
 
     if [ "$DO_IMAGE" = 1 ]; then
-        echo "=== Building $image (torch $torch_cuda, extras [$quack_extras], target $target) ==="
+        echo "=== Building $image (torch $torch_cuda) ==="
         docker build \
-            --target "$target" \
+            --platform linux/amd64 \
             --build-arg "TORCH_CUDA=$torch_cuda" \
-            --build-arg "QUACK_EXTRAS=$quack_extras" \
             -t "$image" \
             -f "$SCRIPT_DIR/Dockerfile" \
             "$REPO_ROOT"
@@ -78,13 +76,26 @@ run_variant() {
     fi
 
     if [ "$DO_PUSH" = 1 ]; then
-        echo "=== Pushing $remote_image ==="
-        docker tag "$image" "$remote_image"
-        docker push "$remote_image"
+        # Push OCI zstd-compressed layers via BuildKit (regular `docker push`
+        # always re-pushes gzip). Reuses BuildKit's cache when --image ran first.
+        echo "=== Pushing $remote_image (OCI zstd level $ZSTD_LEVEL) ==="
+        docker buildx build \
+            --platform linux/amd64 \
+            --build-arg "TORCH_CUDA=$torch_cuda" \
+            --output "type=image,name=${remote_image},push=true,oci-mediatypes=true,compression=zstd,compression-level=${ZSTD_LEVEL},force-compression=true" \
+            -f "$SCRIPT_DIR/Dockerfile" \
+            "$REPO_ROOT"
     fi
 
     if [ "$DO_SIF" = 1 ]; then
         build_sif "$image" "$remote_image"
+    fi
+
+    if [ "$DO_SQSH" = 1 ]; then
+        local sqsh_dir="${SQSH_DIR:-${CI_WORK_DIR:-$HOME}}"
+        local slug
+        slug=$(echo "$remote_image" | tr '/: ' '---')
+        build_sqsh "$image" "$remote_image" "$sqsh_dir/$slug.sqsh"
     fi
 }
 
@@ -110,7 +121,7 @@ build_sif() {
     mkdir -p "$tmpdir" "$work_dir/apptainer_cache"
     APPTAINER_TMPDIR="$tmpdir" \
     APPTAINER_CACHEDIR="$work_dir/apptainer_cache" \
-        apptainer build --force "$sif.tmp" "$source"
+        apptainer build --force --mksquashfs-args="$ENROOT_SQUASH_OPTIONS" "$sif.tmp" "$source"
     mv "$sif.tmp" "$sif"
     echo "Done: $sif"
 }
@@ -126,20 +137,16 @@ if [ "$DO_PUSH" = 1 ]; then
     hub_login
 fi
 
-# cu12.9 runner image uses cu126 torch wheels because PyTorch 2.14 no longer
-# publishes cu129 wheels. These remain runnable on driver 575+ unaided.
-# cu126 lacks Blackwell support, so B300 CI runs only with the cu13.2 image.
-#
-# cu13.2 image pins torch to cu132 wheels and adds the CUDA 13.x forward-
-# compatibility libs (the `cu13` Dockerfile target). The user-mode
-# libcuda.so.590.* shim from /usr/local/cuda/compat lets cu13 torch + cu13
-# cute-dsl JIT successfully on the H100 runner's 575 kernel driver, so
-# cu13.2 is a fully testable image — not driver-gated. Bonus: torch's cu13
-# wheel bundles all nvidia libs under a single nvidia/cu13/ tree (~1.5 GB
-# smaller than cu126's per-lib layout).
-case "$VARIANT" in
-    cu129)  run_variant cu12.9 cu126 dev base ;;
-    cu132)  run_variant cu13.2 cu132 cu13,dev cu13 ;;
-    all)    run_variant cu12.9 cu126 dev base
-            run_variant cu13.2 cu132 cu13,dev cu13 ;;
-esac
+if [ "$DO_SIF" = 1 ]; then
+    source "$REPO_ROOT/tools/docker/sqsh.env"
+fi
+
+if [ "$DO_SQSH" = 1 ]; then
+    source "$REPO_ROOT/tools/docker/build_sqsh.sh"
+fi
+
+# One image: torch cu132 wheels with cute-dsl[cu13]. The cu13.2 tag names the
+# wheel index, which is also what pyproject.toml's `cu13` extra installs. Torch's
+# cu13 wheels bundle all nvidia libs under a single nvidia/cu13/ tree. The image
+# carries no forward-compat libcuda, so runners need a CUDA 13 driver.
+run_variant cu13.2 cu132

@@ -436,3 +436,26 @@ def test_pool_arch_pin_survives_early_dsl_construction():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0 and "arch-pin-ok" in result.stdout, result.stderr
+
+
+def test_oom_retry_recognizes_cutlass_cuda_oom():
+    """The OOM-retry hook must cover kernel-side OOMs, not only torch's.
+
+    Regression: cutlass-dsl 4.8 raises ``CUDADialectError`` for a failed CUDA
+    allocation at kernel load/launch. It derives from ``Exception`` rather than
+    ``RuntimeError``, so the hook stopped retrying and a small test that ran
+    after a memory-heavy one on the same xdist worker (torch still caching most
+    of the GPU) failed instead of freeing the cache and retrying.
+    """
+    from conftest import _is_oom
+
+    class CUDADialectError(Exception):  # same base as cutlass's class
+        pass
+
+    msg = "\nerror: cudaErrorMemoryAllocation (error code: 2) \nCUDA out of memory error.\n"
+    assert _is_oom(CUDADialectError, CUDADialectError(msg))
+    assert _is_oom(RuntimeError, RuntimeError("CUDA out of memory. Tried to allocate 1024.00 MiB"))
+    assert not _is_oom(CUDADialectError, CUDADialectError("cudaErrorInvalidValue (error code: 1)"))
+    assert not _is_oom(KeyboardInterrupt, KeyboardInterrupt("out of memory"))
+    # Text alone is not enough: a failure merely quoting an OOM must still fail.
+    assert not _is_oom(AssertionError, AssertionError("inner run printed: CUDA out of memory"))

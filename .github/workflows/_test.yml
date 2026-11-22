@@ -15,9 +15,8 @@ on:
         default: ''
 
 env:
-  # Bump these when pushing a new image; old SIFs are auto-pruned on the next CI run.
-  IMAGE_CU129: tridao/quack-kernels:cu12.9-26.09.12
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.09.12
+  # Bump this when pushing a new image; CI prunes tags unused for a week.
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.11.22
 
 jobs:
   lint:
@@ -27,11 +26,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
       - name: Install ruff
-        # Pin to the same version as .pre-commit-config.yaml — ruff releases
-        # change default rule selection and formatter output (0.16.0 went from
-        # 59 to 413 default rules), so an unpinned install breaks lint on
-        # upstream releases with no repo change.
-        run: pip install ruff==0.11.13
+        # Pin to the same version as .pre-commit-config.yaml and the dev image
+        # (RUFF_VERSION in tools/dev/docker/Dockerfile) — ruff releases change
+        # formatter output and default rule selection (0.16.0 went from 59 to
+        # 413 default rules; pyproject.toml pins `select` for that reason).
+        run: pip install ruff==0.17.6
       - name: Ruff check
         run: ruff check quack/ tests/
       - name: Ruff format
@@ -69,16 +68,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The cu129 image uses torch cu126 wheels in PyTorch 2.14, which
-          # lack Blackwell support. B300 must use the cu132 image.
-          - { gpu: h100, cuda: cu129 }
+          # Temporarily run only CUDA 13.2 on H100. To restore B300, add:
+          # - { gpu: b300, cuda: cu132 }
           - { gpu: h100, cuda: cu132 }
-          - { gpu: b300, cuda: cu132 }
-          - { gpu: h100, cuda: cu129, arch: '120' }
           - { gpu: h100, cuda: cu132, arch: '120' }
     runs-on: [self-hosted, '${{ matrix.gpu }}']
     name: test (${{ matrix.gpu }}${{ matrix.arch && format(' / sm{0}', matrix.arch) || '' }} / ${{ matrix.cuda }})
-    timeout-minutes: 30
+    # Covers the wait for a Slurm allocation (and a one-off image import) on
+    # top of the run itself; the tests have their own 30-minute Slurm limit.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
         with:
@@ -86,7 +84,5 @@ jobs:
       - uses: ./.github/actions/gpu-test
         with:
           cuda: ${{ matrix.cuda }}
-          gpu: ${{ matrix.gpu }}
-          image_cu129: ${{ env.IMAGE_CU129 }}
-          image_cu132: ${{ env.IMAGE_CU132 }}
+          image: ${{ env.IMAGE_CU132 }}
           arch: ${{ matrix.arch }}
