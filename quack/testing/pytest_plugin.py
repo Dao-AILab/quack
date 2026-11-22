@@ -15,7 +15,24 @@ To opt in, add this line to your ``conftest.py``::
 
 from __future__ import annotations
 
+import inspect
+import os
+import time
+import traceback
+import warnings
+from collections import Counter, deque
+
 import pytest
+import torch
+from _pytest.runner import runtestprotocol
+
+from quack.cache.async_compile import (
+    CompilePending,
+    activate,
+    deactivate,
+    get_active_pool,
+    suppress_pool,
+)
 
 
 # Saved originals so ``pytest_unconfigure`` can restore pytest internals we
@@ -81,9 +98,6 @@ def _install_getfuncargnames_cache() -> None:
     """
     global _orig_compat_getfuncargnames, _orig_fixtures_getfuncargnames
 
-    import os
-    import warnings
-
     if os.environ.get("QUACK_PYTEST_NO_GETFUNCARGNAMES_CACHE"):
         return
 
@@ -106,8 +120,6 @@ def _install_getfuncargnames_cache() -> None:
 
     # Verify the signature is still `(function, *, name, cls)`. If pytest bumps
     # the API we'd rather skip than silently miscache.
-    import inspect
-
     try:
         sig = inspect.signature(orig)
         params = sig.parameters
@@ -186,8 +198,6 @@ def _disable_unused_accelerator_lazy_call() -> None:
     ``from . import _lazy_call`` at import time, so we must replace the name
     on the submodule too — patching only the package attribute is not enough.
     """
-    import torch
-
     nop = lambda callable, **kwargs: None  # noqa: E731
     if not torch.xpu.is_available():
         torch.xpu._lazy_call = nop
@@ -200,15 +210,11 @@ def pytest_configure(config):
     """Set up the async compile pool and pytest-internal speedup patches."""
     jobs = config.getoption("--async-compile", default=None)
     if jobs is not None:
-        import os as _os
-
-        worker = _os.environ.get("PYTEST_XDIST_WORKER")
+        worker = os.environ.get("PYTEST_XDIST_WORKER")
         is_xdist_master = worker is None and getattr(config.option, "numprocesses", None)
         if not is_xdist_master:
             # Real test-running process (single-proc pytest or xdist worker).
-            from quack.cache.async_compile import activate
-
-            n_workers = int(_os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
+            n_workers = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
             pool = activate(max(2, jobs // n_workers))
             pool.prewarm()  # sidecar import overlaps collection, not the first miss
             if worker is not None:
@@ -228,8 +234,6 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     """Tear down the compile pool and undo any pytest-internal patches."""
-    from quack.cache.async_compile import get_active_pool, deactivate
-
     pool = get_active_pool()
     if pool is not None:
         stats = pool.stats()
@@ -265,6 +269,19 @@ def pytest_unconfigure(config):
 # --- CompilePending deferral hooks ------------------------------------------
 
 
+def _defer_compile_pending_call(item, outcome, exc):
+    item._quack_pending_sha = exc.sha
+    outcome.force_result(None)
+    # Dropping the exception from the outcome doesn't break this cycle:
+    #   exception -> traceback -> Pluggy frame -> exception
+    #                    |
+    #                    +-------> test frame -> GPU tensors
+    # The retry starts from scratch. Clear unwound locals so PyTorch can
+    # reuse the tensor memory now instead of waiting for cyclic GC.
+    traceback.clear_frames(exc.__traceback__)
+    exc.__traceback__ = None
+
+
 def _defer_if_compile_pending(item, outcome, force_pass: bool) -> bool:
     """If the phase raised CompilePending, flag the item for deferral.
 
@@ -279,15 +296,16 @@ def _defer_if_compile_pending(item, outcome, force_pass: bool) -> bool:
     must not run the test body. Setup-phase compiles are rare, so the
     longrepr cost is negligible there.
     """
-    if outcome.excinfo is None:
+    excinfo = outcome.excinfo
+    if excinfo is None:
         return False
-    from quack.cache.async_compile import CompilePending
-
-    if not issubclass(outcome.excinfo[0], CompilePending):
+    exc = excinfo[1]
+    if not isinstance(exc, CompilePending):
         return False
-    item._quack_pending_sha = outcome.excinfo[1].sha
     if force_pass:
-        outcome.force_result(None)
+        _defer_compile_pending_call(item, outcome, exc)
+    else:
+        item._quack_pending_sha = exc.sha
     return True
 
 
@@ -349,10 +367,6 @@ _LAST_PREDICTED_NEXT = [None]
 
 def _run_protocol(item, nextitem, force_sync: bool):
     """Run one test protocol without logging. Returns (pending_sha, reports)."""
-    from _pytest.runner import runtestprotocol
-
-    from quack.cache.async_compile import suppress_pool
-
     if _LAST_PREDICTED_NEXT[0] is not item:
         ss = item.session._setupstate
         if ss.stack:
@@ -408,9 +422,6 @@ class _SingleProcDeferLoop:
     def pytest_runtestloop(self, session):
         if session.config.option.collectonly:
             return None
-        import time
-        from collections import Counter, deque
-
         queue = deque(session.items)
         attempts: Counter = Counter()
         deadline: dict = {}  # nodeid -> wedge deadline for the awaited sha
@@ -552,7 +563,6 @@ class _XdistWorkerDefer:
             # already considers them complete; the run is failing anyway).
             self.deferred.clear()
             return
-        import time
 
         # Drain remaining deferred items, blocking on the pool. The channel
         # to the master is still open, so reports flow normally.
@@ -601,8 +611,6 @@ def pytest_runtest_logreport(report):
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
-    import os
-
     config = session.config
     if config.getoption("--async-compile", default=None) is None:
         return  # integrity risk only exists with the defer machinery

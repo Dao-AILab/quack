@@ -21,13 +21,15 @@ Multi-GPU with xdist:
   pytest tests/ -n 4                                   # workers round-robin across GPUs
 """
 
-import os
-import subprocess
+import gc
 import json
 import logging
+import os
+import subprocess
 import tempfile
-from pathlib import Path
+from collections import defaultdict
 from getpass import getuser
+from pathlib import Path
 
 import pytest
 
@@ -124,8 +126,6 @@ def pytest_collection_finish(session):
     """Print a summary of collected tests grouped by file and function."""
     if not session.items:
         return
-    from collections import defaultdict
-
     counts = defaultdict(lambda: defaultdict(int))
     for item in session.items:
         file_name = item.location[0]
@@ -198,7 +198,6 @@ def pytest_runtest_call(item):
     """
     outcome = yield
     if outcome.excinfo is not None and _is_oom(*outcome.excinfo[:2]):
-        import gc
         import torch
 
         logging.warning("OOM in %s, freeing GPU memory and retrying once", item.nodeid)
@@ -210,10 +209,9 @@ def pytest_runtest_call(item):
             from quack.cache.async_compile import CompilePending
 
             if isinstance(e, CompilePending):
-                # Defer: mirror _defer_if_compile_pending (force-pass; the
-                # defer loop discards this attempt and retries the test).
-                item._quack_pending_sha = e.sha
-                outcome.force_result(None)
+                from quack.testing.pytest_plugin import _defer_compile_pending_call
+
+                _defer_compile_pending_call(item, outcome, e)
             else:
                 # Real retry failure: report it through the outcome instead
                 # of raising out of the teardown (see docstring).

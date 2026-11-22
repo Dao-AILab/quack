@@ -117,6 +117,52 @@ def test_pool_poll_external_lifecycle(tmp_path):
 # End-to-end: defer-and-retry through a real pytest session
 # ---------------------------------------------------------------------------
 
+
+def test_deferral_releases_test_locals_without_gc(tmp_path):
+    """Discarding CompilePending must not leave test tensors in traceback cycles."""
+    (tmp_path / "conftest.py").write_text('pytest_plugins = ["quack.testing.pytest_plugin"]\n')
+    (tmp_path / "test_deferred_locals.py").write_text(
+        textwrap.dedent(
+            """
+            import gc
+            import weakref
+
+            import torch
+            from quack.cache.async_compile import CompilePending
+
+            deferred_tensor = None
+
+            def test_deferred_locals():
+                global deferred_tensor
+                if deferred_tensor is None:
+                    gc.disable()  # Do not let cyclic GC hide retained traceback frames.
+                    tensor = torch.empty(1)
+                    deferred_tensor = weakref.ref(tensor)
+                    raise CompilePending("a" * 64, "fake.compile")
+                try:
+                    assert deferred_tensor() is None, "deferred attempt still owns its tensor"
+                finally:
+                    gc.enable()
+            """
+        )
+    )
+
+    env = dict(os.environ)
+    env.pop("PYTEST_XDIST_WORKER", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--async-compile=2"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "1 passed" in out, out
+    assert "1 test deferrals" in out, out
+
+
 _INNER_TEST_SRC = textwrap.dedent(
     """
     import torch
@@ -308,8 +354,8 @@ def test_oom_retry_compile_pending_defers_not_warns(tmp_path):
     Uses the real repo conftest so the actual hook code is exercised. The
     inner test scripts the exact sequence: attempt 1 raises a synthetic OOM,
     the in-teardown retry raises CompilePending, and the defer-loop retry
-    passes (the sha is unknown to the pool, so it polls "new" and re-runs
-    immediately).
+    verifies the deferred attempt released its tensor without cyclic GC. The
+    sha is unknown to the pool, so it polls "new" and re-runs immediately.
     """
     suite = tmp_path / "suite"
     suite.mkdir()
@@ -317,20 +363,32 @@ def test_oom_retry_compile_pending_defers_not_warns(tmp_path):
     (suite / "test_oom_retry.py").write_text(
         textwrap.dedent(
             """
+            import gc
+            import weakref
+
             import torch
             from quack.cache.async_compile import CompilePending
 
             CALLS = {"n": 0}
+            deferred_tensor = None
 
             def test_oom_then_cold_compile():
+                global deferred_tensor
                 CALLS["n"] += 1
                 if CALLS["n"] == 1:
                     raise torch.OutOfMemoryError("synthetic CUDA out of memory")
                 if CALLS["n"] == 2:
                     # This is the conftest OOM-retry's item.runtest() call:
                     # simulate the retry hitting a cold kernel compile.
+                    gc.disable()
+                    tensor = torch.empty(1)
+                    deferred_tensor = weakref.ref(tensor)
                     raise CompilePending("a" * 64, "fake._compile_rmsnorm_bwd")
-                assert CALLS["n"] == 3  # defer-loop retry succeeds
+                try:
+                    assert CALLS["n"] == 3
+                    assert deferred_tensor() is None, "OOM retry still owns its deferred tensor"
+                finally:
+                    gc.enable()
             """
         )
     )
