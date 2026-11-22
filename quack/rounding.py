@@ -32,7 +32,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Uint32, Uint64
 from cutlass.base_dsl.enums import Arch
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, vector
+from cutlass._mlir.dialects import arith, llvm, vector
 from cutlass.cutlass_dsl import dsl_user_op, Int32, T
 from cutlass.experimental import primitives as prims
 
@@ -1002,8 +1002,11 @@ def philox(
 
     round_a = Uint32(PHILOX_ROUND_A)
     round_b = Uint32(PHILOX_ROUND_B)
-    key_a = Uint32(PHILOX_KEY_A)
-    key_b = Uint32(PHILOX_KEY_B)
+    # A 32-bit key starts with literal k1 = 0. With literal increments, the DSL
+    # folds `+=` in Python and warns when the sum exceeds Uint32. Using i32 IR
+    # constants makes `+=` wrap modulo 2^32 as Philox requires.
+    key_a = Uint32(arith.constant(T.i32(), PHILOX_KEY_A, loc=loc, ip=ip))
+    key_b = Uint32(arith.constant(T.i32(), PHILOX_KEY_B, loc=loc, ip=ip))
 
     for _ in range(n_rounds):
         hi_b, lo_b = mul_wide_u32(c2, round_b, loc=loc, ip=ip)
@@ -1012,8 +1015,8 @@ def philox(
         c2 = hi_a ^ c3 ^ k1
         c1 = lo_b
         c3 = lo_a
-        k0 = k0 + key_a
-        k1 = k1 + key_b
+        k0 += key_a
+        k1 += key_b
 
     return c0, c1, c2, c3
 

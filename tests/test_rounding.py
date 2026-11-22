@@ -323,6 +323,7 @@ def philox4_py(counter: int, key: int, n_rounds: int = PHILOX_N_ROUNDS_DEFAULT):
     IS_HW_CVT_TARGET, reason="convert_f32_frag_sr dispatches to the hw cvt.rs on this target"
 )
 @pytest.mark.parametrize("seed", [0, 12345])
+@pytest.mark.filterwarnings("error:(?s).*TYPE_INT_LITERAL_OUT_OF_RANGE")
 def test_e2m1_frag_sr_philox_wiring(seed):
     """convert_f32_frag_sr(Float4E2M1FN) end to end: Philox counter layout
     (one word per quad, (group<<16)|tid counter, 4 quads per batch), straight

@@ -207,6 +207,8 @@ runs:
           # across the xdist workers) while the tests defer and retry; warm
           # runs pay nothing. Replaces the old two-pass
           # \"--compile-only then real run\" strategy.
+          # Pin the Triton 3.9 FP fusion behavior for torch.compile reference paths.
+          export TRITON_DEFAULT_FP_FUSION=1 &&
           CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24
         "
 
