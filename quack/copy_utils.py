@@ -436,7 +436,7 @@ def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
 #   — the shifted pointer must land in physically mapped GPU memory.
 #
 # ptr_shift=False: 2-extra-dim approach (adds 2 dims, supports up to 3D input):
-#   Shape:  (*before, big_int, *after, max_int, max_int)
+#   Shape:  (*before, big_int, *after, big_int + 1, T.shape[ragged_dim] + 1)
 #   Stride: (*before_strides, stride_r, *after_strides, 2^34 - stride_r, stride_r)
 #   No pointer shift. Uses 64-bit address wraparound to cancel the ragged offset.
 #   Let W = 2^34 - stride_r. Address for coords (big_int - length) in ragged dim,
@@ -478,8 +478,16 @@ def create_ragged_tensor_for_tma(
     else:
         assert rank <= 3, "non-ptr_shift ragged tensor only supports up to 3 dimensions"
         stride_r = T.stride[ragged_dim]
+        # Keep the extra-dim extents tight: extra dim 0 is only ever indexed at big_int and
+        # extra dim 1 at offset + length <= T.shape[ragged_dim]. With MAX_INT extents, a TMA
+        # load whose box is partially OOB in the ragged dim also touches ~128 KiB starting at
+        # the base address on B300 (sm_103a), faulting when T sits near the end of a mapping
+        # (issue #243). Tight extents keep the descriptor's span within T itself.
         new_shape = (
-            T.shape[:ragged_dim] + (BIG_INT,) + T.shape[ragged_dim + 1 :] + (MAX_INT, MAX_INT)
+            T.shape[:ragged_dim]
+            + (BIG_INT,)
+            + T.shape[ragged_dim + 1 :]
+            + (BIG_INT + 1, T.shape[ragged_dim] + 1)
         )
         new_stride = (
             T.stride[:ragged_dim]
