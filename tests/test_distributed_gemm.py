@@ -355,7 +355,15 @@ def _run_rank():
 
 
 def _visible_gpus() -> str:
-    """All GPUs, minus any with a large foreign allocation (shared node)."""
+    """GPUs for the torchrun subprocess.
+
+    An explicit CUDA_VISIBLE_DEVICES wins: it is what the caller allotted (and what the
+    skipif's device_count() saw). Otherwise all GPUs minus any with a large foreign
+    allocation (shared node).
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        return ",".join(g.strip() for g in visible.split(",") if g.strip())
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
