@@ -481,8 +481,9 @@ def create_ragged_tensor_for_tma(
         # Keep the extra-dim extents tight: extra dim 0 is only ever indexed at big_int and
         # extra dim 1 at offset + length <= T.shape[ragged_dim]. With MAX_INT extents, a TMA
         # load whose box is partially OOB in the ragged dim also touches ~128 KiB starting at
-        # the base address on B300 (sm_103a), faulting when T sits near the end of a mapping
-        # (issue #243). Tight extents keep the descriptor's span within T itself.
+        # the base address (measured on B200 and B300), faulting when T sits near the end of a
+        # mapping (issue #243). The tight extents still cover every extra-dim coordinate we
+        # issue; the address math (64-bit wraparound) is unchanged.
         new_shape = (
             T.shape[:ragged_dim]
             + (BIG_INT,)
