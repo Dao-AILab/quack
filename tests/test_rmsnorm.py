@@ -14,7 +14,7 @@ from quack.rmsnorm import (
     rmsnorm_fwd_tuned,
     rmsnorm_ref,
 )
-from quack.rmsnorm_config import RmsNormBwdConfig, RmsNormFwdConfig
+from quack.rmsnorm_config import RmsNormBwdConfig, RmsNormFwdConfig, get_all_fwd_configs
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -24,6 +24,14 @@ TOLERANCES = {
     torch.float16: 1e-2,
     torch.float32: 1e-4,
 }
+
+
+@pytest.mark.parametrize("N", [1024, 2048])
+def test_rmsnorm_fwd_autotune_includes_analytical_config(N):
+    heuristic = RmsNormFwdConfig.from_analytical_heuristic(N, 16, arch_major=9)
+
+    assert heuristic.threads_per_row == 32
+    assert heuristic in get_all_fwd_configs()
 
 
 # Grid-reduction rationale: eps does not change the kernel path, fp16 weight_dtype
