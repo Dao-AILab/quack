@@ -181,6 +181,7 @@ JSON key includes package version, tuning key (tensor metadata), and config stri
 |---|---|---|
 | `QUACK_CACHE_AUTOTUNING` | unset | Set to `1` to enable disk caching of tuning results |
 | `QUACK_FORCE_CACHE_UPDATE` | unset | Set to `1` to ignore cached tuning results |
+| `QUACK_DISALLOW_AUTOTUNING` | unset | Set to `1` to raise on a cache miss instead of autotuning |
 
 ### Compile/Bench Overlap
 

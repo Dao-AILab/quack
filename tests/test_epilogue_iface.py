@@ -6,9 +6,10 @@ torch references, independent of the variant wrappers."""
 import pytest
 import torch
 
-from quack.epilogue.ops import ColVecReduce, RowVecReduce
+from quack.activation import swiglu
+from quack.epilogue.ops import ColVecReduce, RowVecReduce, TileStore
 from quack.gemm_config import GemmConfig
-from quack.epilogue.frontend import gemm_epilogue
+from quack.epilogue.frontend import gemm_epilogue, unpack
 
 torch.manual_seed(0)
 
@@ -39,6 +40,12 @@ def _colsum(acc):
     return {"D": acc, "colsum": acc}
 
 
+@gemm_epilogue(outputs=("postact", TileStore("preact", gated=False)), mode="acc_pair")
+def _swiglu_preact(acc):
+    gate, up = unpack(acc)
+    return {"postact": swiglu(gate, up), "preact": acc}
+
+
 def _inputs(m=512, n=768, k=256, dtype=torch.bfloat16):
     A = torch.randn(m, k, device="cuda", dtype=dtype) / 8
     B = torch.randn(k, n, device="cuda", dtype=dtype) / 8
@@ -65,6 +72,21 @@ def test_eager_out_buffers_and_store_d():
     assert "D" not in res and res["doubled"] is dbl
     ref = 2 * ((A.float() @ B.float()) + bias)
     torch.testing.assert_close(dbl, ref, atol=4e-2, rtol=2e-2)
+
+
+def test_eager_full_width_output():
+    A, B = _inputs()
+    # acc_pair mode allocates the gated output at half of N and the
+    # TileStore(gated=False) one at full N
+    res = _swiglu_preact(A, B, config=CFG, store_d=False)
+    ref_preact = A.float() @ B.float()
+    ref_gate, ref_up = ref_preact[:, 0::2], ref_preact[:, 1::2]
+    ref_postact = torch.nn.functional.silu(ref_gate) * ref_up
+    assert set(res) == {"postact", "preact"}
+    assert res["postact"].shape == ref_postact.shape
+    assert res["preact"].shape == ref_preact.shape
+    torch.testing.assert_close(res["postact"].float(), ref_postact, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(res["preact"].float(), ref_preact, atol=2e-2, rtol=2e-2)
 
 
 def test_reduce_finalized():
