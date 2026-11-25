@@ -1,162 +1,67 @@
-"""Regression tests for issue #243: TMA loads through the 2-extra-dim ragged descriptor
-(copy_utils.create_ragged_tensor_for_tma, ptr_shift=False) must not touch memory past the
-operand. Each case runs in a subprocess, since an illegal address is a sticky CUDA error
-that would poison the pytest process. The operand is placed flush against the end of a
-physical mapping inside a larger reserved VA range, so any read past it faults.
+"""Tests for the 2-extra-dim ragged TMA view (copy_utils.create_ragged_tensor_for_tma,
+ptr_shift=False), which varlen GEMM loads go through.
+
+Issue #243: with MAX_INT extents on the two extra dims, a TMA load whose box is partially
+out of bounds in the ragged dim also touched ~128 KiB from the operand's base address on
+Blackwell, faulting when the operand sat near the end of a mapping. The extents must stay
+at what is actually indexed, and the wraparound must still resolve each sequence to its
+own rows.
 """
 
 import pytest
-
-_MAPPING_END_PRELUDE = r"""
-import math
-import sys
 import torch
-from cuda.bindings import driver as cu
 
-dev, dt = torch.device("cuda"), torch.bfloat16
-torch.cuda.init()
-torch.empty(1, device=dev)  # bind the primary context
-torch.manual_seed(0)
+import cutlass.cute as cute
+from cutlass import Int32
+from cutlass.cute.runtime import from_dlpack
 
-def check(r):
-    err, *rest = r if isinstance(r, tuple) else (r,)
-    assert err == cu.CUresult.CUDA_SUCCESS, err
-    return rest[0] if len(rest) == 1 else rest
-
-cu_dev = check(cu.cuDeviceGet(torch.cuda.current_device()))
-if not check(cu.cuDeviceGetAttribute(
-        cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu_dev)):
-    sys.exit(77)  # reported as a skip by the parent
-
-prop = cu.CUmemAllocationProp()
-prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-prop.location.id = torch.cuda.current_device()
-gran = int(check(cu.cuMemGetAllocationGranularity(
-    prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM)))
-size = gran * -(-(2 << 20) // gran)
-va = check(cu.cuMemAddressReserve(4 * size, gran, 0, 0))  # only the first `size` bytes get mapped
-handle = check(cu.cuMemCreate(size, prop, 0))
-check(cu.cuMemMap(va, size, 0, handle, 0))
-access = cu.CUmemAccessDesc()
-access.location = prop.location
-access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-check(cu.cuMemSetAccess(va, size, [access], 1))
-
-class _Buf:
-    def __init__(self, ptr, nbytes):
-        self.__cuda_array_interface__ = dict(
-            shape=(nbytes,), typestr="|u1", data=(ptr, False), version=3, strides=None)
-
-def at_mapping_end(rows, cols):
-    nbytes = rows * cols * 2
-    assert 0 < nbytes <= size
-    raw = torch.as_tensor(_Buf(int(va) + size - nbytes, nbytes), device=dev)
-    return raw.view(dt).view(rows, cols)
-
-which = sys.argv[1]
-lens = [int(x) for x in sys.argv[3:]]
-total = sum(lens)
-cu_seqlens = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), device=dev,
-                          dtype=torch.int32)
-"""
-
-_MAPPING_END_VARLEN_K = r"""
-from quack.gemm_interface import gemm, gemm_ref
-
-gather_A = sys.argv[2] == "1"
-M, N = 384, 256
-A_idx = None
-if gather_A:
-    A = torch.randn(2 * total, M, device=dev, dtype=dt).T  # m-major
-    A_idx = torch.randperm(2 * total, device=dev, dtype=torch.int32)[:total]
-elif which == "A":
-    A = at_mapping_end(total, M).T  # (M, total_k), m-major, flush against the mapping end
-    A.copy_(torch.randn(M, total, device=dev, dtype=dt))
-else:
-    A = torch.randn(total, M, device=dev, dtype=dt).T
-if which == "B":
-    B = at_mapping_end(total, N)
-    B.copy_(torch.randn(total, N, device=dev, dtype=dt))
-else:
-    B = torch.randn(total, N, device=dev, dtype=dt)
-out = gemm(A, B, cu_seqlens_k=cu_seqlens, A_idx=A_idx, tuned=False)
-torch.cuda.synchronize()
-ref = gemm_ref(A.float(), B.float(), cu_seqlens_k=cu_seqlens, A_idx=A_idx)
-ref_bf16 = gemm_ref(A, B, cu_seqlens_k=cu_seqlens, A_idx=A_idx)
-err = (out.float() - ref).abs().max().item()
-err_bf16 = (ref_bf16.float() - ref).abs().max().item()
-assert err <= 2 * err_bf16 + 1e-5, (err, err_bf16)
-print("OK")
-"""
-
-# For varlen_m, an active M-fold (rowvec) sink is what makes the A and C loads go through
-# the ragged descriptor (zero-filled rows past each sequence end).
-_MAPPING_END_VARLEN_M_SINK = r"""
-from quack.cute_dsl_utils import get_device_capacity
-from quack.epilogue.library import dact_dbias_mod
-from quack.gemm_config import cta_tile_shape_m
-
-K, N, tile_M, tile_N = 64, 256, 128, 256
-num_seqs = len(lens)
-def operand(name, rows, cols, scale):
-    T = at_mapping_end(rows, cols) if which == name else torch.empty(rows, cols, device=dev, dtype=dt)
-    return T.copy_(torch.randn(rows, cols, device=dev, dtype=dt) * scale)
-A = operand("A", total, K, 4 / math.sqrt(K))
-z = operand("C", total, N, 1.0)  # saved preact, loaded as C
-B = torch.randn(num_seqs, N, K, device=dev, dtype=dt) / math.sqrt(K) * 4
-D = torch.empty(total, N, device=dev, dtype=dt)
-mod = dact_dbias_mod("gelu_tanh_approx")
-op = mod.sinks["dwb"]
-cta_m = cta_tile_shape_m(tile_M, 1, get_device_capacity(dev)[0])
-dwb = torch.empty(op.sink_alloc_shape((total,), N, cta_m, tile_N, num_seqs=num_seqs),
-                  device=dev, dtype=torch.float32)
-mod.gemm(A, B, D, z, epi_args=dict(dwb=dwb), cu_seqlens_m=cu_seqlens,
-         tile_M=tile_M, tile_N=tile_N, cluster_M=1, cluster_N=1)
-torch.cuda.synchronize()
-dwb_seq = op.host_finalize_varlen(dwb, cu_seqlens, cta_m)
-bounds = cu_seqlens.tolist()
-zf = z.float().requires_grad_()
-da = torch.cat([A[s:e].float() @ B[i].float().mT for i, (s, e) in enumerate(zip(bounds, bounds[1:]))])
-torch.nn.functional.gelu(zf, approximate="tanh").backward(da)
-dz = zf.grad
-def rel(a, b):
-    return ((a.float() - b).abs().max() / b.abs().max().clamp_min(1e-6)).item()
-assert rel(D, dz) < 3e-2, rel(D, dz)
-for i, (s, e) in enumerate(zip(bounds, bounds[1:])):
-    assert rel(dwb_seq[i], dz[s:e].sum(0)) < 2e-3, i
-print("OK")
-"""
+from quack import copy_utils
 
 
-def _run_mapping_end(body, *args):
-    import subprocess
-    import sys
+def _compile_probe(T, out, ragged_dim):
+    @cute.kernel
+    def probe_kernel(
+        mT: cute.Tensor, view: cute.Tensor, mOut: cute.Tensor, offset: Int32, length: Int32
+    ):
+        rank = cute.rank(view)
+        mOut[0] = cute.size(view, mode=[ragged_dim])
+        mOut[1] = cute.size(view, mode=[rank - 2])
+        mOut[2] = cute.size(view, mode=[rank - 1])
+        seq = copy_utils.offset_ragged_tensor(view, offset, length, ragged_dim=ragged_dim)
+        # Byte distance from T to the first row of the sequence, modulo 2^64.
+        mOut[3] = seq.iterator.toint() - mT.iterator.toint()
 
-    result = subprocess.run(
-        [sys.executable, "-c", _MAPPING_END_PRELUDE + body, *map(str, args)],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    if result.returncode == 77:
-        pytest.skip("CUDA virtual memory management not supported on this device")
-    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+    @cute.jit
+    def probe(mT: cute.Tensor, mOut: cute.Tensor, offset: Int32, length: Int32):
+        view = copy_utils.create_ragged_tensor_for_tma(mT, ragged_dim=ragged_dim)
+        probe_kernel(mT, view, mOut, offset, length).launch(grid=(1, 1, 1), block=(1, 1, 1))
 
-
-@pytest.mark.parametrize("lens", [[4], [4, 64], [64, 4], [3, 5, 7]])
-@pytest.mark.parametrize("which,gather_A", [("B", False), ("B", True), ("A", False)])
-def test_gemm_varlen_k_operand_at_mapping_end(which, gather_A, lens):
-    """Partial last K tiles must not read past an operand that ends at a mapping boundary.
-
-    Regression test for issue #243: with MAX_INT extents on the ragged TMA descriptor's
-    extra dims, the load touched ~128 KiB from the operand's base address.
-    """
-    _run_mapping_end(_MAPPING_END_VARLEN_K, which, int(gather_A), *lens)
+    return cute.compile(probe, T, out, Int32(0), Int32(0))
 
 
-@pytest.mark.parametrize("lens", [[4], [20, 17], [128, 5]])
-@pytest.mark.parametrize("which", ["A", "C"])
-def test_gemm_varlen_m_sink_operand_at_mapping_end(which, lens):
-    """Same as above for the varlen_m zero-fill loads of A and C (issue #243)."""
-    _run_mapping_end(_MAPPING_END_VARLEN_M_SINK, which, 0, *lens)
+@pytest.mark.parametrize(
+    "shape,ragged_dim",
+    [((24, 16), 0), ((16, 24), 1), ((24, 8, 4), 0), ((4, 24, 8), 1), ((4, 8, 24), 2)],
+)
+def test_ragged_tma_view_extents_and_wraparound(shape, ragged_dim):
+    total = shape[ragged_dim]
+    # As in the GEMM operands, the ragged dim is the outermost one in memory.
+    rest = shape[:ragged_dim] + shape[ragged_dim + 1 :]
+    x = torch.empty((total, *rest), device="cuda", dtype=torch.bfloat16).movedim(0, ragged_dim)
+    out = torch.zeros(4, device="cuda", dtype=torch.int64)
+    T = from_dlpack(x, assumed_align=16).mark_layout_dynamic()
+    mOut = from_dlpack(out)
+    probe = _compile_probe(T, mOut, ragged_dim)
+    row_bytes = x.stride(ragged_dim) * x.element_size()
+    # (offset, length): first, middle, last (ends exactly at the ragged extent), empty
+    for offset, length in [(0, 5), (5, 12), (17, 7), (0, total), (9, 0), (total, 0)]:
+        probe(T, mOut, Int32(offset), Int32(length))
+        ragged_extent, extra0, extra1, delta = out.tolist()
+        assert ragged_extent == copy_utils.BIG_INT
+        # Tight extents (#243): extra dim 0 is indexed only at BIG_INT, extra dim 1 at
+        # offset + length <= total.
+        assert (extra0, extra1) == (copy_utils.BIG_INT + 1, total + 1)
+        assert offset + length < extra1
+        # Ragged coordinate BIG_INT - length is the sequence's first row, so its rows end
+        # exactly where the ragged dim goes out of bounds.
+        assert delta % (1 << 64) == offset * row_bytes, (offset, length)
