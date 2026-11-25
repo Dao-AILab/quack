@@ -9,7 +9,7 @@ test_gemm_blockscaled_interface.py.
 import pytest
 import torch
 
-from quack.blockscaled.quantize import F8E4M3_MAX, to_mx, to_mx_dim0
+from quack.blockscaled.quantize import F8E4M3_MAX, to_mx, to_mx_2d, to_mx_dim0
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -65,3 +65,28 @@ def test_to_mx_dim0_matches_transposed_rowwise(scaling_mode, shape):
     assert q0.shape == x.shape and s0.shape == (x.shape[0] // 32, x.shape[1])
     assert torch.equal(q0.view(torch.uint8), qt.t().contiguous().view(torch.uint8))
     assert torch.equal(s0.view(torch.uint8), st.t().contiguous().view(torch.uint8))
+
+
+def test_to_mx_2d_row_replication_and_block_numerics():
+    """to_mx_2d = to_mx rceil applied to each flattened 32x32 block, with the
+    per-block scale row-replicated into the standard (M, K // 32) rowwise
+    tensor — so blocked-layout packing and every kernel path apply unchanged."""
+    torch.manual_seed(0)
+    x = torch.randn(128, 96, dtype=torch.bfloat16)
+    x = x * torch.logspace(-3, 3, 128).unsqueeze(1).to(torch.bfloat16)
+    qdata, scale = to_mx_2d(x)
+    assert qdata.dtype == torch.float8_e4m3fn and qdata.shape == (128, 96)
+    assert scale.dtype == torch.float8_e8m0fnu and scale.shape == (128, 3)
+    su8 = scale.view(torch.uint8).view(4, 32, 3)
+    assert torch.equal(su8, su8[:, :1, :].expand_as(su8))  # row-replicated per block
+    # Exact to_mx numerics on each flattened (32, 32) block.
+    blocks = x.view(4, 32, 3, 32).permute(0, 2, 1, 3).reshape(12, 1024)
+    q_ref, s_ref = to_mx(blocks, 1024)
+    q_2d_as_blocks = qdata.view(4, 32, 3, 32).permute(0, 2, 1, 3).reshape(12, 1024)
+    assert torch.equal(q_2d_as_blocks.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(su8[:, 0, :].reshape(-1), s_ref.view(torch.uint8).reshape(-1))
+    # 2D-only and block-divisibility contracts.
+    with pytest.raises(AssertionError):
+        to_mx_2d(x.unsqueeze(0))
+    with pytest.raises(AssertionError):
+        to_mx_2d(x[:48])
