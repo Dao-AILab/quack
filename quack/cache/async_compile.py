@@ -17,7 +17,7 @@ Design notes:
 
 * **The ``.o`` file is the only rendezvous** between workers and consumers —
   compiled kernels aren't picklable, so the persistent cache doubles as the
-  IPC channel, and the per-key ``flock`` in ``jit_cache`` doubles as
+  IPC channel, and the per-key lock file in ``jit_cache`` doubles as
   cross-process dedupe (multiple pools / xdist workers coexist safely;
   :func:`_flock_held_exclusively` lets a consumer defer on a key some other
   process is already compiling).
@@ -32,7 +32,8 @@ Design notes:
   consumer falls through to an in-process compile so the real exception
   surfaces with a local traceback.
 
-Env knobs: ``QUACK_ASYNC_COMPILE_START=spawn`` (disable the fork sidecar),
+Env knobs: ``QUACK_ASYNC_COMPILE_START=spawn`` (disable the fork sidecar;
+already the default on Windows, where ``forkserver`` is unavailable),
 ``QUACK_COMPILE_WORKERS`` (shared-executor size, default 8).
 """
 
@@ -40,13 +41,15 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import fcntl
 import importlib
 import os
 import pickle
+import sys
 from concurrent.futures import Future, ProcessPoolExecutor
 from multiprocessing import get_context
 from typing import NamedTuple, Optional
+
+import filelock
 
 
 class PoolPayload(NamedTuple):
@@ -85,25 +88,21 @@ def _collect_pool_payloads(obj, out: list[PoolPayload]) -> None:
 
 
 def _flock_held_exclusively(lock_path: str) -> bool:
-    """True if some process currently holds the flock exclusively.
+    """True if some process currently holds the cache lock.
 
     Used to detect "another process is compiling this key right now" so the
     consumer defers instead of submitting a duplicate compile to its own
-    pool (a duplicate would occupy a pool slot blocked on the same flock).
+    pool (a duplicate would occupy a pool slot blocked on the same lock).
     """
+    lock = filelock.FileLock(lock_path, timeout=0)
     try:
-        fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT)
+        lock.acquire()
+    except filelock.Timeout:
+        return True
     except OSError:
         return False
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return False
-        except OSError:
-            return True
-    finally:
-        os.close(fd)
+    lock.release()
+    return False
 
 
 class CompilePending(BaseException):
@@ -300,9 +299,12 @@ def _make_executor(jobs: int) -> ProcessPoolExecutor:
     import once, workers fork from it in ~0.1 s each (copy-on-write). The
     forkserver singleton is shared per-process, so multiple executors (the
     test pool, the autotuner's) fork from the same warm sidecar. Opt out
-    with QUACK_ASYNC_COMPILE_START=spawn.
+    with QUACK_ASYNC_COMPILE_START=spawn, the default on Windows (no
+    forkserver there).
     """
-    start_method = os.environ.get("QUACK_ASYNC_COMPILE_START", "forkserver")
+    start_method = os.environ.get("QUACK_ASYNC_COMPILE_START")
+    if start_method is None:
+        start_method = "spawn" if sys.platform == "win32" else "forkserver"
     ctx = get_context(start_method)
     if start_method == "forkserver":
         ctx.set_forkserver_preload(["quack.cache._pool_preload"])
@@ -383,7 +385,7 @@ class CompilePool:
         self._executor = executor if executor is not None else _make_executor(jobs)
         self._futures: dict[str, Future] = {}
         # Keys being compiled by *another process* (e.g. a different xdist
-        # worker's pool), detected via the per-key flock. We defer on them
+        # worker's pool), detected via the per-key lock. We defer on them
         # without spending one of our own pool slots on a duplicate compile.
         # sha -> (o_path, lock_path)
         self._external: dict[str, tuple[str, str]] = {}

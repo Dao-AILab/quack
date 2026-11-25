@@ -57,7 +57,7 @@ With cutlass-dsl >= 4.4.2, `tvm_ffi` loads `.o` files directly (~1 ms) — no
   ├─ 2. hash (fn.__qualname__, *args) → SHA-256 hex
   ├─ 3. Shared lock: .o exists → load via tvm_ffi (~1ms) ✓
   ├─ 3b. Async pool active?
-  │     ├─ another process holds this key's flock → mark external, raise CompilePending
+  │     ├─ another process holds this key's lock → mark external, raise CompilePending
   │     ├─ key not yet submitted → submit to pool,   raise CompilePending
   │     ├─ pool says "pending"                     → raise CompilePending
   │     ├─ pool says "done"   → shared lock, load .o ✓
@@ -68,10 +68,15 @@ With cutlass-dsl >= 4.4.2, `tvm_ffi` loads `.o` files directly (~1 ms) — no
 ### Concurrency Safety
 
 Multiple processes may compile the same key simultaneously (parallel test workers, pool
-workers, autotune sweeps). `FileLock` (`fcntl.flock`) serializes access:
+workers, autotune sweeps). Locks use the cross-platform `filelock` package; the public
+`FileLock` name is a deprecated compatibility shim (`jit_cache` itself uses `filelock.FileLock`
+and catches `filelock.Timeout`):
 
-- **Shared lock** for reads — multiple readers load `.o` concurrently
-- **Exclusive lock** for writes — one writer compiles + exports; others wait, then load
+- **One lock per key** — reads and writes both take it. filelock has no cross-platform
+  shared lock (`exclusive=False` is emulated as exclusive), so same-key readers
+  serialize; that is harmless because the non-blocking probe below detects a live
+  writer before any read lock is taken.
+- **Write path** — one writer compiles + exports; others wait, then load
 - **Double-check** after acquiring the exclusive lock (another process may have won)
 - The lock file doubles as a **cross-process "compile in progress" signal**: a
   non-blocking probe (`_flock_held_exclusively`) lets a consumer defer on a key some
@@ -123,7 +128,7 @@ Both loops share the same failure/termination rules:
 - **Force-sync caps**: after `_MAX_ATTEMPTS` deferrals, or when a sha stays pending past
   a wedge deadline (`_POOL_WEDGE_TIMEOUT_S` / `_WEDGE_TIMEOUT_S`), the item runs with
   the pool suppressed (`suppress_pool()`), compiling in-process. A wedged worker or a
-  hung foreign flock holder can therefore never hang the run.
+  hung foreign lock holder can therefore never hang the run.
 
 ### Worker Startup: Forkserver Sidecar
 
@@ -134,7 +139,8 @@ process pays the heavy import once, workers fork from it copy-on-write.
   `set_forkserver_preload(["quack.cache._pool_preload"])`. The preload imports
   torch + cutlass + tvm_ffi (~13 s) exactly once; each worker forks in ~0.1 s.
   Measured effect: pool CPU cost for a 130-key cold run dropped from ~11 CPU-min
-  (spawn, 32 workers × import) to ~1 CPU-min.
+  (spawn, 32 workers × import) to ~1 CPU-min. On Windows (no `forkserver`) the default
+  is `spawn`; `QUACK_ASYNC_COMPILE_START` overrides the choice on every platform.
 - **Workers are GPU-blind.** The preload pins `QUACK_ARCH`/`CUTE_DSL_ARCH` (via
   `nvidia-smi --query-gpu=compute_cap`, no CUDA context) and sets
   `CUDA_VISIBLE_DEVICES=""`. An explicit `QUACK_ARCH` env override wins — CI

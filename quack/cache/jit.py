@@ -16,14 +16,12 @@ bench loop) retries once the ``.o`` lands.
 
 from __future__ import annotations
 
-import fcntl
 import functools
 import hashlib
 import os
 import pickle
 import sys
 import tempfile
-import time
 import warnings
 from collections import namedtuple
 from getpass import getuser
@@ -31,6 +29,7 @@ from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
+import filelock
 import tvm_ffi
 
 # `quack.cache` (the package itself) holds the mutable runtime flags as a
@@ -92,34 +91,35 @@ def _key_to_hash(key: tuple) -> str:
 
 
 class FileLock:
-    """Advisory file lock using fcntl.flock with timeout."""
+    """Deprecated compatibility shim: use ``filelock.FileLock`` directly.
+
+    Predates the move to the cross-platform ``filelock`` package and is kept
+    only for backwards compatibility, including its ``exclusive`` argument and
+    ``RuntimeError``-on-timeout behavior. It will be removed in a future
+    release.
+    """
 
     def __init__(self, lock_path: Path, exclusive: bool, timeout: float = 15):
+        warnings.warn(
+            "quack.cache.FileLock is deprecated and will be removed in a future "
+            "release; use filelock.FileLock instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.lock_path = lock_path
         self.exclusive = exclusive
         self.timeout = timeout
-        self._fd: int = -1
+        self._lock = filelock.FileLock(str(lock_path), timeout=timeout)
 
     def __enter__(self) -> "FileLock":
-        flags = os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
-        lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
-        self._fd = os.open(str(self.lock_path), flags)
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            try:
-                fcntl.flock(self._fd, lock_type | fcntl.LOCK_NB)
-                return self
-            except OSError:
-                time.sleep(0.1)
-        os.close(self._fd)
-        self._fd = -1
-        raise RuntimeError(f"Timed out waiting for lock: {self.lock_path}")
+        try:
+            self._lock.acquire()
+        except filelock.Timeout:
+            raise RuntimeError(f"Timed out waiting for lock: {self.lock_path}") from None
+        return self
 
     def __exit__(self, *exc) -> None:
-        if self._fd >= 0:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            os.close(self._fd)
-            self._fd = -1
+        self._lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ def jit_cache(fn):
 
     Concurrency model
     -----------------
-    The disk side uses a per-key ``{sha}.lock`` file (advisory ``flock``):
+    The disk side uses a per-key ``{sha}.lock`` file (advisory ``filelock``):
 
     * **Fast path (warm cache).** If the ``.o`` file already exists, we take a
       shared lock just long enough to ``load_module`` it. Many readers can
@@ -208,7 +208,7 @@ def jit_cache(fn):
         #    while a concurrent writer holds the exclusive lock.
         if o_path.exists():
             try:
-                with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
+                with filelock.FileLock(str(lock_path), timeout=LOCK_TIMEOUT):
                     if o_path.exists():
                         try:
                             loaded = _load_cached()
@@ -220,7 +220,7 @@ def jit_cache(fn):
                             cache[cache_key] = loaded
                             hits += 1
                             return loaded
-            except RuntimeError:
+            except filelock.Timeout:
                 pass  # lock timeout; fall through to slow path
 
         # 3b. Async-compile pool: on a cold miss with a pool
@@ -236,7 +236,7 @@ def jit_cache(fn):
             state, err = pool.poll(sha)
             if state == "new":
                 # If another process (e.g. a different xdist worker's pool)
-                # holds the exclusive per-key flock, it is compiling this key
+                # holds the exclusive per-key lock, it is compiling this key
                 # right now: defer on it instead of submitting a duplicate.
                 if _async._flock_held_exclusively(str(lock_path)):
                     pool.mark_external(sha, str(o_path), str(lock_path))
@@ -248,7 +248,7 @@ def jit_cache(fn):
                 raise _async.CompilePending(sha, fn.__qualname__)
             elif state == "done":
                 try:
-                    with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
+                    with filelock.FileLock(str(lock_path), timeout=LOCK_TIMEOUT):
                         if o_path.exists():
                             try:
                                 loaded = _load_cached()
@@ -258,7 +258,7 @@ def jit_cache(fn):
                                 cache[cache_key] = loaded
                                 hits += 1
                                 return loaded
-                except RuntimeError:
+                except filelock.Timeout:
                     pass  # lock timeout; fall through to slow path
             else:  # "failed"
                 # warnings.warn, not print: this fires inside a test whose stdout
@@ -277,14 +277,14 @@ def jit_cache(fn):
         #    while we were waiting; in that case we just load and return
         #    without duplicating the compile.
         try:
-            lock = FileLock(lock_path, exclusive=True, timeout=LOCK_TIMEOUT)
+            lock = filelock.FileLock(str(lock_path), timeout=LOCK_TIMEOUT)
             # Acquire outside the compile's try scope: only the acquisition
-            # raises the timeout RuntimeError. A blanket `try: with lock: fn()`
-            # also caught RuntimeErrors from the compile itself, mislabeling
+            # raises the timeout filelock.Timeout. A blanket `try: with lock: fn()`
+            # also caught timeouts from the compile itself, mislabeling
             # real compile failures as lock timeouts and re-running the failed
             # compile a second time.
             lock.__enter__()
-        except RuntimeError as e:
+        except filelock.Timeout as e:
             # Lock acquisition timed out (heavy contention or stuck holder).
             # Fall back to in-process compile, no disk write. Better to do
             # the work twice than to fail the test.
@@ -314,7 +314,7 @@ def jit_cache(fn):
             # Export to a private temp file, then atomically rename into
             # place: a process killed mid-export (xdist worker OOM-kill,
             # timeout) must never leave a truncated .o at the final path —
-            # the advisory flock dies with the process, and a persistent
+            # the advisory lock dies with the process, and a persistent
             # cache (CI keeps one in $HOME) would then fail every future
             # run on this key with "Symbols not found: __tvm_ffi_func".
             tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")

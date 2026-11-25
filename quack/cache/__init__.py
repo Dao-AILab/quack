@@ -9,8 +9,8 @@ Persistent ``.o`` cache:
   in-memory + persistent ``.o`` caching (see :mod:`quack.cache.jit`).
 * :data:`CACHE_ENABLED`, :data:`CACHE_DIR`, :data:`EXTRA_SOURCE_DIRS` —
   static-config flags.
-* :class:`FileLock`, :func:`get_cache_path`, :class:`CacheInfo` —
-  supporting types.
+* :class:`FileLock` (deprecated — use ``filelock.FileLock``),
+  :func:`get_cache_path`, :class:`CacheInfo` — supporting types.
 
 Async compilation (see :mod:`quack.cache.async_compile`):
 * :class:`CompilePending` — raised by ``jit_cache`` on a cold miss while a

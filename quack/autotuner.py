@@ -61,7 +61,7 @@ def _base32(key):
 
 #: How long a deferred config may wait on its pool compile before the bench
 #: loop stops trusting the pool and benches it with the pool suppressed
-#: (in-process compile). Guards against a wedged worker / a foreign flock
+#: (in-process compile). Guards against a wedged worker / a foreign lock
 #: holder that never produces the .o; without it a permanently-"pending"
 #: sha would rotate forever. Tests override this.
 _POOL_WEDGE_TIMEOUT_S = 300.0
