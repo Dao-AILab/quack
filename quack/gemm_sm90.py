@@ -776,9 +776,13 @@ class GemmSm90(GemmTmaBase):
             mA, mB, mD, scheduler_args, varlen_args, epilogue_args
         )
         tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
-        grid = TileSchedulerCls.get_grid_shape(
-            tile_sched_params, scheduler_args.max_active_clusters
-        )
+        # max_active_clusters assumes 1 CTA/SM; with occupancy > 1 (launched with
+        # min_blocks_per_mp=occupancy) a persistent grid must scale with it,
+        # else the second resident CTA per SM is never launched.
+        max_active_clusters = scheduler_args.max_active_clusters
+        if const_expr(self.occupancy > 1):
+            max_active_clusters = max_active_clusters * self.occupancy
+        grid = TileSchedulerCls.get_grid_shape(tile_sched_params, max_active_clusters)
 
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
