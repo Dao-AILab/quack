@@ -73,7 +73,9 @@ def _gpu_warmup(duration_ms=200):
     Without this, the first autotuning config gets artificially good numbers
     because the GPU hasn't been power-throttled yet.
     """
-    a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    # Warmup must not consume the application's default CUDA RNG.
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16, generator=generator)
     torch.cuda.synchronize()
     target = duration_ms / 1000
     t0 = time.time()

@@ -1,6 +1,7 @@
 import pytest
+import torch
 
-from quack.autotuner import AutotuneConfig
+from quack.autotuner import AutotuneConfig, _gpu_warmup
 
 
 def test_autotune_config_supports_multi_kwarg_hash_and_equality():
@@ -15,6 +16,32 @@ def test_autotune_config_supports_multi_kwarg_hash_and_equality():
     timings = {config_a: 1.25, config_c: 2.5}
     assert timings[config_b] == 1.25
     assert len({config_a, config_b, config_c}) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("device_index", [0, 1])
+@pytest.mark.parametrize("duration_ms", [0, 2])
+def test_gpu_warmup_preserves_rng(device_index, duration_ms):
+    if device_index >= torch.cuda.device_count():
+        pytest.skip("The nondefault-device case requires two visible GPUs")
+    device = torch.device("cuda", device_index)
+    devices = list(range(torch.cuda.device_count()))
+    with torch.cuda.device(device), torch.random.fork_rng(devices=devices):
+        torch.cuda.manual_seed_all(123)
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all()
+        reference_generator = torch.Generator(device=device)
+        reference_generator.set_state(cuda_rng[device_index])
+        expected = torch.randn(64, device=device, generator=reference_generator)
+
+        _gpu_warmup(duration_ms=duration_ms)
+
+        after_cuda_rng = torch.cuda.get_rng_state_all()
+        actual = torch.randn(64, device=device)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.equal(torch.get_rng_state(), cpu_rng)
+        for before, after in zip(cuda_rng, after_cuda_rng):
+            assert torch.equal(before, after)
 
 
 # ---------------------------------------------------------------------------
