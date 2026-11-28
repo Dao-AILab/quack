@@ -119,6 +119,19 @@ def test_topk(M, N, k, input_dtype, softmax, use_compile):
 #     torch.testing.assert_close(out_neg, out_ref_neg, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("N, k", [(128, 16), (256, 16), (512, 16), (1024, 32), (4096, 64)])
+def test_topk_indices_mixed_sign_rows(N, k, input_dtype):
+    """Rows whose top-k mixes positive and negative values with threads_per_row > 1
+    must return the index of each value, not N - 1 - index."""
+    torch.random.manual_seed(0)
+    x = (torch.randn(2048, N, device="cuda") - 2.0).to(input_dtype)  # a few positives per row
+    out_val, out_idx = topk(x, k)
+    atol, rtol = TOLERANCES[input_dtype]
+    torch.testing.assert_close(torch.gather(x, 1, out_idx.long()), out_val, atol=atol, rtol=rtol)
+    assert (out_idx.sort(dim=-1).values.diff(dim=-1) != 0).all(), "duplicate indices in a row"
+
+
 def test_topk_fwd_empty():
     """topk_fwd must handle zero-batch inputs without launching a kernel."""
     N, k = 4096, 8

@@ -162,7 +162,7 @@ class TopK:
             # Check if original value was positive by looking at the cleaned value
             topk_vals_i32[i] = topk_vals_i32[i] & ~idx_mask  # Clear last log_N bits
             # If positive, we need to invert the bits back to get original index
-            col_idx = ~encoded_idx if topk_vals[i] >= 0 else encoded_idx
+            col_idx = ~encoded_idx if topk_vals_split[i] >= 0 else encoded_idx
             topk_indices[i] = Int32(col_idx & idx_mask)
 
         # Compute softmax if requested
