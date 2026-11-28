@@ -235,7 +235,9 @@ def test_epi_mod_ships_by_value_after_eager_call():
     m, n, k = 256, 384, 512
     A = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / math.sqrt(k) * 4
     B = torch.randn(k, n, device="cuda", dtype=torch.bfloat16) / math.sqrt(k) * 4
-    out = mod(A, B, alpha=2.0)["D"]
+    # Populate this instance's caches. The digest-keyed autotuner can hold an
+    # equal mod from an earlier async attempt and cache the plan on that one.
+    out = mod(A, B, alpha=2.0, tuned=False)["D"]
     _rel_check(out, 2.0 * (A.float() @ B.float()), "eager")
     assert mod._plan_cache and mod._call_cache, "precondition: the eager call cached its plan"
 
