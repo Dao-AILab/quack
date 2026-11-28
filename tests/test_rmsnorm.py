@@ -35,7 +35,7 @@ TOLERANCES = {
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N",
-    [192, 256, 760, 1024, 1128, 4096, 32768, 131072, 262144],
+    [192, 256, 760, 1024, 1128, 4096, 8192, 32768, 131072, 262144],
 )
 # @pytest.mark.parametrize("M", [1])
 @pytest.mark.parametrize("M", [1, 199, 8 * 1024])
