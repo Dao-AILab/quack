@@ -7,8 +7,9 @@ user-defined ``@gemm_epilogue`` fns, which otherwise have no torch.compile
 story (precedent: torch.compile's own triton_kernel_wrapper_mutation).
 ``digest`` resolves the epilogue through an in-process registry, falling back
 to import by the module locator carried in ``meta`` (so compiled artifacts
-survive process boundaries when the epilogue is bound to an importable name —
-the same constraint the async-compile pool imposes).
+survive process boundaries when the epilogue is bound to an importable name).
+The op can only carry strings; the async-compile pool has no such constraint
+and is sent the mod itself.
 
 ``ins`` is a packed list of the non-None input tensors, named positionally by
 ``meta['ins_names']``; ``outs`` carries D + declared outputs + reduce-partial
@@ -26,7 +27,7 @@ handle's semantic digest (+ import locator when the mod is bound to a
 module global — @a_transform fns get this automatically), runtime operand
 tensors ride ``ins`` as ``ta__<name>``, a layout-owning transform's SF strip
 as ``transform_sf`` (its blob is already B, with D's N coming from the blob
-rows via n_override). The op body resolves the handle through _TA_REGISTRY
+rows via n_override). The op body resolves the handle through MODS_BY_DIGEST
 and re-enters ``EpiMod.__call__`` eagerly, which rebuilds the
 TransformAOperand bundle from the resolved config.
 """
@@ -40,10 +41,7 @@ import torch
 
 from quack.blockscaled.operand import BlockScaledFormat
 from quack.gemm_config import GemmConfig, cta_tile_shape_m, default_config
-from quack.gemm_runtime.identity import (
-    TORCH_OP_EPI_MODS as _EPI_REGISTRY,
-    TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
-)
+from quack.gemm_runtime.identity import MODS_BY_DIGEST
 from quack.rounding import RoundingMode
 
 # The compile-path body below runs under Dynamo, and default_config is host
@@ -67,8 +65,8 @@ def _sf_decode(SF, bs_format):
     return SF
 
 
-def _resolve(digest: str, locator, registry=_EPI_REGISTRY, what="epilogue"):
-    mod = registry.get(digest)
+def _resolve(digest: str, locator, what="epilogue"):
+    mod = MODS_BY_DIGEST.get(digest)
     if mod is None and locator:
         import importlib
 
@@ -78,7 +76,7 @@ def _resolve(digest: str, locator, registry=_EPI_REGISTRY, what="epilogue"):
             raise RuntimeError(
                 f"{what} {locator[0]}.{locator[1]} changed since this graph was compiled"
             )
-        registry[digest] = mod
+        MODS_BY_DIGEST[digest] = mod
     if mod is None:
         raise RuntimeError(
             f"{what} digest not resolvable in this process; bind the object "
@@ -110,7 +108,7 @@ def _gemm_epi(digest: str, ins: list[torch.Tensor], outs: list[torch.Tensor], me
     transform_a = None
     transform_operands = None
     if t is not None:
-        transform_a = _resolve(t["digest"], t["locator"], _TA_REGISTRY, "transform")
+        transform_a = _resolve(t["digest"], t["locator"], "transform")
         transform_operands = {k[4:]: v for k, v in named.items() if k.startswith("ta__")} or None
     mod(
         named["A"],
@@ -158,7 +156,7 @@ def _alloc_outs_from_meta(digest: str, ins: list, meta: str) -> list:
     t = m.get("transform")
     n_ov = None
     if t is not None and t["owned"]:
-        n_ov = _resolve(t["digest"], t["locator"], _TA_REGISTRY, "transform").padded_n(B)
+        n_ov = _resolve(t["digest"], t["locator"], "transform").padded_n(B)
     out = mod._alloc_outputs(None, A, B, C, m["store_d"], dt, cu, A_idx, n_override=n_ov)
     outs = ([out["D"]] if m["store_d"] else []) + [out[name] for name in m["out_names"]]
     if m["sink_names"]:

@@ -82,8 +82,22 @@ def _compute_source_fingerprint() -> str:
     return h.hexdigest()
 
 
+def _disk_key(obj):
+    """An argument as it enters the disk key. An object that defines
+    ``__quack_cache_key__()`` (an epilogue or transform mod, passed to the
+    compile function as itself) is that key: what it is, not which object it
+    is. Plain tuples are walked, so such an object is found as an argument or
+    inside tuples of arguments; anything else is pickled as it is."""
+    key = getattr(type(obj), "__quack_cache_key__", None)
+    if key is not None:
+        return key(obj)
+    if type(obj) is tuple:
+        return tuple(_disk_key(item) for item in obj)
+    return obj
+
+
 def _key_to_hash(key: tuple) -> str:
-    return hashlib.sha256(pickle.dumps(key)).hexdigest()
+    return hashlib.sha256(pickle.dumps(_disk_key(key))).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +145,8 @@ def jit_cache(fn):
     """Decorator that caches compiled CuTe DSL kernels in-memory and on disk.
 
     The decorated function should return a compiled kernel (i.e. call cute.compile).
-    The disk cache key is (fn.__qualname__, *args, **sorted_kwargs).
+    The disk cache key is (fn.__qualname__, *args, **sorted_kwargs), with any
+    argument that defines ``__quack_cache_key__()`` replaced by its result.
 
     Concurrency model
     -----------------
@@ -231,6 +246,13 @@ def jit_cache(fn):
         #     so the real exception surfaces with a local traceback.
         from quack.cache import async_compile as _async
 
+        # Set when a pool exists but this key is about to compile in-process:
+        # (reason, detail), recorded with the compile's wall time so the
+        # caller (pytest plugin) can show which kernels missed the pool.
+        fallback = None
+        bypass = _async.pool_bypass_reason()
+        if bypass is not None:
+            fallback = (bypass, "")
         pool = _async.get_active_pool()
         if pool is not None:
             state, err = pool.poll(sha)
@@ -244,6 +266,7 @@ def jit_cache(fn):
                 if pool.submit(sha, fn, args, kwargs, o_path):
                     raise _async.CompilePending(sha, fn.__qualname__)
                 # unpicklable key / <locals> qualname: compile in-process
+                fallback = ("unshippable", pool.refused.get(sha, ""))
             elif state == "pending":
                 raise _async.CompilePending(sha, fn.__qualname__)
             elif state == "done":
@@ -260,7 +283,10 @@ def jit_cache(fn):
                                 return loaded
                 except RuntimeError:
                     pass  # lock timeout; fall through to slow path
+                fallback = ("missing_object", f"worker reported success but {o_path} did not load")
             else:  # "failed"
+                pool.noticed.add(sha)
+                fallback = ("worker_failed", str(err))
                 # warnings.warn, not print: this fires inside a test whose stdout
                 # pytest captures and discards on pass (the in-process fallback
                 # usually succeeds), so a print never reaches the user — the
@@ -295,7 +321,10 @@ def jit_cache(fn):
                 stacklevel=2,
             )
             misses += 1
+            t0 = time.monotonic()
             compiled_fn = fn(*args, **kwargs)
+            if fallback is not None:
+                _async.record_fallback(sha, fn.__qualname__, *fallback, time.monotonic() - t0)
             cache[cache_key] = compiled_fn
             return compiled_fn
         try:
@@ -310,7 +339,13 @@ def jit_cache(fn):
                     return loaded
 
             misses += 1
+            t0 = time.monotonic()
             compiled_fn = fn(*args, **kwargs)
+            # Recorded only when the in-process compile succeeds: a kernel
+            # that fails here too (e.g. a config the test expects to be
+            # rejected) is not something the pool missed.
+            if fallback is not None:
+                _async.record_fallback(sha, fn.__qualname__, *fallback, time.monotonic() - t0)
             # Export to a private temp file, then atomically rename into
             # place: a process killed mid-export (xdist worker OOM-kill,
             # timeout) must never leave a truncated .o at the final path —

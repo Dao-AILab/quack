@@ -68,13 +68,15 @@ Two families, one decorator:
   ``fn(xw, sfw, b, consts) -> 4 packed regs`` — and the ``PackedInput``
   carries the geometry (w8 / tile_k) and the host bundle (prepare /
   quantize_reference / dequant_reference) that must stay consistent with it.
-  The mod mints a ``DecodeFormat``, so it slots into everything the
-  class-based formats can (TransformAW4, the gemm_w4 wrapper, the roundtrip
-  test fixture). ``sfw`` is always None for now (scale-factor strips need the
+  The result IS a ``DecodeFormat`` (:class:`FnFormat`), so it slots into
+  everything the class-based formats can (TransformAW4, the gemm_w4 wrapper,
+  the roundtrip test fixture). ``sfw`` is always None for now (scale-factor strips need the
   aux A-side operand, not ported yet — sf_words must be 0).
 
-A mod is a factory ``gemm -> TransformA`` — pass it straight to
-``GemmSm90(transform_a=mod)``. ``__quack_semantic_key__`` fail-closed
+Every transform handle is a mod (:class:`~quack.operand_transform.mod.
+TransformModBase`): a value fn (:class:`ATransformMod`), a decode format,
+dropout. A mod is a factory ``gemm -> TransformA`` — pass it straight to
+``GemmSm90(transform_a=mod)``. Its ``semantic_digest`` fail-closed
 fingerprints the fn (source + every capture, via the gemm_epilogue keyer), so
 mods compose with the jit-cache machinery.
 
@@ -86,29 +88,31 @@ records the single ``quack::gemm_epi`` custom op: mods cross by
 ``semantic_digest`` (registered at construction; bind the mod to a module
 global for graphs that must survive a fresh process) and operand tensors
 ride the op's input list. See quack.gemm_runtime.torch_op.
+
+Staying async-compilable: the rules are the ones in quack.epilogue.frontend
+("Staying async-compilable"). The one that bites transforms: a
+``DecodeFormat`` subclass has a ``@cute.jit`` ``decode_k16``, so it must be a
+module-level class. (For a packed FN that class is :class:`FnFormat`, which
+calls the fn as plain Python.)
 """
 
-import hashlib
 import inspect
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, Optional
 
 
 import cutlass.cute as cute
 
-from quack.operand_transform.formats import DecodeFormat, decode_format
+from quack.operand_transform.formats import DecodeFormat
 from quack.gemm_runtime.identity import (
-    TORCH_OP_TRANSFORM_MODS,
-    TransformARef,
     function_semantic_key as _function_semantic_key,
-    module_locator,
-    register_local_transform_mod,
     semantic_value_key as _semantic_value_key,
 )
 from quack.operand_transform.kinds import ARG_KINDS
-from quack.operand_transform.transform import TransformAValue, TransformAW4
+from quack.operand_transform.mod import TransformModBase
+from quack.operand_transform.transform import TransformAValue
 
-__all__ = ["a_transform", "ATransformMod", "PackedInput", "dropout_a", "w4_transform"]
+__all__ = ["a_transform", "ATransformMod", "FnFormat", "PackedInput", "dropout_a"]
 
 
 @dataclass(frozen=True)
@@ -128,292 +132,66 @@ class PackedInput:
     dequant_reference: Optional[Callable] = None
 
 
-class ResolvedOperands(NamedTuple):
-    """EpiMod.gemm's slot resolution — ONE statement of the transform call
-    contract: what crosses in the kernel's mA/mB slots at launch, the plain
-    activations tensor for metadata/validation, the runtime-operand view
-    (its metadata is a plan-key slot), the resolved tile_K, and the padded
-    weight N for layout-owning transforms (None: derive N from B as
-    usual)."""
+class FnFormat(DecodeFormat):
+    """A packed decode authored as a fn (``@a_transform(packed=...)``): the
+    fn is the k16 decode, the PackedInput the geometry and the host side.
+    Module-level, so an async-compile worker gets the class, and the source
+    of its ``@cute.jit`` decode, by import; the instance (the fn, the spec)
+    travels by value."""
 
-    a_slot: object
-    b_slot: object
-    A: object
-    arg_sf: object = None
-    tile_k: object = None
-    n_gemm: object = None
+    def __init__(self, fn, spec: PackedInput):
+        self.fn = fn
+        self.name, self.w8, self.tile_k = spec.name, spec.w8, spec.tile_k
+        # make_consts shapes device code, so it is public state and part of
+        # the identity; the other host callables don't reach the kernel
+        # (repack consistency is pinned by the roundtrip fixture).
+        self.consts_fn = spec.make_consts
+        self._spec = spec
+        super().__init__()
 
+    def make_consts(self):
+        return self.consts_fn() if self.consts_fn is not None else None
 
-class TransformModBase:
-    """Shared ``transform_a=`` handle protocol. The generic layers
-    (gemm_runtime.host, EpiMod.gemm/__call__/plan, gemm_runtime.torch_op)
-    never enumerate
-    transform flavours: they normalize any handle to a mod
-    (:func:`quack.operand_transform.host.as_transform_mod`) and call these
-    methods — the layout-owning vs value branch below is its single
-    statement."""
+    @cute.jit
+    def decode_k16(self, xw, sfw, b, consts):
+        return self.fn(xw, sfw, b, consts)
 
-    args = ()
-    packed = None
-    consts = None
-    regs = None
+    def quantize_reference(self, w):
+        return self._spec.quantize_reference(w)
 
-    @property
-    def owned_fmt(self):
-        """DecodeFormat when this transform owns A's layout (packed
-        weights); None for value transforms (A stays a plain (M, K)
-        operand)."""
-        return None
+    def dequant_reference(self, q, sf):
+        return self._spec.dequant_reference(q, sf)
 
-    @property
-    def needs_operands(self):
-        """True when calls must carry runtime operand tensors (``args``)."""
-        return bool(self.args)
-
-    def plan_key(self):
-        """Cheap plan-cache identity (the digest is precomputed)."""
-        return ("mod", self.semantic_digest)
-
-    def config_ok(self, cfg):
-        """Cheap autotune prune: can this GemmConfig possibly run this
-        transform? Geometry/kernel asserts still guard correctness (a
-        mispruned config fails host validation and benches as inf) — this
-        only avoids wasted compile attempts."""
-        if cfg.swap_ab:
-            return False  # transform_a + swap_ab is rejected at the call
-        fmt = self.owned_fmt
-        if fmt is None:
-            return True
-        return (
-            not cfg.pingpong
-            and cfg.cluster_m == 1
-            and cfg.tile_m % 64 == 0
-            and cfg.tile_k in (None, fmt.tile_k)
-        )
-
-    def compile_ref(self):
-        """Picklable ref for the jit-cache / async-compile boundary
-        (registers this mod for in-process resolution; workers get it as a
-        cloudpickle payload)."""
-        register_local_transform_mod(self.semantic_digest, self)
-        return TransformARef("mod_local", semantic_digest=self.semantic_digest)
-
-    def _module_locator(self):
-        """Import anchor for cross-process torch.compile graphs (fn-authored
-        mods override via their fn; format/dropout handles have no natural
-        anchor)."""
-        return None
-
-    def default_config(self, A, B):
-        """Transform-specific default GemmConfig, or None for the caller's
-        per-arch default. Layout-owning formats get the measured W4
-        coverage rule."""
-        fmt = self.owned_fmt
-        if fmt is None:
-            return None
-        from quack.cute_dsl_utils import get_device_capacity
-        from quack.gemm_config import GemmConfig
-        from quack.operand_transform.host import pick_w4_cfg, pick_w4a8_cfg
-
-        if fmt.promote:
-            tm, tn, _sk = pick_w4a8_cfg(A.shape[-2], self.padded_n(B))
-        else:
-            # W4 runs atom_n == 1 on every arch (SM120's (4,1,1)/(8,1,1)
-            # decode layouts included): tile_n floor is the 16-wide warp span
-            tm, tn, _sk = pick_w4_cfg(
-                A.shape[-2],
-                self.padded_n(B),
-                A.shape[-1] // fmt.tile_k,
-                sm120=get_device_capacity(A.device)[0] == 12,
-                device=A.device,
-            )
-        return GemmConfig(
-            tile_m=tm,
-            tile_n=tn,
-            cluster_m=1,
-            cluster_n=1,
-            pingpong=False,
-            is_dynamic_persistent=False,
-        )
-
-    def padded_n(self, B):
-        """Padded weight N when B is this transform's repacked blob; None
-        when B is a plain operand."""
-        if self.owned_fmt is None:
-            return None
-        from quack.operand_transform.host import w4_padded_n
-
-        return w4_padded_n(B)
-
-    def resolve_operands(self, A, B, transform_sf, tile_m, tile_k) -> ResolvedOperands:
-        fmt = self.owned_fmt
-        if fmt is None:
-            if transform_sf is not None:
-                raise ValueError("transform_sf without a layout-owning transform_a")
-            if not self.args:
-                return ResolvedOperands(A, B, A, tile_k=tile_k)
-            from quack.operand_transform.transform import TransformAOperand
-
-            if not isinstance(A, TransformAOperand):
-                raise ValueError(
-                    "transform_a with runtime operands: pass A as "
-                    "transform_a_operand(mod, A, values, tile_M, tile_K)"
-                )
-            # blob = plain (m, k) A for keys/validation, sf = the operand
-            # view (must have been built with THIS call's tile_M/tile_K; a
-            # mismatch fails at trace against the kind's fake).
-            return ResolvedOperands(A, B, A.blob, arg_sf=A.sf, tile_k=tile_k)
-        # Layout-owning: caller A = activations, caller B = the repacked blob.
-        from quack.operand_transform.host import w4_operand_views
-
-        if A.ndim != 2 or A.stride(-1) != 1:
-            raise ValueError("layout-owning transform_a: activations are (m, k), k-major")
-        if tile_k is not None and tile_k != fmt.tile_k:
-            raise ValueError(f"format {fmt.name!r} requires tile_K={fmt.tile_k}")
-        if B.shape[1] * fmt.tile_k != A.shape[-1]:
-            raise ValueError(
-                f"K mismatch: activations K={A.shape[-1]}, blob K={B.shape[1] * fmt.tile_k}"
-            )
-        n_full = self.padded_n(B)
-        if n_full % tile_m:
-            raise ValueError(
-                f"padded N ({n_full}) must be divisible by tile_M ({tile_m}): the blob's"
-                " gmem view tiles kernel-M in whole CTA tiles"
-            )
-        bundle = w4_operand_views(fmt, B, transform_sf, tile_m)
-        return ResolvedOperands(bundle, A, A, tile_k=fmt.tile_k, n_gemm=n_full)
-
-    def bundle(self, A, operand_values, tile_m, tile_k):
-        """TransformAOperand from RAW operand tensors (the __call__/plan
-        convention; ``tile_k`` None resolves to the 16-bit kernel
-        default)."""
-        from quack.operand_transform.host import transform_a_operand
-
-        return transform_a_operand(
-            self, A, operand_values, tile_m, 64 if tile_k is None else tile_k
-        )
-
-    def fake_bundle(self, mA_fake, a_dtype, tile_m, tile_k):
-        """Trace-time twin of :meth:`bundle` (same tile_k fallback; the
-        kind's smem box shape is derived from the real tile_K, so a
-        mismatch fails at trace)."""
-        from quack.operand_transform.host import transform_a_fake_operand
-
-        return transform_a_fake_operand(
-            self, mA_fake, a_dtype, tile_m, 64 if tile_k is None else tile_k
-        )
-
-    def compile_dims(self, bundle):
-        """(n_full, k) static problem geometry from a layout-owning bundle's
-        blob view (256, wpt, tm64, Gt, Kt, 1); None for value transforms
-        (their dims are symbolic)."""
-        fmt = self.owned_fmt
-        if fmt is None:
-            return None
-        blob = bundle.blob
-        return (blob.shape[2] * blob.shape[3] * 64, blob.shape[4] * fmt.tile_k)
-
-    def fake_operands(self, n_full, k, tile_m):
-        """Trace-time fake bundle for a layout-owning transform."""
-        from quack.operand_transform.host import w4_fake_operands
-
-        return w4_fake_operands(self.owned_fmt, n_full, k, tile_m)
+    def prepare(self, q, sf):
+        return self._spec.prepare(q, sf)
 
 
 class ATransformMod(TransformModBase):
-    """A fn-authored A-operand transform; callable as the ``transform_a=``
-    factory. See module docstring for the fn contracts."""
+    """A fn-authored VALUE transform; callable as the ``transform_a=``
+    factory. See module docstring for the fn contract."""
 
-    def __init__(self, fn, vec_size, packed, consts=None, regs=None, args=None):
+    def __init__(self, fn, vec_size, consts=None, regs=None, args=None):
         self.fn = fn
         self.name = getattr(fn, "__name__", "a_transform")
-        self.packed = packed
-        if packed is not None:
-            assert vec_size in (None, 8), "packed fn transforms decode whole k16 blocks"
-            assert consts is None, "packed fns take consts via PackedInput.make_consts"
-            assert not args, "runtime operands are value-fn only (packed decodes own A)"
-            vec_size = 8
-        else:
-            vec_size = 2 if vec_size is None else vec_size
-            assert vec_size in (2, 4, 8), "vec_size must be 2, 4 or 8 (one k16 block max)"
+        vec_size = 2 if vec_size is None else vec_size
+        assert vec_size in (2, 4, 8), "vec_size must be 2, 4 or 8 (one k16 block max)"
         self.vec_size = vec_size
         self.consts = consts
         self.regs = regs
         self.args = _normalize_args(fn, args)
-        self._fmt = None
-        self.semantic_digest = _digest(self.__quack_semantic_key__())
-        TORCH_OP_TRANSFORM_MODS[self.semantic_digest] = self  # quack::gemm_epi resolution
-
-    @property
-    def owned_fmt(self):
-        return self.as_decode_format() if self.packed is not None else None
+        self._identify(
+            (
+                "a_transform",
+                _semantic_value_key(self.fn, set()),
+                self.vec_size,
+                _function_semantic_key(self.consts) if self.consts is not None else None,
+                self.regs,
+                self.args,
+            )
+        )
 
     def __call__(self, gemm):
-        if self.packed is not None:
-            return TransformAW4(gemm, self.as_decode_format())
         return TransformAValue(gemm, self)
-
-    def _module_locator(self):
-        """(module, global_name) if this mod is reachable by import in a fresh
-        process (the quack::gemm_epi custom op re-resolves it that way when a
-        compiled graph crosses processes), else None — same contract as
-        EpiMod._module_locator."""
-        return module_locator(self, self.fn)
-
-    def as_decode_format(self) -> DecodeFormat:
-        """Mint the DecodeFormat backing a packed fn transform (cached)."""
-        assert self.packed is not None, "value transforms do not define a decode format"
-        if self._fmt is None:
-            mod, spec = self, self.packed
-
-            class _FnFormat(DecodeFormat):
-                name = spec.name
-                w8 = spec.w8
-                tile_k = spec.tile_k
-
-                def make_consts(self):
-                    return spec.make_consts() if spec.make_consts is not None else None
-
-                @cute.jit
-                def decode_k16(self, xw, sfw, b, consts):
-                    return mod.fn(xw, sfw, b, consts)
-
-                def quantize_reference(self, w):
-                    return spec.quantize_reference(w)
-
-                def dequant_reference(self, q, sf):
-                    return spec.dequant_reference(q, sf)
-
-                def prepare(self, q, sf):
-                    return spec.prepare(q, sf)
-
-            _FnFormat.__qualname__ = f"FnFormat_{spec.name}"
-            self._fmt = _FnFormat()
-        return self._fmt
-
-    def __quack_semantic_key__(self):
-        packed_key = None
-        if self.packed is not None:
-            packed_key = (
-                self.packed.name,
-                self.packed.w8,
-                self.packed.tile_k,
-                # make_consts shapes device code; the other host callables
-                # don't reach the kernel (repack consistency is pinned by the
-                # roundtrip fixture, not the cache key).
-                _function_semantic_key(self.packed.make_consts)
-                if self.packed.make_consts is not None
-                else None,
-            )
-        return (
-            "a_transform",
-            _semantic_value_key(self.fn, set()),
-            self.vec_size,
-            _function_semantic_key(self.consts) if self.consts is not None else None,
-            self.regs,
-            packed_key,
-            self.args,
-        )
 
 
 def _normalize_args(fn, args) -> tuple:
@@ -429,55 +207,6 @@ def _normalize_args(fn, args) -> tuple:
     missing = set(args) - set(params[1:])
     assert not missing, f"args {missing} are not parameters of {fn.__name__} (after x)"
     return tuple((name, args[name]) for name in params[1:] if name in args)
-
-
-def _digest(key) -> str:
-    return hashlib.sha256(repr(key).encode()).hexdigest()
-
-
-class PackedFormatMod(TransformModBase):
-    """``transform_a=`` handle for a DecodeFormat: runs a registered (or
-    instance) packed dequant format, e.g.
-    ``GemmSm90(transform_a=w4_transform("qtip2s"))``."""
-
-    def __init__(self, fmt):
-        self.fmt = decode_format(fmt)
-        self.packed = self.fmt
-        # registry names get a by-name compile ref (stable disk keys, no
-        # payload shipping); instance formats resolve through the local
-        # registry like fn mods
-        self._registry_name = fmt if isinstance(fmt, str) else None
-        self.name = f"w4_{self.fmt.name}"
-        self.semantic_digest = _digest(
-            (
-                "w4_format",
-                self.fmt.name,
-                _function_semantic_key(type(self.fmt).decode_k16),
-                _function_semantic_key(type(self.fmt).make_consts),
-            )
-        )
-        TORCH_OP_TRANSFORM_MODS[self.semantic_digest] = self
-
-    @property
-    def owned_fmt(self):
-        return self.fmt
-
-    def compile_ref(self):
-        if self._registry_name is not None:
-            return TransformARef("w4_name", name=self._registry_name)
-        return super().compile_ref()
-
-    def __call__(self, gemm):
-        return TransformAW4(gemm, self.fmt)
-
-    def __quack_semantic_key__(self):
-        return ("w4_format_mod", self.semantic_digest)
-
-
-def w4_transform(fmt) -> PackedFormatMod:
-    """A ``transform_a=`` handle for a packed dequant format (name from the
-    W4_FORMATS registry, or a DecodeFormat instance)."""
-    return PackedFormatMod(fmt)
 
 
 class DropoutAMod(TransformModBase):
@@ -499,16 +228,12 @@ class DropoutAMod(TransformModBase):
         self.rounds = rounds
         self.name = f"dropout_a_t{self.threshold}"
         # trailing int: scheme version
-        self.semantic_digest = _digest(("dropout_a", self.threshold, rounds, 1))
-        TORCH_OP_TRANSFORM_MODS[self.semantic_digest] = self
+        self._identify(("dropout_a", self.threshold, rounds, 1))
 
     def __call__(self, gemm):
         from quack.operand_transform.transform import TransformADropout
 
         return TransformADropout(gemm, self)
-
-    def __quack_semantic_key__(self):
-        return ("dropout_a_mod", self.semantic_digest)
 
 
 def dropout_a(p: float, rounds: int = 7) -> DropoutAMod:
@@ -538,8 +263,11 @@ def a_transform(
     see setmaxnreg constraints in TransformAW4)."""
 
     def wrap(fn):
-        return ATransformMod(
-            fn, vec_size=vec_size, packed=packed, consts=consts, regs=regs, args=args
-        )
+        if packed is not None:
+            assert vec_size in (None, 8), "packed fn transforms decode whole k16 blocks"
+            assert consts is None, "packed fns take consts via PackedInput.make_consts"
+            assert not args and regs is None, "runtime operands and regs are value-fn only"
+            return FnFormat(fn, packed)
+        return ATransformMod(fn, vec_size=vec_size, consts=consts, regs=regs, args=args)
 
     return wrap

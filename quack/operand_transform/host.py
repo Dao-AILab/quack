@@ -4,15 +4,14 @@ generic GEMM host layer (:mod:`quack.gemm_runtime.host`), mirroring what EpiOps'
 host hooks do for epilogues:
 
 * :func:`as_transform_mod` — normalize any handle to a TransformModBase
-  mod (refs/registries/payloads live in :mod:`quack.gemm_runtime.identity`,
-  exactly like the epilogue side).
+  mod (a :class:`~quack.gemm_runtime.identity.GemmMod`, like an EpiMod).
 * the W4 blob/strip geometry — ONE implementation (over meta tensors)
   serves both the runtime torch views and the trace-time fake tensors, so
   the compiled layout and the launched layout cannot drift.
 
-A transform handle is anything ``transform_a=`` accepts today: a registered
-format name, a DecodeFormat instance, or an ATransformMod / PackedFormatMod.
-Value transforms (packed=None) have no host geometry — they only contribute
+A transform handle is anything ``transform_a=`` accepts: a transform mod (a
+DecodeFormat, an ``@a_transform`` mod, ``dropout_a(p)``) or the registry name
+of a format. Value transforms have no host geometry — they only contribute
 the ctor factory and their semantic digest to the compile key.
 """
 
@@ -24,7 +23,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
-from quack.operand_transform.formats import DecodeFormat, W4_FORMATS
+from quack.operand_transform.formats import DecodeFormat, decode_format
 from quack.operand_transform.kinds import ARG_KINDS
 from quack.operand_transform.transform import TransformAOperand
 
@@ -40,29 +39,11 @@ __all__ = [
 ]
 
 
-@functools.lru_cache(maxsize=None)
-def _named_w4_mod(name: str):
-    from quack.operand_transform.frontend import w4_transform
-
-    return w4_transform(name)
-
-
 def as_transform_mod(handle):
-    """Normalize any ``transform_a=`` handle (W4 registry name / DecodeFormat
-    instance / mod) to a digest-carrying mod implementing the
-    TransformModBase protocol. Memoized for names and format instances, so
-    warm paths pay a dict lookup, never a source fingerprint."""
+    """Normalize a ``transform_a=`` handle to its mod: a W4 registry name is
+    looked up, a mod is returned as it is."""
     if isinstance(handle, str):
-        if handle not in W4_FORMATS:
-            raise KeyError(f"unknown W4 format {handle!r}")
-        return _named_w4_mod(handle)
-    if isinstance(handle, DecodeFormat):
-        mod = handle.__dict__.get("_transform_mod")
-        if mod is None:
-            from quack.operand_transform.frontend import PackedFormatMod
-
-            mod = handle._transform_mod = PackedFormatMod(handle)
-        return mod
+        return decode_format(handle)
     if not hasattr(handle, "semantic_digest"):
         raise TypeError(f"not a transform handle: {handle!r}")
     return handle

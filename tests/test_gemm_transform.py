@@ -17,16 +17,8 @@ import math
 import pytest
 import torch
 
-import cuda.bindings.driver as cuda
-
-import cutlass
-import cutlass.cute as cute
-from cutlass import Float32, Int32
-from cutlass.cute.runtime import from_dlpack
-
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm120
-from quack.tile_scheduler import TileSchedulerOptions
 
 _ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
 pytestmark = pytest.mark.skipif(
@@ -38,30 +30,59 @@ sm90_only = pytest.mark.skipif(_ARCH != 9, reason="SS/RS mode split is SM90 only
 # SM120 has no TMA multicast, so its GEMM takes only 1x1 clusters.
 needs_multicast = pytest.mark.skipif(_ARCH != 9, reason="TMA multicast (cluster > 1) needs SM90")
 
-_TORCH2CUTE = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}
-
 
 def _run_gemm(A, B, D, tile_mnk, cluster_mnk, pingpong, mma_is_rs, transform_a=None, aux=None):
+    """One GEMM through the generic host layer, so the kernel is jit-cached
+    and a cold one compiles in the ``--async-compile`` pool. ``aux`` is the
+    transform's runtime operand view; it rides the kernel's A slot bundled
+    with A."""
+    from quack.gemm_runtime.host import build_gemm_epi_plan, run_gemm_epi_plan
     from quack.operand_transform import TransformAOperand
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    mA = from_dlpack(A, assumed_align=16)
-    if aux is not None:
-        mA = TransformAOperand(mA, from_dlpack(aux, assumed_align=16))
-    mB = from_dlpack(B, assumed_align=16)
-    mD = from_dlpack(D, assumed_align=16)
-    epi_args = _GEMM_CLS.EpilogueArguments()
-    scheduler_args = TileSchedulerOptions(Int32(get_max_active_clusters(math.prod(cluster_mnk))))
-    # SM120 has no SS/RS mode split (A is always register-sourced)
-    rs_kwargs = {"mma_is_rs": mma_is_rs} if _ARCH == 9 else {}
-    gemm_obj = _GEMM_CLS(
-        Float32,
-        _TORCH2CUTE[A.dtype],
-        tile_mnk,
-        cluster_mnk,
+    if mma_is_rs:
+        assert transform_a is None and aux is None
+        return _run_gemm_rs(A, B, D, tile_mnk, cluster_mnk, pingpong)
+    A_arg = A if aux is None else TransformAOperand(A, aux)
+    plan = build_gemm_epi_plan(
+        _GEMM_CLS,
+        get_device_capacity(A.device),
+        A_arg,
+        B,
+        D,
+        None,
+        epi_values={},
+        tile_M=tile_mnk[0],
+        tile_N=tile_mnk[1],
+        tile_K=tile_mnk[2],
+        cluster_M=cluster_mnk[0],
+        cluster_N=cluster_mnk[1],
         pingpong=pingpong,
         transform_a=transform_a,
-        **rs_kwargs,
+    )
+    run_gemm_epi_plan(plan, A_arg, B, D, None, {})
+
+
+def _run_gemm_rs(A, B, D, tile_mnk, cluster_mnk, pingpong):
+    """SM90 RS mainloop WITHOUT a transform: a kernel-developer mode the host
+    layer does not expose (a transform implies RS there), so the RS-vs-SS
+    gates build this one kernel directly, outside the jit cache and the pool."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from quack.cute_dsl_utils import get_max_active_clusters
+    from quack.tile_scheduler import TileSchedulerOptions
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    mA, mB, mD = (from_dlpack(t, assumed_align=16) for t in (A, B, D))
+    epi_args = GemmDefaultSm90.EpilogueArguments()
+    scheduler_args = TileSchedulerOptions(
+        cutlass.Int32(get_max_active_clusters(math.prod(cluster_mnk)))
+    )
+    a_dtype = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}[A.dtype]
+    gemm_obj = GemmDefaultSm90(
+        cutlass.Float32, a_dtype, tile_mnk, cluster_mnk, pingpong=pingpong, mma_is_rs=True
     )
     compiled = cute.compile(gemm_obj, mA, mB, mD, None, epi_args, scheduler_args, None, stream)
     compiled(mA, mB, mD, None, epi_args, scheduler_args, None, stream)
@@ -493,9 +514,7 @@ def test_a_transform_args_validation():
     def _no_args(x, u):
         return x
 
-    assert (
-        _colvec_ktile_scale_a.__quack_semantic_key__()[-1] != _no_args.__quack_semantic_key__()[-1]
-    )
+    assert _colvec_ktile_scale_a.semantic_key[-1] != _no_args.semantic_key[-1]
 
 
 def test_a_transform_via_host_plan():
@@ -762,8 +781,8 @@ def test_dropout_semantics_and_determinism():
     D3 = _dropout_via_identity(A, 1234, 1, p)
     D4 = _dropout_via_identity(A, 99, 0, p)
     assert not torch.equal(D1, D3) and not torch.equal(D1, D4)
-    # the direct-compile layer (TransformAOperand straight into the kernel)
-    # produces the identical mask
+    # the host plan layer (TransformAOperand straight into the kernel's A
+    # slot, no epilogue mod) produces the identical mask
     from quack.operand_transform import dropout_a
 
     seed_t = torch.tensor([1234, 0], dtype=torch.int64, device="cuda")
@@ -780,7 +799,7 @@ def test_dropout_semantics_and_determinism():
         aux=seed_t,
     )
     torch.cuda.synchronize()
-    assert torch.equal(D1, D_direct), "mod.gemm and direct-compile masks differ"
+    assert torch.equal(D1, D_direct), "mod.gemm and host-plan masks differ"
 
 
 def test_dropout_mask_is_canonical():

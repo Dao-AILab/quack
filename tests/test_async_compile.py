@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from quack.cache import jit_cache
 from quack.cache.async_compile import CompilePending, CompilePool, _flock_held_exclusively
 
 
@@ -160,6 +161,223 @@ def test_deferral_releases_test_locals_without_gc(tmp_path):
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert "1 passed" in out, out
+    assert "1 test deferrals" in out, out
+
+
+class _FakeKernel:
+    def export_to_c(self, object_file_path, function_name):
+        Path(object_file_path).write_bytes(b"fake object file")
+
+
+@jit_cache
+def _alias_probe_compile(mode):
+    return _FakeKernel()
+
+
+def test_pool_worker_exports_keys_equal_in_memory_but_not_on_disk(tmp_path, monkeypatch):
+    """Two requests whose arguments compare equal but pickle differently (an
+    IntEnum and its int) are one in-memory jit-cache entry and two disk keys.
+    A worker that had compiled the first answered the second from memory and
+    exported nothing: the pool reported "compile succeeded but .o was not
+    exported" (seen on a B300 CI-style run, for a kernel requested with
+    ``RoundingMode.RN`` eagerly and ``0`` under torch.compile)."""
+    import base64
+    import pickle
+
+    import quack.cache as cache_state
+    from quack.cache import async_compile
+    from quack.cache.jit import _compute_source_fingerprint, _key_to_hash
+    from quack.rounding import RoundingMode
+
+    monkeypatch.setattr(cache_state, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(cache_state, "CACHE_ENABLED", True)
+    monkeypatch.setattr(async_compile, "_active_pool", None)  # run the worker body right here
+    fn = _alias_probe_compile
+    assert (RoundingMode.RN,) == (0,) and hash((RoundingMode.RN,)) == hash((0,))
+    for mode in (RoundingMode.RN, 0):
+        sha = _key_to_hash((fn.__qualname__, mode))
+        o_path = tmp_path / _compute_source_fingerprint() / f"{sha}.o"
+        key_b64 = base64.b64encode(pickle.dumps(((mode,), {}))).decode("ascii")
+        err = async_compile._pool_worker(fn.__module__, fn.__qualname__, key_b64, str(o_path))
+        assert err is None, f"mode {mode!r}: {err}"
+        assert o_path.exists()
+    assert len(list((tmp_path / _compute_source_fingerprint()).glob("*.o"))) == 2
+
+
+_NEVER_BUILT_TEST_SRC = textwrap.dedent(
+    """
+    from quack.cache.async_compile import CompilePending, get_active_pool
+
+    SHA = "a" * 64
+    attempts = []
+
+    def test_served_another_way():
+        # First attempt: needs a kernel, the pool takes the request. The
+        # retry passes without asking jit_cache for that kernel again.
+        attempts.append(1)
+        if len(attempts) == 1:
+            get_active_pool()._requests[SHA] = ("fake._compile_kernel", "/nonexistent/aaa.o")
+            raise CompilePending(SHA, "fake._compile_kernel")
+        if "{RETRY}" == "noticed":  # what jit_cache does when a retry lands on a failed request
+            get_active_pool().noticed.add(SHA)
+        if "{RETRY}" == "skips":
+            import pytest
+
+            pytest.skip("not here")
+    """
+)
+
+_NEVER_BUILT_CONFTEST_SRC = textwrap.dedent(
+    """
+    pytest_plugins = ["quack.testing.pytest_plugin"]
+
+
+    def pytest_configure(config):
+        # The request for sha "aaa..." fails in its worker and leaves no .o.
+        from quack.cache import async_compile as ac
+
+        poll = ac.CompilePool.poll
+        failed = ("failed", "compile succeeded but .o was not exported")
+        ac.CompilePool.poll = lambda self, s: failed if s == "a" * 64 else poll(self, s)
+    """
+)
+
+
+@pytest.mark.parametrize(
+    "retry,xdist",
+    [("passes", False), ("passes", True), ("noticed", False), ("skips", False)],
+    ids=["silent", "xdist", "seen", "skipped"],
+)
+def test_failed_request_nobody_retried_is_reported(tmp_path, retry, xdist):
+    """A pool request that fails, for a kernel the waiting test then passes
+    without, must not go unseen: the request and the retry disagree about
+    which kernel is needed. This is how one kernel under two disk keys looked
+    (``rounding_mode`` as an enum eagerly and an int under torch.compile): a
+    worker answered the second key from memory and exported nothing, and the
+    test's retry was served from the in-memory cache under the first key. Only
+    a per-worker "failed" counter showed it.
+
+    silent/xdist: reported as ``never_built`` and fails ``--async-compile-strict``,
+    also when the test ran in an xdist worker. seen: a retry that does come
+    back to jit_cache handles the failure itself (compiles in-process, or
+    surfaces the expected error), so nothing is reported here. skipped: a
+    retry that does not pass says nothing about the kernel either."""
+    (tmp_path / "conftest.py").write_text(_NEVER_BUILT_CONFTEST_SRC)
+    (tmp_path / "test_never_built.py").write_text(_NEVER_BUILT_TEST_SRC.format(RETRY=retry))
+    env = dict(os.environ)
+    env.pop("PYTEST_XDIST_WORKER", None)
+    cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--async-compile=2"]
+    result = subprocess.run(
+        cmd + ["--async-compile-strict"] + (["-n", "1"] if xdist else []),
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    out = result.stdout + result.stderr
+    assert ("1 skipped" if retry == "skips" else "1 passed") in out, out
+    if retry != "passes":
+        assert result.returncode == 0 and "never_built" not in out, out
+    else:
+        assert result.returncode == 1, out
+        assert "1 kernels not compiled by the pool" in out, out
+        assert "never_built: compile succeeded but .o was not exported" in out, out
+        assert "test_never_built.py::test_served_another_way" in out, out
+
+
+def test_strict_refuses_a_disabled_cache(tmp_path):
+    """The pool hands kernels over as .o files in the disk cache. With the
+    cache off every kernel compiles in-process and none of it is recorded,
+    so a strict run would pass having checked nothing."""
+    (tmp_path / "conftest.py").write_text('pytest_plugins = ["quack.testing.pytest_plugin"]\n')
+    (tmp_path / "test_nothing.py").write_text("def test_nothing():\n    pass\n")
+    env = dict(os.environ, QUACK_CACHE_ENABLED="0")
+    env.pop("PYTEST_XDIST_WORKER", None)
+    cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--async-compile=2"]
+    strict = subprocess.run(
+        cmd + ["--async-compile-strict"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert strict.returncode == 4 and "needs the kernel cache" in strict.stderr, (
+        strict.stdout + strict.stderr
+    )
+    plain = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300)
+    assert plain.returncode == 0, plain.stdout + plain.stderr
+
+
+_WEDGE_QUEUE_TEST_SRC = textwrap.dedent(
+    """
+    import time
+
+    from quack.cache.async_compile import CompilePending, get_active_pool
+
+    attempts = []
+
+    def test_deferred():
+        attempts.append(get_active_pool() is not None)
+        if len(attempts) == 1:
+            raise CompilePending("a" * 64, "fake.compile")
+        assert attempts[-1] == {POOL_ACTIVE_ON_RETRY}, attempts
+
+    def test_slow_neighbour():
+        time.sleep(0.6)  # longer than the wedge timeout below
+    """
+)
+
+_WEDGE_QUEUE_CONFTEST_SRC = textwrap.dedent(
+    """
+    pytest_plugins = ["quack.testing.pytest_plugin"]
+
+
+    def pytest_configure(config):
+        from quack.cache import async_compile as ac
+        from quack.testing import pytest_plugin as tp
+
+        tp._SingleProcDeferLoop._WEDGE_TIMEOUT_S = 0.2
+        if {WEDGED}:
+            ac.CompilePool.poll = lambda self, sha: ("pending", None)
+    """
+)
+
+
+@pytest.mark.parametrize("wedged", [False, True], ids=["healthy", "wedged"])
+def test_single_proc_wedge_timeout_ignores_queue_time(tmp_path, wedged):
+    """The wedge timeout is about a compile that stays pending, not about how
+    long a deferred test sat in the queue behind other tests.
+
+    A deferred test goes to the back of the queue, so in a long session it
+    comes around again well after the timeout although its compile finished
+    long ago. Taking that as a wedged pool re-ran the test with the pool
+    suppressed, and every further cold kernel it needed compiled in-process
+    (seen as ``suppressed`` fallbacks in a 16 min single-process run).
+
+    healthy: the awaited sha is no longer pending when the test's turn comes,
+    so the retry runs with the pool active whatever the elapsed time.
+    wedged: the sha polls pending forever, so the retry still escapes to an
+    in-process compile once the timeout passes.
+    """
+    (tmp_path / "conftest.py").write_text(_WEDGE_QUEUE_CONFTEST_SRC.format(WEDGED=wedged))
+    (tmp_path / "test_queue.py").write_text(
+        _WEDGE_QUEUE_TEST_SRC.format(POOL_ACTIVE_ON_RETRY=not wedged)
+    )
+    env = dict(os.environ)
+    env.pop("PYTEST_XDIST_WORKER", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--async-compile=2"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "2 passed" in out, out
     assert "1 test deferrals" in out, out
 
 

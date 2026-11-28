@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import time
 import traceback
 import warnings
@@ -30,6 +31,7 @@ from quack.cache.async_compile import (
     CompilePending,
     activate,
     deactivate,
+    drain_fallbacks,
     get_active_pool,
     suppress_pool,
 )
@@ -55,6 +57,16 @@ def pytest_addoption(parser):
             "On a kernel-compile cache miss, submit the compile to a pool of "
             "N CPU workers, defer the test, and retry it once the .o is "
             "ready. Zero overhead when the cache is warm."
+        ),
+    )
+    parser.addoption(
+        "--async-compile-strict",
+        action="store_true",
+        help=(
+            "Exit non-zero if any kernel was not compiled by the active pool: "
+            "it compiled in-process instead, or its pool compile failed and "
+            "the test passed without it (tests still run to completion and "
+            "report their real results)."
         ),
     )
 
@@ -209,7 +221,17 @@ def _disable_unused_accelerator_lazy_call() -> None:
 def pytest_configure(config):
     """Set up the async compile pool and pytest-internal speedup patches."""
     jobs = config.getoption("--async-compile", default=None)
+    _fallbacks_by_test.clear()  # a second pytest.main() in one interpreter starts clean
     if jobs is not None:
+        import quack.cache as cache_state
+
+        if config.getoption("--async-compile-strict") and not cache_state.CACHE_ENABLED:
+            # the pool hands kernels over as .o files in the disk cache: with
+            # it off every kernel compiles in-process and nothing is recorded
+            raise pytest.UsageError(
+                "--async-compile-strict needs the kernel cache (QUACK_CACHE_ENABLED=0 is set)"
+            )
+        drain_fallbacks()  # anything recorded before this session is not a test's
         worker = os.environ.get("PYTEST_XDIST_WORKER")
         is_xdist_master = worker is None and getattr(config.option, "numprocesses", None)
         if not is_xdist_master:
@@ -379,7 +401,31 @@ def _run_protocol(item, nextitem, force_sync: bool):
             reports = runtestprotocol(item, nextitem=nextitem, log=False)
     else:
         reports = runtestprotocol(item, nextitem=nextitem, log=False)
-    return getattr(item, "_quack_pending_sha", None), reports
+    pending_sha = getattr(item, "_quack_pending_sha", None)
+    # Kernels this attempt compiled in-process although the pool was active.
+    # Kept on the item across deferred attempts (their reports are dropped)
+    # and attached to the reports that are logged: user_properties travel
+    # with the report, so they reach the xdist controller too.
+    item._quack_fallbacks = getattr(item, "_quack_fallbacks", []) + [
+        list(f) for f in drain_fallbacks()
+    ]
+    awaited = getattr(item, "_quack_awaited", [])
+    if pending_sha:
+        item._quack_awaited = awaited + [pending_sha]
+    elif reports:
+        # Kernels this test waited for that failed in the pool and that it
+        # then PASSED without asking for again: built by nobody. (A retry
+        # that fails or skips says nothing about the kernel.)
+        pool = get_active_pool()
+        passed = pool is not None and all(report.passed for report in reports)
+        for sha in awaited if passed else ():
+            orphan = pool.orphaned(sha)
+            if orphan is not None:
+                item._quack_fallbacks.append([sha, orphan[0], "never_built", orphan[1], 0.0])
+        if item._quack_fallbacks:
+            reports[-1].user_properties.append((_FALLBACK_PROP, item._quack_fallbacks))
+        item._quack_fallbacks, item._quack_awaited = [], []
+    return pending_sha, reports
 
 
 def _log_reports(item, reports):
@@ -415,7 +461,10 @@ class _SingleProcDeferLoop:
     #: (in-process compile). Guards against a permanently-"pending" sha
     #: (wedged worker, foreign flock holder that never produces the .o) —
     #: without it a rotation-only item would spin forever, since attempts
-    #: increment only on actual runs.
+    #: increment only on actual runs. It applies only while the awaited sha
+    #: still polls "pending": a deferred test waits at the back of the queue,
+    #: so in a long session its turn comes long after its compile finished,
+    #: and that queue time says nothing about the pool.
     _WEDGE_TIMEOUT_S = 600.0
 
     @pytest.hookimpl(tryfirst=True)
@@ -429,12 +478,10 @@ class _SingleProcDeferLoop:
         while queue:
             item = queue.popleft()
             awaiting = getattr(item, "_quack_await_sha", None)
-            wedged = awaiting is not None and time.monotonic() > deadline.get(
-                item.nodeid, float("inf")
-            )
-            if awaiting is not None and not wedged:
-                state, _ = self.pool.poll(awaiting)
-                if state == "pending":
+            wedged = False
+            if awaiting is not None and self.pool.poll(awaiting)[0] == "pending":
+                wedged = time.monotonic() > deadline[item.nodeid]
+                if not wedged:
                     queue.append(item)
                     spins += 1
                     if spins >= len(queue):
@@ -449,7 +496,7 @@ class _SingleProcDeferLoop:
             )
             if pending_sha:
                 item._quack_await_sha = pending_sha
-                deadline.setdefault(item.nodeid, time.monotonic() + self._WEDGE_TIMEOUT_S)
+                deadline[item.nodeid] = time.monotonic() + self._WEDGE_TIMEOUT_S
                 _log_deferred_teardown_errors(item, reports, _log_reports)
                 queue.append(item)
                 self.defer_count += 1
@@ -599,6 +646,11 @@ class _XdistWorkerDefer:
 _reported_nodeids: set = set()
 _deselected_nodeids: set = set()
 
+_FALLBACK_PROP = "quack_async_fallback"
+# nodeid -> [[sha, qualname, reason, detail, seconds], ...], filled where the
+# reports are logged (single process, or the xdist controller).
+_fallbacks_by_test: dict = {}
+
 
 def pytest_deselected(items):
     for item in items:
@@ -607,6 +659,59 @@ def pytest_deselected(items):
 
 def pytest_runtest_logreport(report):
     _reported_nodeids.add(report.nodeid)
+    for name, value in report.user_properties:
+        if name == _FALLBACK_PROP:
+            _fallbacks_by_test.setdefault(report.nodeid, []).extend(value)
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _fallback_cause(reason: str, detail: str) -> str:
+    """One line naming the cause: the exception line of a worker error,
+    without its traceback tail."""
+    detail = _ANSI.sub("", detail).split(" [worker:")[0]
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    return f"{reason}: {' '.join(lines[:2])[:240]}" if lines else reason
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Name every kernel the active pool should have compiled and did not:
+    grouped by compile function and cause, with the tests that hit it."""
+    if config.getoption("--async-compile", default=None) is None or not _fallbacks_by_test:
+        return
+    tr = terminalreporter
+    # (kernel compile fn, cause) -> {sha: seconds}, tests that hit it
+    groups: dict = {}
+    for nodeid, events in _fallbacks_by_test.items():
+        for sha, qualname, reason, detail, seconds in events:
+            keys, tests = groups.setdefault(
+                (qualname, _fallback_cause(reason, detail)), ({}, set())
+            )
+            keys[sha] = seconds
+            tests.add(nodeid)
+    n_keys = sum(len(keys) for keys, _ in groups.values())
+    total = sum(sum(keys.values()) for keys, _ in groups.values())
+    tr.write_sep(
+        "=",
+        f"async-compile: {n_keys} kernels not compiled by the pool "
+        f"({total:.0f}s in-process) in {len(_fallbacks_by_test)} tests",
+        red=True,
+        bold=True,
+    )
+    for (qualname, cause), (keys, tests) in sorted(
+        groups.items(), key=lambda kv: -sum(kv[1][0].values())
+    ):
+        tr.write_line(
+            f"{qualname}: {len(keys)} kernels, {sum(keys.values()):.0f}s, {len(tests)} tests",
+            bold=True,
+        )
+        tr.write_line(f"  {cause}")
+        shown = sorted(tests)[: None if config.option.verbose > 0 else 8]
+        for nodeid in shown:
+            tr.write_line(f"    {nodeid}")
+        if len(shown) < len(tests):
+            tr.write_line(f"    ... {len(tests) - len(shown)} more (-v lists all)")
 
 
 @pytest.hookimpl(trylast=True)
@@ -618,6 +723,8 @@ def pytest_sessionfinish(session, exitstatus):
         return  # workers see the full collection but run a subset
     if getattr(config.option, "collectonly", False):
         return
+    if config.getoption("--async-compile-strict") and _fallbacks_by_test and exitstatus == 0:
+        session.exitstatus = 1  # the terminal summary names the kernels and tests
     if exitstatus not in (0, 1):
         return  # interrupted (-x, ^C, internal error): missing reports expected
     missing = {item.nodeid for item in session.items} - _reported_nodeids - _deselected_nodeids

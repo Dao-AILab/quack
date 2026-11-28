@@ -23,7 +23,9 @@ import cutlass.cute as cute
 from cutlass import const_expr
 
 from quack.blockscaled import nvfp4_utils as U
+from quack.gemm_runtime.identity import function_semantic_key, semantic_value_key
 from quack.operand_transform.formats import qtip as Q
+from quack.operand_transform.mod import TransformModBase
 
 
 @cute.jit
@@ -54,8 +56,10 @@ def _pad_n128(q, sf):
     return q, sf
 
 
-class DecodeFormat:
-    """One W4/W8 decode format. Device contract:
+class DecodeFormat(TransformModBase):
+    """One W4/W8 decode format: an A-operand transform that owns A's storage
+    layout. It is itself the ``transform_a=`` handle (a GemmMod), by instance
+    or by its ``W4_FORMATS`` name. Device contract:
 
     ``decode_k16(xw, sfw, b, consts)``: xw is the thread's raw ``Int32`` word
     view for one m-atom ((4,) for 4-bit, (8,) for 8-bit formats), sfw its
@@ -85,7 +89,17 @@ class DecodeFormat:
     (blob, sf_blob)`` — the offline repack whose word order ``decode_k16``
     assumes. The framework never interprets the blob; the roundtrip test
     fixture is what keeps the two sides honest.
+
+    Identity: the class, the geometry above, the instance's own public
+    attributes (e.g. ``Int4.group``) and the device hooks. A subclass with
+    its own ``__init__`` sets its attributes first and then calls
+    ``super().__init__()``, which fingerprints them; state the kernel never
+    sees (the host bundle of a fn format) goes in ``_private`` attributes.
     """
+
+    # what TransformAW4 reads off a format while tracing
+    _GEOMETRY = ("name", "w8", "tile_k", "sf_words", "promote", "tile_state_words", "mma_dtype")
+    _DEVICE_HOOKS = ("decode_k16", "make_consts", "build_tile_state", "promote_scale_pair")
 
     name: str
     w8 = False
@@ -101,6 +115,36 @@ class DecodeFormat:
     # the MMA compute dtype decode_k16 produces (the gemm ctor a_dtype);
     # bf16 for the whole W4A16 family, e4m3 for w4a8 (int4sm)
     mma_dtype = cutlass.BFloat16
+
+    def __init__(self):
+        cls = type(self)
+        self._identify(
+            (
+                "decode_format",
+                cls.__module__,
+                cls.__qualname__,
+                tuple((a, semantic_value_key(getattr(self, a), set())) for a in self._GEOMETRY),
+                tuple(
+                    (a, semantic_value_key(value, set()))
+                    for a, value in sorted(vars(self).items())
+                    if not a.startswith("_")
+                ),
+                tuple(
+                    function_semantic_key(getattr(cls, hook))
+                    for hook in self._DEVICE_HOOKS
+                    if hasattr(cls, hook)
+                ),
+            )
+        )
+
+    @property
+    def owned_fmt(self):
+        return self
+
+    def __call__(self, gemm):
+        from quack.operand_transform.transform import TransformAW4
+
+        return TransformAW4(gemm, self)
 
     @property
     def sf_bytes(self):
@@ -161,6 +205,7 @@ class Int4(DecodeFormat):
         self.group = group
         self.name = "int4" if group == 128 else f"int4_g{group}"
         self.sf_words = 2 if group == 32 else 1
+        super().__init__()
 
     def make_consts(self):
         return U.make_i4_decode_consts()
@@ -593,4 +638,6 @@ def decode_format(fmt):
     """Resolve a format name or instance to a DecodeFormat."""
     if isinstance(fmt, DecodeFormat):
         return fmt
+    if fmt not in W4_FORMATS:
+        raise KeyError(f"unknown W4 format {fmt!r}")
     return W4_FORMATS[fmt]

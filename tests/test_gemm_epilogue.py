@@ -9,10 +9,9 @@ import pytest
 from quack.epilogue.ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
 from quack.epilogue.frontend import gemm_epilogue, pack, unpack
 from quack.gemm_config import cta_tile_shape_m
-from quack.gemm_runtime.host import resolve_gemm_class
 import math
-import pickle
 import torch
+import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from quack.epilogue.library import (
@@ -95,48 +94,155 @@ _cache_max_mod = gemm_epilogue(reduces={"stat": ColVecReduce("stat", combine="ma
 )
 
 
-def test_epi_mod_semantic_cache_key_and_resolver():
-    """Static op config changes identity; a pickled class recipe remints locally."""
+@cute.jit
+def _trace_state_probe(x, doubled: bool):
+    if cutlass.const_expr(doubled):
+        x = x * 2
+    return x
+
+
+def test_semantic_key_is_independent_of_trace_state():
+    """A function's fingerprint must not depend on whether this process has
+    traced it yet. The DSL swaps a traced ``@cute.jit`` function for a
+    rewritten one that starts at the ``def`` line, so ``inspect.getsource``
+    stops returning the decorator lines: a mod built after the trace then had
+    a different digest from one built before it. Seen as a kernel recompiled
+    on the second run of a warm cache, and as a digest mismatch when an
+    async-compile worker rebuilt a mod it had already traced a helper of."""
+    import inspect
+
+    from quack.gemm_runtime.identity import function_semantic_key
+    from quack.testing.trace import run_traced
+
+    first_line = lambda: inspect.unwrap(_trace_state_probe).__code__.co_firstlineno  # noqa: E731
+    before, line_before = function_semantic_key(_trace_state_probe), first_line()
+    run_traced(lambda: _trace_state_probe(Int32(3), True))
+    if first_line() == line_before:
+        pytest.skip("this DSL version does not swap in a rewritten function on trace")
+    assert function_semantic_key(_trace_state_probe) == before
+
+
+def _mul_by(k):
+    def mul(x):
+        return x * k
+
+    return mul
+
+
+def test_semantic_key_tells_sibling_closures_apart():
+    """Two closures of one factory share a module and a qualname and differ
+    in what they captured. A fn that uses two of them must change identity
+    when either changes: the cycle guard used to go by name, so the second
+    one was recorded as a back-reference and its capture never read."""
+    from quack.gemm_runtime.identity import function_semantic_key
+
+    def build(a, b):
+        left, right = _mul_by(a), _mul_by(b)
+
+        def epi(acc):
+            return {"D": left(acc) + right(acc)}
+
+        return epi
+
+    assert function_semantic_key(build(2, 3)) != function_semantic_key(build(2, 5))
+    assert function_semantic_key(build(2, 3)) == function_semantic_key(build(2, 3))
+
+
+def test_semantic_key_reads_installed_user_code(tmp_path, monkeypatch):
+    """A downstream package installed in site-packages is user code: two
+    closures of its epilogue factory are two epilogues. Installed code used
+    to be fingerprinted by name alone, which is right only for the toolchain
+    (cutlass, torch, ...) and the standard library."""
+    import importlib
+    import sys
+
+    from cutlass.cute.runtime import from_dlpack
+
+    from quack.gemm_runtime.identity import function_semantic_key
+
+    pkg = tmp_path / "site-packages" / "quack_downstream_probe"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text(
+        "def make_scale(s):\n    def epi(acc):\n        return {'D': acc * s}\n    return epi\n"
+    )
+    monkeypatch.syspath_prepend(str(pkg.parent))
+    probe = importlib.import_module("quack_downstream_probe")
+    monkeypatch.setitem(sys.modules, "quack_downstream_probe", probe)  # removed again at teardown
+    assert function_semantic_key(probe.make_scale(0.5)) != function_semantic_key(
+        probe.make_scale(2.0)
+    )
+    assert function_semantic_key(from_dlpack)[0] == "extern_function"
+
+
+def test_epi_mod_sink_order_is_identity():
+    """Sinks are minted into the kernel's EpilogueArguments in declaration
+    order, so two mods that differ only in that order are two kernels with
+    different launch ABIs. The digest used to sort them."""
+
+    def fn(acc):
+        return {"D": acc, "lo": acc, "hi": acc}
+
+    lo, hi = ColVecReduce("lo"), ColVecReduce("hi", combine="max")
+    ab = gemm_epilogue(reduces={"lo": lo, "hi": hi})(fn)
+    ba = gemm_epilogue(reduces={"hi": hi, "lo": lo})(fn)
+    assert ab.semantic_digest != ba.semantic_digest
+    assert ab.semantic_digest == gemm_epilogue(reduces={"lo": lo, "hi": hi})(fn).semantic_digest
+
+
+def test_epi_mod_identity_is_its_content():
+    """Static op config changes a mod's identity; a by-value copy keeps it.
+    The jit cache's disk key sees the digest and not the object, so a copy
+    in another process asks for, and mints, the same kernel."""
+    import cloudpickle
+
+    from quack.cache.jit import _key_to_hash
     from quack.rounding import RoundingMode
 
     assert _cache_add_mod.semantic_digest != _cache_max_mod.semantic_digest
     # trailing (): arg_forms; trailing False: add_to_output
     mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
-    ref = pickle.loads(pickle.dumps(_cache_add_mod._class_ref(mint_key)))
-    cls = resolve_gemm_class(ref)
+    copy = cloudpickle.loads(cloudpickle.dumps(_cache_add_mod))
+    assert copy is not _cache_add_mod and copy.semantic_digest == _cache_add_mod.semantic_digest
+    # equal by content, so the in-memory jit cache (keyed by the arguments)
+    # holds one entry and one mod per digest however often a mod is rebuilt
+    assert copy == _cache_add_mod != _cache_max_mod
+    assert {(_cache_add_mod, mint_key): "kernel"}[(copy, mint_key)] == "kernel"
+
+    def key(mod):  # shaped like _compile_gemm_epi's: (epi_mod, mint_key) first
+        return _key_to_hash(("_compile_gemm_epi", (mod, mint_key), (128, 128)))
+
+    assert key(copy) == key(_cache_add_mod) != key(_cache_max_mod)
+    cls = copy._mint(*mint_key)
     assert cls._epi_mod_class_semantic_key == (_cache_add_mod.semantic_digest, mint_key)
 
 
-def test_epi_mod_local_payload_identity_and_consumption():
-    import cloudpickle  # noqa: F401
-
-    from quack.cache.async_compile import PoolPayload
-    from quack.gemm_runtime.identity import LOCAL_EPI_MODS, install_epi_mod_payload
-    from quack.rounding import RoundingMode
+def test_epi_mod_ships_by_value_after_eager_call():
+    """An eager call leaves compiled launch plans in the mod's process-local
+    caches. They hold tvm-ffi functions, which do not pickle, so the copy an
+    async-compile worker receives must drop them: with one left in, the pool
+    refused the mod's next cold kernel and it compiled in-process."""
+    import cloudpickle
 
     def build():
         @gemm_epilogue()
-        def local_epi(acc):
-            return {"D": acc}
+        def local_scaled(acc, alpha):
+            return {"D": acc * alpha}
 
-        return local_epi
+        return local_scaled
 
     mod = build()
-    mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
-    ref = mod._class_ref(mint_key)
-    payload = ref.__quack_pool_payload__()
-    assert isinstance(payload, PoolPayload)
-    assert payload.identity == mod.semantic_digest
+    torch.manual_seed(31)
+    m, n, k = 256, 384, 512
+    A = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / math.sqrt(k) * 4
+    B = torch.randn(k, n, device="cuda", dtype=torch.bfloat16) / math.sqrt(k) * 4
+    out = mod(A, B, alpha=2.0)["D"]
+    _rel_check(out, 2.0 * (A.float() @ B.float()), "eager")
+    assert mod._plan_cache and mod._call_cache, "precondition: the eager call cached its plan"
 
-    # Model the separate worker: it starts without the submitter's registry.
-    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is mod  # consumes (pops)
-    with pytest.raises(ValueError, match="digest mismatch"):
-        install_epi_mod_payload("wrong-digest", payload.data)
-    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
-
-    install_epi_mod_payload(payload.identity, payload.data)
-    resolve_gemm_class(ref)  # consumes the installed payload
-    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
+    shipped = cloudpickle.loads(cloudpickle.dumps(mod))  # what the pool sends a worker
+    assert shipped.semantic_digest == mod.semantic_digest
+    assert not any(getattr(shipped, name) for name in mod._PROCESS_LOCAL_CACHES)
+    assert mod._plan_cache and mod._call_cache, "the submitter keeps its own caches"
 
 
 def test_epi_scalar_fixed_abi():
@@ -265,19 +371,51 @@ def async_probe_epi(acc, alpha):
     return {"D": acc * alpha}
 
 
-def test_epi_mod_async_compile(tmp_path, monkeypatch):
+def test_epi_mod_compile_key_has_one_spelling(monkeypatch):
+    """``rounding_mode`` reaches EpiMod.gemm as the enum from eager callers
+    and as a plain int from the torch custom op: one kernel, so one disk key
+    (the same check as test_gemm_compile_key_has_one_spelling, for the
+    epilogue compile path)."""
+    import quack.gemm_runtime.host as host
+    from quack.cache.jit import _key_to_hash
+    from quack.rounding import RoundingMode
+
+    class _Seen(Exception):
+        pass
+
+    keys = []
+
+    def spy(*args, **kwargs):
+        keys.append(_key_to_hash(("_compile_gemm_epi", args, tuple(sorted(kwargs.items())))))
+        raise _Seen  # the key is all we need: no compile, no launch
+
+    monkeypatch.setattr(host, "_compile_gemm_epi", spy)
+    A = torch.randn(1, 256, 256, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(1, 256, 256, device="cuda", dtype=torch.bfloat16)
+    D = torch.empty(1, 256, 256, device="cuda", dtype=torch.bfloat16)
+    for mode in (RoundingMode.RN, 0):
+        monkeypatch.setattr(async_probe_epi, "_plan_cache", {})
+        with pytest.raises(_Seen):
+            async_probe_epi.gemm(
+                A,
+                B,
+                D,
+                epi_args=dict(alpha=2.0),
+                tile_M=128,
+                tile_N=128,
+                cluster_M=1,
+                cluster_N=1,
+                rounding_mode=mode,
+            )
+    assert keys[0] == keys[1]
+
+
+def test_epi_mod_async_compile(through_pool):
     """Async-compile pool end-to-end for minted epilogue kernels: a
-    module-anchored mod resolves by import in the worker, a factory-local mod
-    ships by value (cloudpickle payload side-channel). A fresh CACHE_DIR
-    forces cold misses through the pool; the test fails if the pool was
-    bypassed (no submission) or a worker failed (in-process fallback warns)."""
-    import time
-    import warnings
-
+    module-level mod and one made inside a function both reach the worker by
+    value (cloudpickle). Fails if the pool was bypassed (no submission) or
+    a kernel compiled in-process (see ``through_pool``)."""
     import cloudpickle  # noqa: F401
-
-    import quack.cache as cache_state
-    from quack.cache import async_compile
 
     device = "cuda"
     torch.random.manual_seed(25)
@@ -294,49 +432,83 @@ def test_epi_mod_async_compile(tmp_path, monkeypatch):
     B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
     ref = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
     cases = [
-        ("by-import", async_probe_epi, dict(alpha=2.0), 2.0 * ref),
-        ("payload", build(0.25), dict(alpha=3.0), 3.0 * ref + 0.25),
+        ("module-level", async_probe_epi, dict(alpha=2.0), 2.0 * ref),
+        ("function-local", build(0.25), dict(alpha=3.0), 3.0 * ref + 0.25),
     ]
-
-    monkeypatch.setattr(cache_state, "CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(cache_state, "CACHE_ENABLED", True)
-    with async_compile.pool_scope() as pool:
-        submitted_before = pool.n_submitted
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            for label, mod, eargs, expected in cases:
-                D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
-                deadline = time.monotonic() + 180
-                while True:
-                    try:
-                        mod.gemm(
-                            A,
-                            B,
-                            D,
-                            epi_args=eargs,
-                            tile_M=128,
-                            tile_N=128,
-                            cluster_M=1,
-                            cluster_N=1,
-                        )
-                        break
-                    except async_compile.CompilePending:
-                        assert time.monotonic() < deadline, f"{label}: compile never completed"
-                        time.sleep(0.2)
-                _rel_check(D, expected, label)
-        fallbacks = [str(w.message) for w in caught if "async compile failed" in str(w.message)]
-        assert not fallbacks, f"pool worker failed, compiled in-process instead: {fallbacks}"
-        assert pool.n_submitted - submitted_before == 2, (
-            f"expected both epilogue compiles to go through the pool, "
-            f"got {pool.n_submitted - submitted_before} submissions"
+    for label, mod, eargs, expected in cases:
+        D = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
+        _, compiled = through_pool(
+            lambda: mod.gemm(
+                A, B, D, epi_args=eargs, tile_M=128, tile_N=128, cluster_M=1, cluster_N=1
+            )
         )
+        assert compiled == 1, f"{label}: the compile did not go through the pool"
+        _rel_check(D, expected, label)
+
+
+def test_library_mods_ship_to_a_fresh_process(tmp_path):
+    """The epilogues of quack.epilogue.{library,rotary,scaled_exp}, a few
+    factory products and four transforms survive the trip to an async-compile
+    worker: pickled by value here, unpickled in a fresh process, and able to
+    mint their classes there. It checks that a mod ships and mints, not that
+    the worker traces the same math. A library mod that holds something
+    unpicklable would otherwise show up only as an in-process compile, on
+    the one arch whose tests use it."""
+    import subprocess
+    import sys
+    import textwrap
+
+    import cloudpickle
+
+    from quack.epilogue import library, rotary, scaled_exp
+    from quack.epilogue.frontend import EpiMod
+    from quack.linear_cross_entropy import _lce_dw_scale, _lce_dx_scale
+    from quack.operand_transform import dropout_a
+    from quack.operand_transform.formats import W4_FORMATS
+    from quack.rounding import RoundingMode
+
+    epi_mods = {
+        f"{module.__name__}.{name}": value
+        for module in (library, rotary, scaled_exp)
+        for name, value in vars(module).items()
+        if isinstance(value, EpiMod)
+    }
+    epi_mods["linear_act_mod"] = library.linear_act_mod(
+        "gelu_tanh_approx", gated=False, has_c=True, has_rowvec=False, has_colvec=True
+    )
+    epi_mods["dact_mod"] = library.dact_mod("relu", has_scale=True, has_reduce=True)
+    epi_mods["sq_reduce_mod"] = library.sq_reduce_mod(has_c=False, has_rowvec=True, has_aux=True)
+    epi_mods["gated_quant_mod"] = library.gated_quant_mod("geglu")
+    transforms = [_lce_dx_scale, _lce_dw_scale, dropout_a(0.3), W4_FORMATS["qtip2s"]]
+
+    mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
+    digests = [mod.semantic_digest for mod in (*epi_mods.values(), *transforms)]
+    shipped = tmp_path / "shipped.pkl"
+    # exactly how the pool serializes a compile request's arguments
+    shipped.write_bytes(cloudpickle.dumps((epi_mods, transforms, mint_key, digests)))
+    child = textwrap.dedent(
+        """
+        import pickle, sys
+
+        epi_mods, transforms, mint_key, digests = pickle.load(open(sys.argv[1], "rb"))
+        assert [m.semantic_digest for m in (*epi_mods.values(), *transforms)] == digests
+        for name, mod in epi_mods.items():
+            cls = mod._mint(*mint_key)  # what _compile_gemm_epi does with (epi_mod, mint_key)
+            assert cls._epi_mod_class_semantic_key == (mod.semantic_digest, mint_key), name
+        print("received", len(epi_mods), "epilogues", len(transforms), "transforms")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(shipped)], capture_output=True, text=True, timeout=600
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"received {len(epi_mods)} epilogues {len(transforms)} transforms" in result.stdout
 
 
 def test_epi_mod_factory_local():
     """An EpiMod never bound to a module global (factory-local, closure-
-    carrying) must still plan/compile: it gets an ``epi_mod_local`` ref
-    resolved through the process registry, and under --async-compile the
-    pool ships it by value (cloudpickle payload side-channel)."""
+    carrying) must still plan/compile, and under --async-compile the pool
+    ships it by value (cloudpickle)."""
     device = "cuda"
     torch.random.manual_seed(24)
 

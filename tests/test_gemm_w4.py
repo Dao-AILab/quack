@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from quack.blockscaled import nvfp4_utils as U
-from quack.operand_transform.formats import W4_FORMATS
+from quack.operand_transform.formats import DecodeFormat, W4_FORMATS
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_w4 import gemm_w4a16
 from quack.operand_transform import PackedInput, a_transform
@@ -439,7 +439,7 @@ def _int8_ts_fn(xw, sfw, b, consts):
 
 @pytest.mark.parametrize("m,n,k", [(16, 1024, 2048), (300, 2112, 4096)])
 def test_new_format_int8_ts_demo(m, n, k):
-    fmt = _int8_ts_fn.as_decode_format()
+    fmt = _int8_ts_fn  # a packed fn transform IS a DecodeFormat
     torch.manual_seed(13)
     act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.float32)
@@ -449,6 +449,79 @@ def test_new_format_int8_ts_demo(m, n, k):
     ref = act.float() @ fmt.dequant_reference(q, sf).t()
     atol = ref.abs().max().item() * 2**-7 + 1e-5
     torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=1e-2)
+
+
+def test_packed_fn_transform_async_compile(through_pool):
+    """A packed fn transform's kernel compiles in an async-compile worker. The
+    DecodeFormat wrapping the fn has a ``@cute.jit`` decode, and the DSL needs
+    its source: a format class defined inside a function reaches the worker
+    by value, without source, and the kernel falls back to an in-process
+    compile. (The weight geometry is static in the kernel and no other test
+    uses this one, so the kernel is cold in this process too.)"""
+    fmt = _int8_ts_fn  # a packed fn transform IS a DecodeFormat
+    torch.manual_seed(17)
+    m, n, k = 16, 768, 1024
+    act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.float32)
+    q, sf = fmt.quantize_reference(w)
+    blob, _ = fmt.prepare(q, sf)
+    out, compiled = through_pool(lambda: gemm_w4a16(act, blob, wformat=fmt))
+    assert compiled == 1, "the compile did not go through the pool"
+    ref = act.float() @ fmt.dequant_reference(q, sf).t()
+    atol = ref.abs().max().item() * 2**-7 + 1e-5
+    torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=1e-2)
+
+
+def test_format_is_its_own_transform_handle(monkeypatch):
+    """A decode format is the ``transform_a=`` mod itself, whether it is
+    written as a class or as a packed fn, and a registry name is only a way
+    to look one up: every spelling is one handle and one kernel."""
+    from quack.operand_transform import FnFormat
+    from quack.operand_transform.host import as_transform_mod
+    from quack.operand_transform.mod import TransformModBase
+
+    assert isinstance(_int8_ts_fn, FnFormat) and isinstance(_int8_ts_fn, TransformModBase)
+    assert as_transform_mod(_int8_ts_fn) is _int8_ts_fn and _int8_ts_fn.owned_fmt is _int8_ts_fn
+    monkeypatch.setitem(W4_FORMATS, "int8_ts_registered", _int8_ts_fn)
+    assert as_transform_mod("int8_ts_registered") is _int8_ts_fn
+    assert as_transform_mod("int4") is W4_FORMATS["int4"]
+    with pytest.raises(KeyError, match="unknown W4 format"):
+        as_transform_mod("no_such_format")
+
+
+class _ScaledProbeFormat(DecodeFormat):
+    """Two instances differ only in ``scale``, which make_consts would bake
+    into the kernel. Never traced: the test below reads digests only."""
+
+    name = "scaled_probe"
+
+    def __init__(self, scale):
+        self.scale = scale
+        super().__init__()
+
+    def make_consts(self):
+        return self.scale
+
+    def decode_k16(self, xw, sfw, b, consts):
+        return xw[b], xw[b], xw[b], xw[b]
+
+
+def test_format_digest_covers_the_instance():
+    """A format's identity covers the INSTANCE the kernel is traced from, not
+    only its class-level name and decode source: two configurations of one
+    format class are two kernels, and two packed fns over one PackedInput
+    are two kernels although they share FnFormat's decode method."""
+    half, double = _ScaledProbeFormat(0.5), _ScaledProbeFormat(2.0)
+    assert half.semantic_digest != double.semantic_digest
+    assert half == _ScaledProbeFormat(0.5)
+    assert W4_FORMATS["int4"].semantic_digest != W4_FORMATS["int4_g32"].semantic_digest
+
+    @a_transform(packed=_int8_ts)
+    def _other_fn(xw, sfw, b, consts):
+        return xw[b], xw[b], xw[b], xw[b]
+
+    assert _other_fn.name == _int8_ts_fn.name
+    assert _other_fn.semantic_digest != _int8_ts_fn.semantic_digest
 
 
 def test_w4_epi_mod_composition():
@@ -488,14 +561,13 @@ def test_w4_epi_mod_composition():
 
 def test_w4_epi_mod_torch_compile():
     """Layout-owning transforms under torch.compile through the single
-    quack::gemm_epi op: the format crosses by digest (w4_transform handle —
+    quack::gemm_epi op: the format crosses by digest (the format itself —
     a bare string name has none and is rejected), the SF strip rides the op
     input list, and D's N comes from the blob rows (n_override) on the fake
     side. Compiled == eager bitwise."""
     import pytest
 
     from quack.epilogue.frontend import gemm_epilogue
-    from quack.operand_transform import w4_transform
 
     @gemm_epilogue()
     def _bias_w4c(acc, bias):
@@ -509,7 +581,7 @@ def test_w4_epi_mod_torch_compile():
     blob, sf_blob = fmt.prepare(q, sf)
     act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     bias = torch.randn(1, n, device="cuda", dtype=torch.float32)
-    handle = w4_transform("int4")
+    handle = W4_FORMATS["int4"]
 
     def f(act, blob, sf_blob, bias):
         return _bias_w4c(act, blob, transform_a=handle, transform_sf=sf_blob, bias=bias)["D"]

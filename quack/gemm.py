@@ -711,6 +711,10 @@ def _build_gemm_plan(
     sfd_norm_const=None,
     SFDCol=None,
 ) -> _GemmPlan:
+    # One spelling per value in the compile key: the torch custom op passes
+    # the mode as a plain int, eager callers as the enum. The two are equal
+    # in memory but pickle differently, i.e. one kernel under two disk keys.
+    rounding_mode = RoundingMode(rounding_mode)
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k

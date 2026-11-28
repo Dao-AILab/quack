@@ -142,6 +142,57 @@ def pytest_collection_finish(session):
 # only normal-mode hook we keep here is the OOM-retry, which is QuACK-specific.
 
 
+@pytest.fixture
+def through_pool(tmp_path, monkeypatch):
+    """``through_pool(call, cold=())`` runs ``call()`` so that the kernels it
+    needs must compile in the async pool: a fresh cache directory makes them
+    cold on disk, and the call is retried until their ``.o`` files land.
+    ``cold`` lists jit-cached compile functions whose in-memory entries are
+    set aside meanwhile (another test may have compiled the same kernel in
+    this process). Returns ``(call's result, kernels the pool submitted)``;
+    fails if any kernel compiled in-process instead (a refused submit, a
+    failed worker, an unloadable ``.o``)."""
+    import time
+    import warnings
+
+    import quack.cache as cache_state
+    from quack.cache import async_compile
+
+    monkeypatch.setattr(cache_state, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(cache_state, "CACHE_ENABLED", True)
+
+    def run(call, cold=(), timeout=180):
+        saved = [(fn, dict(fn.cache)) for fn in cold]
+        for fn, _ in saved:
+            fn.cache.clear()
+        try:
+            with async_compile.pool_scope() as pool:
+                before, n_fallbacks = pool.n_submitted, len(async_compile._fallbacks)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    deadline = time.monotonic() + timeout
+                    while True:
+                        try:
+                            result = call()
+                            break
+                        except async_compile.CompilePending:
+                            assert time.monotonic() < deadline, "compile never completed"
+                            time.sleep(0.2)
+                failed = [
+                    str(w.message) for w in caught if "async compile failed" in str(w.message)
+                ]
+                assert not failed, f"pool worker failed, compiled in-process instead: {failed}"
+                # left in the log: the session's own report still attributes them
+                in_process = async_compile._fallbacks[n_fallbacks:]
+                assert not in_process, f"compiled in-process instead: {in_process}"
+                return result, pool.n_submitted - before
+        finally:
+            for fn, entries in saved:
+                fn.cache.update(entries)
+
+    return run
+
+
 def _is_oom(exc_type, exc_val):
     """Check if an exception is a CUDA out-of-memory error."""
     import torch

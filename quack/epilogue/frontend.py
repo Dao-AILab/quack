@@ -114,14 +114,48 @@ implementing ``__quack_semantic_key__(self) -> object`` are supported;
 anything else raises at decoration time — a capture we cannot fingerprint
 must never reach the compile cache, because a too-coarse key silently reuses
 the wrong kernel. EpiOps implement the protocol as their ``cache_key()``.
+One limit: a ``@cute.jit`` / ``@dsl_user_op`` helper counts by its own source
+only; the module constants it reads and the helpers it calls are covered by
+the cache's source fingerprint of the package (downstream code: add its
+directory to ``quack.cache.EXTRA_SOURCE_DIRS``), not by the digest. See
+:func:`quack.gemm_runtime.identity.function_semantic_key`.
 Kernel classes are minted per (semantic digest, operand kinds, SM, modes)
-but never cross the jit-cache boundary directly: compiles carry a picklable
-:class:`~quack.gemm_runtime.identity.GemmClassRef` recipe that re-mints the class at the
-point of use — by importing the module-global EpiMod, or, for EpiMods with
-no importable anchor (``__main__``, notebooks), via a digest-validated
-cloudpickle payload installed into async workers as a side channel that
-never touches the cache key. Same digest -> same disk ``.o``, across
-processes and workers.
+but never cross the jit-cache boundary directly: a compile is handed
+``(epi_mod, mint_key)`` and mints the class where it runs. The jit cache keys
+on the mod's ``semantic_digest`` (what it is) and sends the mod itself, by
+value (cloudpickle), to an async worker, so it works the same for a library
+mod, a mod made in a test and one typed into a notebook. Same digest -> same
+disk ``.o``, across processes and workers.
+
+Staying async-compilable
+------------------------
+With ``--async-compile`` (and in autotune sweeps) a cold kernel is traced by
+a pool worker: another process, with no GPU, that is sent the mod. A mod the
+pool cannot use still works, but its kernels compile in-process, one at a
+time; ``pytest --async-compile=N --async-compile-strict`` names each such
+kernel, its test and the cause. What a new epilogue (or A-transform, same
+rules) must respect:
+
+* DSL-traced code lives at MODULE LEVEL. The DSL reads the source file of
+  every ``@cute.jit`` / ``@dsl_user_op`` function it traces. The mod is sent
+  by value, and in such a copy module-level functions and classes travel by
+  name: the worker imports them, source and all. Anything defined inside a
+  function (a nested def, a class built in a method, a lambda) travels as
+  bytecode with no file behind it, and tracing it fails with
+  ``UNSUP_NO_SOURCE``. The epilogue fn itself is exempt: it is called as
+  plain Python at trace time, so it may be a closure, generated, or local to
+  a test. Only what it CALLS under ``@cute.jit`` must be importable.
+* The mod holds nothing that only exists in this process. It is pickled, so
+  a compiled kernel, a launch plan or a tensor stored on it makes the pool
+  refuse the kernel ("unshippable"). Per-process caches go in the mod's
+  ``_PROCESS_LOCAL_CACHES``, which pickling empties.
+* Nothing in the trace asks the GPU. Workers see no device; the arch comes
+  from ``get_device_capacity`` (pinned by ``QUACK_ARCH``), never from torch
+  or the driver.
+* One spelling per value in compile-function arguments. The in-memory cache
+  compares arguments with ``==``, the disk key pickles them: an IntEnum and
+  its int (``RoundingMode.RN`` / ``0``), ``True`` and ``1`` are one entry in
+  memory and two kernels on disk. Normalize where the plan is built.
 
 Why this design (and not an epilogue IR)
 ----------------------------------------
@@ -155,7 +189,6 @@ and <=1% perf vs the hand-written mixins for every expressible epilogue.
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import sys
 from typing import NamedTuple, Optional
@@ -182,11 +215,8 @@ from quack.gemm_runtime.host import (
     run_gemm_epi_plan,
 )
 from quack.gemm_runtime.identity import (
-    GemmClassRef,
-    TORCH_OP_EPI_MODS,
+    GemmMod,
     function_semantic_key as _function_semantic_key,
-    module_locator,
-    register_local_epi_mod,
 )
 from quack.gemm_config import (
     SplitKMode,
@@ -290,7 +320,7 @@ def _mod_gemm_key(A, B, D, C, epi_args, epi_key_overrides, *tail) -> tuple:
     )
 
 
-class EpiMod:
+class EpiMod(GemmMod):
     """A user epilogue function plus the machinery to mint and launch kernels."""
 
     def __init__(
@@ -393,62 +423,31 @@ class EpiMod:
         for op in self.extra_ops:
             if not isinstance(op, EpiOp) or op.name in all_names:
                 raise ValueError(f"extra op {op!r} must be an EpiOp with a fresh name")
-        self.semantic_key = (
-            _function_semantic_key(fn),
-            _function_semantic_key(prepass) if prepass is not None else None,
-            self.outputs,
-            self.mode,
-            self.prepass_outs,
-            tuple(op.cache_key() for _, op in sorted(self.ops.items())),
-            tuple(op.cache_key() for _, op in sorted(self.sinks.items())),
-            tuple(op.cache_key() for _, op in sorted(self.output_ops.items())),
-            tuple(op.cache_key() for op in self.extra_ops),
-            ("vectorize", self.vectorize),
-        )
-        self.semantic_digest = hashlib.sha256(repr(self.semantic_key).encode()).hexdigest()
-        self._ident = f"{fn.__name__}_{self.semantic_digest[:16]}"
-        self._minted = {}
-        self._plan_cache = {}
-        self._call_cache = {}  # eager __call__ fast path: metadata -> launch recipe
-        TORCH_OP_EPI_MODS[self.semantic_digest] = self  # quack::gemm_epi resolution
-
-    def __getstate__(self):
-        # Shipped by value (cloudpickle) to async-compile workers when there
-        # is no importable anchor: the minted classes and launch plans are
-        # process-local (compiled fns, registered dynamic classes) — the
-        # worker re-mints from the recipe.
-        state = self.__dict__.copy()
-        state["_minted"] = {}
-        state["_plan_cache"] = {}
-        return state
-
-    def _module_locator(self):
-        """(module, global_name) if this EpiMod is reachable by import in a
-        fresh process (async workers rebuild it that way), else None: defined
-        in __main__ (scripts, notebooks) or never bound to a module global."""
-        return module_locator(self, self.fn)
-
-    def _class_ref(self, mint_key):
-        locator = self._module_locator()
-        if locator is None:
-            # No importable anchor: the disk key stays semantically correct
-            # (the digest is in the ref), resolution goes through the
-            # process-local registry, and pool submission ships this EpiMod
-            # by value (GemmClassRef.__quack_pool_payload__).
-            register_local_epi_mod(self.semantic_digest, self)
-            return GemmClassRef(
-                "epi_mod_local",
-                "",
-                "",
-                mint_key=mint_key,
-                semantic_digest=self.semantic_digest,
+        self._identify(
+            (
+                _function_semantic_key(fn),
+                _function_semantic_key(prepass) if prepass is not None else None,
+                self.outputs,
+                self.mode,
+                self.prepass_outs,
+                tuple(op.cache_key() for _, op in sorted(self.ops.items())),
+                # in declaration order: it is the order of the minted
+                # EpilogueArguments fields, i.e. part of the kernel's ABI
+                tuple(op.cache_key() for op in self.sinks.values()),
+                tuple(op.cache_key() for _, op in sorted(self.output_ops.items())),
+                tuple(op.cache_key() for op in self.extra_ops),
+                ("vectorize", self.vectorize),
             )
-        return GemmClassRef(
-            "epi_mod",
-            *locator,
-            mint_key=mint_key,
-            semantic_digest=self.semantic_digest,
         )
+        self._ident = f"{fn.__name__}_{self.semantic_digest[:16]}"
+        for name in self._PROCESS_LOCAL_CACHES:
+            setattr(self, name, {})
+
+    # Minted classes (registered dynamic classes), launch plans, the eager
+    # __call__ fast path (metadata -> launch recipe) and tuned sink shapes;
+    # plans and recipes hold compiled tvm-ffi functions. Add a new cache
+    # HERE, not as a bare attribute (see GemmMod._PROCESS_LOCAL_CACHES).
+    _PROCESS_LOCAL_CACHES = ("_minted", "_plan_cache", "_call_cache", "_sink_shape_cache")
 
     def _mint(
         self, kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms, add_to_output
@@ -549,7 +548,7 @@ class EpiMod:
             },
         )
         # Registration is useful for inspection and in-process reuse. The JIT
-        # cache receives a GemmClassRef, never this process-local class object.
+        # cache receives (this mod, mint key), never this process-local class.
         setattr(sys.modules[__name__], cls_name, cls)
         self._minted[key] = cls
         return cls
@@ -618,6 +617,9 @@ class EpiMod:
         #                        split-k self-resets); None = fresh per call
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
+        # one spelling per value in the mint key (the torch custom op passes
+        # an int): see "Staying async-compilable" in the module docstring
+        rounding_mode = RoundingMode(rounding_mode)
         varlen_m = cu_seqlens_m is not None
         gather_A = A_idx is not None
         blockscaled = SFA is not None
@@ -1115,7 +1117,7 @@ class EpiMod:
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
             post_init_attrs=post_init_attrs,
-            gemm_cls_ref=self._class_ref(mint_key),
+            minted_by=(self, mint_key),
             packed_cd=packed_form,
             has_ag=ag_args is not None,
             split_k=split_k,
@@ -1345,7 +1347,7 @@ class EpiMod:
                 if torch.compiler.is_compiling():
                     raise NotImplementedError(
                         "transform_a under torch.compile needs a digest-carrying handle "
-                        "(@a_transform / dropout_a / w4_transform)"
+                        "(@a_transform / dropout_a / a W4_FORMATS entry)"
                     )
                 from quack.operand_transform.host import as_transform_mod
 
@@ -1524,7 +1526,7 @@ class EpiMod:
                 l = lead[0] if len(lead) == 2 else None
                 num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
                 shape_key = (lead[-1], n, l, str(A.device), num_seqs)
-                cache = self.__dict__.setdefault("_sink_shape_cache", {})
+                cache = self._sink_shape_cache
                 shapes = cache.get(shape_key)
                 if shapes is None:
                     shapes = sink_arg_shapes(

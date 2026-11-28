@@ -9,9 +9,11 @@ generic implementation driven by the variant's EpiOp schema:
 * each EpiOp describes its own host argument via ``host_arg_key`` (torch value
   -> picklable descriptor), ``host_fake_arg`` (descriptor -> fake trace-time
   tensor/scalar), and ``host_call_arg`` (torch value -> runtime argument);
-* a reconstructable ``GemmClassRef`` is the jit_cache key component — static
-  classes resolve by module+qualname, while dynamic epilogue classes resolve
-  through a module-global EpiMod and mint locally in async workers.
+* the kernel class is a compile-function argument: a class written in a
+  module as itself, a class an EpiMod minted as ``(epi_mod, mint_key)``,
+  minted again wherever the compile runs (a dynamic class exists only in the
+  process that made it). Mods are passed as themselves; the jit cache keys
+  on their ``semantic_digest`` and ships them to async workers by value.
 
 A variant file keeps only: its mixin(s), the per-SM class stampings, its
 validation asserts, and thin ``gemm_X`` / ``run_gemm_X_plan`` wrappers that
@@ -30,11 +32,6 @@ from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_config import SplitKMode, cta_tile_shape_m
 from quack.epilogue.ops import EpiOp
-from quack.gemm_runtime.identity import (
-    resolve_gemm_class,
-    resolve_transform_a,
-    static_gemm_class_ref,
-)
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
     compute_cu_tiles_m,
@@ -82,7 +79,7 @@ def _has_m_fold_sink(ops, epi_keys):
 
 @jit_cache
 def _compile_gemm_epi(
-    gemm_cls_ref,
+    gemm_cls,  # a GEMM class, or (epi_mod, mint_key) for a class an EpiMod mints
     device_capacity,
     a_dtype,  # the gemm ctor a_dtype: the MMA dtype (= A's dtype except for
     # layout-owning transforms, where A crosses as a storage blob)
@@ -119,24 +116,24 @@ def _compile_gemm_epi(
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
     # A-operand transform (SM90 RS / SM120 warp-MMA mainloop,
-    # quack.operand_transform): a
-    # picklable TransformARef. Layout-owning (packed W4) transforms replace
-    # the standard fake operands: A is the repacked blob (static geometry
-    # from transform_dims = (n_full, k)), the SF strip rides a trailing AuxA
-    # arg, kernel-N (the activation M) is the only symbolic dim.
-    transform_a_ref=None,
+    # quack.operand_transform): the transform mod. Layout-owning (packed W4)
+    # transforms replace the standard fake operands: A is the repacked blob
+    # (static geometry from transform_dims = (n_full, k)), the SF strip rides
+    # a trailing AuxA arg, kernel-N (the activation M) is the only symbolic dim.
+    transform_a=None,
     transform_dims=None,
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
-    Every argument is a picklable primitive (jit_cache pickles the tuple for
-    the disk key and to ship cold misses to async-compile workers).
+    Every argument is a picklable primitive or a mod (an EpiMod inside
+    ``gemm_cls``, ``transform_a``). jit_cache pickles the tuple for the disk
+    key, a mod standing in as its ``semantic_digest``, and ships cold misses
+    to async-compile workers by value.
     """
-    GemmCls = resolve_gemm_class(gemm_cls_ref)
-    transform_mod = None
+    GemmCls = gemm_cls if isinstance(gemm_cls, type) else gemm_cls[0]._mint(*gemm_cls[1])
+    transform_mod = transform_a
     owned_fmt = None
-    if transform_a_ref is not None:
-        transform_mod = resolve_transform_a(transform_a_ref)
+    if transform_mod is not None:
         owned_fmt = transform_mod.owned_fmt
     if owned_fmt is not None:
         assert not (varlen_m or gather_A or batched or b_kn or swap_ab or concat_layout), (
@@ -342,7 +339,7 @@ def build_gemm_epi_plan(
     a_mma_dtype=None,
     b_mma_dtype=None,
     post_init_attrs=(),
-    gemm_cls_ref=None,
+    minted_by=None,  # (epi_mod, mint_key) when an EpiMod minted GemmCls
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
     split_k=1,
@@ -355,12 +352,11 @@ def build_gemm_epi_plan(
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
-    transform_ref, owned_fmt, transform_dims = None, None, None
+    transform_mod, owned_fmt, transform_dims = None, None, None
     if transform_a is not None:
         from quack.operand_transform.host import as_transform_mod
 
         transform_mod = as_transform_mod(transform_a)
-        transform_ref = transform_mod.compile_ref()
         owned_fmt = transform_mod.owned_fmt
         if owned_fmt is not None:
             # A is the TransformAOperand bundle; recover the static problem
@@ -418,10 +414,8 @@ def build_gemm_epi_plan(
             epi_keys.append((name, key))
     epi_keys = tuple(sorted(epi_keys, key=lambda nk: nk[0]))
 
-    if gemm_cls_ref is None:
-        gemm_cls_ref = static_gemm_class_ref(GemmCls)
     compiled_fn = _compile_gemm_epi(
-        gemm_cls_ref,
+        GemmCls if minted_by is None else minted_by,
         device_capacity,
         a_dtype,
         b_dtype,
@@ -454,7 +448,7 @@ def build_gemm_epi_plan(
         has_ag=has_ag,
         split_k=split_k,
         split_k_mode=split_k_mode,
-        transform_a_ref=transform_ref,
+        transform_a=transform_mod,
         transform_dims=transform_dims,
     )
 

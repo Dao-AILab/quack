@@ -5,32 +5,27 @@ nothing from quack at module level; anyone may import it):
 * fail-closed semantic fingerprinting (:func:`function_semantic_key` /
   :func:`semantic_value_key`) — the compile-cache identity of fn-authored
   mods;
-* :func:`module_locator` — importable-anchor discovery for digest-keyed
-  objects (torch.compile graphs and async workers re-resolve by import);
-* :class:`LocalModRegistry` + payload installers — process-local resolution
-  for mods with no importable anchor, shipped to async-compile workers as
-  cloudpickle side-channel payloads that never touch cache keys;
-* ``TORCH_OP_EPI_MODS`` / ``TORCH_OP_TRANSFORM_MODS`` — digest -> mod for
-  ``quack::gemm_epi`` resolution (written at mod CONSTRUCTION, never inside
-  a traced call: Dynamo buffers global dict mutations as deferred side
-  effects, so a trace-time write would be invisible to the fake-tensor pass);
-* :class:`GemmClassRef` / :class:`TransformARef` — picklable recipes that
-  cross the jit-cache boundary in place of dynamic classes / mod instances.
+* :class:`GemmMod` — what an epilogue and an A-operand transform have in
+  common outside their own process: an identity and a way to travel;
+* ``MODS_BY_DIGEST`` + :func:`module_locator` — digest -> mod and its
+  import anchor, for the torch custom op: a compiled graph can only carry
+  strings.
 """
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import enum
 import functools
 import hashlib
-import importlib
 import inspect
+import linecache
 import os
 import sys
 import sysconfig
 import types
-from typing import NamedTuple, Optional
+from typing import Optional
 
 
 def semantic_value_key(value, seen):
@@ -129,41 +124,111 @@ def _stdlib_root() -> str:
     return os.path.abspath(sysconfig.get_paths()["stdlib"]) + os.sep
 
 
+# Packages whose functions fingerprint by name: the toolchain the traced code
+# is written against, pinned by the environment (the disk cache stamps the
+# cutlass and tvm_ffi versions).
+_EXTERN_PACKAGES = frozenset({"cutlass", "tvm_ffi", "torch", "numpy", "cuda"})
+
+
 def _is_extern_function(fn) -> bool:
-    """True for functions defined in installed (stdlib / site-packages /
-    dist-packages) code outside the quack package. Like classes and modules,
-    they fingerprint by qualname only: their source is pinned by the installed
-    distribution (the disk cache additionally stamps the cutlass version and
-    hashes every quack source file), and recursing into them would pull
-    runtime-MUTABLE library globals into the digest — e.g. any fn touching
-    cutlass's dsl_user_op machinery reaches cutlass._mlir_helpers.op, which
-    lazily materializes _DSL_PACKAGE_ROOT(S) on the first traced op, so the
-    digest would depend on whether this process compiled anything yet (async
-    workers resolve module-global EpiMods by re-import and reject the ref as
-    "changed" on any mismatch)."""
-    module = getattr(fn, "__module__", None) or ""
-    if module == "quack" or module.startswith("quack."):
-        return False
-    code = getattr(fn, "__code__", None)
-    if code is None:
-        return False
-    filename = code.co_filename
-    if f"{os.sep}site-packages{os.sep}" in filename or f"{os.sep}dist-packages{os.sep}" in filename:
+    """True for functions of the standard library and of the toolchain
+    (:data:`_EXTERN_PACKAGES`). Like classes and modules, they fingerprint by
+    qualname only: their source is pinned by the environment, and recursing
+    into them would pull runtime-MUTABLE library globals into the digest —
+    e.g. any fn touching cutlass's dsl_user_op machinery reaches
+    cutlass._mlir_helpers.op, which lazily materializes _DSL_PACKAGE_ROOT(S)
+    on the first traced op, so the digest would depend on whether this process
+    compiled anything yet.
+
+    Everything else is fingerprinted by content, installed or not: a
+    downstream package in site-packages is user code, and two closures of one
+    of its factories are two different epilogues."""
+    # Where the function was WRITTEN: a user function under @cute.jit or
+    # @dsl_user_op is a wrapper whose own code lives in cutlass, and judging
+    # by that would fingerprint every such function by name alone.
+    inner = inspect.unwrap(fn)
+    module = getattr(inner, "__module__", None) or ""
+    if module.partition(".")[0] in _EXTERN_PACKAGES:
         return True
-    return filename.startswith(_stdlib_root())
+    filename = getattr(getattr(inner, "__code__", None), "co_filename", "")
+    installed = f"{os.sep}site-packages{os.sep}" in filename or (
+        f"{os.sep}dist-packages{os.sep}" in filename
+    )
+    return filename.startswith(_stdlib_root()) and not installed
+
+
+@functools.lru_cache(maxsize=256)
+def _definition_spans(source: str) -> dict:
+    """(name, line) -> (first line, last line) of every ``def`` in a file's
+    source, entered under both its ``def`` line and its first decorator line."""
+    spans = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = min([d.lineno for d in node.decorator_list] + [node.lineno])
+            spans[node.name, node.lineno] = spans[node.name, first] = (first, node.end_lineno)
+    return spans
+
+
+def _definition_source(fn) -> Optional[str]:
+    """``fn``'s definition as written in its file, decorators included; None
+    when the file or the ``def`` cannot be found.
+
+    ``inspect.getsource`` is not a stable answer for ``@cute.jit`` functions:
+    once the DSL has traced one it swaps in a rewritten function whose first
+    line is the ``def``, and the decorator lines drop out of the result. A mod
+    built after such a trace then got a different digest from one built
+    before it, for the same source: one kernel under two cache keys, and a
+    mismatch whenever another process rebuilt the mod. So locate the ``def``
+    in the file by either line and always return the decorated form."""
+    inner = inspect.unwrap(fn)
+    code = getattr(inner, "__code__", None)
+    if code is None:
+        return None
+    linecache.checkcache(code.co_filename)  # a file edited and reloaded in this process
+    lines = linecache.getlines(code.co_filename, getattr(inner, "__globals__", None))
+    try:
+        span = _definition_spans("".join(lines)).get((code.co_name, code.co_firstlineno))
+    except SyntaxError:
+        return None
+    return None if span is None else "".join(lines[span[0] - 1 : span[1]])
 
 
 def function_semantic_key(fn, seen=None):
-    """Fingerprint source plus the globals/closures that can change its math."""
+    """Fingerprint source plus the globals/closures that can change its math.
+
+    A plain function is followed all the way: its source, its defaults, and
+    every global and closure cell it names, recursively.
+
+    A DECORATED function (``@cute.jit``, ``@dsl_user_op``, anything built
+    with ``functools.wraps``) is fingerprinted by its own source only. What
+    it reads from its module — a constant, another helper it calls — is NOT
+    followed: the DSL rewrites a traced function in place, so the names it
+    references are not the same before and after a trace, and a key built
+    from them would depend on what the process has compiled so far. Such
+    code is covered by the disk cache's source fingerprint instead, which
+    hashes every file of the quack package and of each directory in
+    ``quack.cache.EXTRA_SOURCE_DIRS``. So inside quack nothing is missed; a
+    downstream project either lists its source directory there, or keeps its
+    ``@cute.jit`` helpers self-contained and passes what varies through the
+    epilogue fn (a plain function, followed in full)."""
     seen = set() if seen is None else seen
     ident = (fn.__module__, fn.__qualname__)
-    if ident in seen:
+    # Guard against cycles by OBJECT: two closures of one factory share a
+    # qualname and differ in what they captured. A decorated function is one
+    # function however many wrapper layers it has, so mark the whole chain:
+    # the layers hold each other in their closures.
+    if ("id", id(fn)) in seen:
         return ("function_ref", *ident)
-    seen.add(ident)
+    layer = fn
+    for _ in range(32):
+        seen.add(("id", id(layer)))
+        layer = getattr(layer, "__wrapped__", None)
+        if layer is None:
+            break
     if _is_extern_function(fn):
         return ("extern_function", *ident)
     try:
-        source = inspect.getsource(fn).encode()
+        source = (_definition_source(fn) or inspect.getsource(fn)).encode()
     except (OSError, TypeError):
         code = getattr(fn, "__code__", None)
         if code is None:
@@ -194,19 +259,17 @@ def function_semantic_key(fn, seen=None):
 
 def module_locator(obj, fn) -> Optional[tuple]:
     """(module, global_name) if ``obj`` is reachable by import in a fresh
-    process — torch.compile graphs and async workers re-resolve digest-keyed
-    objects that way. ``fn`` anchors the search (the authored function whose
-    ``__module__``/``__name__`` name the natural home); returns None for
-    ``__main__`` / notebook objects and objects never bound to a module
-    global.
+    process — a torch.compile graph in another process re-resolves
+    digest-keyed objects that way. ``fn`` anchors the search (the authored
+    function whose ``__module__``/``__name__`` name the natural home);
+    returns None for ``__main__`` / notebook objects and objects never bound
+    to a module global.
 
     A binding found here may not exist in a fresh process: a module global
     bound at CALL time (e.g. a test helper's ``global`` trick) satisfies this
     scan but is never replayed by a fresh import. That can't be detected on
     the fn object (a ``global``-declared def even strips the ``<locals>``
-    qualname marker), so consumers must tolerate it at resolve time — the
-    async pool ships the mod by value as a fallback payload (see
-    ``GemmClassRef.__quack_pool_payload__``)."""
+    qualname marker), so the torch op checks the digest of what it imports."""
     module_name = getattr(fn, "__module__", None)
     if module_name is None or module_name == "__main__":
         return None
@@ -222,222 +285,74 @@ def module_locator(obj, fn) -> Optional[tuple]:
     return module_name, names[0]
 
 
-# digest -> mod, for quack::gemm_epi resolution (quack.gemm_runtime.torch_op).
-# Populated at CONSTRUCTION (EpiMod / transform-mod __init__), never inside
-# compile_call: Dynamo buffers global dict mutations as deferred side
-# effects, so a trace-time write would be invisible to the fake-tensor pass
-# that resolves the digest. Same-digest reconstruction overwrites in place.
-TORCH_OP_EPI_MODS: dict[str, object] = {}
-TORCH_OP_TRANSFORM_MODS: dict[str, object] = {}
+# digest -> mod, for the one boundary that can only carry a string: the
+# quack::gemm_epi torch custom op (quack.gemm_runtime.torch_op) names its
+# epilogue and transform by digest. Filled at CONSTRUCTION (GemmMod._identify),
+# never inside compile_call: Dynamo buffers global dict mutations as deferred
+# side effects, so a trace-time write would be invisible to the fake-tensor
+# pass that resolves the digest. Same-digest reconstruction overwrites in place.
+MODS_BY_DIGEST: dict[str, object] = {}
 
 
-class LocalModRegistry:
-    """digest -> mod, for refs with no importable module anchor (defined in
-    ``__main__``, notebooks, or never bound to a module global). ``consume``
-    pops entries on resolve: worker payloads may close over sizeable Python
-    state and async workers live for the whole test/autotune session. A
-    non-consuming registry holds small format bundles / fn mods that a plan
-    may resolve several times."""
+class GemmMod:
+    """Something that specializes a GEMM kernel at trace time: an epilogue
+    (EpiMod) or an A-operand transform. It is traceable code plus static
+    config. Outside its own process two things about it matter, and they are
+    separate:
 
-    def __init__(self, installer: str, consume: bool):
-        self.installer = installer  # module-level installer fn name (PoolPayload target)
-        self.consume = consume
-        self._mods: dict[str, object] = {}
+    * WHAT it is: ``semantic_digest``, a hash of its content and of nothing
+      else (not which object it is, how it was reached, or what this process
+      has traced so far). Same digest, same kernel: the jit cache keys on it,
+      and two mods with one digest are equal.
+    * GETTING it somewhere else: it pickles. A mod is passed to the compile
+      function as itself, and an async-compile worker receives it by value
+      (cloudpickle), wherever it was defined. Nothing is rebuilt from a
+      description. The copy carries module-level functions and classes BY
+      NAME and the worker imports them, so it trusts that they are the same
+      there: module state that some other module changes at import time is
+      not replayed, and the worker does not recompute the digest.
 
-    def register(self, digest: str, mod) -> None:
-        self._mods[digest] = mod
+    A subclass calls :meth:`_identify` once, at the end of ``__init__``, with
+    a key covering everything the traced kernel depends on (build it with
+    :func:`function_semantic_key` / :func:`semantic_value_key`), and lists
+    its per-process caches in ``_PROCESS_LOCAL_CACHES``."""
 
-    def resolve(self, digest: str):
-        """The registered mod, or None (caller owns the error message)."""
-        if self.consume:
-            return self._mods.pop(digest, None)
-        return self._mods.get(digest)
+    semantic_key: object
+    semantic_digest: str
+    # Attributes holding state that only means something in this process
+    # (minted classes, launch plans, compiled kernels): dicts, emptied when
+    # the mod is pickled. Compiled kernels do not pickle, so a cache left out
+    # of this tuple makes the mod unshippable to async-compile workers.
+    _PROCESS_LOCAL_CACHES: tuple = ()
 
-    def payload(self, digest: str):
-        """Worker-side install recipe for a registered mod (cloudpickle side
-        channel — never enters the cache key; an unserializable mod makes the
-        pool refuse the key and the cold miss compiles in-process)."""
-        import cloudpickle
+    def _identify(self, semantic_key) -> None:
+        self.semantic_key = semantic_key
+        self.semantic_digest = hashlib.sha256(repr(semantic_key).encode()).hexdigest()
+        MODS_BY_DIGEST[self.semantic_digest] = self
 
-        from quack.cache.async_compile import PoolPayload
+    def __quack_semantic_key__(self):
+        """A mod captured by another mod's fn counts as its digest."""
+        return self.semantic_digest
 
-        data = cloudpickle.dumps(self._mods[digest])
-        return PoolPayload(__name__, self.installer, digest, data)
+    def __quack_cache_key__(self):
+        """What stands for this mod in a jit-cache disk key (quack.cache.jit)."""
+        return ("quack.GemmMod", self.semantic_digest)
 
-    def install(self, expected_digest: str, data: bytes) -> None:
-        import cloudpickle
+    def __eq__(self, other):
+        return isinstance(other, GemmMod) and self.semantic_digest == other.semantic_digest
 
-        mod = cloudpickle.loads(data)
-        if mod.semantic_digest != expected_digest:
-            raise ValueError(
-                f"local mod payload digest mismatch: expected {expected_digest}, "
-                f"got {mod.semantic_digest}"
-            )
-        self._mods[expected_digest] = mod
+    def __hash__(self):
+        return hash(self.semantic_digest)
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.update((name, {}) for name in self._PROCESS_LOCAL_CACHES)
+        return state
 
-LOCAL_EPI_MODS = LocalModRegistry("install_epi_mod_payload", consume=True)
-LOCAL_TRANSFORM_MODS = LocalModRegistry("install_transform_mod_payload", consume=False)
-
-
-def register_local_epi_mod(digest: str, epi_mod) -> None:
-    LOCAL_EPI_MODS.register(digest, epi_mod)
-
-
-def register_local_transform_mod(digest: str, mod) -> None:
-    LOCAL_TRANSFORM_MODS.register(digest, mod)
-
-
-def install_epi_mod_payload(expected_digest: str, data: bytes) -> None:
-    """Worker-side installer for ``epi_mod_local`` payloads (see
-    ``GemmClassRef.__quack_pool_payload__``)."""
-    LOCAL_EPI_MODS.install(expected_digest, data)
-
-
-def install_transform_mod_payload(expected_digest: str, data: bytes) -> None:
-    """Worker-side installer for ``mod_local`` transform payloads (see
-    ``TransformARef.__quack_pool_payload__``)."""
-    LOCAL_TRANSFORM_MODS.install(expected_digest, data)
-
-
-class GemmClassRef(NamedTuple):
-    """Picklable recipe for resolving a GEMM class in async workers.
-
-    Dynamic epilogue classes must never cross the cache boundary directly:
-    their module registration exists only in the creating process. Instead an
-    epi_mod reference imports the module-global EpiMod and asks it to mint the
-    same class from a semantic digest plus the runtime kind signature.
-
-    ``epi_mod_local`` covers EpiMods with no importable anchor (defined in
-    ``__main__`` — scripts, notebooks — or never bound to a module global):
-    the semantic digest still keys the disk cache correctly and resolution
-    goes through :data:`LOCAL_EPI_MODS`. To reach async workers, the ref
-    ships the EpiMod by value as a side-channel payload (cloudpickle, see
-    ``__quack_pool_payload__``) — the payload never enters the cache key, so
-    shas stay deterministic. If the payload can't be serialized the pool
-    refuses the key and the cold miss compiles in-process.
-    """
-
-    kind: str  # "static", "epi_mod", or "epi_mod_local"
-    module: str
-    qualname: str
-    mint_key: tuple = ()
-    semantic_digest: str = ""
-
-    def __quack_pool_payload__(self):
-        """Worker setup payload for the EpiMod.
-
-        ``epi_mod_local``: mandatory (no importable anchor; a serialization
-        failure makes the pool refuse the key -> in-process compile).
-
-        ``epi_mod``: best-effort belt-and-braces. Resolvable-by-import at
-        submit time does not guarantee resolvable in a worker: a module
-        global bound at CALL time (a test helper's ``global`` trick)
-        satisfies the locator here but doesn't exist after the worker's
-        fresh import — or resolves to a different mod the module binds at
-        import time. Ship the mod by value too and let
-        :func:`resolve_gemm_class` fall back to the installed payload in
-        both cases; if it can't be serialized, keep the by-ref-only behavior
-        (those mods resolve fine when the binding is real, exactly as
-        before)."""
-        if self.kind == "epi_mod_local":
-            return LOCAL_EPI_MODS.payload(self.semantic_digest)
-        if self.kind != "epi_mod":
-            return None
-        mod = TORCH_OP_EPI_MODS.get(self.semantic_digest)
-        if mod is None:
-            return None
-        try:
-            import cloudpickle
-
-            from quack.cache.async_compile import PoolPayload
-
-            return PoolPayload(
-                __name__, "install_epi_mod_payload", self.semantic_digest, cloudpickle.dumps(mod)
-            )
-        except Exception:
-            return None
-
-
-def _resolve_qualname(obj, qualname):
-    for part in qualname.split("."):
-        obj = getattr(obj, part)
-    return obj
-
-
-def static_gemm_class_ref(GemmCls):
-    return GemmClassRef("static", GemmCls.__module__, GemmCls.__qualname__)
-
-
-def resolve_gemm_class(ref: GemmClassRef):
-    if ref.kind == "epi_mod_local":
-        obj = LOCAL_EPI_MODS.resolve(ref.semantic_digest)
-        if obj is None:
-            raise RuntimeError(
-                "process-local epilogue reference is not registered here (created in "
-                "another process and its payload was not installed); bind the "
-                "@gemm_epilogue object to a module-global name in an importable module "
-                "to make it resolvable by import"
-            )
-        return obj._mint(*ref.mint_key)
-    if ref.kind == "static":
-        return _resolve_qualname(importlib.import_module(ref.module), ref.qualname)
-    if ref.kind != "epi_mod":
-        raise ValueError(f"unknown GEMM class reference kind {ref.kind!r}")
-    obj = err = None
-    try:
-        obj = _resolve_qualname(importlib.import_module(ref.module), ref.qualname)
-    except AttributeError as e:
-        err = e
-    if obj is None or obj.semantic_digest != ref.semantic_digest:
-        # The submitter saw a module-global binding that a fresh import does
-        # not replay (bound at call time, e.g. via a `global` declaration
-        # inside a function): the attribute is missing here, or holds a
-        # different mod the module binds at import time. Async workers get
-        # the mod by value as a side-channel payload for exactly this case
-        # (digest-checked at install) — resolve through it.
-        installed = LOCAL_EPI_MODS.resolve(ref.semantic_digest)
-        if installed is None:
-            if err is not None:
-                raise err
-            raise RuntimeError(
-                f"epilogue {ref.module}.{ref.qualname} changed while resolving a compile request"
-            )
-        obj = installed
-    return obj._mint(*ref.mint_key)
-
-
-class TransformARef(NamedTuple):
-    """Picklable recipe for resolving a transform mod in async workers.
-
-    ``w4_name`` re-mints from the W4_FORMATS registry by name; ``mod_local``
-    resolves through :data:`LOCAL_TRANSFORM_MODS` (populated by
-    ``register_local_transform_mod`` at mod construction/ref time, and by
-    :func:`install_transform_mod_payload` in async workers)."""
-
-    kind: str  # "w4_name" | "mod_local"
-    name: str = ""
-    semantic_digest: str = ""
-
-    def __quack_pool_payload__(self):
-        if self.kind != "mod_local":
-            return None
-        return LOCAL_TRANSFORM_MODS.payload(self.semantic_digest)
-
-
-def resolve_transform_a(ref: TransformARef):
-    if ref.kind == "w4_name":
-        # by-name refs re-mint through the memoized normalizer (one mod per
-        # format name per process, shared with every other entry surface)
-        from quack.operand_transform.host import as_transform_mod
-
-        return as_transform_mod(ref.name)
-    if ref.kind != "mod_local":
-        raise ValueError(f"unknown transform reference kind {ref.kind!r}")
-    mod = LOCAL_TRANSFORM_MODS.resolve(ref.semantic_digest)
-    if mod is None:
-        raise RuntimeError(
-            "process-local transform reference is not registered here (created in "
-            "another process and its payload was not installed)"
-        )
-    return mod
+    def _module_locator(self):
+        """(module, global_name) if this mod is reachable by import in a fresh
+        process (a torch.compile graph in another process re-resolves it that
+        way), else None: no authored fn, defined in ``__main__`` (scripts,
+        notebooks), or never bound to a module global."""
+        fn = getattr(self, "fn", None)
+        return None if fn is None else module_locator(self, fn)

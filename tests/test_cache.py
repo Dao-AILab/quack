@@ -241,3 +241,50 @@ def test_merge_tensor_helper():
 # ---------------------------------------------------------------------------
 # Smoke: module imports / re-imports stay consistent
 # ---------------------------------------------------------------------------
+
+
+def test_gemm_compile_key_has_one_spelling(monkeypatch):
+    """One kernel, one disk key. ``rounding_mode`` reaches the plan builder as
+    the RoundingMode enum from eager callers and as a plain int from the
+    torch custom op. The two are equal, so they share an in-memory entry, but
+    they pickle differently: the same kernel was compiled and stored twice."""
+    import pickle
+
+    import pytest
+    import torch
+
+    import quack.gemm as G
+    from quack.rounding import RoundingMode
+
+    if not torch.cuda.is_available():
+        pytest.skip("the plan builder reads the device capability")
+
+    class _Seen(Exception):
+        pass
+
+    keys = []
+
+    def spy(*args, **kwargs):
+        keys.append(pickle.dumps((args, kwargs)))
+        raise _Seen  # the key is all we need: no compile, no launch
+
+    monkeypatch.setattr(G, "_compile_gemm", spy)
+    A = torch.randn(1, 256, 256, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(1, 256, 256, device="cuda", dtype=torch.bfloat16)
+    D = torch.empty(1, 256, 256, device="cuda", dtype=torch.bfloat16)
+    for mode in (RoundingMode.RN, 0):
+        monkeypatch.setattr(G, "_gemm_plan_cache", {})
+        with pytest.raises(_Seen):
+            G.gemm(
+                A,
+                B,
+                D,
+                None,
+                None,
+                tile_M=128,
+                tile_N=128,
+                cluster_M=1,
+                cluster_N=1,
+                rounding_mode=mode,
+            )
+    assert keys[0] == keys[1]

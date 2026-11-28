@@ -58,11 +58,14 @@ Key rules:
   minted kernel classes) → `library.py` + domain modules (rotary, scaled_exp, ...).
   Hand-written mixins (`gemm_default_epi.py`, `gemm_drmsnorm_bwd.py`) are the escape hatch.
 - `quack/gemm_runtime/` — generic host plumbing shared by every epilogue/transform:
-  `identity.py` (digests, refs, registries — a leaf) → `host.py` (plan/compile/launch) →
-  `torch_op.py` (the single `quack::gemm_epi` custom op) + `autotune.py`
+  `identity.py` (semantic digests, the `GemmMod` base, the digest registry — a leaf) →
+  `host.py` (plan/compile/launch) → `torch_op.py` (the single `quack::gemm_epi` custom op)
+  + `autotune.py`. A mod (epilogue or transform) is keyed by its digest and reaches
+  async-compile workers by value; see `AI/epilogue_transform_reorg.md`.
 - `quack/operand_transform/` — A-operand transforms (dequant, dropout, value fns):
-  `transform.py`/`kinds.py` (kernel-side) → `frontend.py` (`@a_transform`, handles) →
-  `host.py` (bundles, W4 config rules) + `formats/` (packed-weight decode formats)
+  `transform.py`/`kinds.py` (kernel-side) → `mod.py` (the `transform_a=` handle protocol) →
+  `formats/` (packed-weight decode formats, themselves transform mods), `frontend.py`
+  (`@a_transform`) + `host.py` (bundles, W4 config rules)
 - `gemm_config.py` — `GemmConfig` dataclass with tile sizes, cluster dims, swizzle settings
 
 ### Core utilities

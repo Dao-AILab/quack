@@ -48,40 +48,49 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from multiprocessing import get_context
 from typing import NamedTuple, Optional
 
+import cloudpickle
 
-class PoolPayload(NamedTuple):
-    """Out-of-band worker setup attached to a stable jit-cache argument.
 
-    ``identity`` commits the payload's semantics without putting the generally
-    non-deterministic serialized bytes in the persistent cache key. The
-    installer must validate it before making the payload visible to the
-    compile function.
+class Fallback(NamedTuple):
+    """One kernel that an active pool should have compiled and did not.
+
+    Compiled in-process instead (the slow, serial path), ``reason``:
+    ``unshippable`` (the key could not be sent to a worker), ``worker_failed``
+    (the worker raised or died), ``missing_object`` (the worker reported
+    success but its ``.o`` is absent or unloadable), ``suppressed`` (the
+    caller gave up on the pool: max attempts / wedge).
+
+    Or compiled by nobody, ``reason`` ``never_built``: the worker failed and
+    the caller's retry got by without asking for this kernel again (see
+    :meth:`CompilePool.orphaned`). The request and the retry disagree about
+    which kernel is needed, e.g. one kernel under two disk keys.
     """
 
-    installer_module: str
-    installer_qualname: str
-    identity: str
-    data: bytes
+    sha: str
+    qualname: str
+    reason: str
+    detail: str
+    seconds: float  # wall time of the in-process compile
 
 
-def _collect_pool_payloads(obj, out: list[PoolPayload]) -> None:
-    """Walk nested tuples collecting ``__quack_pool_payload__`` side-channel
-    payloads the worker must install before compiling (e.g. shipping a
-    process-local epilogue definition by value). A provider raising means the
-    key cannot be shipped — the caller falls back to in-process compile."""
-    provider = getattr(obj, "__quack_pool_payload__", None)
-    if provider is not None:
-        payload = provider()
-        if payload is not None:
-            if not isinstance(payload, PoolPayload):
-                raise TypeError(
-                    f"{type(obj).__name__}.__quack_pool_payload__() must return PoolPayload or None"
-                )
-            out.append(payload)
-        return
-    if isinstance(obj, tuple):
-        for item in obj:
-            _collect_pool_payloads(item, out)
+# Process-wide log of fallbacks, drained by whoever attributes them (the
+# pytest plugin: per test). Bounded by the number of distinct keys.
+_fallbacks: list[Fallback] = []
+
+
+def record_fallback(sha: str, qualname: str, reason: str, detail: str, seconds: float) -> None:
+    _fallbacks.append(Fallback(sha, qualname, reason, detail, seconds))
+
+
+def drain_fallbacks() -> list[Fallback]:
+    out = _fallbacks[:]
+    _fallbacks.clear()
+    return out
+
+
+def pool_bypass_reason() -> Optional[str]:
+    """Why a pool that exists is not being used for this call, else None."""
+    return "suppressed" if _active_pool is not None and _suppress_depth > 0 else None
 
 
 def _flock_held_exclusively(lock_path: str) -> bool:
@@ -251,9 +260,7 @@ def _pool_initializer(quack_arch: Optional[str], cute_dsl_arch: Optional[str]):
         _install_gpu_blind_device_attrs()
 
 
-def _pool_worker(
-    mod_name: str, qualname: str, key_b64: str, o_path: str, payloads_b64: str = ""
-) -> Optional[str]:
+def _pool_worker(mod_name: str, qualname: str, key_b64: str, o_path: str) -> Optional[str]:
     """Compile one key. Returns None on success, error string on failure."""
     try:
         # Honor the submitter's cache root: the jit_cache wrapper recomputes
@@ -265,18 +272,17 @@ def _pool_worker(
         import quack.cache as _state
 
         _state.CACHE_DIR = os.path.dirname(os.path.dirname(o_path))
-        if payloads_b64:
-            # Side-channel payloads (``__quack_pool_payload__``): install
-            # process-local definitions before the compile fn resolves them.
-            for payload in pickle.loads(base64.b64decode(payloads_b64)):
-                installer = importlib.import_module(payload.installer_module)
-                for part in payload.installer_qualname.split("."):
-                    installer = getattr(installer, part)
-                installer(payload.identity, payload.data)
         obj = importlib.import_module(mod_name)
         for part in qualname.split("."):
             obj = getattr(obj, part)
         args, kwargs = pickle.loads(base64.b64decode(key_b64))
+        # A worker is asked for each disk key once, so the wrapper's in-memory
+        # cache can only ever answer for a DIFFERENT disk key: arguments that
+        # compare equal but pickle differently (an IntEnum and its int) share
+        # an in-memory entry and not a sha. Such a hit returns without
+        # exporting, and the request fails with no .o. Emptying it also drops
+        # the compiled kernels a long-lived worker would otherwise hold.
+        getattr(obj, "cache", {}).clear()
         obj(*args, **kwargs)  # jit_cache wrapper: compiles + exports .o
         if not os.path.exists(o_path):
             return "compile succeeded but .o was not exported"
@@ -347,8 +353,9 @@ def _neutral_main():
     ``Process.start()`` captures preparation data from ``sys.modules['__main__']``:
     for a path-based script the *child* re-runs the whole file via
     ``runpy.run_path`` (so pickles referencing ``__main__`` resolve). Our
-    tasks never reference ``__main__`` — they resolve everything by module
-    name — and a user script that, say, builds CUDA tensors at import time
+    tasks never reference ``__main__`` — the compile function is resolved by
+    module name, and arguments defined in ``__main__`` travel by value
+    (cloudpickle) — and a user script that, say, builds CUDA tensors at import time
     would kill every worker at spawn with "Cannot re-initialize CUDA in
     forked subprocess". Executor workers are spawned synchronously inside
     ``executor.submit`` (``_adjust_process_count``), so masking ``__main__``
@@ -388,6 +395,12 @@ class CompilePool:
         # sha -> (o_path, lock_path)
         self._external: dict[str, tuple[str, str]] = {}
         self.n_submitted = 0
+        self._requests: dict[str, tuple[str, str]] = {}  # sha -> (qualname, o_path)
+        # shas whose failure a consumer has seen: jit_cache then compiles
+        # in-process, which surfaces the real error or records a Fallback
+        self.noticed: set[str] = set()
+        # sha -> why submit() refused the key (it then compiles in-process)
+        self.refused: dict[str, str] = {}
 
     def mark_external(self, sha: str, o_path: str, lock_path: str) -> None:
         """Record that some other process is compiling ``sha`` right now."""
@@ -406,40 +419,34 @@ class CompilePool:
         with _neutral_main():
             self._executor.submit(os.getpid)
 
-    def submit_raw(
-        self, sha: str, mod: str, qualname: str, key_b64: str, o_path: str, payloads_b64: str = ""
-    ) -> None:
+    def submit_raw(self, sha: str, mod: str, qualname: str, key_b64: str, o_path: str) -> None:
         if sha in self._futures:
             return
         with _neutral_main():
-            self._futures[sha] = self._executor.submit(
-                _pool_worker, mod, qualname, key_b64, o_path, payloads_b64
-            )
+            self._futures[sha] = self._executor.submit(_pool_worker, mod, qualname, key_b64, o_path)
+        self._requests[sha] = (qualname, o_path)
         self.n_submitted += 1
 
     def submit(self, sha: str, fn, args: tuple, kwargs: dict, o_path) -> bool:
-        """Submit a live jit_cache miss. Returns False if the key can't be
-        shipped to a subprocess (unpicklable args, ``<locals>`` qualname,
-        fn defined in ``__main__``, unserializable process-local payloads) —
-        the caller should compile in-process instead."""
+        """Submit a live jit_cache miss. Returns False if the request can't
+        be shipped to a subprocess (``<locals>`` qualname, fn defined in
+        ``__main__``, arguments that do not pickle) — the caller should
+        compile in-process instead.
+
+        The arguments go by value (cloudpickle), so an epilogue or transform
+        mod among them reaches the worker as itself, wherever it is defined."""
         if sha in self._futures:
             return True
         if "<locals>" in fn.__qualname__ or fn.__module__ == "__main__":
             # Not resolvable by module+qualname in a worker; compile in-process.
+            self.refused[sha] = f"{fn.__module__}.{fn.__qualname__} is not importable by a worker"
             return False
         try:
-            payloads: list = []
-            _collect_pool_payloads(args, payloads)
-            _collect_pool_payloads(tuple(kwargs.values()), payloads)
-            key_b64 = base64.b64encode(pickle.dumps((args, kwargs))).decode("ascii")
-            payloads_b64 = (
-                base64.b64encode(pickle.dumps(list(dict.fromkeys(payloads)))).decode("ascii")
-                if payloads
-                else ""
-            )
-        except Exception:
+            key_b64 = base64.b64encode(cloudpickle.dumps((args, kwargs))).decode("ascii")
+        except Exception as e:
+            self.refused[sha] = f"cannot serialize the arguments: {type(e).__name__}: {e}"[:800]
             return False
-        self.submit_raw(sha, fn.__module__, fn.__qualname__, key_b64, str(o_path), payloads_b64)
+        self.submit_raw(sha, fn.__module__, fn.__qualname__, key_b64, str(o_path))
         return True
 
     def poll(self, sha: str) -> tuple[str, Optional[str]]:
@@ -466,6 +473,24 @@ class CompilePool:
         except Exception as e:  # BrokenProcessPool etc.
             err = f"pool worker died: {type(e).__name__}: {e}"
         return ("done", None) if err is None else ("failed", err)
+
+    def orphaned(self, sha: str) -> Optional[tuple[str, str]]:
+        """``(compile fn, worker error)`` if this request failed and nothing
+        built the kernel afterwards: no ``.o`` exists, and no consumer came
+        back to compile it in-process. Else None.
+
+        A failed request is normally followed by its consumer's retry, which
+        lands in jit_cache again and compiles in-process: the real error
+        surfaces there (a test that expects the rejection passes), or a
+        Fallback is recorded. A consumer that waited for the kernel and then
+        finished without it was served some other way, which means the
+        request was for a kernel nobody needed under that key."""
+        request = self._requests.get(sha)
+        if request is None or sha in self.noticed:
+            return None
+        state, err = self.poll(sha)
+        qualname, o_path = request
+        return (qualname, err) if state == "failed" and not os.path.exists(o_path) else None
 
     def stats(self) -> dict:
         done = sum(1 for f in self._futures.values() if f.done())
