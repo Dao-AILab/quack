@@ -17,11 +17,16 @@
 # - Keep this image Apptainer-friendly: no baked-in non-root user, writable
 #   workspaces are expected to be bind-mounted at runtime.
 #
-# Build (needs BuildKit, i.e. docker buildx: RUN heredocs, cache and bind mounts):
+# Build (needs RUN heredocs, cache and bind mounts: BuildKit, i.e. docker buildx,
+# or Podman/Buildah. The legacy docker builder cannot):
 #   tools/dev/docker/build.sh [--image] [--push] [--sif] [--sqsh]
-#   (tags tridao/quack-kernels-dev:YY.MM.DD)
+#   (tags tridao/quack-kernels-dev:YY.MM.DD; the script itself calls docker)
 # or by hand:
 #   docker build --platform linux/amd64 -f tools/dev/docker/Dockerfile -t kernel-dev:cu135 .
+#   podman build --format docker --platform linux/amd64 -f tools/dev/docker/Dockerfile -t kernel-dev:cu135 .
+# Keep --format docker: in the default OCI format, Podman before 6.0 ignores SHELL,
+# so the RUN heredocs run under /bin/sh and fail on `set -o pipefail` (Podman 5.8.9
+# fails without it; 6.2 builds either way but still drops SHELL from the image).
 #
 # Every version pin is a build arg (`--build-arg NAME=value`); the ARG lines
 # below are the single source of truth for the defaults.
@@ -248,7 +253,7 @@ uv pip install --system \
     "nvidia-matmul-heuristics==${MATMUL_HEURISTICS_VERSION}" \
     "ruff==${RUFF_VERSION}" \
     "tilelang==${TILELANG_VERSION}" \
-    einops ipdb ipython loguru matplotlib nvitop numpy pandas pre-commit py-spy pyelftools \
+    cloudpickle einops ipdb ipython loguru matplotlib nvitop numpy pandas pre-commit py-spy pyelftools \
     pytest pytest-benchmark pytest-timeout pytest-xdist ty tyro
 uv pip check --system
 

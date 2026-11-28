@@ -98,7 +98,9 @@ and manual `--sqsh` / `--sif` builds. Existing cached images are not repacked.
 ## Cutting a new image
 
 The image tags are **pinned in `.github/workflows/_test.yml`** (used by both
-ci.yml and ci-pr.yml). Three steps:
+ci.yml and ci-pr.yml). CI installs the checkout with `--no-deps` and then runs
+`pip check`, so a dependency that `pyproject.toml` requires and the image lacks
+fails CI until a new image is cut. Three steps:
 
 ```bash
 # 1. Build & push from a box that has docker (one-time Hub login: `docker login -u tridao`)

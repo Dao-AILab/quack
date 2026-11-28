@@ -108,7 +108,8 @@ def test_epi_mod_semantic_cache_key_and_resolver():
 
 
 def test_epi_mod_local_payload_identity_and_consumption():
-    cloudpickle = pytest.importorskip("cloudpickle")  # noqa: F841
+    import cloudpickle  # noqa: F401
+
     from quack.cache.async_compile import PoolPayload
     from quack.gemm_runtime.identity import LOCAL_EPI_MODS, install_epi_mod_payload
     from quack.rounding import RoundingMode
@@ -273,10 +274,11 @@ def test_epi_mod_async_compile(tmp_path, monkeypatch):
     import time
     import warnings
 
+    import cloudpickle  # noqa: F401
+
     import quack.cache as cache_state
     from quack.cache import async_compile
 
-    pytest.importorskip("cloudpickle")
     device = "cuda"
     torch.random.manual_seed(25)
 

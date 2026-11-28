@@ -164,6 +164,10 @@ runs:
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
           pip install --break-system-packages --no-deps -q -e . &&
+          # --no-deps: the image supplies every dependency. Fail here if this
+          # commit's pyproject.toml needs one the image lacks (fix: cut a new
+          # image, see tools/ci/README.md), instead of running without it.
+          pip check &&
           # Per-leg cache directories. apptainer --writable-tmpfs does NOT
           # isolate /tmp (the host /tmp is bind-mounted in), and HOME is
           # bound by default too — so without explicit overrides every CI

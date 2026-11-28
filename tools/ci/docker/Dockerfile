@@ -80,8 +80,9 @@ RUN --mount=type=bind,from=helpers,source=/strip-elf,target=/usr/local/bin/strip
            nvidia/nvshmem/lib/libnvshmem_host.so.3 nvidia/cudnn/lib/libcudnn.so.9 && \
     python3 -c "import torch; print('torch', torch.__version__, 'imports with stubs')"
 
-# Install quack-kernels' transitive dependencies. The package itself is
-# overwritten at run time by an editable install from the mounted repo.
+# Install quack-kernels and its dependencies. CI replaces the package with an
+# editable --no-deps install and then runs `pip check`, so every dependency in
+# pyproject.toml must already be installed here.
 # Install only the test runner here; lint runs in its own workflow job.
 #
 # Note on cu13 install order: nvidia-cutlass-dsl-libs-cu13 is an OVERLAY on top
@@ -99,7 +100,7 @@ RUN --mount=type=bind,from=helpers,source=/strip-elf,target=/usr/local/bin/strip
     --mount=type=bind,source=pyproject.toml,target=/tmp/src/pyproject.toml \
     --mount=type=bind,source=quack,target=/tmp/src/quack \
     cp -r /tmp/src /tmp/quack && \
-    pip install --break-system-packages --no-cache-dir '/tmp/quack[cu13]' pytest pytest-xdist && \
+    pip install --break-system-packages --no-cache-dir /tmp/quack pytest pytest-xdist && \
     rm -rf /tmp/quack && \
     cd /usr/local/lib/python3.12/dist-packages && \
     rm -rf nvidia_cutlass_dsl/cu12 \

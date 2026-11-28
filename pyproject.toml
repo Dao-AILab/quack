@@ -12,6 +12,7 @@ dependencies = [
     "torch",
     "apache-tvm-ffi>=0.1.6,<0.2",
     "einops",
+    "cloudpickle",
 ]
 
 [project.optional-dependencies]
