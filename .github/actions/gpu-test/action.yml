@@ -211,9 +211,16 @@ runs:
           # across the xdist workers) while the tests defer and retry; warm
           # runs pay nothing. Replaces the old two-pass
           # \"--compile-only then real run\" strategy.
+          #
+          # --async-compile-strict: fail the leg if the pool did not compile a
+          # kernel it should have. Either the kernel compiled in-process (the
+          # pool could not ship it, its worker failed, or a test gave up
+          # waiting), or its worker failed and the test passed without it.
+          # Tests still report their real results; the summary names the
+          # kernels, the tests and the cause.
           # Pin the Triton 3.9 FP fusion behavior for torch.compile reference paths.
           export TRITON_DEFAULT_FP_FUSION=1 &&
-          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24
+          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24 --async-compile-strict
         "
 
         if [ "$QUACK_CI_MODE" = slurm ]; then

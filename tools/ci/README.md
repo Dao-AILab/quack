@@ -72,13 +72,15 @@ of its memory.
 
 Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
-- `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24`
+- `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24 --async-compile-strict`
   On Slurm runners the GPUs are the ones Slurm allocates. On Apptainer runners
   the action picks GPUs with at least 50 GB free, waiting up to 5 minutes and
   polling every 15 seconds when runner assignment races with transient GPU
   contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
   workers (forkserver sidecar, GPU-blind) while the affected tests defer and
-  retry once their `.o` lands; warm runs pay nothing. The
+  retry once their `.o` lands; warm runs pay nothing. `--async-compile-strict`
+  fails the leg if the pool did not compile a kernel it should have (the
+  summary names the kernels, tests and cause). The
   persistent kernel cache (`QUACK_CACHE_DIR`) carries `.o` files across runs
   on the same runner. CI prunes QuACK source-fingerprint cache directories
   older than 7 days before each test run, plus interrupted `.o.tmp.*` exports
