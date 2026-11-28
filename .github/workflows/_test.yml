@@ -16,7 +16,7 @@ on:
 
 env:
   # Bump this when pushing a new image; CI prunes tags unused for a week.
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.11.22
+  IMAGE_CU132: tridao/quack-kernels:cu13.2-26.11.28
 
 jobs:
   lint:
