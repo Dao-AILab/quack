@@ -10,7 +10,6 @@ import cutlass
 
 from quack.blockscaled.utils import (
     blockscaled_gemm_reference,
-    compile_blockscaled_gemm_tvm_ffi,
     create_blockscaled_operand_tensor,
     create_blockscaled_scale_tensor,
 )
@@ -25,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 TILES = [((128, 128), (1, 1)), ((256, 256), (2, 1)), ((256, 192), (2, 1)), ((128, 64), (1, 1))]
 FORMATS = {
-    "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
+    "mxfp8_e4m3": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
     "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
     "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
 }
@@ -68,8 +67,8 @@ def test_wide_k_selection(ab_dtype, sf_vec_size, tile, cluster, tile_k, varlen_k
 @pytest.mark.parametrize(
     "fmt,k",
     [
-        ("mxfp8", 512),
-        ("mxfp8", 288),  # ends mid wide instruction
+        ("mxfp8_e4m3", 512),
+        ("mxfp8_e4m3", 288),  # ends mid wide instruction
         ("mxfp4", 512),
         ("mxfp4", 384),  # One all-pad instruction in the last k-tile.
         ("nvfp4", 512),
@@ -86,11 +85,22 @@ def test_blockscaled_wide_k(fmt, k, tile, cluster):
     _, mD = create_blockscaled_operand_tensor(l, m, n, False, cutlass.BFloat16, init="empty")
     sfa_ref, mSFA = create_blockscaled_scale_tensor(l, m, k, sf_vec_size, sf_dtype)
     sfb_ref, mSFB = create_blockscaled_scale_tensor(l, n, k, sf_vec_size, sf_dtype)
-    compiled = compile_blockscaled_gemm_tvm_ffi(
-        ab_dtype, sf_dtype, sf_vec_size, cutlass.BFloat16, tile, cluster, mA, mB, mD, mSFA, mSFB
+    gemm(
+        mA.permute(2, 0, 1),  # batch-last (mn, k, l) -> (l, mn, k)
+        mB.permute(2, 0, 1),
+        mD.permute(2, 0, 1),
+        None,
+        None,
+        tile[0],
+        tile[1],
+        cluster[0],
+        cluster[1],
+        is_dynamic_persistent=True,
+        SFA=mSFA,
+        SFB=mSFB,
+        bs_format_a=fmt,
+        bs_format_b=fmt,
     )
-    compiled(mA, mB, mD, mSFA, mSFB)
-    torch.cuda.synchronize()
     ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
     torch.testing.assert_close(mD.float(), ref, atol=ref.abs().max().item() * 2**-7, rtol=1e-2)
 

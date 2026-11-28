@@ -35,6 +35,8 @@ pytestmark = pytest.mark.skipif(
 )
 _GEMM_CLS = {9: GemmDefaultSm90, 12: GemmDefaultSm120}.get(_ARCH, GemmDefaultSm90)
 sm90_only = pytest.mark.skipif(_ARCH != 9, reason="SS/RS mode split is SM90 only")
+# SM120 has no TMA multicast, so its GEMM takes only 1x1 clusters.
+needs_multicast = pytest.mark.skipif(_ARCH != 9, reason="TMA multicast (cluster > 1) needs SM90")
 
 _TORCH2CUTE = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}
 
@@ -336,6 +338,7 @@ def test_a_transform_colvec_ktile_pingpong():
     _check_colvec_strip(pingpong=True)
 
 
+@needs_multicast
 def test_a_transform_colvec_ktile_cluster():
     # cluster_N = 2 exercises the aux multicast opt-out (dup box loads)
     _check_colvec_strip(m=512, n=512, k=256, cluster_mnk=(1, 2, 1))
@@ -410,6 +413,7 @@ def test_a_transform_kvec_m64_atom_layouts(tile_mnk):
     _check_kvec_m64(m=768, n=512, k=256, tile_mnk=tile_mnk)
 
 
+@needs_multicast
 def test_a_transform_kvec_m64_cluster():
     _check_kvec_m64(m=512, n=512, k=256, cluster_mnk=(1, 2, 1))
 

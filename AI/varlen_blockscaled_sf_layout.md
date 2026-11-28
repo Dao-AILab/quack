@@ -253,19 +253,19 @@ a tile-unit offset integer.
 
 ## Tests
 
-`tests/test_gemm_sm100_blockscaled.py`:
-- `test_blockscaled_varlen_m_public_api` — same setup through
-  `quack.gemm.gemm` (3 patterns × 2 B-majors × 3 formats); interface-level coverage in
-  `tests/test_gemm_blockscaled_interface.py::test_blockscaled_gemm_varlen_m`.
-- `test_blockscaled_varlen_m_nonaligned` — 4 seqlen patterns × 2 B-majors × 3 formats.
+`tests/test_gemm_blockscaled.py` (SM100/110 and SM120):
+- `test_blockscaled_varlen_m_tile_cluster` — varlen_m through `quack.gemm.gemm` across
+  1-CTA/2-CTA tile and cluster shapes (MXFP8 K-/N-major B, MXFP4, NVFP4).
+- `test_blockscaled_varlen_k_poisoned_sf_pad` — varlen_k through `quack.gemm.gemm`
+  across 1-CTA/2-CTA tile and cluster shapes, with 0xFF-poisoned SF padding.
+- `test_blockscaled_gemm_varlen_m` — 4 seqlen patterns; MXFP8 E4M3 with K-/N-major B, and
+  K-major E5M2, MXFP4, NVFP4 and packed FP6.
   Patterns include `[128, 128, 128]`, `[100, 200, 150]`, `[30, 300, 64, 200]`,
   `[1, 128, 127, 129]`.
-- `test_blockscaled_mxfp8_varlen_k` — 6 patterns including non-128-aligned
+- `test_blockscaled_gemm_varlen_k` — 6 patterns including non-128-aligned
   `[96, 160, 128]`, `[32, 256, 64, 128]` and non-32-aligned `[100, 220, 65]`,
-  `[1, 33, 158, 192]` (partial last scale block per expert).
-- `test_blockscaled_varlen_k_public_api` — same through `quack.gemm.gemm`
-  (3 patterns incl. non-32-aligned); interface-level coverage in
-  `tests/test_gemm_blockscaled_interface.py::test_blockscaled_gemm_varlen_k`.
+  `[1, 33, 158, 192]` (partial last scale block per expert). SF padding is
+  poisoned with 0xFF, so a consumed pad scale turns the output NaN.
 
 All per-expert reference checks use `a_ref_list[i] @ b_ref_list[i].T` (or
 equivalent cat along the non-varying dim) against the kernel's single-pass

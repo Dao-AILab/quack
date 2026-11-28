@@ -664,3 +664,29 @@ def test_quant_postact_nvfp4_norm_const():
     deq = out_values(postact[0]) * scale
     bound = scale * 1.05 + 1e-3
     assert ((deq - post_ref).abs() <= bound).all()
+
+
+def test_quant_out_b_n_major():
+    """N-major fp8 B must give bit-identical quantized values and SF bytes to K-major
+    B. On SM120 the vec-32 mxfp8 SFD output widens the warp's N run to 32 columns, so
+    the N-major B copy issues two 16-column ldmatrix atoms per warp
+    (GemmSm120._nmajor_b_tiled_copy, _retile_b)."""
+    m, n, k = 256, 320, 512
+
+    def quantized(rows, seed):
+        torch.manual_seed(seed)
+        x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
+        return BlockScaledOperand.quantize(x, "mxfp8_e4m3")
+
+    A, W = quantized(m, 0), quantized(n, 1)
+    W_n_major = BlockScaledOperand.from_parts(
+        W.qdata.t().contiguous(), W.scale, W.format, quant_dim=-2
+    )
+    out_kmaj = gemm(A, W.mT, out_dtype="mxfp8_e4m3", tuned=False)
+    out = gemm(A, W_n_major, out_dtype="mxfp8_e4m3", tuned=False)
+    assert torch.equal(out.qdata.view(torch.uint8), out_kmaj.qdata.view(torch.uint8)), (
+        "n-major quantized values != k-major"
+    )
+    assert torch.equal(out.scale.view(torch.uint8), out_kmaj.scale.view(torch.uint8)), (
+        "n-major SF bytes != k-major"
+    )

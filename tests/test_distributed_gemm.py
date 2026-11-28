@@ -18,6 +18,13 @@ import torch
 NUM_ITERS = 6  # exercises epoch monotonicity + double-buffer reuse
 
 
+def _cluster_m(device):
+    """cluster_M for these GEMMs: 2, or 1 on SM120 (no TMA multicast; QUACK_ARCH-aware)."""
+    from quack.cute_dsl_utils import get_device_capacity
+
+    return 1 if get_device_capacity(device)[0] == 12 else 2
+
+
 def _ag_gemm(runner, a_shard, b, d=None):
     """Plain AG+GEMM (D = A_full @ B^T) through the gather() context."""
     from quack.gemm import gemm as quack_gemm
@@ -25,7 +32,9 @@ def _ag_gemm(runner, a_shard, b, d=None):
     if d is None:
         d = torch.empty(runner.m_total, b.shape[0], dtype=runner.dtype, device=runner.device)
     with runner.gather(a_shard) as (a_full, ag_args):
-        quack_gemm(a_full, b, d, None, None, 128, 256, 2, 1, ag_args=ag_args)
+        quack_gemm(
+            a_full, b, d, None, None, 128, 256, _cluster_m(runner.device), 1, ag_args=ag_args
+        )
     return d
 
 
@@ -127,7 +136,7 @@ def _run_rank():
                 epi_args=dict(mAuxOut=postact),
                 tile_M=128,
                 tile_N=256,
-                cluster_M=2,
+                cluster_M=_cluster_m(device),
                 cluster_N=1,
                 ag_args=ag_args,
             )

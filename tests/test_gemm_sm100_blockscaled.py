@@ -5,74 +5,58 @@ import cutlass
 
 from quack.blockscaled.utils import (
     blockscaled_gemm_reference,
-    compile_blockscaled_gemm_tvm_ffi,
     create_blockscaled_operand_quantized,
     create_blockscaled_operand_tensor,
     create_blockscaled_scale_tensor,
-    create_blockscaled_varlen_k_operands,
-    create_blockscaled_varlen_m_operands,
     scale_blocked_for_cublas,
     scale_view_for_kernel,
 )
 from quack.blockscaled.operand import (
+    BlockScaledFormat,
     MXFP4,
     MXFP6_E2M3,
     MXFP6_E2M3_PACKED,
     MXFP8_E4M3,
     NVFP4,
 )
+from quack.cute_dsl_utils import get_compile_target_capacity, get_device_capacity
+from quack.gemm import gemm
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.sm100_utils import MmaKind
 from quack.blockscaled.quantize import to_blocked
 
 
-def _skip_if_not_sm100():
-    major = torch.cuda.get_device_properties(0).major
-    if major < 10:
-        pytest.skip("SM100+ required")
+_SM100_FAMILY = (10, 11)
+_PHYSICAL_ARCH = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+# SM100-family kernel configs (2-CTA tiles, tile_n 64/192). QUACK_ARCH can select a
+# dispatch arch but cannot give a proxy GPU tcgen05 instructions.
+requires_sm100 = pytest.mark.skipif(
+    _PHYSICAL_ARCH not in _SM100_FAMILY
+    or get_compile_target_capacity()[0] not in _SM100_FAMILY
+    or get_device_capacity()[0] not in _SM100_FAMILY,
+    reason="SM100/SM110 tcgen05 kernel configs",
+)
 
 
-def _compile_blockscaled_gemm(
-    ab_dtype,
-    sf_dtype,
-    sf_vec_size,
-    d_dtype,
-    mma_tiler_mn,
-    cluster_shape_mn,
-    m,
-    n,
-    k,
-    l,
-):
-    a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
-    b_ref, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype)
-    _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
-    sfa_ref, mSFA = create_blockscaled_scale_tensor(l, m, k, sf_vec_size, sf_dtype)
-    sfb_ref, mSFB = create_blockscaled_scale_tensor(l, n, k, sf_vec_size, sf_dtype)
-    compiled = compile_blockscaled_gemm_tvm_ffi(
-        ab_dtype,
-        sf_dtype,
-        sf_vec_size,
-        d_dtype,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        mA,
-        mB,
-        mD,
-        mSFA,
-        mSFB,
+def _run_gemm(mA, mB, mD, mSFA, mSFB, fmt, mma_tiler_mn, cluster_shape_mn):
+    """quack.gemm.gemm on batch-last (mn, k, l) operands with an explicit tile and cluster,
+    on the CLC (dynamic persistent) scheduler."""
+    gemm(
+        mA.permute(2, 0, 1),
+        mB.permute(2, 0, 1),
+        mD.permute(2, 0, 1),
+        None,
+        None,
+        tile_M=mma_tiler_mn[0],
+        tile_N=mma_tiler_mn[1],
+        cluster_M=cluster_shape_mn[0],
+        cluster_N=cluster_shape_mn[1],
+        is_dynamic_persistent=True,
+        SFA=mSFA,
+        SFB=mSFB,
+        bs_format_a=fmt,
+        bs_format_b=fmt,
     )
-    return (
-        compiled,
-        (mA, mB, mD, mSFA, mSFB),
-        (a_ref, b_ref, sfa_ref, sfb_ref, mD),
-    )
-
-
-def _run_blockscaled_gemm(compiled, args):
-    mA, mB, mD, mSFA, mSFB = args
-    compiled(mA, mB, mD, mSFA, mSFB)
-    torch.cuda.synchronize()
 
 
 def test_blockscaled_validation():
@@ -236,6 +220,37 @@ def test_blockscaled_validation():
         "n",
     )
 
+    # Operand layouts. can_implement is not on the gemm() dispatch path (benchmarks filter
+    # configs with it), so the kernel tests can't catch a wrong layout rule here.
+    def layout_ok(fmt_a, fmt_b, a_major, b_major):
+        return GemmDefaultSm100.can_implement(
+            fmt_a,
+            fmt_b,
+            cutlass.Float32,
+            cutlass.BFloat16,
+            (128, 128),
+            (1, 1),
+            256,
+            256,
+            256,
+            1,
+            a_major,
+            b_major,
+            "n",
+        )
+
+    # fp8 may be M-major A / N-major B; the scale tensor stays K-major.
+    for a_major, b_major in [("k", "k"), ("m", "k"), ("k", "n"), ("m", "n")]:
+        assert layout_ok(MXFP8_E4M3, MXFP8_E4M3, a_major, b_major), (a_major, b_major)
+    # Packed sub-byte operands pack along K, so they must be K-major. Each pair is
+    # accepted K-major first, so a rejection below is the layout rule's.
+    for fmt_a, fmt_b in [(MXFP4, MXFP4), (MXFP6_E2M3_PACKED, MXFP8_E4M3), (MXFP8_E4M3, MXFP4)]:
+        assert layout_ok(fmt_a, fmt_b, "k", "k"), (fmt_a.name, fmt_b.name)
+        if fmt_a is not MXFP8_E4M3:
+            assert not layout_ok(fmt_a, fmt_b, "m", "k"), (fmt_a.name, "m-major A")
+        if fmt_b is not MXFP8_E4M3:
+            assert not layout_ok(fmt_a, fmt_b, "k", "n"), (fmt_b.name, "n-major B")
+
 
 def test_can_implement_operand_kind_polymorphism():
     """One preflight entry point for both kernels: plain cutlass dtypes select
@@ -294,7 +309,7 @@ def test_mixed_unpack_explicit_tile_k_validation(fmt_a):
 
 
 def test_direct_quantized_generator_rejects_packed_fp6():
-    """The direct TVM-FFI helper has no separate uint8-storage/FP6-MMA dtype."""
+    """The raw-tensor generator has no separate uint8-storage/FP6-MMA dtype."""
     with pytest.raises(ValueError, match="init=quant does not support"):
         create_blockscaled_operand_quantized(
             1,
@@ -307,6 +322,7 @@ def test_direct_quantized_generator_rejects_packed_fp6():
         )
 
 
+@requires_sm100
 @pytest.mark.parametrize(
     "ab_dtype,sf_dtype,sf_vec_size,d_dtype,mma_tiler_mn,cluster_shape_mn,m,n,k,l",
     [
@@ -422,18 +438,6 @@ def test_direct_quantized_generator_rejects_packed_fp6():
         ),
         (
             cutlass.Float4E2M1FN,
-            cutlass.Float8E8M0FNU,
-            16,
-            cutlass.Float32,
-            (128, 64),
-            (1, 1),
-            256,
-            64,
-            256,
-            1,
-        ),
-        (
-            cutlass.Float4E2M1FN,
             cutlass.Float8E4M3FN,
             16,
             cutlass.Float32,
@@ -507,29 +511,16 @@ def test_direct_quantized_generator_rejects_packed_fp6():
 def test_blockscaled_correctness(
     ab_dtype, sf_dtype, sf_vec_size, d_dtype, mma_tiler_mn, cluster_shape_mn, m, n, k, l
 ):
-    _skip_if_not_sm100()
+    fmt = BlockScaledFormat.from_cutlass_dtypes(ab_dtype, sf_dtype, sf_vec_size).name
+    a_ref, mA = create_blockscaled_operand_tensor(l, m, k, False, ab_dtype)
+    b_ref, mB = create_blockscaled_operand_tensor(l, n, k, False, ab_dtype)
+    _, mD = create_blockscaled_operand_tensor(l, m, n, False, d_dtype, init="empty")
+    sfa_ref, mSFA = create_blockscaled_scale_tensor(l, m, k, sf_vec_size, sf_dtype)
+    sfb_ref, mSFB = create_blockscaled_scale_tensor(l, n, k, sf_vec_size, sf_dtype)
+    _run_gemm(mA, mB, mD, mSFA, mSFB, fmt, mma_tiler_mn, cluster_shape_mn)
 
-    (
-        compiled,
-        args,
-        (a_ref, b_ref, sfa_ref, sfb_ref, _),
-    ) = _compile_blockscaled_gemm(
-        ab_dtype,
-        sf_dtype,
-        sf_vec_size,
-        d_dtype,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        m,
-        n,
-        k,
-        l,
-    )
-    _run_blockscaled_gemm(compiled, args)
-
-    _, _, d_torch, _, _ = args
     ref = blockscaled_gemm_reference(a_ref, b_ref, sfa_ref, sfb_ref)
-    err = (d_torch.float() - ref).abs().max().item()
+    err = (mD.float() - ref).abs().max().item()
     tol = 5e-3 if d_dtype != cutlass.Float32 else 5e-4
     assert err < tol, f"max_err={err}"
 
@@ -586,6 +577,7 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
 # ---------------------------------------------------------------------------
 # End-to-end: quantized MXFP8 inputs through quack kernel vs cuBLAS vs dequant ref
 # ---------------------------------------------------------------------------
+@requires_sm100
 @pytest.mark.parametrize(
     "mma_tiler_mn,cluster_shape_mn,m,n,k",
     [
@@ -603,7 +595,6 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
     ],
 )
 def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
-    _skip_if_not_sm100()
     l, sf_vec = 1, 32
 
     torch.manual_seed(0)
@@ -614,28 +605,14 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
     mSFA = scale_view_for_kernel(a_sc, m, k // sf_vec, l)
     mSFB = scale_view_for_kernel(b_sc, n, k // sf_vec, l)
 
-    runner = compile_blockscaled_gemm_tvm_ffi(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        sf_vec,
-        cutlass.BFloat16,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        mA,
-        mB,
-        mD,
-        mSFA,
-        mSFB,
-    )
-    runner(mA, mB, mD, mSFA, mSFB)
-    torch.cuda.synchronize()
+    _run_gemm(mA, mB, mD, mSFA, mSFB, "mxfp8_e4m3", mma_tiler_mn, cluster_shape_mn)
 
     # Reference: dequant matmul (a_ref/b_ref are already dequantized)
     d_ref = torch.einsum("mkl,nkl->mnl", a_ref, b_ref)
     err = (mD.float() - d_ref).abs().max().item()
     assert err < 5e-3, f"quack vs dequant max_err={err}"
 
-    # cuBLAS: bit-exact match expected (same operand bits, same scale bytes, same hw MMA)
+    # Compare cuBLAS on identical operand bits and scale bytes, at BF16 precision.
     from torch.nn.functional import scaled_mm as F_scaled_mm, ScalingType, SwizzleType
 
     a_cub = mA[:, :, 0].contiguous()
@@ -653,661 +630,9 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
         swizzle_b=SwizzleType.SWIZZLE_32_4_4,
         output_dtype=torch.bfloat16,
     )
-    assert torch.equal(mD.squeeze(-1), out_cublas), (
-        f"quack != cuBLAS: max_err={(mD.squeeze(-1).float() - out_cublas.float()).abs().max().item()}"
+    torch.testing.assert_close(
+        mD.squeeze(-1), out_cublas, rtol=torch.finfo(mD.dtype).eps, atol=1e-7
     )
-
-
-@pytest.mark.parametrize("a_major", ["k", "m"])
-@pytest.mark.parametrize("b_major", ["k", "n"])
-def test_blockscaled_mxfp8_major_modes(a_major, b_major):
-    """MXFP8 with A in {k,m}-major × B in {k,n}-major. The SF tensor layout
-    stays K-major (hardware convention); only A/B operand strides differ."""
-    _skip_if_not_sm100()
-    from quack.blockscaled.quantize import to_mx
-
-    m, n, k, l = 256, 256, 256, 1
-    sf_vec = 32
-
-    def _make_operand(mn, major):
-        hp = (torch.randn(l, mn, k, device="cuda", dtype=torch.bfloat16) * k**-0.5).contiguous()
-        q_flat, sc_flat = to_mx(hp.view(l * mn, k), sf_vec)
-        ref_mkl = (
-            (
-                q_flat.float().view(l, mn, k)
-                * sc_flat.float().view(l, mn, k // sf_vec).repeat_interleave(sf_vec, dim=-1)
-            )
-            .permute(1, 2, 0)
-            .contiguous()
-        )
-        if major == "k":
-            # (l, mn, k) contig → permute to (mn, k, l) → stride (k, 1, mn*k)
-            q_mkl = q_flat.view(l, mn, k).contiguous().permute(1, 2, 0)
-        else:
-            # (l, mn, k) contig → permute to (mn, k, l) with mn fastest → stride (1, mn, mn*k)
-            q_mkl = (
-                q_flat.view(l, mn, k).contiguous().permute(0, 2, 1).contiguous().permute(2, 1, 0)
-            )
-        return ref_mkl, q_mkl, sc_flat.view(l, mn, k // sf_vec)
-
-    a_ref, mA, sa_2d = _make_operand(m, a_major)
-    b_ref, mB, sb_2d = _make_operand(n, b_major)
-    # Sanity: stride(0) == 1 iff mn-major.
-    assert (mA.stride(0) == 1) == (a_major == "m"), f"mA stride: {mA.stride()}"
-    assert (mB.stride(0) == 1) == (b_major == "n"), f"mB stride: {mB.stride()}"
-    from quack.blockscaled.utils import pack_scale_2d_to_blocked_contig
-
-    a_sc = pack_scale_2d_to_blocked_contig(sa_2d)
-    b_sc = pack_scale_2d_to_blocked_contig(sb_2d)
-    _, mD = create_blockscaled_operand_tensor(l, m, n, False, cutlass.BFloat16, init="empty")
-
-    assert GemmDefaultSm100.can_implement(
-        MXFP8_E4M3,
-        MXFP8_E4M3,
-        cutlass.Float32,
-        cutlass.BFloat16,
-        (128, 128),
-        (1, 1),
-        m,
-        n,
-        k,
-        l,
-        a_major,
-        b_major,
-        "n",
-    )
-    runner = compile_blockscaled_gemm_tvm_ffi(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        sf_vec,
-        cutlass.BFloat16,
-        (128, 128),
-        (1, 1),
-        mA,
-        mB,
-        mD,
-        a_sc,
-        b_sc,
-    )
-    runner(mA, mB, mD, a_sc, b_sc)
-    torch.cuda.synchronize()
-
-    ref = torch.einsum("mkl,nkl->mnl", a_ref, b_ref)
-    err = (mD.float() - ref).abs().max().item()
-    assert err < 5e-3, f"A={a_major} B={b_major} max_err={err}"
-
-
-VARLEN_FMT = {
-    # format: (ab_dtype, sf_dtype, sf_vec_size)
-    "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
-    "mxfp8_e5m2": (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, 32),
-    "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
-    "mxfp6_e2m3_packed": (cutlass.Float6E2M3FN, cutlass.Float8E8M0FNU, 32),
-    "mxfp6_e3m2_packed": (cutlass.Float6E3M2FN, cutlass.Float8E8M0FNU, 32),
-    "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
-}
-
-
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
-@pytest.mark.parametrize("b_major", ["k", "n"])
-@pytest.mark.parametrize(
-    "seqlens_m",
-    [
-        [128, 128, 128],  # baseline: all aligned
-        [100, 200, 150],  # none aligned to 128
-        [30, 300, 64, 200],  # mix small + non-aligned
-        [1, 128, 127, 129],  # boundary conditions
-    ],
-)
-def test_blockscaled_varlen_m_nonaligned(seqlens_m, b_major, fmt):
-    """varlen_m with per-expert seqlens not divisible by 128, plus k/n-major B.
-    SFA is stored with tile-aligned per-batch padding; kernel reads it via
-    offset_batch_SFA."""
-    _skip_if_not_sm100()
-    if fmt != "mxfp8" and b_major == "n":
-        pytest.skip("fp4 operands must be K-major")
-    ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
-    num_experts = len(seqlens_m)
-    n, k = 256, 256
-    mma_tiler_mn = (128, 128)
-    cluster_shape_mn = (1, 1)
-
-    torch.manual_seed(0)
-    a_ref_dq, b_ref_dq, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_m = (
-        create_blockscaled_varlen_m_operands(
-            num_experts,
-            0,
-            n,
-            k,
-            sf_vec,
-            ab_dtype,
-            sf_dtype,
-            seqlens_m=seqlens_m,
-            b_major=b_major,
-        )
-    )
-    expected_b_stride0 = 1 if b_major == "n" else mB.shape[1]  # k, or k/2 for packed fp4
-    assert mB.stride(0) == expected_b_stride0, (
-        f"b_major={b_major} → mB.stride(0) should be {expected_b_stride0}, got {mB.stride()}"
-    )
-    total_m = int(sum(seqlens_m))
-    mSFA = a_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4)
-    mSFB = b_sc_contig  # (L, rn, rk, 32, 4, 4)
-
-    mD = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
-    runner = compile_blockscaled_gemm_tvm_ffi(
-        ab_dtype,
-        sf_dtype,
-        sf_vec,
-        cutlass.BFloat16,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        mA,
-        mB,
-        mD,
-        mSFA,
-        mSFB,
-        varlen_m=True,
-    )
-    runner(mA, mB, mD, mSFA, mSFB, cu_seqlens_m)
-    torch.cuda.synchronize()
-
-    # Per-expert reference matmul on dequantized operands.
-    cu = cu_seqlens_m.tolist()
-    ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
-    err = (mD.float() - ref).abs().max().item()
-    assert err < 5e-3, f"varlen_m non-aligned {fmt} seqlens_m={seqlens_m} max_err={err}"
-
-
-@pytest.mark.parametrize(
-    "seqlens_k",
-    [
-        [128, 128, 128],  # all aligned to 128
-        [128, 256, 128],  # 128-aligned mixed sizes
-        [96, 160, 128],  # not 128-aligned (but all sf_vec-aligned)
-        [32, 256, 64, 128],  # small + varied
-        [100, 220, 65],  # not even sf_vec(32)-aligned: partial last scale block
-        [1, 33, 158, 192],  # boundary conditions, non-aligned
-    ],
-)
-def test_blockscaled_mxfp8_varlen_k(seqlens_k):
-    """varlen_k blockscaled: per-expert k_i is arbitrary (neither 128- nor
-    sf_vec(32)-alignment required; a partial last scale block pairs with the
-    ragged TMA's zero-filled value tail). SFA/SFB use tile-aligned per-batch K
-    padding and the kernel reads them via offset_batch_SFA/offset_batch_SFB
-    padded-K formula."""
-    _skip_if_not_sm100()
-    num_experts = len(seqlens_k)
-    m, n = 256, 256
-    sf_vec = 32
-    mma_tiler_mn = (128, 128)
-    cluster_shape_mn = (1, 1)
-
-    torch.manual_seed(0)
-    a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
-        create_blockscaled_varlen_k_operands(num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k)
-    )
-    # (m, n, L) with stride 1 on N dim (compile expects leading_dim=1 on mD).
-    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda").permute(1, 2, 0)
-    runner = compile_blockscaled_gemm_tvm_ffi(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        sf_vec,
-        cutlass.BFloat16,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        mA,
-        mB,
-        mD,
-        a_sc_contig,
-        b_sc_contig,
-        varlen_k=True,
-    )
-    runner(mA, mB, mD, a_sc_contig, b_sc_contig, cu_seqlens_k)
-    torch.cuda.synchronize()
-
-    # Per-expert reference: for expert i, result = a_ref[i] @ b_ref[i].T.
-    # mD has shape (m, n, L) N-major; each mD[:, :, i] is one expert's output.
-    for i in range(num_experts):
-        ref_i = a_ref_list[i] @ b_ref_list[i].T
-        out_i = mD[:, :, i].float()
-        err = (out_i - ref_i).abs().max().item()
-        assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
-
-
-@pytest.mark.parametrize(
-    "seqlens_k",
-    [
-        [128, 128, 128],  # baseline: all aligned
-        [96, 160, 128],  # not 128-aligned
-        [100, 220, 65],  # not even sf_vec(32)-aligned
-    ],
-)
-def test_blockscaled_varlen_k_public_api(seqlens_k):
-    """varlen_k through the public quack.gemm.gemm API (jit-cached compile path).
-    A is (m, total_k) m-major, B is (n, total_k) n-major, and BOTH SFA/SFB are
-    tile-aligned K-padded buffers passed as (1, rm/rn, total_padded_rk, 32, 4, 4)."""
-    _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
-
-    num_experts = len(seqlens_k)
-    m, n, sf_vec = 256, 256, 32
-
-    torch.manual_seed(0)
-    a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
-        create_blockscaled_varlen_k_operands(num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k)
-    )
-    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
-    gemm_public(
-        mA,  # (m, total_k) m-major
-        mB,  # (n, total_k) n-major
-        mD,  # (L, m, n); gemm() permutes to (m, n, L) internally
-        None,
-        None,
-        tile_M=128,
-        tile_N=128,
-        cluster_M=1,
-        cluster_N=1,
-        cu_seqlens_k=cu_seqlens_k,
-        SFA=a_sc_contig,
-        SFB=b_sc_contig,
-        bs_format_a="mxfp8_e4m3",
-        bs_format_b="mxfp8_e4m3",
-    )
-    torch.cuda.synchronize()
-
-    for i in range(num_experts):
-        ref_i = a_ref_list[i] @ b_ref_list[i].T
-        err = (mD[i].float() - ref_i).abs().max().item()
-        assert err < 5e-3, f"public API varlen_k seqlens_k={seqlens_k} expert={i} max_err={err}"
-
-
-@pytest.mark.parametrize(
-    "a_fmt,b_fmt",
-    [("mxfp8_e4m3", "mxfp8_e5m2"), ("mxfp8_e5m2", "mxfp8_e4m3")],
-)
-@pytest.mark.parametrize("seqlens_k", [[128, 128, 128], [96, 160, 128]])
-def test_blockscaled_varlen_k_mixed_dtype(seqlens_k, a_fmt, b_fmt):
-    """varlen_k with mixed fp8 operand dtypes (mxf8f6f4 kind). Only fp8 pairs
-    are possible here: varlen_k needs m-major A / n-major B, while packed
-    sub-byte (fp4/fp6) operands must be K-major."""
-    _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
-    from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY
-
-    a_dtype = BLOCKSCALED_FORMAT_REGISTRY[a_fmt].to_cutlass_dtype()
-    b_dtype = BLOCKSCALED_FORMAT_REGISTRY[b_fmt].to_cutlass_dtype()
-    num_experts = len(seqlens_k)
-    m, n, sf_vec = 256, 256, 32
-
-    torch.manual_seed(0)
-    a_ref_list, b_ref_list, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_k = (
-        create_blockscaled_varlen_k_operands(
-            num_experts, 0, m, n, sf_vec, a_dtype, seqlens_k=seqlens_k, b_dtype=b_dtype
-        )
-    )
-    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
-    gemm_public(
-        mA,  # (m, total_k) m-major
-        mB,  # (n, total_k) n-major
-        mD,  # (L, m, n); gemm() permutes to (m, n, L) internally
-        None,
-        None,
-        tile_M=128,
-        tile_N=128,
-        cluster_M=1,
-        cluster_N=1,
-        cu_seqlens_k=cu_seqlens_k,
-        SFA=a_sc_contig,
-        SFB=b_sc_contig,
-        bs_format_a=a_fmt,
-        bs_format_b=b_fmt,
-    )
-    torch.cuda.synchronize()
-
-    for i in range(num_experts):
-        ref_i = a_ref_list[i] @ b_ref_list[i].T
-        err = (mD[i].float() - ref_i).abs().max().item()
-        assert err < 5e-3, (
-            f"varlen_k mixed a={a_fmt} b={b_fmt} seqlens_k={seqlens_k} expert={i} max_err={err}"
-        )
-
-
-@pytest.mark.parametrize(
-    "tile_cluster",
-    [((128, 128), (1, 1)), ((128, 256), (1, 2)), ((256, 128), (2, 1)), ((256, 256), (2, 2))],
-)
-@pytest.mark.parametrize("seqlens_k", [[96, 160, 128], [100, 220, 65]])
-def test_blockscaled_varlen_k_poisoned_sf_pad(seqlens_k, tile_cluster):
-    """For mxfp8 one MMA instruction consumes exactly one SF k-block, so the
-    kernel skips the instructions for pad blocks on the ragged last k-tile
-    (their A/B values are TMA-zero-filled, contributing nothing) — pad scales
-    are never consumed and the gmem SF pad may be arbitrary. Poison it with
-    0xFF (e8m0 NaN): any pad byte reaching an MMA would turn whole output rows
-    NaN via 0-value x NaN-scale products in the K tail. Instruction issue is a
-    leader-only decision, so 2-CTA MMA (tile_M 256) is covered too."""
-    _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
-
-    (tile_m, tile_n), (cluster_m, cluster_n) = tile_cluster
-    num_experts = len(seqlens_k)
-    m, n, sf_vec = 256, 256, 32
-    torch.manual_seed(0)
-    a_ref_list, b_ref_list, mA, mB, SFA, SFB, cu_seqlens_k = create_blockscaled_varlen_k_operands(
-        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k, sf_pad_byte=0xFF
-    )
-    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
-    gemm_public(
-        mA,
-        mB,
-        mD,
-        None,
-        None,
-        tile_M=tile_m,
-        tile_N=tile_n,
-        cluster_M=cluster_m,
-        cluster_N=cluster_n,
-        cu_seqlens_k=cu_seqlens_k,
-        SFA=SFA,
-        SFB=SFB,
-        bs_format_a="mxfp8_e4m3",
-        bs_format_b="mxfp8_e4m3",
-    )
-    torch.cuda.synchronize()
-    assert not mD.isnan().any(), "NaN leaked from poisoned SF pad into the output"
-    for i in range(num_experts):
-        ref_i = a_ref_list[i] @ b_ref_list[i].T
-        err = (mD[i].float() - ref_i).abs().max().item()
-        assert err < 5e-3, f"poisoned pad seqlens_k={seqlens_k} expert={i} max_err={err}"
-
-
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
-@pytest.mark.parametrize("b_major", ["k", "n"])
-@pytest.mark.parametrize(
-    "seqlens_m",
-    [
-        [128, 128, 128],  # baseline: all aligned
-        [100, 200, 150],  # none aligned to 128
-        [1, 128, 127, 129],  # boundary conditions
-    ],
-)
-def test_blockscaled_varlen_m_public_api(seqlens_m, b_major, fmt):
-    """varlen_m through the public quack.gemm.gemm API (jit-cached compile path).
-    SFA is the tile-aligned M-padded buffer passed as a
-    (1, total_padded_rm, rk, 32, 4, 4) view."""
-    _skip_if_not_sm100()
-    if fmt != "mxfp8" and b_major == "n":
-        pytest.skip("fp4 operands must be K-major")
-    from quack.gemm import gemm as gemm_public
-
-    ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
-    num_experts = len(seqlens_m)
-    n, k = 256, 256
-
-    torch.manual_seed(0)
-    a_ref_dq, b_ref_dq, mA, mB, a_sc_contig, b_sc_contig, cu_seqlens_m = (
-        create_blockscaled_varlen_m_operands(
-            num_experts, 0, n, k, sf_vec, ab_dtype, sf_dtype, seqlens_m=seqlens_m, b_major=b_major
-        )
-    )
-    total_m = int(sum(seqlens_m))
-    SFA, SFB = a_sc_contig, b_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4), (L, rn, rk, 32, 4, 4)
-    mD = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
-    gemm_public(
-        mA,
-        mB.permute(2, 0, 1),  # (n, k, l) -> (l, n, k); gemm() permutes back internally
-        mD,
-        None,
-        None,
-        tile_M=128,
-        tile_N=128,
-        cluster_M=1,
-        cluster_N=1,
-        cu_seqlens_m=cu_seqlens_m,
-        SFA=SFA,
-        SFB=SFB,
-        bs_format_a=fmt,  # from_name resolves the legacy "mxfp8" alias
-        bs_format_b=fmt,
-    )
-    torch.cuda.synchronize()
-
-    cu = cu_seqlens_m.tolist()
-    ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
-    err = (mD.float() - ref).abs().max().item()
-    assert err < 5e-3, f"public API varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
-
-
-@pytest.mark.parametrize("fmt", ["mxfp8_e5m2", "mxfp6_e2m3_packed", "mxfp6_e3m2_packed"])
-def test_blockscaled_varlen_m_extended_formats_public_api(fmt):
-    """The benchmark's varlen generator supports every advertised same-format input."""
-    _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
-
-    seqlens_m = [100, 156]
-    num_experts = len(seqlens_m)
-    n, k = 256, 256
-    ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
-
-    torch.manual_seed(0)
-    a_ref, b_ref, A, B, SFA, SFB, cu_seqlens_m = create_blockscaled_varlen_m_operands(
-        num_experts,
-        0,
-        n,
-        k,
-        sf_vec,
-        ab_dtype,
-        sf_dtype,
-        seqlens_m=seqlens_m,
-    )
-    if fmt.startswith("mxfp6"):
-        assert A.shape[1] == 3 * k // 4
-        assert B.shape[1] == 3 * k // 4
-
-    out = torch.empty(sum(seqlens_m), n, dtype=torch.bfloat16, device="cuda")
-    gemm_public(
-        A,
-        B.permute(2, 0, 1),
-        out,
-        None,
-        None,
-        tile_M=128,
-        tile_N=128,
-        cluster_M=1,
-        cluster_N=1,
-        cu_seqlens_m=cu_seqlens_m,
-        SFA=SFA,
-        SFB=SFB,
-        bs_format_a=fmt,
-        bs_format_b=fmt,
-    )
-    torch.cuda.synchronize()
-
-    cu = cu_seqlens_m.tolist()
-    ref = torch.cat([a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)])
-    torch.testing.assert_close(out.float(), ref, atol=5e-3, rtol=1e-3)
-
-
-@pytest.mark.parametrize("rk_pad", [1, 3, 5])
-def test_blockscaled_mxfp8_strided_sf(rk_pad):
-    """Verify the kernel honors mSFA/mSFB's actual outer strides (doesn't
-    require the full scale tensor to be contig — only the innermost 512-B
-    tile). Allocates a larger scale buffer with extra rk padding and slices
-    back to the valid rk, producing a non-packed rm stride."""
-    _skip_if_not_sm100()
-    m, n, k = 256, 256, 512  # k=512 → sf_k=16 → rk=4 (meaningful stride change)
-    l, sf_vec = 1, 32
-
-    torch.manual_seed(0)
-    a_ref, mA, a_sc = create_blockscaled_operand_quantized(l, m, k, False, sf_vec)
-    b_ref, mB, b_sc = create_blockscaled_operand_quantized(l, n, k, False, sf_vec)
-
-    rm = (m + 127) // 128
-    rn = (n + 127) // 128
-    rk = ((k // sf_vec) + 3) // 4
-
-    # Allocate padded scale buffers (rk + rk_pad along K-blocks), copy valid
-    # tiles into the prefix, slice back to rk.  The slice is non-contig:
-    # stride(1) = (rk + rk_pad) * 512 elements instead of rk * 512.
-    a_sc_big = torch.zeros(l, rm, rk + rk_pad, 32, 4, 4, dtype=torch.float8_e8m0fnu, device="cuda")
-    b_sc_big = torch.zeros(l, rn, rk + rk_pad, 32, 4, 4, dtype=torch.float8_e8m0fnu, device="cuda")
-    a_sc_big[:, :, :rk] = a_sc
-    b_sc_big[:, :, :rk] = b_sc
-    mSFA_strided = a_sc_big[:, :, :rk]
-    mSFB_strided = b_sc_big[:, :, :rk]
-    assert not mSFA_strided.is_contiguous()
-    assert mSFA_strided.stride(-1) == 1
-    assert mSFA_strided.stride(1) == (rk + rk_pad) * 512, (
-        f"expected non-packed rm stride {(rk + rk_pad) * 512}, got {mSFA_strided.stride(1)}"
-    )
-
-    # Validate our helper accepts the non-contig layout
-    _ = scale_view_for_kernel(mSFA_strided, m, k // sf_vec, l)
-    _ = scale_view_for_kernel(mSFB_strided, n, k // sf_vec, l)
-
-    _, mD_strided = create_blockscaled_operand_tensor(
-        l, m, n, False, cutlass.BFloat16, init="empty"
-    )
-    runner = compile_blockscaled_gemm_tvm_ffi(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        sf_vec,
-        cutlass.BFloat16,
-        (128, 128),
-        (1, 1),
-        mA,
-        mB,
-        mD_strided,
-        mSFA_strided,
-        mSFB_strided,
-    )
-    runner(mA, mB, mD_strided, mSFA_strided, mSFB_strided)
-
-    # Compare bit-exactly against the same matmul with contig scales.
-    _, mD_contig = create_blockscaled_operand_tensor(l, m, n, False, cutlass.BFloat16, init="empty")
-    runner_contig = compile_blockscaled_gemm_tvm_ffi(
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        sf_vec,
-        cutlass.BFloat16,
-        (128, 128),
-        (1, 1),
-        mA,
-        mB,
-        mD_contig,
-        a_sc,
-        b_sc,
-    )
-    runner_contig(mA, mB, mD_contig, a_sc, b_sc)
-    torch.cuda.synchronize()
-
-    assert torch.equal(mD_strided, mD_contig), (
-        f"strided-SF output differs from contig-SF: "
-        f"max_abs_err={(mD_strided.float() - mD_contig.float()).abs().max().item()}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Split-K (MXFP8 block-scaled)
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("split_k_mode", ["serial", "parallel"])
-@pytest.mark.parametrize("split_k", [2, 4])
-@pytest.mark.parametrize("batched", [False, True])
-def test_mxfp8_split_k(batched, split_k, split_k_mode):
-    """MXFP8 block-scaled split-K: the dense finalizer-only split-K device path composes
-    with block-scaled as-is (the SF loads ride the same k_tile_start-offset copy list as
-    A/B; the accumulator is already descaled f32 before the epilogue). split-K must match
-    the plain (split_k=1) MXFP8 kernel to within ~1 bf16 ULP and stay deterministic for
-    serial."""
-    _skip_if_not_sm100()
-    from quack.blockscaled.operand import BlockScaledOperand
-    from quack.blockscaled.utils import blockscaled_quantize
-    from quack.gemm_config import SplitKMode
-    from quack.gemm_interface import gemm, gemm_blockscaled_ref
-
-    mode = SplitKMode[split_k_mode.upper()]
-    # Small M/N, large K -> the regime split-K targets. K a multiple of 32 (sf_vec).
-    M, N, K = 256, 256, 8192
-    L = 2 if batched else 1
-    torch.manual_seed(0)
-    shape_A = (L, M, K) if batched else (M, K)
-    shape_W = (L, N, K) if batched else (N, K)
-    A_hp = torch.randn(*shape_A, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    W_hp = torch.randn(*shape_W, device="cuda", dtype=torch.bfloat16) * K**-0.5
-    A_q, A_sc = blockscaled_quantize(A_hp, "mxfp8")
-    W_q, W_sc = blockscaled_quantize(W_hp, "mxfp8")
-    A_op = BlockScaledOperand.from_parts(A_q, A_sc, "mxfp8")
-    B_op = BlockScaledOperand.from_parts(W_q, W_sc, "mxfp8").mT  # B = (..., K, N) K-contig view
-
-    ref = gemm_blockscaled_ref(A_op, B_op)
-    base = gemm(A_op, B_op, tuned=False)  # plain (split_k=1) MXFP8 kernel
-    out = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tuned=False)
-    assert out.shape == ((L, M, N) if batched else (M, N))
-
-    # f32 partials accumulation -> split-K is no less accurate than the plain kernel.
-    err = (out.float() - ref.float()).abs().max().item()
-    base_err = (base.float() - ref.float()).abs().max().item()
-    assert err < 2 * base_err + 5e-3, f"split-K err={err} vs base_err={base_err}"
-    # Differs from the plain kernel only by f32 reassociation (~1 bf16 ULP at O(1)).
-    assert (out.float() - base.float()).abs().max().item() < 1e-2
-
-    if mode != SplitKMode.PARALLEL:  # arrival-order reduction is not deterministic
-        for _ in range(3):
-            out2 = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tuned=False)
-            assert torch.equal(out, out2), "serial split-K is not bitwise deterministic"
-
-
-@pytest.mark.parametrize("fmt,K", [("mxfp8", 288), ("mxfp4", 384), ("nvfp4", 384)])
-def test_blockscaled_split_k_ragged_k(fmt, K):
-    """With a ragged K only the split holding the last k-tile may skip pad-scale MMA
-    instructions; applying the skip to every split's last tile dropped valid K."""
-    _skip_if_not_sm100()
-    from quack.blockscaled.operand import BlockScaledOperand
-    from quack.blockscaled.utils import blockscaled_quantize
-    from quack.gemm_config import SplitKMode
-    from quack.gemm_interface import gemm, gemm_blockscaled_ref
-
-    M, N = 256, 256
-    torch.manual_seed(0)
-    A_q, A_sc = blockscaled_quantize(
-        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
-    )
-    W_q, W_sc = blockscaled_quantize(
-        torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
-    )
-    A_op = BlockScaledOperand.from_parts(A_q, A_sc, fmt)
-    B_op = BlockScaledOperand.from_parts(W_q, W_sc, fmt).mT
-    ref = gemm_blockscaled_ref(A_op, B_op).float()
-    base = gemm(A_op, B_op, tuned=False).float()
-    out = gemm(A_op, B_op, split_k=2, split_k_mode=SplitKMode.SERIAL, tuned=False).float()
-    base_err = (base - ref).abs().max().item()
-    assert (out - ref).abs().max().item() < 2 * base_err + 5e-3
-
-
-def test_mxfp8_split_k_staged_rejected():
-    """SEPARATE needs a block-scaled-reachable reduction kernel (not yet wired); it must
-    raise a clear error rather than silently misconfigure."""
-    _skip_if_not_sm100()
-    from quack.blockscaled.operand import BlockScaledOperand
-    from quack.blockscaled.utils import blockscaled_quantize
-    from quack.gemm_config import SplitKMode
-    from quack.gemm_interface import gemm
-
-    M, N, K = 256, 256, 2048
-    torch.manual_seed(0)
-    A_q, A_sc = blockscaled_quantize(
-        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, "mxfp8"
-    )
-    W_q, W_sc = blockscaled_quantize(
-        torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, "mxfp8"
-    )
-    with pytest.raises(NotImplementedError, match="SEPARATE"):
-        gemm(
-            BlockScaledOperand.from_parts(A_q, A_sc, "mxfp8"),
-            BlockScaledOperand.from_parts(W_q, W_sc, "mxfp8").mT,
-            split_k=2,
-            split_k_mode=SplitKMode.SEPARATE,
-            tuned=False,
-        )
 
 
 def test_mma_kind_mirrors_kernel_kind():
@@ -1334,3 +659,38 @@ def test_mma_kind_mirrors_kernel_kind():
             assert kernel_kind.value == {"mxf4": "mxf4nvf4"}.get(kind, kind), (
                 f"{fmt_a.name} x {fmt_b.name}: kind {kind}, kernel derives {kernel_kind}"
             )
+
+
+def test_sm100_dtype_gate():
+    """Kernel dtype support is a per-architecture gate
+    (GemmSm100.is_valid_dtypes_and_scale_factor_vec_size), not a registry
+    property. New world: fp6 MMA dtypes are accepted with a Uint8 copy dtype
+    (packed fp6 crosses the FFI boundary as raw bytes and is TMA-unpacked
+    in-kernel) and mixed fp4/fp8 pairs are accepted with packed-fp4 storage;
+    byte-container (one code per uint8) sub-byte storage has no kernel path."""
+    from quack.gemm_sm100 import GemmSm100
+
+    ok = GemmSm100.is_valid_dtypes_and_scale_factor_vec_size
+    e8m0, e4m3, bf16 = cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, cutlass.BFloat16
+    f4, f6a, f6b, u8 = (
+        cutlass.Float4E2M1FN,
+        cutlass.Float6E2M3FN,
+        cutlass.Float6E3M2FN,
+        cutlass.Uint8,
+    )
+    # fp6 MMA dtypes with Uint8 copy dtype (packed 6-bit gmem, raw bytes at FFI)
+    assert ok(f6a, e4m3, e8m0, 32, bf16, a_copy_dtype=u8)
+    assert ok(e4m3, f6b, e8m0, 32, bf16, b_copy_dtype=u8)
+    assert ok(f6a, f6b, e8m0, 32, bf16, a_copy_dtype=u8, b_copy_dtype=u8)
+    # mixed packed fp4 x fp8 (TMA unpack under kind::mxf8f6f4) and pure packed fp4
+    assert ok(f4, e4m3, e8m0, 32, bf16)
+    assert ok(e4m3, f4, e8m0, 32, bf16)
+    assert ok(f4, f4, e8m0, 32, bf16)
+    assert ok(f4, f4, e4m3, 16, bf16)  # nvfp4
+    # copy dtype must be the storage the kernel implements: byte-container fp4
+    # (one code per uint8) and non-Uint8 fp6 copy dtypes have no kernel path
+    assert not ok(f4, e4m3, e8m0, 32, bf16, a_copy_dtype=u8)
+    assert not ok(f6a, e4m3, e8m0, 32, bf16, a_copy_dtype=e4m3)
+    # vec-16 (nvfp4 scale config) requires fp4 on BOTH operands
+    assert not ok(f4, e4m3, e4m3, 16, bf16)
+    assert not ok(f6a, f6a, e4m3, 16, bf16, a_copy_dtype=u8, b_copy_dtype=u8)

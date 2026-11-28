@@ -31,7 +31,11 @@
 - On SM90/SM100, TMA multicast allows a single TMA load to broadcast data
   to multiple CTAs in a cluster; SM120 lacks this hardware feature
 - This is why GEMM uses cluster_shape=(1,1,1) on SM120 — multicast is
-  required for efficient multi-CTA GEMM data sharing
+  required for efficient multi-CTA GEMM data sharing. `GemmSm120.__init__`
+  rejects any other cluster shape: ptxas would compile a cluster's multicast
+  loads to driver syscalls (`__cuda_syscall_cp_async_bulk_tensor_*_tile_multicast`,
+  software TMA in libcuda) that share no bandwidth and assert
+  (`emulate_tma: INVALID_DESCRIPTOR_FORMAT`) on 4-bit (FP4) tensormaps.
 - Reduction kernels use cluster for cross-CTA mbarrier synchronization
   (not TMA multicast), so cluster works fine without multicast
 

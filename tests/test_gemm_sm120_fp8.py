@@ -26,6 +26,11 @@ from quack.gemm import gemm
 # with the same probe), so the drift bound holds with margin there.
 _ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
 requires_sm120 = pytest.mark.skipif(_ARCH != 12, reason="SM120 fp8 warp-MMA path")
+# The blockscaled MMA kinds need real sm_120/121 silicon, not the QUACK_ARCH=120 proxy.
+_PHYSICAL_ARCH = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+requires_sm120_silicon = pytest.mark.skipif(
+    _PHYSICAL_ARCH != 12, reason="kind::mxf8f6f4 needs sm_120/121 silicon"
+)
 
 _DTYPES = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 
@@ -99,3 +104,34 @@ def test_fp8_long_k_accum_drift():
     rel = ((D.float() - ref) / ref).abs().max().item()
     # bf16 store alone is 2^-8; the accumulate adds ~(K/32)*2^-21 (~2.4e-4)
     assert rel < 6e-3, f"fp8 accumulate drift {rel:.2e} exceeds the fp32-acc bound"
+
+
+@requires_sm120
+@pytest.mark.parametrize("tile_m", [pytest.param(128, marks=requires_sm120_silicon), 64])
+def test_fp8_mixed_e4m3_e5m2(tile_m):
+    """Mixed e4m3 x e5m2 (not blockscaled). tile_m=128 rides kind::mxf8f6f4 with
+    constant unit scales (full Blackwell rate); tile_m=64 forces the Ada-instruction
+    fallback (MmaFP8MixedOp - the sm_89 opcode takes independent .e4m3/.e5m2
+    qualifiers), the same path the H100 QUACK_ARCH=120 CI leg takes."""
+    torch.manual_seed(0)
+    m, n, k = 256, 256, 512
+    A = (torch.randn(m, k, device="cuda") / math.sqrt(k)).to(torch.float8_e4m3fn)
+    B = (torch.randn(n, k, device="cuda") / math.sqrt(k)).to(torch.float8_e5m2)
+    D = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    gemm(A, B, D, None, None, tile_m, 128, 1, 1)
+    torch.cuda.synchronize()
+    ref = A.float() @ B.float().mT
+    atol = ref.abs().max().item() * 2**-7 + 1e-6
+    torch.testing.assert_close(D.float(), ref, atol=atol, rtol=1e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("cluster_mn", [(1, 2), (2, 1)])
+def test_fp8_cluster_rejected(cluster_mn):
+    """SM120 has no TMA multicast, so the GEMM rejects clusters other than 1x1 instead of
+    compiling multicast loads to driver syscalls."""
+    A = torch.randn(256, 512, device="cuda").to(torch.float8_e4m3fn)
+    B = torch.randn(256, 512, device="cuda").to(torch.float8_e4m3fn)
+    D = torch.empty(256, 256, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match=r"cluster shape \(1, 1, 1\)"):
+        gemm(A, B, D, None, None, 128, 128, *cluster_mn)

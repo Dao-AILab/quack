@@ -34,6 +34,7 @@ def _run_rank():
         to_mx,
         to_mxfp4,
     )
+    from quack.cute_dsl_utils import get_device_capacity
     from quack.distributed import BlockScaledAllGatherRunner
     from quack.gemm import gemm as quack_gemm
 
@@ -43,6 +44,8 @@ def _run_rank():
     dist.init_process_group("nccl")
     device = torch.device("cuda", rank % torch.cuda.device_count())
     tm, tn, cm, cn = TILE
+    if get_device_capacity(device)[0] == 12:  # SM120 has no TMA multicast: 1x1 clusters
+        cm, cn = 1, 1
 
     failures = []
     a_dtypes = {

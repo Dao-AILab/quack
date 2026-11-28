@@ -7,18 +7,23 @@ import pytest
 import torch
 
 from quack.epilogue.ops import ColVecReduce, RowVecReduce
+from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig
 from quack.epilogue.frontend import gemm_epilogue
 
 torch.manual_seed(0)
 
+# SM120 has no TMA multicast, so its GEMM takes only 1x1 clusters (QUACK_ARCH-aware).
+_CLUSTER_M = (
+    1 if torch.cuda.is_available() and get_device_capacity(torch.device("cuda"))[0] == 12 else 2
+)
 CFG = GemmConfig(
     tile_m=128,
     tile_n=256,
     tile_k=None,
     pingpong=False,
     is_dynamic_persistent=False,
-    cluster_m=2,
+    cluster_m=_CLUSTER_M,
     cluster_n=1,
 )
 

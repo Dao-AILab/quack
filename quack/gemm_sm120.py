@@ -236,7 +236,8 @@ class GemmSm120(GemmSm90):
 
     Warp roles and pipeline schedule: inherited from GemmSm90 (see its docstring),
     including the quack.pipeline_checks arrive-count validation at construction.
-    SM120 deltas to the facts: no thread-block clusters, so the A/B multicast peer
+    SM120 deltas to the facts: no TMA multicast, so the cluster shape must be
+    (1, 1, 1) (rejected in __init__ otherwise) and the A/B multicast peer
     set is always 1 (ab empty barrier gets one arrive per mma warp, CTA-local) and
     the scheduler barrier routes within a single CTA; the ab-pipeline consumers are
     mma.sync warps fed by ldmatrix rather than WGMMA warpgroups (same per-warp
@@ -336,6 +337,14 @@ class GemmSm120(GemmSm90):
             assert cluster_shape_mnk[1] == 1
         self._init_split_k(split_k, split_k_mode)
 
+        # SM120 has no TMA multicast. A cluster's multicast A/B loads would compile to
+        # driver syscalls (__cuda_syscall_cp_async_bulk_tensor_*_tile_multicast) that
+        # save no bandwidth and fail on 4-bit tensormaps (emulate_tma assertion).
+        if any(c != 1 for c in cluster_shape_mnk):
+            raise ValueError(
+                "SM120 GEMM requires cluster shape (1, 1, 1) (SM120 has no TMA multicast), "
+                f"got {tuple(cluster_shape_mnk)}"
+            )
         self.cluster_shape_mnk = cluster_shape_mnk
         assert len(tile_shape_mnk) in [2, 3], "CTA tile shape must be (M, N) or (M, N, K)"
         # K dimension: if user provides 3 values, use their K; otherwise default in _setup_tiled_mma.
@@ -1577,7 +1586,8 @@ class GemmSm120(GemmSm90):
         widened warp run (mma_n_warp_run 32, vec-32 SFD) issues the atom
         n_run/16 times per warp, each repetition 16 columns further along N.
         If a DSL upgrade fixes the trait, the bit-exact n-major-vs-k-major
-        tests (test_sm120_b_n_major*) will catch any placement change."""
+        tests (test_blockscaled_gemm_b_n_major_bitwise, test_sm120_b_n_major_tiles,
+        test_quant_out_b_n_major) will catch any placement change."""
         atom = cute.make_copy_atom(
             warp.LdMatrix16x16x8bOp(transpose=True, num_matrices=2), self.b_dtype
         )

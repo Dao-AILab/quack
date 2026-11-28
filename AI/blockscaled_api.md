@@ -229,9 +229,11 @@ element-class + recipe gates in `mma_kind_for_pair`) are already in place.
   spec uses a byte-extent K symbol for fp6 because `div_for_dtype` with width 6 is
   non-integral (96 bytes = 128 logical elements).
 - `_blockscaled_format_of` is a shim over `BlockScaledFormat.from_cutlass_dtypes`.
-  Its legacy direct-compiler generator still rejects packed FP6 because that path
-  has no separate uint8 storage dtype / FP6 MMA dtype; unified and varlen APIs do.
-- `compile_blockscaled_gemm_tvm_ffi`: asserts plain tensors; docstring states the policy.
+  Its raw-tensor test generator (`create_blockscaled_operand_quantized`) still rejects
+  packed FP6 because it has no separate uint8 storage dtype / FP6 MMA dtype; unified
+  and varlen APIs do.
+- The direct SM100 compile helper (`compile_blockscaled_gemm_tvm_ffi`) is gone: tests reach
+  explicit tile/cluster configs through `quack.gemm.gemm`.
 
 ## 6. Sub-byte operands: mixed fp4/fp6/fp8
 
@@ -375,7 +377,7 @@ shape or smoke checks alone.
   TypeError from torch ops; repr; deepcopy; save/`load(weights_only=True)`; pytree
   round-trip (orientation flag included), including JSON TreeSpec serialization for
   custom and legacy formats; rejection guards at the non-blockscaled entry points.
-- Interface (`tests/test_gemm_blockscaled_interface.py`): the dtype matrix runs on
+- Interface (`tests/test_gemm_blockscaled.py`): the dtype matrix runs on
   containers (the only operand form); a negative test pins the tuple/list
   `TypeError` (removal regression); regression tests encoding the failure modes the
   design exists to prevent: **pts-folding** (non-unit pts, default alpha => matches

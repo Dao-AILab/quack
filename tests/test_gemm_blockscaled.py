@@ -1,7 +1,10 @@
 # Copyright (c) 2026, Tri Dao.
-"""Tests for the unified blockscaled GEMM interface.
+"""Blockscaled GEMM tests for every blockscaled GPU (SM100/SM110 and SM120): the
+unified interface (gemm, gemm_add, gemm_act, ...), explicit tile/cluster sweeps
+through the raw-tensor quack.gemm.gemm, and split-K. Arch-specific kernel configs
+live in test_gemm_sm100_blockscaled.py and test_gemm_sm120_mxfp8.py.
 
-Operands are BlockScaledOperand containers - the only accepted blockscaled
+Interface operands are BlockScaledOperand containers - the only accepted blockscaled
 operand form ((data, scale_factor) tuples are rejected, see
 test_tuple_operand_rejected).
 
@@ -20,10 +23,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import cutlass
+
 from quack.blockscaled.quantize import nvfp4_per_tensor_scale
 from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
 from quack.blockscaled.utils import blockscaled_quantize_dim0
+from quack.blockscaled.utils import (
+    create_blockscaled_varlen_k_operands,
+    create_blockscaled_varlen_m_operands,
+)
+from quack.gemm_config import SplitKMode
 from quack.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
@@ -40,10 +50,33 @@ from quack.gemm_interface import (
 )
 
 
-def _skip_if_not_sm100():
-    major = torch.cuda.get_device_properties(0).major
-    if major < 10:
-        pytest.skip("SM100+ required")
+# Blockscaled GEMMs need SM100/SM110/SM120, so the whole file is gated. Host-only checks that
+# should also run on the H100 CI live in test_gemm_sm100_blockscaled.py.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="SM100+ required",
+)
+
+# Explicit tile/cluster sweeps: 1-CTA and 2-CTA tiles with their clusters on SM100. SM120 has
+# no TMA multicast, so its GEMM takes only 1x1 clusters: same tiles, cluster 1x1.
+_TILE_CLUSTERS = [
+    ((128, 128), (1, 1)),
+    ((128, 256), (1, 2)),
+    ((256, 128), (2, 1)),
+    ((256, 256), (2, 2)),
+]
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
+    _TILE_CLUSTERS = [(tile, (1, 1)) for tile, _ in _TILE_CLUSTERS]
+
+# format: (cutlass ab dtype, sf dtype, sf_vec_size), for the raw-tensor varlen generators
+_CUTLASS_DTYPES = {
+    "mxfp8_e4m3": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
+    "mxfp8_e5m2": (cutlass.Float8E5M2, cutlass.Float8E8M0FNU, 32),
+    "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
+    "mxfp6_e2m3_packed": (cutlass.Float6E2M3FN, cutlass.Float8E8M0FNU, 32),
+    "mxfp6_e3m2_packed": (cutlass.Float6E3M2FN, cutlass.Float8E8M0FNU, 32),
+    "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
+}
 
 
 def _quantized_operands(fmt, m, n, k, batched, seed=0):
@@ -65,7 +98,7 @@ def _rel_err(out, ref):
     return (out.float() - ref.float()).abs().max().item() / (ref.float().abs().max().item() + 1e-9)
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize(
     "shape_mnk",
@@ -78,7 +111,6 @@ def _rel_err(out, ref):
     ],
 )
 def test_blockscaled_gemm(fmt, batched, shape_mnk):
-    _skip_if_not_sm100()
     m, n, k = shape_mnk
     A, B = _quantized_operands(fmt, m, n, k, batched)
     out = gemm(A, B, tuned=False)
@@ -91,9 +123,8 @@ def test_blockscaled_gemm(fmt, batched, shape_mnk):
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_blockscaled_gemm_out_dtype(out_dtype):
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     out = gemm(A, B, out_dtype=out_dtype, tuned=False)
     ref = gemm_blockscaled_ref(A, B, out_dtype=out_dtype)
     assert out.dtype == out_dtype
@@ -102,7 +133,6 @@ def test_blockscaled_gemm_out_dtype(out_dtype):
 
 
 def test_blockscaled_gemm_alpha_and_preallocated_out():
-    _skip_if_not_sm100()
     # nvfp4's per-tensor global scales fold into alpha
     m, n, k = 512, 256, 512
     A, B = _quantized_operands("nvfp4", m, n, k, batched=False)
@@ -115,20 +145,27 @@ def test_blockscaled_gemm_alpha_and_preallocated_out():
     assert rel < 5e-3, f"alpha={alpha}: rel_err={rel}"
 
 
-def test_blockscaled_gemm_sf_slice():
+@pytest.mark.parametrize("a_pad,b_pad", [(1, 3), (3, 5), (5, 1)])
+def test_blockscaled_gemm_sf_slice(a_pad, b_pad):
     """Atom-aligned slices of larger SF buffers work (outer strides are free)."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     out_ref = gemm(A, B, tuned=False)
-    # SFA living inside a larger buffer (extra rk columns), sliced back out
-    sfa = A.scale
-    rm, rk = sfa.shape[0], sfa.shape[1]
-    big = torch.zeros(rm, rk + 3, 32, 4, 4, device="cuda", dtype=sfa.dtype)
-    big[:, :rk] = sfa
-    A_slice = BlockScaledOperand.from_parts(A.qdata, big[:, :rk], A.format)
-    out_slice = gemm(A_slice, B, tuned=False)
+
+    def with_strided_scale(op, rk_pad):
+        rm, rk, *atom = op.scale.shape
+        padded = op.scale.new_zeros((rm, rk + rk_pad, *atom))
+        scale = padded[:, :rk]
+        scale.copy_(op.scale)
+        assert not scale.is_contiguous()
+        return BlockScaledOperand.from_parts(op.qdata, scale, op.format, quant_dim=op.quant_dim)
+
+    # Independent outer strides: using either packed strides or A's pitch for B is wrong.
+    out_slice = gemm(with_strided_scale(A, a_pad), with_strided_scale(B, b_pad), tuned=False)
     assert torch.equal(out_ref, out_slice)
+    ref = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
+    rel = (out_slice.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 5e-3, f"strided scales: rel_err={rel}"
 
 
 @pytest.mark.parametrize("a_major", ["k", "m"])
@@ -140,10 +177,9 @@ def test_blockscaled_gemm_major_modes(a_major, b_major):
     all four cases (the (rm, rk, 32, 4, 4) hardware format does not depend on
     how the operand values are stored).
     """
-    _skip_if_not_sm100()
     m, n, k = 256, 320, 512  # n not a multiple of 128 (padded SF rows)
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
-    ref = gemm_blockscaled_ref(A, B)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
+    ref = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
     qa, bq = A.qdata, B.qdata
     if a_major == "m":
         qa = qa.t().contiguous().t()  # (m, k) with M contiguous
@@ -158,32 +194,39 @@ def test_blockscaled_gemm_major_modes(a_major, b_major):
     assert rel < 5e-3, f"A={a_major}-major B={b_major}-major: rel_err={rel}"
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
-@pytest.mark.parametrize("seqlens_m", [[128, 128, 128], [100, 200, 150], [1, 128, 127, 129]])
-def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
+@pytest.mark.parametrize(
+    "fmt,b_major",
+    [
+        ("mxfp8_e4m3", "k"),
+        ("mxfp8_e4m3", "n"),
+        ("mxfp8_e5m2", "k"),
+        ("mxfp4", "k"),
+        ("nvfp4", "k"),
+        ("mxfp6_e2m3_packed", "k"),
+        ("mxfp6_e3m2_packed", "k"),
+    ],
+)
+@pytest.mark.parametrize(
+    "seqlens_m", [[128, 128, 128], [100, 200, 150], [30, 300, 64, 200], [1, 128, 127, 129]]
+)
+def test_blockscaled_gemm_varlen_m(seqlens_m, fmt, b_major):
     """Grouped (varlen_m) blockscaled GEMM through the unified interface. SFA is a
-    single M-padded buffer (tile-aligned per-batch padding, batch dim 1); SFB stays per-expert."""
-    _skip_if_not_sm100()
-    import cutlass
-
-    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
-
-    fmt_map = {
-        "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
-        "mxfp4": (cutlass.Float4E2M1FN, cutlass.Float8E8M0FNU, 32),
-        "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, 16),
-    }
-    ab_dtype, sf_dtype, sf_vec = fmt_map[fmt]
+    single M-padded buffer (tile-aligned per-batch padding, batch dim 1); SFB stays
+    per-expert. Packed sub-byte formats (fp4, fp6) must be K-major."""
+    ab_dtype, sf_dtype, sf_vec = _CUTLASS_DTYPES[fmt]
     num_experts = len(seqlens_m)
     n, k = 256, 256
     torch.manual_seed(0)
     a_ref_dq, b_ref_dq, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_m = (
         create_blockscaled_varlen_m_operands(
-            num_experts, 0, n, k, sf_vec, ab_dtype, sf_dtype, seqlens_m=seqlens_m
+            num_experts, 0, n, k, sf_vec, ab_dtype, sf_dtype, seqlens_m=seqlens_m, b_major=b_major
         )
     )
+    if fmt.startswith("mxfp6"):  # packed fp6: 3 bytes per 4 values along K
+        assert qa.shape[1] == 3 * k // 4 and qb.shape[1] == 3 * k // 4
     SFA, SFB = a_sc_contig, b_sc_contig  # (1, total_padded_rm, rk, 32, 4, 4), (L, rn, rk, 32, 4, 4)
-    B = qb.permute(2, 1, 0)  # (n, k[/2], L) -> (L, K[/2], N) with K contiguous
+    B = qb.permute(2, 1, 0)  # (n, k_storage, L) -> (L, k_storage, n)
+    assert B.stride(-2 if b_major == "k" else -1) == 1
     A_op = BlockScaledOperand.from_parts(qa, SFA, fmt)
     B_op = BlockScaledOperand.from_parts(B, SFB, fmt, quant_dim=-2)
     out = gemm(A_op, B_op, cu_seqlens_m=cu_seqlens_m, tuned=False)
@@ -194,55 +237,75 @@ def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
     assert err < 5e-3, f"varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
 
 
-@pytest.mark.parametrize("seqlens_k", [[128, 128, 128], [96, 160, 128], [100, 220, 65]])
-def test_blockscaled_gemm_varlen_k(seqlens_k):
-    """Grouped varlen_k blockscaled GEMM through the unified interface (MXFP8 only:
-    fp4 must be K-major, varlen_k needs m-major A / n-major B). Both SFA and SFB
+@pytest.mark.parametrize(
+    "seqlens_k",
+    [
+        [128, 128, 128],
+        [128, 256, 128],
+        [96, 160, 128],
+        [32, 256, 64, 128],
+        [100, 220, 65],
+        [1, 33, 158, 192],
+    ],
+)
+@pytest.mark.parametrize(
+    "a_fmt,b_fmt",
+    [("mxfp8_e4m3", "mxfp8_e4m3"), ("mxfp8_e4m3", "mxfp8_e5m2"), ("mxfp8_e5m2", "mxfp8_e4m3")],
+)
+def test_blockscaled_gemm_varlen_k(seqlens_k, a_fmt, b_fmt):
+    """Grouped varlen_k blockscaled GEMM through the unified interface (fp8 only, same
+    or mixed e4m3/e5m2: packed fp4/fp6 must be K-major, varlen_k needs m-major A / n-major B). Both SFA and SFB
     are single K-padded buffers (tile-aligned per-batch padding, batch dim 1).
-    Per-expert k_i is arbitrary — not even sf_vec(32)-aligned."""
-    _skip_if_not_sm100()
-    from quack.blockscaled.utils import create_blockscaled_varlen_k_operands
-
+    Per-expert k_i is arbitrary — not even sf_vec(32)-aligned. SF pad bytes are
+    TMA-loaded but the ragged-tail MMA skip must never consume them: poisoning
+    them with 0xFF (e8m0 NaN) turns any consumed pad into NaN output rows."""
     num_experts = len(seqlens_k)
     m, n, sf_vec = 256, 256, 32
     torch.manual_seed(0)
     a_ref_list, b_ref_list, qa, qb, SFA, SFB, cu_seqlens_k = create_blockscaled_varlen_k_operands(
-        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k
+        num_experts,
+        0,
+        m,
+        n,
+        sf_vec,
+        _CUTLASS_DTYPES[a_fmt][0],
+        seqlens_k=seqlens_k,
+        sf_pad_byte=0xFF,  # NaN if consumed
+        b_dtype=_CUTLASS_DTYPES[b_fmt][0],
     )
     # Interface takes B as (total_K, N); qb is (n, total_k) n-major so .t() is
     # the (total_k, n) row-major view and gemm_tuned's .mT restores n-major.
-    A_op = BlockScaledOperand.from_parts(qa, SFA, "mxfp8")
-    B_op = BlockScaledOperand.from_parts(qb.t(), SFB, "mxfp8", quant_dim=-2)
+    A_op = BlockScaledOperand.from_parts(qa, SFA, a_fmt)
+    B_op = BlockScaledOperand.from_parts(qb.t(), SFB, b_fmt, quant_dim=-2)
     out = gemm(A_op, B_op, cu_seqlens_k=cu_seqlens_k, tuned=False)
     assert out.shape == (num_experts, m, n)
 
     ref = torch.stack([a_ref_list[i] @ b_ref_list[i].T for i in range(num_experts)])
     err = (out.float() - ref).abs().max().item()
-    assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} max_err={err}"
+    assert err < 5e-3, f"varlen_k {a_fmt} x {b_fmt} seqlens_k={seqlens_k} max_err={err}"
 
 
 def test_blockscaled_gemm_vs_cublas():
-    """Bit-exact comparison against torch._scaled_mm (cuBLAS MXFP8 path)."""
-    _skip_if_not_sm100()
+    """Compare against the cuBLAS MXFP8 path with BF16 output."""
     m, n, k = 512, 512, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     out = gemm(A, B, tuned=False)
     sfa_flat = scale_blocked_for_cublas(A.scale.unsqueeze(0), m, k // 32)
     sfw_flat = scale_blocked_for_cublas(B.scale.unsqueeze(0), n, k // 32)
     out_cublas = torch._scaled_mm(
         A.qdata, B.qdata, scale_a=sfa_flat, scale_b=sfw_flat, out_dtype=torch.bfloat16
     )
-    assert torch.equal(out, out_cublas), (
-        f"quack != cuBLAS: max_err={(out.float() - out_cublas.float()).abs().max().item()}"
-    )
+    # On SM120 cuBLAS sums partial FP32 accumulators; QuACK accumulates K in
+    # one chain per output. They can round to adjacent BF16 values. The
+    # absolute floor covers FP32 accumulation error for near-zero dot products.
+    torch.testing.assert_close(out, out_cublas, rtol=torch.finfo(out.dtype).eps, atol=1e-7)
 
 
 def test_blockscaled_gemm_bad_sf_layout_rejected():
     """Bad SF layouts cannot reach the GEMM: the container rejects them at
     construction, and one-sided scale factors are rejected at dispatch."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     # non-contiguous inner block (transposed (4, 4) tail) must be rejected
     with pytest.raises(ValueError, match="inner"):
         BlockScaledOperand.from_parts(A.qdata, A.scale.transpose(-1, -2), A.format)
@@ -256,9 +319,8 @@ def test_blockscaled_gemm_bad_sf_layout_rejected():
 
 def test_blockscaled_gemm_torch_compile():
     """Raw parts as graph inputs, with from_parts staying in one full graph."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     ref = gemm(A, B, tuned=False)
 
     @torch.compile(dynamic=False, fullgraph=True)
@@ -271,11 +333,10 @@ def test_blockscaled_gemm_torch_compile():
     assert torch.equal(out, ref)
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("batched", [False, True])
 def test_blockscaled_gemm_add(fmt, batched):
     """D = alpha * A@B + beta * C with blockscaled A/B."""
-    _skip_if_not_sm100()
     m, n, k = 512, 256, 512
     A, B = _quantized_operands(fmt, m, n, k, batched)
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
@@ -300,11 +361,10 @@ def test_blockscaled_gemm_add(fmt, batched):
     _max_err_within_2ulp(acc, ref2, "gemm_add_inplace")
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
-@pytest.mark.parametrize("activation", ["relu_sq", "gelu_tanh_approx", "swiglu"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx", "swiglu"])
 def test_blockscaled_gemm_act(fmt, activation):
     """gemm_act / gemm_gated with blockscaled A/B, checked against the dequant reference."""
-    _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
@@ -316,6 +376,7 @@ def test_blockscaled_gemm_act(fmt, activation):
         assert postact.shape == (m, n // 2)
     else:
         act_fn = {
+            "relu": F.relu,
             "relu_sq": lambda x: F.relu(x).square(),
             "gelu_tanh_approx": lambda x: F.gelu(x, approximate="tanh"),
         }[activation]
@@ -330,9 +391,8 @@ def test_blockscaled_gemm_act(fmt, activation):
 
 def test_blockscaled_gemm_act_bias_no_preact():
     """Bias broadcast + store_preact=False on the blockscaled act path."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     bias = torch.randn(n, dtype=torch.float32, device="cuda")
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
     preact, postact = gemm_act(A, B, bias=bias, activation="relu", store_preact=False, tuned=False)
@@ -343,12 +403,11 @@ def test_blockscaled_gemm_act_bias_no_preact():
     assert rel < 1e-2, f"bias+relu: rel_err={rel}"
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("activation", ["relu", "gelu_tanh_approx"])
 def test_blockscaled_gemm_dact(fmt, activation):
     """gemm_dact with blockscaled A (dout) and B (weight): dout crosses the
     mainloop quantized, PreAct rides the C slot in bf16."""
-    _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     preact = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
@@ -363,13 +422,12 @@ def test_blockscaled_gemm_dact(fmt, activation):
     assert _rel_err(postact, postact_ref) < 1e-2, f"{fmt} {activation}: postact"
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("scale_reduce", [False, True])
 def test_blockscaled_gemm_dgated(fmt, scale_reduce):
     """gemm_dgated with blockscaled A/B: the packed-C/D epilogue (interleaved
     gate/up PreAct, 2*N-wide dx) on the blockscaled mainloop, optionally with
     the colvec scale + reduce sinks."""
-    _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     activation = "swiglu"
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
@@ -402,11 +460,10 @@ def test_blockscaled_gemm_dgated(fmt, scale_reduce):
     assert _rel_err(postact, postact_ref) < 1e-2, f"{fmt}: postact"
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
 def test_blockscaled_gemm_rms(fmt):
     """gemm_rms with blockscaled A/B: normalized D, the rstd from the sq-reduce
     partials, and the premult aux, all against the dequant reference."""
-    _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     eps = 1e-6
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
@@ -424,11 +481,10 @@ def test_blockscaled_gemm_rms(fmt):
     assert _rel_err(premult_out, ref_mm) < 5e-3, f"{fmt}: premult"
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("activation", ["gelu_tanh_approx", "swiglu"])
 def test_blockscaled_gemm_norm_act(fmt, activation):
     """gemm_norm_act / gemm_norm_gated with blockscaled A/B and an rstd colvec."""
-    _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     rstd = torch.rand(m, device="cuda", dtype=torch.float32) + 0.5
@@ -455,7 +511,6 @@ def test_blockscaled_gemm_rms_norm_act_per_tensor_scale():
     the norm scales. RMSNorm's scale invariance makes the normalized output
     nearly insensitive to a dropped scale, so this test pins the outputs that
     DO break: rstd and the premult/preact values (wrong by 1/s if dropped)."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     eps = 1e-6
     torch.manual_seed(0)
@@ -506,13 +561,12 @@ def _quantized_symmetric_operand(fmt, m, k, batched=False):
     return BlockScaledOperand.from_parts(qa, sfa, BlockScaledFormat.from_name(fmt))
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("batched", [False, True])
 def test_blockscaled_gemm_symmetric(fmt, batched):
     """gemm_symmetric with a blockscaled pair (B = A.mT of the same quantized
     tensor): the mirror store must keep the output exactly symmetric, and the
     values must track the dequant reference."""
-    _skip_if_not_sm100()
     m, k = 512, 512
     A = _quantized_symmetric_operand(fmt, m, k, batched=batched)
     out = gemm_symmetric(A, A.mT)
@@ -526,7 +580,6 @@ def test_blockscaled_gemm_symmetric_per_tensor_scale():
     """NVFP4 per-tensor scales fold into gemm_symmetric's alpha (as scale^2 —
     both slots are the same tensor), composing with C/beta and an explicit
     alpha; eager + compile."""
-    _skip_if_not_sm100()
     m, k = 256, 512
     torch.manual_seed(0)
     a_hp = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -546,16 +599,26 @@ def test_blockscaled_gemm_symmetric_per_tensor_scale():
         assert _rel_err(out, ref) < 5e-3
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", "nvfp4"])
 def test_blockscaled_gemm_tuned(fmt):
     """Autotuned path: config pruning + sweep must produce a correct result."""
-    _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     out = gemm(A, B, tuned=True)
     ref = gemm_blockscaled_ref(A, B)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"{fmt} tuned: rel_err={rel}"
+
+
+def test_blockscaled_gemm_add_tuned():
+    """Autotuned gemm_add: the pruned config sweep must also be correct with a C epilogue."""
+    m, n, k = 512, 512, 512
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
+    C = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C, alpha=0.5, beta=2.0)
+    ref = 0.5 * gemm_blockscaled_ref(A, B, out_dtype=torch.float32) + 2.0 * C.float()
+    rel = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 5e-3, f"tuned gemm_add: rel_err={rel}"
 
 
 def test_blockscaled_gemm_training_orientations():
@@ -566,7 +629,6 @@ def test_blockscaled_gemm_training_orientations():
       dgrad: dX = dY W    (dY rowwise, W dim0; B (N, K) n-major)
       wgrad: dW = dY^T X  (dY, X dim0; A (N, M) m-major, B (M, K) n-major)
     """
-    _skip_if_not_sm100()
     torch.manual_seed(0)
     m, n, k = 256, 320, 512  # tokens, out-features, in-features
     X = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
@@ -582,12 +644,14 @@ def test_blockscaled_gemm_training_orientations():
         assert rel_quant < quant_tol, f"{label}: vs bf16 truth rel={rel_quant}"
 
     # Rowwise (dim -1) quantizations: scales run along K of the (rows, K) view.
-    rowwise = lambda t: BlockScaledOperand.from_parts(*blockscaled_quantize(t), "mxfp8")
+    rowwise = lambda t: BlockScaledOperand.from_parts(
+        *blockscaled_quantize(t, "mxfp8_e4m3"), "mxfp8_e4m3"
+    )
     # dim0 quantizations: scales run along dim 0 (the reduction dim of the
     # MN-major consumption), i.e. quant_dim=-2 on the (dim0, dim1) view; pass
     # directly as a B operand or as .mT for an A operand (.mT flips quant_dim).
     dim0 = lambda t: BlockScaledOperand.from_parts(
-        *blockscaled_quantize_dim0(t), "mxfp8", quant_dim=-2
+        *blockscaled_quantize_dim0(t, "mxfp8_e4m3"), "mxfp8_e4m3", quant_dim=-2
     )
 
     check(rowwise(X), rowwise(W).mT, X.float() @ W.float().T, "fwd", 0.04)
@@ -601,9 +665,8 @@ def test_blockscaled_gemm_training_orientations():
 def test_tuple_operand_rejected():
     """(data, scale_factor) tuple/list operands are removed: TypeError pointing
     at BlockScaledOperand, raised before any kernel work."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 256
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     with pytest.raises(TypeError, match="BlockScaledOperand"):
         gemm((A.qdata, A.scale), (B.qdata, B.scale), tuned=False)
     with pytest.raises(TypeError, match="no longer accepted"):
@@ -617,7 +680,6 @@ def test_nvfp4_per_tensor_scale_folding():
     product must be folded into alpha automatically. Encodes the silent-accuracy
     trap where dropped scales leave every output off by scale_A * scale_B (all
     unit-scale tests stay green)."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)
     # Large magnitudes so the per-tensor scales are far from 1.
@@ -649,7 +711,6 @@ def test_square_weight_orientation():
     """K == N square weight: the .mT idiom computes x @ w^T correctly, and the
     wrong-axis forms - shape-legal on square weights, previously silent garbage -
     are rejected via the operand's quant_dim (per-slot contraction-axis check)."""
-    _skip_if_not_sm100()
     m, k = 256, 512  # n == k (square weight)
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
@@ -678,7 +739,6 @@ def test_uint8_scale_view_construction():
     """An NVFP4 scale round-tripped through a uint8 view (e.g. a collective)
     must still compute as vec-16 e4m3. Encodes the old dtype-sniffing decode
     trap where uint8 was assumed to mean e8m0 (vec 32)."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("nvfp4", m, n, k, batched=False)
     ref = gemm(A, B, tuned=False)
@@ -708,45 +768,106 @@ def _relayout_packed_operand(op, offset_bytes, row_pad_bytes):
     return BlockScaledOperand.from_parts(qdata, op.scale, op.format, orig_dtype=op.orig_dtype)
 
 
+_MIXED_PAIRS = [
+    # fp8 x fp8 (independent a/b dtypes, no sub-byte unpack)
+    ("mxfp8_e4m3", "mxfp8_e5m2"),
+    ("mxfp8_e5m2", "mxfp8_e4m3"),
+    # packed fp4 x fp8 (sub-byte operand unpacked into 8-bit containers, both orders)
+    ("mxfp4", "mxfp8_e4m3"),
+    ("mxfp8_e4m3", "mxfp4"),
+    ("mxfp4", "mxfp8_e5m2"),
+    ("mxfp8_e5m2", "mxfp4"),
+    # packed fp6 x fp8 (both orders)
+    ("mxfp6_e2m3_packed", "mxfp8_e4m3"),
+    ("mxfp8_e4m3", "mxfp6_e2m3_packed"),
+    # both operands sub-byte: fp6 x fp6 (mixed and same-dtype), fp6 x fp4, fp4 x fp6
+    ("mxfp6_e2m3_packed", "mxfp6_e3m2_packed"),
+    ("mxfp6_e2m3_packed", "mxfp6_e2m3_packed"),
+    ("mxfp6_e2m3_packed", "mxfp4"),
+    ("mxfp4", "mxfp6_e3m2_packed"),
+]
+
+
+@pytest.mark.parametrize("fmt_pair", _MIXED_PAIRS)
 @pytest.mark.parametrize(
-    "fmt_pair",
+    "shape_mnk",
     [
-        # fp8 x fp8 (independent a/b dtypes, no sub-byte unpack)
-        ("mxfp8_e4m3", "mxfp8_e5m2"),
-        ("mxfp8_e5m2", "mxfp8_e4m3"),
-        # packed fp4 x fp8 (sub-byte operand TMA-unpacked, both orders)
-        ("mxfp4", "mxfp8_e4m3"),
-        ("mxfp8_e4m3", "mxfp4"),
-        ("mxfp4", "mxfp8_e5m2"),
-        # packed fp6 x fp8 (both orders)
-        ("mxfp6_e2m3_packed", "mxfp8_e4m3"),
-        ("mxfp8_e4m3", "mxfp6_e2m3_packed"),
-        # both operands sub-byte: fp6 x fp6, fp6 x fp4, fp4 x fp6
-        ("mxfp6_e2m3_packed", "mxfp6_e3m2_packed"),
-        ("mxfp6_e2m3_packed", "mxfp4"),
-        ("mxfp4", "mxfp6_e3m2_packed"),
+        (256, 512, 512),
+        (448, 320, 512),  # M, N not multiples of 128 (padded SF rows)
+        (256, 256, 8192),  # long K: sub-byte unpack + SF pipeline over many k-tiles
     ],
 )
-def test_blockscaled_gemm_mixed(fmt_pair):
-    """Mixed A/B element types on SM100 (tcgen05 kind::mxf8f6f4 takes independent
-    a/b dtypes): fp8/fp4/fp6 pairings across {e4m3, e5m2, fp4, fp6_e2m3, fp6_e3m2},
-    including packed sub-byte operands (TMA-unpacked into 8-bit SMEM containers).
-    Checked against both the blockscaled reference and the dequantized product.
-    (Both-fp4 runs the single mxf4nvf4 atom - scale config from the format -
-    and is covered by test_blockscaled_gemm; nvfp4 pairs only with itself, see
-    test_mixed_format_pairs.)"""
-    _skip_if_not_sm100()
+def test_blockscaled_gemm_mixed(fmt_pair, shape_mnk):
+    """Mixed A/B element types (kind::mxf8f6f4 takes independent a/b dtypes on
+    SM100 and SM120): fp8/fp4/fp6 pairings across {e4m3, e5m2, fp4, fp6_e2m3,
+    fp6_e3m2}, including packed sub-byte operands (unpacked into 8-bit
+    containers: TMA unpack on SM100, padded tensormaps + unpacking ldmatrix on
+    SM120). Checked against both the blockscaled reference and the dequantized
+    product. (Both-fp4 runs the single mxf4/mxf4nvf4 atom - scale config from the
+    format - and is covered by test_blockscaled_gemm; nvfp4 pairs only with
+    itself, see test_mixed_format_pairs.)"""
     fmt_a, fmt_b = fmt_pair
-    m, n, k = 256, 512, 512
+    m, n, k = shape_mnk
     A = _mixed_operand(fmt_a, m, k, seed=0)
     W = _mixed_operand(fmt_b, n, k, seed=1)
     out = gemm(A, W.mT, tuned=False)
     ref = gemm_blockscaled_ref(A, W.mT)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
-    assert rel < 5e-3, f"{fmt_a} x {fmt_b}: rel_err={rel}"
+    assert rel < 5e-3, f"{fmt_a} x {fmt_b} {shape_mnk}: rel_err={rel}"
     ref_dq = A.dequantize(torch.float32) @ W.dequantize(torch.float32).T
     rel_dq = (out.float() - ref_dq).abs().max().item() / ref_dq.abs().max().item()
-    assert rel_dq < 5e-3, f"{fmt_a} x {fmt_b}: rel_err vs dequant={rel_dq}"
+    assert rel_dq < 5e-3, f"{fmt_a} x {fmt_b} {shape_mnk}: rel_err vs dequant={rel_dq}"
+
+
+def test_blockscaled_gemm_add_mixed():
+    """Mixed operands (fp8 A x packed fp4 B) through the epilogue frontend."""
+    m, n, k = 256, 256, 512
+    A = _mixed_operand("mxfp8_e4m3", m, k, seed=0)
+    B = _mixed_operand("mxfp4", n, k, seed=1).mT
+    C = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    out = gemm_add(A, B, C, alpha=0.5, beta=2.0, tuned=False)
+    ref = 0.5 * gemm_blockscaled_ref(A, B, out_dtype=torch.float32) + 2.0 * C.float()
+    rel = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 5e-3, f"mixed gemm_add: rel_err={rel}"
+
+
+def test_blockscaled_gemm_m_major_a_fp4_b():
+    """M-major fp8 A with packed fp4 B (which stays K-major). The scale tensor is
+    layout-independent; only the qdata strides swap. test_blockscaled_gemm_major_modes
+    covers fp8 x fp8."""
+    m, n, k = 256, 320, 512
+    A, _ = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
+    W = _mixed_operand("mxfp4", n, k, seed=1)
+    ref = gemm_blockscaled_ref(A, W.mT)
+    qa_mm = A.qdata.t().contiguous().t()  # (m, k) with M contiguous
+    assert qa_mm.stride() == (1, m)
+    out = gemm(BlockScaledOperand.from_parts(qa_mm, A.scale, A.format), W.mT, tuned=False)
+    rel = _rel_err(out, ref)
+    assert rel < 5e-3, f"m-major A x mxfp4: rel_err={rel}"
+
+
+def _n_major_b(W):
+    """(k, n) row-major view of an (n, k) quantized operand: the interface's .mT
+    relabel makes it n-major B. The scale tensor is layout-independent."""
+    qb_kn = W.qdata.t().contiguous()  # (k, n) with N contiguous
+    return BlockScaledOperand.from_parts(qb_kn, W.scale, W.format, quant_dim=-2)
+
+
+@pytest.mark.parametrize("fmt_a", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp6_e2m3_packed"])
+def test_blockscaled_gemm_b_n_major_bitwise(fmt_a):
+    """N-major fp8 B must be bit-identical to K-major B on the same quantized
+    operands, under every A format that pairs with fp8 B (same-dtype mxfp8, mixed
+    e5m2 x e4m3, fp4 x fp8, fp6 x fp8). On SM120 N-major B goes through the
+    transposing ldmatrix (GemmSm120._nmajor_b_tiled_copy)."""
+    m, n, k = 256, 320, 512
+    A = _mixed_operand(fmt_a, m, k, seed=0)
+    W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
+    out_kmaj = gemm(A, W.mT, tuned=False)
+    out = gemm(A, _n_major_b(W), tuned=False)
+    assert torch.equal(out, out_kmaj), (
+        f"{fmt_a} x n-major fp8 B != k-major: "
+        f"max_err={(out.float() - out_kmaj.float()).abs().max().item()}"
+    )
 
 
 @pytest.mark.parametrize("unpack_side", ["a", "b"])
@@ -758,7 +879,6 @@ def test_blockscaled_gemm_mixed(fmt_pair):
 )
 def test_mixed_unpack_alignment_rejected(unpack_side, unpack_fmt, offset_bytes, row_pad_bytes):
     """U4/U6 TMA unpack rejects bad bases/pitches before issuing a device instruction."""
-    _skip_if_not_sm100()
     m = n = 128
     k = 512
     A = _mixed_operand(unpack_fmt if unpack_side == "a" else "mxfp8_e4m3", m, k, seed=0)
@@ -789,7 +909,6 @@ def test_mixed_unpack_alignment_rejected(unpack_side, unpack_fmt, offset_bytes, 
 @pytest.mark.parametrize("unpack_fmt", ["mxfp4", "mxfp6_e2m3_packed"])
 def test_mixed_unpack_aligned_padded_numeric(unpack_side, unpack_fmt):
     """A 32-byte-offset/padded packed view remains a valid unpack source."""
-    _skip_if_not_sm100()
     m = n = 128
     k = 512
     A = _mixed_operand(unpack_fmt if unpack_side == "a" else "mxfp8_e4m3", m, k, seed=0)
@@ -814,7 +933,6 @@ def test_mixed_fp4_unpack_k_granule_rejected():
     (K % 32 == 0) but violates the unpack granule: the mixed fp4 x fp8 pair must
     be rejected cleanly (ValueError from the compiled arg-spec binding for fp4,
     AssertionError from validate_blockscaled_sf for fp6), not crash or corrupt."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 320
     A = _mixed_operand("mxfp4", m, k, seed=0)
     W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
@@ -830,9 +948,8 @@ def test_mixed_format_pairs():
     packed gmem operand is TMA-unpacked into 8-bit SMEM containers, so mixed
     packed-fp4 x fp8 pairs must NOT be rejected. (End-to-end numerics for the
     mixed matrix: test_blockscaled_gemm_mixed.)"""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A8, B8 = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A8, B8 = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     A4, B4 = _quantized_operands("nvfp4", m, n, k, batched=False)
     # nvfp4's mxf4nvf4 kind requires nvfp4 on both operands
     with pytest.raises(ValueError, match="cannot pair"):
@@ -852,49 +969,11 @@ def test_mixed_format_pairs():
     assert mma_kind_for_pair(MXFP4, MXFP6_E2M3_PACKED) == "mxf8f6f4"
 
 
-def test_sm100_dtype_gate():
-    """Kernel dtype support is a per-architecture gate
-    (GemmSm100.is_valid_dtypes_and_scale_factor_vec_size), not a registry
-    property. New world: fp6 MMA dtypes are accepted with a Uint8 copy dtype
-    (packed fp6 crosses the FFI boundary as raw bytes and is TMA-unpacked
-    in-kernel) and mixed fp4/fp8 pairs are accepted with packed-fp4 storage;
-    byte-container (one code per uint8) sub-byte storage has no kernel path."""
-    import cutlass
-
-    from quack.gemm_sm100 import GemmSm100
-
-    ok = GemmSm100.is_valid_dtypes_and_scale_factor_vec_size
-    e8m0, e4m3, bf16 = cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, cutlass.BFloat16
-    f4, f6a, f6b, u8 = (
-        cutlass.Float4E2M1FN,
-        cutlass.Float6E2M3FN,
-        cutlass.Float6E3M2FN,
-        cutlass.Uint8,
-    )
-    # fp6 MMA dtypes with Uint8 copy dtype (packed 6-bit gmem, raw bytes at FFI)
-    assert ok(f6a, e4m3, e8m0, 32, bf16, a_copy_dtype=u8)
-    assert ok(e4m3, f6b, e8m0, 32, bf16, b_copy_dtype=u8)
-    assert ok(f6a, f6b, e8m0, 32, bf16, a_copy_dtype=u8, b_copy_dtype=u8)
-    # mixed packed fp4 x fp8 (TMA unpack under kind::mxf8f6f4) and pure packed fp4
-    assert ok(f4, e4m3, e8m0, 32, bf16)
-    assert ok(e4m3, f4, e8m0, 32, bf16)
-    assert ok(f4, f4, e8m0, 32, bf16)
-    assert ok(f4, f4, e4m3, 16, bf16)  # nvfp4
-    # copy dtype must be the storage the kernel implements: byte-container fp4
-    # (one code per uint8) and non-Uint8 fp6 copy dtypes have no kernel path
-    assert not ok(f4, e4m3, e8m0, 32, bf16, a_copy_dtype=u8)
-    assert not ok(f6a, e4m3, e8m0, 32, bf16, a_copy_dtype=e4m3)
-    # vec-16 (nvfp4 scale config) requires fp4 on BOTH operands
-    assert not ok(f4, e4m3, e4m3, 16, bf16)
-    assert not ok(f6a, f6a, e4m3, 16, bf16, a_copy_dtype=u8, b_copy_dtype=u8)
-
-
 def test_fp6_k_granule_rejected():
     """fp6 operands require logical K % 128 == 0 (the TMA unpack tensormap
     granule): host-side validation must fail with a clear message instead of a
     spec-binding error at compile. K=192 is quantizable (K % 32 == 0) but not
     unpackable."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 192
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
@@ -910,9 +989,8 @@ def test_blockscaled_out_dtype_reserved():
     """out_dtype accepting a BlockScaledFormat (blockscaled D output) is shipped
     for `gemm` (returns a BlockScaledOperand, tested in test_gemm_quant_out.py);
     the other entry points still reserve it, and unknown format names raise."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     from quack.blockscaled.operand import MXFP8_E4M3
 
     for out_dtype in (MXFP8_E4M3, "mxfp8_e4m3"):
@@ -928,7 +1006,6 @@ def test_e5m2_from_parts_kernel():
     """from_parts stays a valid e5m2 construction path (pre-quantized data
     with caller-provided scales): unit e8m0 scales, checked against the
     dequant reference."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
@@ -950,7 +1027,6 @@ def test_e5m2_from_parts_kernel():
 @pytest.mark.parametrize("activation", ["relu", "swiglu"])
 def test_gemm_act_per_tensor_scale_alpha(activation):
     """NVFP4 per-tensor scales compose with pre-activation alpha."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -987,9 +1063,8 @@ def test_blockscaled_gemm_torch_compile_container():
     """BlockScaledOperand as a torch.compile graph input, fullgraph=True
     (attribute reads trace through the frozen dataclass; exercises the preserved
     _sf_encode e8m0->uint8 Inductor workaround)."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
-    A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
+    A, B = _quantized_operands("mxfp8_e4m3", m, n, k, batched=False)
     ref = gemm(A, B, tuned=False)
 
     @torch.compile(dynamic=False, fullgraph=True)
@@ -1002,7 +1077,6 @@ def test_blockscaled_gemm_torch_compile_container():
 
 def test_blockscaled_quantize_in_graph():
     """Quantize + gemm in one full graph, including container construction."""
-    _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
@@ -1016,3 +1090,191 @@ def test_blockscaled_quantize_in_graph():
     ref = f(x, w)
     out = torch.compile(f, dynamic=False, fullgraph=True)(x, w)
     assert torch.equal(out, ref)
+
+
+# -- Explicit tile/cluster sweeps through quack.gemm.gemm (raw tensors, SFA/SFB) --
+
+
+@pytest.mark.parametrize(
+    "tile_cluster",
+    _TILE_CLUSTERS,
+)
+@pytest.mark.parametrize("seqlens_k", [[96, 160, 128], [100, 220, 65]])
+def test_blockscaled_varlen_k_poisoned_sf_pad(seqlens_k, tile_cluster):
+    """For mxfp8 one MMA instruction consumes exactly one SF k-block, so the
+    kernel skips the instructions for pad blocks on the ragged last k-tile
+    (their A/B values are TMA-zero-filled, contributing nothing) — pad scales
+    are never consumed and the gmem SF pad may be arbitrary. Poison it with
+    0xFF (e8m0 NaN): any pad byte reaching an MMA would turn whole output rows
+    NaN via 0-value x NaN-scale products in the K tail. Instruction issue is a
+    leader-only decision, so 2-CTA MMA (tile_M 256) is covered too."""
+    from quack.gemm import gemm as gemm_public
+
+    (tile_m, tile_n), (cluster_m, cluster_n) = tile_cluster
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+    torch.manual_seed(0)
+    a_ref_list, b_ref_list, mA, mB, SFA, SFB, cu_seqlens_k = create_blockscaled_varlen_k_operands(
+        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k, sf_pad_byte=0xFF
+    )
+    mD = torch.empty(num_experts, m, n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,
+        mB,
+        mD,
+        None,
+        None,
+        tile_M=tile_m,
+        tile_N=tile_n,
+        cluster_M=cluster_m,
+        cluster_N=cluster_n,
+        cu_seqlens_k=cu_seqlens_k,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+    )
+    torch.cuda.synchronize()
+    assert not mD.isnan().any(), "NaN leaked from poisoned SF pad into the output"
+    for i in range(num_experts):
+        ref_i = a_ref_list[i] @ b_ref_list[i].T
+        err = (mD[i].float() - ref_i).abs().max().item()
+        assert err < 5e-3, f"poisoned pad seqlens_k={seqlens_k} expert={i} max_err={err}"
+
+
+@pytest.mark.parametrize(
+    "tile_cluster",
+    _TILE_CLUSTERS,
+)
+@pytest.mark.parametrize(
+    "fmt,b_major", [("mxfp8_e4m3", "k"), ("mxfp8_e4m3", "n"), ("mxfp4", "k"), ("nvfp4", "k")]
+)
+def test_blockscaled_varlen_m_tile_cluster(fmt, b_major, tile_cluster):
+    """varlen_m through quack.gemm.gemm with explicit 1-CTA/2-CTA tile and cluster
+    shapes (the interface picks one config per problem size). Small, non-aligned
+    experts: SFA is the tile-aligned M-padded buffer passed as a
+    (1, total_padded_rm, rk, 32, 4, 4) view."""
+    from quack.gemm import gemm as gemm_public
+
+    (tile_m, tile_n), (cluster_m, cluster_n) = tile_cluster
+    seqlens_m = [30, 300, 64, 200]
+    ab_dtype, sf_dtype, sf_vec = _CUTLASS_DTYPES[fmt]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    torch.manual_seed(0)
+    a_ref_dq, b_ref_dq, mA, mB, SFA, SFB, cu_seqlens_m = create_blockscaled_varlen_m_operands(
+        num_experts, 0, n, k, sf_vec, ab_dtype, sf_dtype, seqlens_m=seqlens_m, b_major=b_major
+    )
+    mD = torch.empty(sum(seqlens_m), n, dtype=torch.bfloat16, device="cuda")
+    gemm_public(
+        mA,
+        mB.permute(2, 0, 1),  # (n, k, l) -> (l, n, k); gemm() permutes back internally
+        mD,
+        None,
+        None,
+        tile_M=tile_m,
+        tile_N=tile_n,
+        cluster_M=cluster_m,
+        cluster_N=cluster_n,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=SFA,
+        SFB=SFB,
+        bs_format_a=fmt,
+        bs_format_b=fmt,
+    )
+    torch.cuda.synchronize()
+    cu = cu_seqlens_m.tolist()
+    ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
+    err = (mD.float() - ref).abs().max().item()
+    assert err < 5e-3, f"varlen_m {fmt} tile={tile_cluster} max_err={err}"
+
+
+# -- Split-K --
+
+
+@pytest.mark.parametrize("split_k_mode", ["serial", "parallel"])
+@pytest.mark.parametrize("split_k", [2, 4])
+@pytest.mark.parametrize("batched", [False, True])
+def test_mxfp8_split_k(batched, split_k, split_k_mode):
+    """MXFP8 block-scaled split-K: the dense finalizer-only split-K device path composes
+    with block-scaled as-is (the SF loads ride the same k_tile_start-offset copy list as
+    A/B; the accumulator is already descaled f32 before the epilogue). split-K must match
+    the plain (split_k=1) MXFP8 kernel to within ~1 bf16 ULP and stay deterministic for
+    serial."""
+
+    mode = SplitKMode[split_k_mode.upper()]
+    # Small M/N, large K -> the regime split-K targets. K a multiple of 32 (sf_vec).
+    M, N, K = 256, 256, 8192
+    L = 2 if batched else 1
+    torch.manual_seed(0)
+    shape_A = (L, M, K) if batched else (M, K)
+    shape_W = (L, N, K) if batched else (N, K)
+    A_hp = torch.randn(*shape_A, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    W_hp = torch.randn(*shape_W, device="cuda", dtype=torch.bfloat16) * K**-0.5
+    A_q, A_sc = blockscaled_quantize(A_hp, "mxfp8_e4m3")
+    W_q, W_sc = blockscaled_quantize(W_hp, "mxfp8_e4m3")
+    A_op = BlockScaledOperand.from_parts(A_q, A_sc, "mxfp8_e4m3")
+    B_op = BlockScaledOperand.from_parts(
+        W_q, W_sc, "mxfp8_e4m3"
+    ).mT  # B = (..., K, N) K-contig view
+
+    ref = gemm_blockscaled_ref(A_op, B_op)
+    base = gemm(A_op, B_op, tuned=False)  # plain (split_k=1) MXFP8 kernel
+    out = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tuned=False)
+    assert out.shape == ((L, M, N) if batched else (M, N))
+
+    # f32 partials accumulation -> split-K is no less accurate than the plain kernel.
+    err = (out.float() - ref.float()).abs().max().item()
+    base_err = (base.float() - ref.float()).abs().max().item()
+    assert err < 2 * base_err + 5e-3, f"split-K err={err} vs base_err={base_err}"
+    # Differs from the plain kernel only by f32 reassociation (~1 bf16 ULP at O(1)).
+    assert (out.float() - base.float()).abs().max().item() < 1e-2
+
+    if mode != SplitKMode.PARALLEL:  # arrival-order reduction is not deterministic
+        for _ in range(3):
+            out2 = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tuned=False)
+            assert torch.equal(out, out2), "serial split-K is not bitwise deterministic"
+
+
+@pytest.mark.parametrize("fmt,K", [("mxfp8_e4m3", 288), ("mxfp4", 384), ("nvfp4", 384)])
+def test_blockscaled_split_k_ragged_k(fmt, K):
+    """With a ragged K only the split holding the last k-tile may skip pad-scale MMA
+    instructions; applying the skip to every split's last tile dropped valid K."""
+
+    M, N = 256, 256
+    torch.manual_seed(0)
+    A_q, A_sc = blockscaled_quantize(
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
+    )
+    W_q, W_sc = blockscaled_quantize(
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, fmt
+    )
+    A_op = BlockScaledOperand.from_parts(A_q, A_sc, fmt)
+    B_op = BlockScaledOperand.from_parts(W_q, W_sc, fmt).mT
+    ref = gemm_blockscaled_ref(A_op, B_op).float()
+    base = gemm(A_op, B_op, tuned=False).float()
+    out = gemm(A_op, B_op, split_k=2, split_k_mode=SplitKMode.SERIAL, tuned=False).float()
+    base_err = (base - ref).abs().max().item()
+    assert (out - ref).abs().max().item() < 2 * base_err + 5e-3
+
+
+def test_mxfp8_split_k_staged_rejected():
+    """SEPARATE needs a block-scaled-reachable reduction kernel (not yet wired); it must
+    raise a clear error rather than silently misconfigure."""
+
+    M, N, K = 256, 256, 2048
+    torch.manual_seed(0)
+    A_q, A_sc = blockscaled_quantize(
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, "mxfp8_e4m3"
+    )
+    W_q, W_sc = blockscaled_quantize(
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * K**-0.5, "mxfp8_e4m3"
+    )
+    with pytest.raises(NotImplementedError, match="SEPARATE"):
+        gemm(
+            BlockScaledOperand.from_parts(A_q, A_sc, "mxfp8_e4m3"),
+            BlockScaledOperand.from_parts(W_q, W_sc, "mxfp8_e4m3").mT,
+            split_k=2,
+            split_k_mode=SplitKMode.SEPARATE,
+            tuned=False,
+        )

@@ -1,24 +1,19 @@
 # Copyright (c) 2026, Tri Dao.
 
 import itertools
-from functools import partial
-from typing import Callable, Optional, Type, Tuple
+from typing import Optional, Type, Tuple
 
 import torch
 
 import cutlass
-import cutlass.cute as cute
 
-from cutlass import Int32, Float32
 
-from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_config import SplitKMode
-from quack.gemm_tvm_ffi_utils import div_for_dtype, make_scheduler_args
 from quack.blockscaled.operand import (
     BLOCKSCALED_FORMAT_REGISTRY,
+    MXFP8_E4M3,
     BlockScaledFormat,
     BlockScaledOperand,
+    _coerce_format,
     legacy_format_name,
 )
 from quack.blockscaled.quantize import (  # noqa: F401  (pure-torch helpers re-exported)
@@ -33,7 +28,6 @@ from quack.blockscaled.quantize import (  # noqa: F401  (pure-torch helpers re-e
     to_nvfp4_compiled,
     unpack_scale_blocked_to_2d,
 )
-from quack.varlen_utils import VarlenArguments
 
 
 TORCH_DTYPE_MAP = {
@@ -61,60 +55,6 @@ def torch_dtype_for_cutlass(dtype: Type[cutlass.Numeric]) -> torch.dtype:
     if dtype not in TORCH_DTYPE_MAP:
         raise TypeError(f"Unsupported dtype: {dtype}")
     return TORCH_DTYPE_MAP[dtype]
-
-
-def _make_fake_tensor_like(tensor: torch.Tensor, dtype: Type[cutlass.Numeric]) -> cute.Tensor:
-    return cute.runtime.make_fake_tensor(
-        dtype,
-        tensor.shape,
-        stride=tensor.stride(),
-        assumed_align=16,
-    )
-
-
-def _batch_first(tensor: torch.Tensor) -> torch.Tensor:
-    """Batch-last (x, y, l) -> batch-first (l, x, y) view; rank-2 passes through."""
-    return tensor.permute(2, 0, 1) if tensor.dim() == 3 else tensor
-
-
-def _leading_dim_from_stride(tensor: torch.Tensor) -> int:
-    # Size-1 dims carry an arbitrary (often 1) stride — e.g. the l=1 batch dim of a
-    # batch-first (1, m, k) view — and must not shadow the real contiguous dim.
-    for i, (size, stride) in enumerate(zip(tensor.shape, tensor.stride())):
-        if stride == 1 and size != 1:
-            return i
-    for i, stride in enumerate(tensor.stride()):
-        if stride == 1:
-            return i
-    raise ValueError(
-        f"Tensor has no unit stride dimension: shape={tensor.shape}, stride={tensor.stride()}"
-    )
-
-
-def _make_compile_tensor_like(
-    tensor: torch.Tensor, dtype: Type[cutlass.Numeric], dynamic_layout: bool = False
-) -> cute.Tensor:
-    compile_tensor = cute.runtime.from_dlpack(tensor)
-    compile_tensor.element_type = dtype
-    if dynamic_layout:
-        marked = compile_tensor.mark_layout_dynamic(leading_dim=_leading_dim_from_stride(tensor))
-        if marked is not None:
-            compile_tensor = marked
-    return compile_tensor
-
-
-def _make_fake_compact_tensor(
-    shape: Tuple[int, ...], dtype: Type[cutlass.Numeric], leading_dim: int
-) -> cute.Tensor:
-    logical_shape = list(shape)
-    if dtype == cutlass.Float4E2M1FN:
-        logical_shape[leading_dim] *= 2
-    return fake_tensor(
-        dtype,
-        tuple(logical_shape),
-        leading_dim=leading_dim,
-        divisibility=div_for_dtype(dtype),
-    )
 
 
 def _fp4_e2m1fn_value_table(device: torch.device) -> torch.Tensor:
@@ -279,7 +219,7 @@ def blockscaled_quantize(
 
 
 def blockscaled_quantize_dim0(
-    x: torch.Tensor, format: str = "mxfp8"
+    x: torch.Tensor, format: str | BlockScaledFormat = "mxfp8"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a (M, K) bf16/fp32 tensor along M (dim 0) for a blockscaled GEMM
     whose reduction dim is M — the dgrad/wgrad orientations of training linears.
@@ -288,15 +228,28 @@ def blockscaled_quantize_dim0(
       q:  (M, K) fp8, same row-major layout as ``x``.
       sf: blocked (rm, rk, 32, 4, 4) scale factors for the logical operand
           (mn=K, sf_k=M/32) - the same tensor serves both usages below.
-    Wrap for the GEMM as ``op = BlockScaledOperand.from_parts(q, sf, "mxfp8",
+    Wrap for the GEMM as ``op = BlockScaledOperand.from_parts(q, sf, "mxfp8_e4m3",
     quant_dim=-2)`` (scales run along M, dim 0): pass ``op`` as an MN-major B
     operand (reduction dim first), or ``op.mT`` as an MN-major A operand.
+
+    ``format`` is resolved like :func:`blockscaled_quantize`'s (``"mxfp8"``,
+    ``"mxfp8_e4m3"`` or the descriptor). Only MXFP8 E4M3 has a dim0 quantizer so far;
+    other formats raise NotImplementedError until theirs is added.
     """
     from quack.blockscaled.quantize import to_mx_dim0_compiled
 
-    assert format == "mxfp8", "dim0 quantization currently supports mxfp8 only"
+    fmt = _coerce_format(format)
+    # TODO: dim0 quantizers for the other formats (mxfp8_e5m2, mxfp4, nvfp4). Nothing rules
+    # them out; only to_mx_dim0 (E4M3) is written. E5M2 can keep this row-major layout. Packed
+    # fp4 packs two values per byte along the quantized dim, so its quantizer will emit M-packed
+    # data with M contiguous instead (still no transposed high-precision copy).
+    if fmt != MXFP8_E4M3:
+        raise NotImplementedError(
+            f"dim0 quantization is not implemented yet for {fmt.name} "
+            f"(only {MXFP8_E4M3.name} so far)"
+        )
     assert x.ndim == 2, f"expected (M, K), got shape {tuple(x.shape)}"
-    sf_vec = BLOCKSCALED_FORMATS[format][2]
+    sf_vec = fmt.sf_vec_size
     assert x.shape[0] % sf_vec == 0, f"M ({x.shape[0]}) must be divisible by {sf_vec}"
     q, sc = to_mx_dim0_compiled(x, sf_vec)  # sc: (M/32, K)
     sf = _pack_scale_compiled(sc.mT.contiguous().unsqueeze(0))
@@ -679,279 +632,6 @@ def create_blockscaled_varlen_k_operands(
         [0] + list(itertools.accumulate(seqlens_k)), dtype=torch.int32, device="cuda"
     )
     return a_ref_list, b_ref_list, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_k
-
-
-def compile_blockscaled_gemm_tvm_ffi(
-    ab_dtype: Type[cutlass.Numeric],
-    sf_dtype: Type[cutlass.Numeric],
-    sf_vec_size: int,
-    d_dtype: Type[cutlass.Numeric],
-    mma_tiler_mn: Tuple[int, int],
-    cluster_shape_mn: Tuple[int, int],
-    mA: torch.Tensor,
-    mB: torch.Tensor,
-    mD: torch.Tensor,
-    mSFA: torch.Tensor,
-    mSFB: torch.Tensor,
-    *,
-    use_clc_persistence: bool = True,
-    varlen_m: bool = False,
-    varlen_k: bool = False,
-    split_k: int = 1,
-    split_k_mode: int = SplitKMode.SERIAL,
-) -> Callable:
-    """Compile the SM100 blockscaled GEMM.
-
-    Caller convention is batch-LAST — mA (m, k, l), mB (n, k, l), mD (m, n, l) —
-    matching the reference-math einsums. The kernel itself expects batch-FIRST
-    tensors and rotates (l, x, y) -> (x, y, l) at trace time
-    (GemmBase.rotate_batch_last), so this wrapper converts at the boundary: the
-    compile-time fakes are built batch-first, and run(...) passes batch-first
-    views (a free .permute). Rank-2 (varlen-flattened) operands and the SF
-    tensors pass through untouched (the kernel does not rotate SFA/SFB).
-
-    This direct TVM-FFI path takes plain tensors only (raw qdata + scale buffers
-    with explicit cutlass dtypes). BlockScaledOperand operands are
-    the quack.gemm_interface layer's job; unwrap before calling this.
-
-    When varlen_m: mA is (total_m, k) K-major, mD is (total_m, n) N-major,
-    mB is (n, k, l); run(...) takes an extra cu_seqlens_m tensor.
-    When varlen_k: mA is (m, total_k), mB is (n, total_k), mD is (m, n, l);
-    run(...) takes an extra cu_seqlens_k tensor.
-
-    split_k > 1 (dense only): block-scaled composes with the dense finalizer-only
-    split-K device path with no kernel changes (the SF loads ride the same
-    k_tile_start-offset copy list as A/B; the accumulator is already descaled f32
-    before the epilogue). run(...) allocates the per-tile completion flag and the f32
-    partials workspace per call (mirroring quack.gemm.gemm) and threads them through.
-    SERIAL/PARALLEL only — SEPARATE needs a block-scaled reduction-kernel path.
-    """
-    assert not isinstance(mA, BlockScaledOperand) and not isinstance(mB, BlockScaledOperand), (
-        "compile_blockscaled_gemm_tvm_ffi takes plain tensors; unwrap BlockScaledOperand "
-        "(use .qdata / .scale) or call quack.gemm"
-    )
-    device_capacity = get_device_capacity(mA.device)
-    if device_capacity[0] not in (10, 11):
-        raise RuntimeError("Blockscaled SM100 GEMM requires SM100/SM110")
-    assert not (varlen_m and varlen_k), "Only one of varlen_m / varlen_k"
-    split_k_mode = SplitKMode(split_k_mode)
-    if split_k > 1:
-        if varlen_m or varlen_k:
-            raise ValueError("block-scaled split_k requires a dense GEMM (no varlen)")
-        if split_k_mode == SplitKMode.SEPARATE:
-            raise NotImplementedError(
-                "block-scaled split_k does not support SEPARATE yet; use SERIAL or PARALLEL"
-            )
-
-    # Lazy: this SM100 compile helper must not force the kernel-class import
-    # chain (gemm_default_epi -> gemm_sm90) onto every consumer of the
-    # blockscaled package (e.g. nvfp4_utils, imported by kernel-side code).
-    from quack.gemm_default_epi import GemmDefaultSm100
-
-    gemm = partial(
-        GemmDefaultSm100,
-        sf_vec_size=sf_vec_size,
-        use_clc_persistence=use_clc_persistence,
-        split_k=split_k,
-        split_k_mode=split_k_mode,
-    )(cutlass.Float32, ab_dtype, mma_tiler_mn, (*cluster_shape_mn, 1))
-    # Per-CTA tile shape (post 2-CTA halving): the workspace stripe is exactly
-    # cta_tile_m * cta_tile_n f32 elements per output tile. cta_tile_shape_mnk is only
-    # populated later in _setup_attributes, so derive from use_2cta_instrs + mma_tiler.
-    cta_tile_m = mma_tiler_mn[0] // (2 if gemm.use_2cta_instrs else 1)
-    cta_tile_n = mma_tiler_mn[1]
-    split_k_compile = split_k > 1  # SERIAL/PARALLEL reach the in-kernel finalize path
-    if split_k_compile:
-        compile_epi_args = gemm.EpilogueArguments(
-            split_k_semaphore=fake_tensor(
-                Int32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1
-            ),
-            split_k_workspace=fake_tensor(
-                Float32,
-                (cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()),
-                leading_dim=0,
-                divisibility=4,
-            ),
-        )
-    else:
-        compile_epi_args = gemm.EpilogueArguments()
-    scheduler_args = make_scheduler_args(
-        get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]),
-        max_swizzle_size=8,
-        tile_count_semaphore=None,
-        batch_idx_permute=None,
-    )
-    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-
-    from quack.gemm_tvm_ffi_utils import make_fake_varlen_args
-
-    varlen_args_fake = make_fake_varlen_args(varlen_m, varlen_k, False, None) or VarlenArguments()
-
-    # Fake operand tensors with sym_ints (varlen-aware shapes).
-    if varlen_m:
-        total_m_sym = cute.sym_int()
-        n_sym, l_sym = cute.sym_int(), cute.sym_int()
-        # Sub-byte (fp4) operands need the contiguous K extent statically divisible
-        # by the packing factor; harmless for 8-bit dtypes.
-        k_sym = cute.sym_int(divisibility=div_for_dtype(ab_dtype) if ab_dtype.width < 8 else 1)
-        # Detect B's leading (stride-1) dim so n-major B is accepted for varlen_m
-        # (mxfp8 only; fp4 is always K-major). A must be K-major for varlen_m —
-        # the public API enforces this (see quack/gemm.py) for all dtypes.
-        fake_mA = fake_tensor(
-            ab_dtype,
-            (total_m_sym, k_sym),
-            leading_dim=_leading_dim_from_stride(mA),
-            divisibility=div_for_dtype(ab_dtype),
-        )
-        fake_mB = fake_tensor(
-            ab_dtype,
-            (l_sym, n_sym, k_sym),
-            leading_dim=_leading_dim_from_stride(_batch_first(mB)),
-            divisibility=div_for_dtype(ab_dtype),
-        )
-        fake_mD = fake_tensor(
-            d_dtype,
-            (total_m_sym, n_sym),
-            leading_dim=_leading_dim_from_stride(mD),
-            divisibility=div_for_dtype(d_dtype),
-        )
-    elif varlen_k:
-        total_k_sym = cute.sym_int()
-        m_sym, n_sym, l_sym = cute.sym_int(), cute.sym_int(), cute.sym_int()
-        # varlen_k uses MN-major A/B convention (stride 1 on M/N axis), but
-        # detect from the actual tensor so either layout works.
-        fake_mA = fake_tensor(
-            ab_dtype,
-            (m_sym, total_k_sym),
-            leading_dim=_leading_dim_from_stride(mA),
-            divisibility=div_for_dtype(ab_dtype),
-        )
-        fake_mB = fake_tensor(
-            ab_dtype,
-            (n_sym, total_k_sym),
-            leading_dim=_leading_dim_from_stride(mB),
-            divisibility=div_for_dtype(ab_dtype),
-        )
-        fake_mD = fake_tensor(
-            d_dtype,
-            (l_sym, m_sym, n_sym),
-            leading_dim=_leading_dim_from_stride(_batch_first(mD)),
-            divisibility=div_for_dtype(d_dtype),
-        )
-    else:
-        # Detect each operand's leading (stride-1) dim so m-major A / n-major B
-        # are accepted along with the default k-major. Fakes are batch-first to
-        # match the kernel's calling convention (see docstring).
-        mA_bf, mB_bf, mD_bf = _batch_first(mA), _batch_first(mB), _batch_first(mD)
-        fake_mA = _make_fake_compact_tensor(
-            mA_bf.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mA_bf)
-        )
-        fake_mB = _make_fake_compact_tensor(
-            mB_bf.shape, ab_dtype, leading_dim=_leading_dim_from_stride(mB_bf)
-        )
-        fake_mD = _make_fake_compact_tensor(
-            mD_bf.shape, d_dtype, leading_dim=_leading_dim_from_stride(mD_bf)
-        )
-
-    if split_k_compile:
-
-        @cute.jit
-        def runner(
-            a: cute.Tensor,
-            b: cute.Tensor,
-            d: cute.Tensor,
-            sfa: cute.Tensor,
-            sfb: cute.Tensor,
-            sem: cute.Tensor,
-            ws: cute.Tensor,
-            varlen_args,
-            stream,
-        ):
-            epi = compile_epi_args._replace(split_k_semaphore=sem, split_k_workspace=ws)
-            gemm(a, b, d, None, epi, scheduler_args, varlen_args, stream, sfa, sfb, None)
-
-        compiled = cute.compile(
-            runner,
-            fake_mA,
-            fake_mB,
-            fake_mD,
-            _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
-            _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
-            compile_epi_args.split_k_semaphore,
-            compile_epi_args.split_k_workspace,
-            varlen_args_fake,
-            stream,
-            options="--enable-tvm-ffi",
-        )
-
-        def run(a, b, d, sfa, sfb):
-            # Allocate the per-tile completion flag + f32 partials workspace per call,
-            # mirroring quack.gemm.gemm. d is (m, n, l) here.
-            num_l = d.shape[2]
-            ntile_m = ceil_div(d.shape[0], cta_tile_m)
-            ntile_n = ceil_div(d.shape[1], cta_tile_n)
-            ntile_m = ceil_div(ntile_m, cluster_shape_mn[0]) * cluster_shape_mn[0]
-            ntile_n = ceil_div(ntile_n, cluster_shape_mn[1]) * cluster_shape_mn[1]
-            sem = torch.zeros((num_l, ntile_m, ntile_n), dtype=torch.int32, device=d.device)
-            alloc = torch.empty if split_k_mode == SplitKMode.SERIAL else torch.zeros
-            ws = alloc(
-                (num_l, ntile_m, ntile_n, cta_tile_m * cta_tile_n),
-                dtype=torch.float32,
-                device=d.device,
-            )
-            compiled(
-                _batch_first(a),
-                _batch_first(b),
-                _batch_first(d),
-                sfa,
-                sfb,
-                # sem/ws are not TileLoad/TileStore epi fields, so the kernel does
-                # not rotate them; pass kernel-order views (same as quack.gemm.gemm).
-                sem.permute(1, 2, 0),
-                ws.permute(3, 1, 2, 0),
-                VarlenArguments(),
-            )
-
-        return run
-
-    @cute.jit
-    def runner(
-        a: cute.Tensor,
-        b: cute.Tensor,
-        d: cute.Tensor,
-        sfa: cute.Tensor,
-        sfb: cute.Tensor,
-        varlen_args,
-        stream,
-    ):
-        gemm(a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb)
-
-    compiled = cute.compile(
-        runner,
-        fake_mA,
-        fake_mB,
-        fake_mD,
-        _make_compile_tensor_like(mSFA, sf_dtype, dynamic_layout=True),
-        _make_compile_tensor_like(mSFB, sf_dtype, dynamic_layout=True),
-        varlen_args_fake,
-        stream,
-        options="--enable-tvm-ffi",
-    )
-
-    if varlen_m or varlen_k:
-
-        def run(a, b, d, sfa, sfb, cu_seqlens):
-            varlen_args = VarlenArguments(
-                mCuSeqlensM=cu_seqlens if varlen_m else None,
-                mCuSeqlensK=cu_seqlens if varlen_k else None,
-            )
-            compiled(_batch_first(a), _batch_first(b), _batch_first(d), sfa, sfb, varlen_args)
-    else:
-
-        def run(a, b, d, sfa, sfb):
-            compiled(_batch_first(a), _batch_first(b), _batch_first(d), sfa, sfb, VarlenArguments())
-
-    return run
 
 
 def blockscaled_gemm_reference(

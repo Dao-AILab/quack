@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 
 from quack.cross_entropy import cross_entropy, cross_entropy_fwd_out
+from quack.cute_dsl_utils import get_device_capacity
 from quack.epilogue.scaled_exp import scaled_exp_target_epi
 from quack.epilogue.library import identity_epi, lse_target_epi
 from quack.epilogue.frontend import gemm_epilogue
@@ -456,8 +457,8 @@ def _pick_tile_n1(V: int) -> Optional[int]:
 def scaled_exp_lce_supported(
     x: Tensor, weight: Tensor, chunk_size: Optional[int], reduction: str
 ) -> bool:
-    """Eligibility for the scaled-exp pipeline: SM90 (the A-transform RS
-    mainloop), bf16 compute, V % 128 (the dw strip GEMM's tile_M over the
+    """Eligibility for the scaled-exp pipeline: SM90 hardware and SM90 dispatch
+    (the A-transform RS mainloop), bf16 compute, V % 128 (the dw strip GEMM's tile_M over the
     vocab dim), a tile_n1 divisor of V, and 128-divisible chunks (the dx
     strip GEMM's tile_M over rows; a ragged last chunk is padded)."""
     if not (x.is_cuda and weight.is_cuda) or reduction not in ("mean", "sum"):
@@ -473,7 +474,13 @@ def scaled_exp_lce_supported(
         return False
     if V % 128 != 0 or d % 8 != 0 or _pick_tile_n1(V) is None:
         return False
-    return torch.cuda.get_device_capability(x.device) == (9, 0)
+    # The dispatch arch (QUACK_ARCH-aware) must be SM90 too: under QUACK_ARCH=120 on
+    # an H100 the GEMMs below would build SM120 kernels, which reject the clusters
+    # this pipeline uses (SM120 has no TMA multicast).
+    return (
+        torch.cuda.get_device_capability(x.device) == (9, 0)
+        and get_device_capacity(x.device)[0] == 9
+    )
 
 
 def scaled_exp_linear_cross_entropy_fwd(

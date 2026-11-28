@@ -70,6 +70,14 @@ from quack.epilogue.library import (
     swiglu_mod,
 )
 
+from quack.cute_dsl_utils import get_device_capacity
+
+# SM120 has no TMA multicast, so its GEMM takes only 1x1 clusters. QUACK_ARCH-aware: the
+# H100 CI leg with QUACK_ARCH=120 builds the SM120 kernel too.
+_SM120 = torch.cuda.is_available() and get_device_capacity(torch.device("cuda"))[0] == 12
+_CLUSTER_M = 1 if _SM120 else 2  # cluster_M for these tests: 2, or 1 on SM120
+_needs_multicast = pytest.mark.skipif(_SM120, reason="SM120 has no TMA multicast (1x1 clusters)")
+
 
 def _rel_check(out, ref, name, tol=2e-2):
     err = (out.float() - ref).abs().max().item()
@@ -215,7 +223,7 @@ def test_epi_mod_norm_gelu(batched):
         epi_args=dict(rstd=rstd, weight=weight, postact=postact),
         tile_M=128,
         tile_N=256,
-        cluster_M=2,
+        cluster_M=_CLUSTER_M,
         cluster_N=1,
     )
 
@@ -241,7 +249,7 @@ def test_epi_mod_norm_gelu(batched):
             epi_args=dict(mAuxOut=postact2, mRowVecBroadcast=weight, mColVecBroadcast=rstd),
             tile_M=128,
             tile_N=256,
-            cluster_M=2,
+            cluster_M=_CLUSTER_M,
             cluster_N=1,
         )
         _rel_check(D, D2.float(), "D vs handwritten", tol=1e-3)
@@ -492,7 +500,7 @@ def test_epi_mod_dact():
         epi_args=dict(postact=postact),
         tile_M=128,
         tile_N=256,
-        cluster_M=2,
+        cluster_M=_CLUSTER_M,
         cluster_N=1,
     )
 
@@ -514,7 +522,7 @@ def test_epi_mod_dact():
         epi_args=dict(mAuxOut=postact2),
         tile_M=128,
         tile_N=256,
-        cluster_M=2,
+        cluster_M=_CLUSTER_M,
         cluster_N=1,
     )
     _rel_check(dx, dx2.float(), "dx vs handwritten", tol=1e-3)
@@ -530,7 +538,7 @@ def test_epi_mod_dgelu_dbias(m):
     device = "cuda"
     torch.random.manual_seed(4)
     l, n, k = 2, 1024, 736
-    tile_M, tile_N, cluster_M = 128, 256, 2
+    tile_M, tile_N, cluster_M = 128, 256, _CLUSTER_M
     cta_tile_M = cta_tile_shape_m(tile_M, cluster_M, torch.cuda.get_device_capability()[0])
     dout = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
     W = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
@@ -622,7 +630,7 @@ def test_epi_mod_rms_fused(tile_N):
 # cluster_M=2 with tile_M=128 gives cta_tile_m=64 + 2-CTA on SM100, i.e. the
 # (2, 2) epilogue warp shape. The half-N gated aux store used to corrupt warp 1's
 # smem there (~27% of postact wrong); see TileStore._make_tiled_copy_r2s.
-@pytest.mark.parametrize("cluster_M", [1, 2])
+@pytest.mark.parametrize("cluster_M", [1, pytest.param(2, marks=_needs_multicast)])
 def test_epi_mod_gated_swiglu(cluster_M):
     """GemmGated as a mod, cross-checked against the hand-written kernel."""
     device = "cuda"
@@ -663,7 +671,7 @@ def test_epi_mod_gated_swiglu(cluster_M):
     _rel_check(postact, postact2.float(), "postact vs handwritten", tol=1e-3)
 
 
-@pytest.mark.parametrize("cluster_M", [1, 2])
+@pytest.mark.parametrize("cluster_M", [1, pytest.param(2, marks=_needs_multicast)])
 def test_epi_mod_gated_operands_and_d(cluster_M):
     """Gated mod with rowvec (per-lane tuple), colvec (scalar), and D writeback."""
     device = "cuda"
@@ -2474,7 +2482,14 @@ def test_epi_mod_multi_output_mixed_dtype():
     y1 = torch.empty((l, m, n), device=device, dtype=torch.bfloat16)
     y2 = torch.empty((l, m, n), device=device, dtype=torch.float32)  # mixed dtype
     dual_out.gemm(
-        A, B, D, epi_args=dict(y1=y1, y2=y2), tile_M=128, tile_N=256, cluster_M=2, cluster_N=1
+        A,
+        B,
+        D,
+        epi_args=dict(y1=y1, y2=y2),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=_CLUSTER_M,
+        cluster_N=1,
     )
     ref = torch.einsum("lmk,lnk->lmn", A.float(), B.float())
     _rel_check(D, ref, "D")

@@ -3,13 +3,15 @@
 the dim0 ("columnwise") variant used by training linears (dgrad/wgrad).
 
 Pure-PyTorch quantizers — CPU-runnable; the GEMM-side orientation tests live in
-test_gemm_blockscaled_interface.py.
+test_gemm_blockscaled.py.
 """
 
 import pytest
 import torch
 
+from quack.blockscaled.operand import MXFP4, MXFP8_E4M3
 from quack.blockscaled.quantize import F8E4M3_MAX, to_mx, to_mx_dim0
+from quack.blockscaled.utils import blockscaled_quantize_dim0
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -65,3 +67,25 @@ def test_to_mx_dim0_matches_transposed_rowwise(scaling_mode, shape):
     assert q0.shape == x.shape and s0.shape == (x.shape[0] // 32, x.shape[1])
     assert torch.equal(q0.view(torch.uint8), qt.t().contiguous().view(torch.uint8))
     assert torch.equal(s0.view(torch.uint8), st.t().contiguous().view(torch.uint8))
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8_e5m2", "nvfp4", MXFP4])
+def test_quantize_dim0_rejects_other_formats(fmt):
+    """Formats whose dim0 quantizer isn't written yet are rejected, not quantized as
+    mxfp8_e4m3. Update this test as e5m2/fp4 dim0 quantizers are added."""
+    x = torch.randn(64, 96, dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        blockscaled_quantize_dim0(x, fmt)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled quantizer runs on CUDA")
+@pytest.mark.parametrize("fmt", ["mxfp8_e4m3", MXFP8_E4M3])
+def test_quantize_dim0_format_names(fmt):
+    """dim0 resolves format names like blockscaled_quantize: the canonical name
+    and the descriptor give the same parts as the legacy "mxfp8" alias."""
+    torch.manual_seed(0)
+    x = torch.randn(128, 160, dtype=torch.bfloat16, device="cuda")
+    q_ref, sf_ref = blockscaled_quantize_dim0(x, "mxfp8")
+    q, sf = blockscaled_quantize_dim0(x, fmt)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(sf.view(torch.uint8), sf_ref.view(torch.uint8))
