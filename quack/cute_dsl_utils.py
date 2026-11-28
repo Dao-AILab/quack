@@ -114,17 +114,14 @@ def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
     return int(major), int(minor)
 
 
-@lru_cache
-def _get_device_capacity_cached(device: torch.device = None) -> Tuple[int, int]:
-    """Return (major, minor) device capability.
-
-    Override with QUACK_ARCH (e.g. 'sm_90' or '90') for CPU-only compilation
-    without a GPU present.
-    """
+def _get_device_capacity(device: torch.device | None) -> Tuple[int, int]:
     arch_override = os.environ.get("QUACK_ARCH")
     if arch_override is not None:
         return _parse_arch_str(arch_override)
     return torch.cuda.get_device_capability(device)
+
+
+_get_device_capacity_cached = lru_cache(_get_device_capacity)
 
 
 def get_device_capacity(
@@ -141,6 +138,9 @@ def get_device_capacity(
     """
     if isinstance(device, torch.Tensor):
         device = device.device
+    # Dynamo skips lru_cache wrappers and warns; trace the uncached helper directly.
+    if torch.compiler.is_compiling():
+        return _get_device_capacity(device)
     return _get_device_capacity_cached(device)
 
 
