@@ -89,6 +89,31 @@ def mbarrier_acquire_cluster(mbar_ptr: Pointer, phase: Int, *, loc=None, ip=None
     )
 
 
+@cute.jit
+def mbarrier_wait_acquire_cluster(mbar_ptr: Pointer, phase: Int) -> None:
+    """Wait for an mbarrier phase and acquire its completion at cluster scope.
+
+    Pairs with a cluster-scope release performed by another CTA, e.g. the complete-tx
+    of a DSMEM st.async (utils.store_shared_remote) or mbarrier_arrive_release_cluster.
+    cute.arch.mbarrier_wait acquires at cta scope only, which cannot pair with those
+    releases. Emits mbarrier.try_wait.parity.relaxed.cluster in a retry loop followed by
+    fence.acquire.sync_restrict::shared::cluster.cluster: a strong read that observes the
+    completed phase, then an acquire fence restricted to shared memory, the PTX memory
+    model's acquire pattern. This is the cheaper form of
+    mbarrier.try_wait.parity.acquire.cluster, which makes ptxas invalidate L1 after every
+    try_wait (CCTL.IVALL on sm_100a); the restricted fence lowers to no instruction.
+    """
+    while not prims.mbarrier_wait_parity(
+        mbar_ptr.to_llvm_ptr(),
+        phase,
+        prims.MBarrierWait.TRY,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
+
+
 def _make_state(index: Int32, phase: Int32) -> PipelineState:
     """Construct a PipelineState from index and phase (count/stages unused by callers)."""
     return PipelineState(stages=0, count=Int32(0), index=index, phase=phase)
