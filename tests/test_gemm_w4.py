@@ -3,18 +3,18 @@
 (nvfp4, int4, int4awq, mxfp4, mxfp8 — the strip rides the SFA aux operand),
 the qtip trellis family, and fn-authored packed formats.
 
-The roundtrip fixture (quantize -> the format's own offline repack -> GEMM ->
-compare against the format's own fp32 dequant reference) is the only thing
-pinning decode_k16 <-> prepare consistency — the framework never interprets
-the blob or the strip — so a NEW format gets correctness coverage by
-registering itself.
+The roundtrip tests check each participating format's prepare and decode_k16
+together: GEMM must match a matmul against the format's fp32 dequant reference.
+Large QTIP cases start from random valid trellis streams instead of running the
+Viterbi encoder. test_qtip_quantize_roundtrip covers the encoder end to end.
 """
 
 import pytest
 import torch
 
 from quack.blockscaled import nvfp4_utils as U
-from quack.operand_transform.formats import DecodeFormat, W4_FORMATS
+from quack.operand_transform.formats import DecodeFormat, Qtip, Qtip2, W4_FORMATS
+from quack.operand_transform.formats import qtip as Q
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_w4 import gemm_w4a16
 from quack.operand_transform import PackedInput, a_transform
@@ -34,34 +34,66 @@ sm90_only = pytest.mark.skipif(_ARCH != 9, reason="W4A8 promote (int4sm) is SM90
 _ROUNDTRIP = [n for n, f in W4_FORMATS.items() if f.roundtrip and f.mma_dtype.width == 16]
 
 
+def _random_qtip_stream(fmt, n, k):
+    # Any byte string is a valid tail-biting stream. GEMM tests need not run
+    # the offline 2^16-state Viterbi encoder, especially on async-compile retries.
+    shape = (n // 64, k // fmt.tile_k, 128, fmt.tile_k // 4)
+    return torch.randint(0, 256, shape, device="cuda", dtype=torch.uint8)
+
+
+def _check_format_gemm(fmt, act, q, sf, n):
+    blob, sf_blob = fmt.prepare(q, sf)
+    out = gemm_w4a16(act, blob, sf_blob, wformat=fmt.name)
+    ref = act.float() @ fmt.dequant_reference(q, sf).t()
+    atol = ref.abs().max().item() * 2**-7 + 1e-5
+    torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=1e-2)
+
+
 @pytest.mark.parametrize("fmtname", _ROUNDTRIP)
 @pytest.mark.parametrize("m,n,k", [(16, 1024, 2048), (300, 2112, 4096)])
 def test_format_roundtrip(m, n, k, fmtname):
     fmt = W4_FORMATS[fmtname]
     torch.manual_seed(11)
     act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    if isinstance(fmt, (Qtip, Qtip2)):
+        q, sf = _random_qtip_stream(fmt, n, k), None
+    else:
+        w = torch.randn(n, k, device="cuda", dtype=torch.float32)
+        q, sf = fmt.quantize_reference(w)
+    _check_format_gemm(fmt, act, q, sf, n)
+
+
+@pytest.mark.parametrize("fmtname", ["qtip", "qtip2", "qtip2s"])
+def test_qtip_quantize_roundtrip(fmtname):
+    fmt = W4_FORMATS[fmtname]
+    torch.manual_seed(11)
+    n, k = 64, 2 * fmt.tile_k  # odd N tile count exercises padding in prepare
+    act = torch.randn(17, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.float32)
     q, sf = fmt.quantize_reference(w)
-    blob, sf_blob = fmt.prepare(q, sf)
-    out = gemm_w4a16(act, blob, sf_blob, wformat=fmtname)
-    ref = act.float() @ fmt.dequant_reference(q, sf).t()
-    atol = ref.abs().max().item() * 2**-7 + 1e-5
-    torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=1e-2)
+    # Encode the same 256 sequences with an uneven last batch. Packing must
+    # not depend on where the Viterbi batches split.
+    if fmtname == "qtip":
+        batched, _ = Q.quantize_qtip_reference(w, batch_size=100)
+    else:
+        values = Q.qtip2s_state_values(w.device) if fmtname == "qtip2s" else None
+        batched, _ = Q.quantize_qtip2_reference(w, batch_size=100, tile_k=fmt.tile_k, values=values)
+    assert torch.equal(q, batched)
+    assert (fmt.dequant_reference(q, sf) - w).square().mean().item() < 0.01
+    _check_format_gemm(fmt, act, q, sf, n)
 
 
-@pytest.mark.parametrize("wformat,tile_k", [("qtip", 64), ("qtip2s", 64), ("qtip2", 128)])
-def test_gemm_qtip_decode_exactness(wformat, tile_k):
+@pytest.mark.parametrize("wformat", ["qtip", "qtip2s", "qtip2"])
+def test_gemm_qtip_decode_exactness(wformat):
     """Trellis decodes must be bit-exact vs the host reference: with one-hot
     activations the kernel output IS the decoded weight matrix. This pins the
     window extraction (incl. the tail-biting wrap into xw[0]) and the hash
-    math against blockscaled/qtip.py. Random streams exercise every
+    math against formats/qtip.py. Random streams exercise every
     window/wrap path without a Viterbi run; tile_k=128 (qtip2) runs the
     8-block-per-tile mainloop."""
     torch.manual_seed(12)
     n, k = 128, 256
-    blob = torch.randint(
-        0, 256, (n // 64, k // tile_k, 128, tile_k // 4), device="cuda", dtype=torch.uint8
-    )
+    blob = _random_qtip_stream(W4_FORMATS[wformat], n, k)
     act = torch.eye(k, device="cuda", dtype=torch.bfloat16)
     out = gemm_w4a16(act, blob, wformat=wformat)  # (K, N) = dequant(W)^T
     w_ref = W4_FORMATS[wformat].dequant_reference(blob, None).to(torch.bfloat16)
@@ -81,11 +113,10 @@ def test_gemm_w4a16_shapes(m, n, k):
     torch.manual_seed(3)
     act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     fmt = W4_FORMATS["qtip2s"]
-    w = torch.randn(n, k, device="cuda", dtype=torch.float32)
-    q, sf = fmt.quantize_reference(w)
-    blob, _ = fmt.prepare(q, sf)
+    q = _random_qtip_stream(fmt, n, k)
+    blob, _ = fmt.prepare(q, None)
     out = gemm_w4a16(act, blob, wformat="qtip2s")
-    ref = act.float() @ fmt.dequant_reference(q, sf).t()
+    ref = act.float() @ fmt.dequant_reference(q, None).t()
     atol = ref.abs().max().item() * 2**-7 + 1e-5
     torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=1e-2)
 
@@ -106,11 +137,10 @@ def test_gemm_w4a16_configs(tile_m, tile_n):
         pytest.skip("padded N not divisible by tile_m")
     act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     fmt = W4_FORMATS["qtip2s"]
-    w = torch.randn(n, k, device="cuda", dtype=torch.float32)
-    q, sf = fmt.quantize_reference(w)
-    blob, _ = fmt.prepare(q, sf)
+    q = _random_qtip_stream(fmt, n, k)
+    blob, _ = fmt.prepare(q, None)
     out = gemm_w4a16(act, blob, wformat="qtip2s", tile_m=tile_m, tile_n=tile_n)
-    ref = act.float() @ fmt.dequant_reference(q, sf).t()
+    ref = act.float() @ fmt.dequant_reference(q, None).t()
     atol = ref.abs().max().item() * 2**-7 + 1e-5
     torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=1e-2)
 
@@ -121,11 +151,10 @@ def test_gemm_w4a16_tensor_scale():
     m, n, k = 64, 512, 768
     act = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     fmt = W4_FORMATS["qtip2s"]
-    w = torch.randn(n, k, device="cuda", dtype=torch.float32)
-    q, sf = fmt.quantize_reference(w)
-    blob, _ = fmt.prepare(q, sf)
+    q = _random_qtip_stream(fmt, n, k)
+    blob, _ = fmt.prepare(q, None)
     out = gemm_w4a16(act, blob, tensor_scale=0.03125, wformat="qtip2s")
-    ref = (act.float() @ fmt.dequant_reference(q, sf).t()) * 0.03125
+    ref = (act.float() @ fmt.dequant_reference(q, None).t()) * 0.03125
     atol = ref.abs().max().item() * 2**-7 + 1e-5
     torch.testing.assert_close(out[:, :n].float(), ref, atol=atol, rtol=1e-2)
 
@@ -137,7 +166,7 @@ def test_gemm_w4a16_split_k(split_k):
     contribution, so split accumulation introduces no rounding."""
     torch.manual_seed(14)
     n, k = 128, 512
-    blob = torch.randint(0, 256, (n // 64, k // 64, 128, 16), device="cuda", dtype=torch.uint8)
+    blob = _random_qtip_stream(W4_FORMATS["qtip2s"], n, k)
     act = torch.eye(k, device="cuda", dtype=torch.bfloat16)
     out = gemm_w4a16(act, blob, wformat="qtip2s", split_k=split_k)
     w_ref = W4_FORMATS["qtip2s"].dequant_reference(blob, None).to(torch.bfloat16)
@@ -153,12 +182,11 @@ def test_gemm_w4a16_split_k_auto():
     torch.manual_seed(15)
     n, k = 4096, 4096
     fmt = W4_FORMATS["qtip2s"]
-    w = torch.randn(n, k, device="cuda", dtype=torch.float32)
-    q, sf = fmt.quantize_reference(w)
-    blob, _ = fmt.prepare(q, sf)
+    q = _random_qtip_stream(fmt, n, k)
+    blob, _ = fmt.prepare(q, None)
     act = torch.randn(4, k, device="cuda", dtype=torch.bfloat16)
     out_auto = gemm_w4a16(act, blob, wformat="qtip2s")  # auto -> 2
-    ref = act.float() @ fmt.dequant_reference(q, sf).t()
+    ref = act.float() @ fmt.dequant_reference(q, None).t()
     atol = ref.abs().max().item() * 2**-7 + 1e-5
     torch.testing.assert_close(out_auto[:, :n].float(), ref, atol=atol, rtol=1e-2)
 
