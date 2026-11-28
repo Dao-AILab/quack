@@ -1,5 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import dataclasses
+import functools
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -25,7 +27,7 @@ from quack.pipeline import make_pipeline_state, PipelineStasAsync
 from quack.reduce import row_reduce
 from quack.reduction_base import ReductionBase
 from quack.cache import jit_cache
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
 from quack.autotuner import autotune, AutotuneConfig
 from quack.rmsnorm_config import (
     RmsNormBwdConfig,
@@ -54,6 +56,19 @@ def _bucket_T_hint(T_hint: int) -> int:
     return 1 << (T_hint - 1).bit_length()
 
 
+def _fwd_tile_N(N: int, vecsize: int, config: RmsNormFwdConfig) -> Tuple[RmsNormFwdConfig, int]:
+    """Cluster size and tile width the forward kernel uses for rows of ``N`` elements.
+
+    The kernel only depends on ``N`` through these, so every ``N`` with the same tile width can
+    share it. Uses the kernel's own cluster and tiling rules; ``cluster_n`` in the returned
+    config is already capped for this ``N``.
+    """
+    norm = RMSNorm(cutlass.Float32, N, config=config)
+    norm.cluster_n = RMSNorm._max_cluster_n(config.cluster_n, get_compile_target_capacity()[0])
+    norm._cap_cluster_n(vecsize)
+    return dataclasses.replace(config, cluster_n=norm.cluster_n), norm._tile_N(vecsize)
+
+
 def _ensure_contiguous(t):
     """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
     (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
@@ -71,9 +86,15 @@ class RMSNorm(ReductionBase):
         is_layernorm: bool = False,
         weight_offset: float = 0.0,
         config: Optional["RmsNormFwdConfig"] = None,
+        vecsize: Optional[int] = None,
+        min_N: Optional[int] = None,
     ):
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
+        # When N is the tile width and the row width is dynamic, the vector size comes from the
+        # row width's alignment, and min_N is the smallest row width sharing this kernel.
+        self.vecsize = vecsize
+        self.min_N = min_N
         # Constant added to the weight in fp32 before scaling (Gemma-style
         # "out = x_hat * (1 + w)" uses weight_offset=1.0). Baked in at compile time.
         self.weight_offset = weight_offset
@@ -94,15 +115,16 @@ class RMSNorm(ReductionBase):
     def _threads_per_row(self):
         return self._threads_per_row_val
 
+    @staticmethod
+    def _max_cluster_n(cluster_n: int, arch_major: int) -> int:
+        # SM8x (Ampere/Ada) lacks cluster support, SM12x supports cluster up to 8
+        if arch_major < 9:
+            return 1
+        return min(cluster_n, 8 if arch_major == 12 else 16)
+
     def _set_cluster_n(self):
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-        # SM8x (Ampere/Ada) lacks cluster support
-        if arch < Arch.sm_90:
-            self.cluster_n = 1
-            return
-        # SM12x supports cluster up to 8
-        max_cluster = 8 if arch.major == 12 else 16
-        self.cluster_n = min(self._cluster_n_val, max_cluster)
+        self.cluster_n = self._max_cluster_n(self._cluster_n_val, arch.major)
 
     @cute.jit
     def __call__(
@@ -123,7 +145,11 @@ class RMSNorm(ReductionBase):
         largest_dtype_width = const_expr(
             max(*(t.element_type.width for t in [mX, mRes, mW, mB, mO, mResO] if t is not None))
         )
-        vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        vecsize = (
+            self.vecsize
+            if const_expr(self.vecsize is not None)
+            else math.gcd(self.N, 128 // largest_dtype_width)
+        )
         self._cap_cluster_n(vecsize)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
@@ -131,6 +157,8 @@ class RMSNorm(ReductionBase):
             layout_utils.expand(mT, dim=0, size=tiler_mn[0]) if const_expr(mT is not None) else None
             for mT in (mW, mB)
         ]
+        # Broadcast rstd/mean over the row with stride 0; only column 0 writes them, so the
+        # tile width (self.N) works even when the row is shorter.
         mRstd, mMean = [
             layout_utils.expand(mT, dim=cute.rank(mT), size=self.N)
             if const_expr(mT is not None)
@@ -225,9 +253,13 @@ class RMSNorm(ReductionBase):
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        is_even_N = const_expr(
+            cute.is_static(shape[1]) and shape[1] == tiler_mn[1] * self.cluster_n
+        )
         tXpX = (
-            copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+            copy_utils.predicate_k(
+                thr_copy_X.partition_S(cX), limit=shape[1], limit_lower_bound=self.min_N
+            )
             if not is_even_N
             else None
         )
@@ -407,13 +439,8 @@ def _rmsnorm_fwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, out, weight, bias, residual, residual_out]
     ]
-    _compile_rmsnorm_fwd(
-        dtype,
-        out_dtype,
-        res_dtype,
-        weight_dtype,
-        bias_dtype,
-        res_out_dtype,
+    _get_compiled_rmsnorm_fwd(
+        (dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype),
         N,
         rstd is not None,
         mean is not None,
@@ -421,6 +448,40 @@ def _rmsnorm_fwd(
         per_head,
         weight_offset,
     )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
+
+
+# Memoized so warm calls skip the config and tiling work. Unbounded: entries only reference
+# kernels that jit_cache already holds. Cleared together with _compile_rmsnorm_fwd.
+@functools.lru_cache(maxsize=None)
+def _get_compiled_rmsnorm_fwd(
+    dtypes,
+    N,
+    has_rstd,
+    has_mean,
+    is_layernorm,
+    per_head,
+    weight_offset=0.0,
+    config: Optional[RmsNormFwdConfig] = None,
+):
+    if config is None:
+        config = RmsNormFwdConfig.from_analytical_heuristic(
+            N, dtypes[0].width, is_layernorm=is_layernorm
+        )
+    vecsize = math.gcd(N, *(128 // dt.width for dt in dtypes if dt is not None))
+    config, tile_N = _fwd_tile_N(N, vecsize, config)
+    # Rows that fill the tile keep a static N; shorter rows share a kernel.
+    return _compile_rmsnorm_fwd(
+        *dtypes,
+        tile_N,
+        vecsize,
+        N == tile_N,
+        has_rstd,
+        has_mean,
+        is_layernorm,
+        per_head,
+        weight_offset,
+        config=config,
+    )
 
 
 @jit_cache
@@ -431,7 +492,9 @@ def _compile_rmsnorm_fwd(
     weight_dtype,
     bias_dtype,
     res_out_dtype,
-    N,
+    tile_N,
+    vecsize,
+    static_N,
     has_rstd,
     has_mean,
     is_layernorm,
@@ -439,23 +502,40 @@ def _compile_rmsnorm_fwd(
     weight_offset=0.0,
     config: Optional[RmsNormFwdConfig] = None,
 ):
+    """Compile the forward kernel for one tile width.
+
+    Only ``_get_compiled_rmsnorm_fwd`` should build the arguments: with ``static_N=False`` the
+    kernel assumes every row width it sees is at least the tile's smallest width.
+    """
+    # Smallest row width that shares this tile (rows are multiples of vecsize).
+    vecs_per_row = config.threads_per_row * config.cluster_n
+    min_N = tile_N if static_N else tile_N - vecsize * (vecs_per_row - 1)
+    if config.cluster_n > max(1, (min_N // vecsize) // config.threads_per_row):
+        raise ValueError("cluster_n must be capped for every row width sharing the tile")
     batch_sym = cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
     batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
-    all_dtypes = [dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype]
-    div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
+    N = tile_N if static_N else cute.sym_int(divisibility=vecsize)
     x_cute, out_cute, res_cute, res_out_cute = [
-        fake_tensor(dt, (*batch_shape, N), div)
+        fake_tensor(dt, (*batch_shape, N), vecsize)
         for dt in [dtype, out_dtype, res_dtype, res_out_dtype]
     ]
     weight_shape = (head_sym, N) if per_head else (N,)
     weight_cute, bias_cute = [
-        fake_tensor(dt, weight_shape, div) for dt in [weight_dtype, bias_dtype]
+        fake_tensor(dt, weight_shape, vecsize) for dt in [weight_dtype, bias_dtype]
     ]
     rstd_cute = fake_tensor(Float32, batch_shape) if has_rstd else None
     mean_cute = fake_tensor(Float32, batch_shape) if has_mean else None
     return cute.compile(
-        RMSNorm(dtype, N, is_layernorm=is_layernorm, weight_offset=weight_offset, config=config),
+        RMSNorm(
+            dtype,
+            tile_N,
+            is_layernorm=is_layernorm,
+            weight_offset=weight_offset,
+            config=config,
+            vecsize=vecsize,
+            min_N=None if static_N else min_N,
+        ),
         x_cute,
         weight_cute,
         bias_cute,
@@ -468,6 +548,18 @@ def _compile_rmsnorm_fwd(
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
+
+
+# Clearing the compiled kernels must also clear the front memo, which holds references to them.
+_clear_compiled_rmsnorm_fwd = _compile_rmsnorm_fwd.cache_clear
+
+
+def _clear_rmsnorm_fwd_caches():
+    _get_compiled_rmsnorm_fwd.cache_clear()
+    _clear_compiled_rmsnorm_fwd()
+
+
+_compile_rmsnorm_fwd.cache_clear = _clear_rmsnorm_fwd_caches
 
 
 def rmsnorm_fwd(
@@ -543,13 +635,8 @@ def rmsnorm_fwd_tuned(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, out, weight, bias, residual, residual_out]
     ]
-    _compile_rmsnorm_fwd(
-        dtype,
-        out_dtype,
-        res_dtype,
-        weight_dtype,
-        bias_dtype,
-        res_out_dtype,
+    _get_compiled_rmsnorm_fwd(
+        (dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype),
         N,
         rstd is not None,
         mean is not None,

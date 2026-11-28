@@ -19,8 +19,8 @@ caching:
 
 ```python
 @jit_cache
-def _compile_rmsnorm_fwd(dtype, out_dtype, ..., N, ...):
-    # ... build fake CuTe tensors with cute.sym_int() batch dims ...
+def _compile_rmsnorm_fwd(dtype, out_dtype, ..., tile_N, vecsize, static_N, ...):
+    # ... build fake CuTe tensors with cute.sym_int() batch dims (and N, unless static_N) ...
     return cute.compile(RMSNorm(...), ...)
 ```
 
