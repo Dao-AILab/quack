@@ -83,6 +83,8 @@ hostname and rootless daemon name `quack-b300`; test containers use `quack-job`.
 As the CI account, `docker --context rootless logs --tail 20 quack-b300` checks
 the listener. Its restart policy is `unless-stopped`, and the rootless daemon
 is a lingering systemd user service. No listener rebuild on a CI image bump.
+The job container enforces its own 30-minute timeout (including GPU wait),
+then force-kills after a 60-second grace period, even if the listener exits.
 
 ## Test strategy
 
@@ -104,11 +106,16 @@ Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
 ## Image caching on runners
 
-The action pulls `docker://$IMAGE` into `${CI_WORK_DIR:-$HOME}/<tagslug>.sif`
+On Apptainer the action pulls `docker://$IMAGE` into `${CI_WORK_DIR:-$HOME}/<tagslug>.sif`
 (`.sqsh` on Slurm runners) on first use, then reuses the cached file on
 subsequent jobs with the same tag. Each cache hit refreshes the file's mtime.
 During image setup, CI prunes other tags of the same repository and format
 that have gone unused for at least seven days.
+
+On Docker, the listener records last use per CI image tag under
+`$HOME/.cache/quack-ci/docker-images`. It removes only previously used tags of
+the same repository after seven idle days, never the current tag, listener
+image, or cache volume.
 
 `tools/docker/sqsh.env` sets zstd level 3 and 1 MiB blocks for CI cache misses
 and manual `--sqsh` / `--sif` builds. Existing cached images are not repacked.

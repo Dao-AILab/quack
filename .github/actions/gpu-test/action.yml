@@ -49,8 +49,22 @@ runs:
       env:
         IMAGE: ${{ inputs.image }}
       run: |
-        # Docker caches registry images itself; pull on first docker run.
-        if [[ -n "${QUACK_CI_DOCKER_GPUS:-}" ]]; then
+        if [[ ${QUACK_CI_DOCKER_GPUS+x} ]]; then
+          if ! [[ "$QUACK_CI_DOCKER_GPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            echo '::error::QUACK_CI_DOCKER_GPUS must be a comma-separated list of GPU indices (e.g. 0,1,2,3)'
+            exit 2
+          fi
+          # Docker caches pulls, but image creation time isn't last CI use.
+          # Track just the tags this listener uses; never prune the whole daemon.
+          repo=${IMAGE%:*}
+          tag=${IMAGE##*:}
+          stamps="$HOME/.cache/quack-ci/docker-images/$repo"
+          mkdir -p "$stamps"
+          docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE"
+          touch "$stamps/$tag"
+          while IFS= read -r stale; do
+            if docker image rm "$repo:$stale"; then rm -- "$stamps/$stale"; fi
+          done < <(find "$stamps" -maxdepth 1 -type f ! -name "$tag" -mtime +6 -printf '%f\n')
           echo 'QUACK_CI_MODE=docker' >> "$GITHUB_ENV"
           exit 0
         fi
@@ -217,7 +231,6 @@ runs:
             export NUM_GPUS=\$(tr ',' '\n' <<< \"\$FREE_GPUS\" | wc -l)
             $INNER"
         elif [ "$QUACK_CI_MODE" = docker ]; then
-          [[ "$QUACK_CI_DOCKER_GPUS" =~ ^[0-9]+(,[0-9]+)*$ ]] || exit 2
           IFS=, read -ra gpus <<< "$QUACK_CI_DOCKER_GPUS"
           devices=()
           for gpu in "${gpus[@]}"; do devices+=(--device "nvidia.com/gpu=$gpu"); done
@@ -229,7 +242,8 @@ runs:
             --security-opt no-new-privileges --shm-size 16g --memory 200g "${devices[@]}" \
             -v "$PWD:$PWD" -w "$PWD" -v quack-ci-cache:/ci-home -e HOME=/ci-home \
             -e PYTHONNOUSERSITE=1 -e GPU_WAIT_SECONDS -e GPU_POLL_SECONDS \
-            "$IMAGE" bash -ec 'source .github/actions/gpu-test/free-gpus.sh; exec bash -ec "$1"' _ "$INNER"
+            "$IMAGE" timeout --verbose --kill-after=60s 30m \
+            bash -ec 'source .github/actions/gpu-test/free-gpus.sh; exec bash -ec "$1"' _ "$INNER"
         else
           source .github/actions/gpu-test/free-gpus.sh
           # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without

@@ -73,8 +73,8 @@ jobs:
           - { gpu: h100, cuda: cu132, arch: '120' }
     runs-on: [self-hosted, '${{ matrix.gpu }}']
     name: test (${{ matrix.gpu }}${{ matrix.arch && format(' / sm{0}', matrix.arch) || '' }} / ${{ matrix.cuda }})
-    # Covers the wait for a Slurm allocation (and a one-off image import) on
-    # top of the run itself; the tests have their own 30-minute Slurm limit.
+    # Allow time for allocation and image setup. Slurm and Docker also enforce
+    # a 30-minute limit on the run itself, independent of the Actions listener.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
