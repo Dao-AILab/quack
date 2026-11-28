@@ -48,8 +48,8 @@ job as `srun --gres=gpu:4 --container-image=<sqsh>` on a compute node, so the
 login node only hosts the listener. The image is imported once per tag into
 `$CI_WORK_DIR` (`~/quack-ci`, shared storage) as an Enroot SquashFS. The login
 pod restarting kills the listener; restart it on the login node with
-`bash ~/actions-runner-quack/start.sh`. Runners without Slurm
-keep using an Apptainer SIF.
+`bash ~/actions-runner-quack/start.sh`. The action also supports an Apptainer
+SIF on runners without Slurm or a configured Docker backend.
 
 The listener runs as a cluster user on the login node, and a job's checkout
 (including this action) executes there before any container starts. The test
@@ -69,24 +69,20 @@ of its memory.
 
 ### B300 listener
 
-`quack-b300` runs inside the pinned image as a non-root user. Docker exposes
-only GPUs 0–3 and a CI-only named volume (registration, workspace and caches);
-neither the host user's home nor the Docker socket is mounted. Both the runner
-name and its container hostname must stay generic: Actions publishes both.
-The listener shares its user with the checkout, so the same PR review rule
-applies here. `unless-stopped` restarts it after daemon or machine restarts.
+Like H100, the listener handles checkout and launches the pinned CI image for
+each job. Here the launcher is a dedicated account's rootless Docker daemon,
+not Slurm. The listener uses GitHub's stock `actions-runner` image, needs no
+GPU, and mounts the workspace at its host path so it can pass the checkout to
+Docker. `QUACK_CI_DOCKER_GPUS=0,1,2,3` selects the Docker backend and devices.
+Each test container gets only those GPUs, the checkout, and a cache volume;
+it gets neither the Docker socket nor the listener credentials. The checkout
+on the listener can access the CI account's daemon: keep the PR approval gate.
 
-From `tools/ci/runner` on the Docker host, set `IMAGE` to `IMAGE_CU132` from
-`_test.yml`, then `bash listener.sh build "$IMAGE"`. For first registration,
-pipe a short-lived repository registration token from a trusted admin client
-to `bash listener.sh register "$IMAGE"` over SSH; do not put a PAT on the
-runner. Then `bash listener.sh start "$IMAGE"` and verify the `b300` label is
-online in repository Settings → Actions → Runners.
-
-**On an image bump**, build the new listener image first. When the runner is
-idle, `docker stop quack-b300 && docker rm quack-b300`, then `bash listener.sh
-start "$IMAGE"`. Keep its named volume; no re-registration is needed. CI fails
-explicitly if the deployed image tag doesn't match the workflow pin.
+GitHub logs both runner name and machine name. Keep the registration, listener
+hostname and rootless daemon name `quack-b300`; test containers use `quack-job`.
+As the CI account, `docker --context rootless logs --tail 20 quack-b300` checks
+the listener. Its restart policy is `unless-stopped`, and the rootless daemon
+is a lingering systemd user service. No listener rebuild on a CI image bump.
 
 ## Test strategy
 
@@ -145,8 +141,7 @@ git commit -am "Bump CI image to cu13.2-NEW_DATE"
 git push
 ```
 
-Slurm and Apptainer runners fetch the new image on the next run. For Docker,
-redeploy the [B300 listener](#b300-listener) when changing the pin.
+All three backends fetch the new image on the next run.
 
 ## Manual / local SIF testing (off-CI)
 
