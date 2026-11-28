@@ -68,8 +68,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Temporarily run only CUDA 13.2 on H100. To restore B300, add:
-          # - { gpu: b300, cuda: cu132 }
+          - { gpu: b300, cuda: cu132 }
           - { gpu: h100, cuda: cu132 }
           - { gpu: h100, cuda: cu132, arch: '120' }
     runs-on: [self-hosted, '${{ matrix.gpu }}']

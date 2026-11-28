@@ -1,8 +1,7 @@
 # QuACK CI
 
-CI runs on a self-hosted H100 runner (sm90 and an sm120-override leg) inside a
-container built from a Docker image on Docker Hub: through Slurm/Pyxis from an
-Enroot SquashFS on the cluster, or in an Apptainer SIF on runners without Slurm.
+CI runs on self-hosted H100 (sm90 and an sm120-override leg) and B300 runners
+using the same pinned Docker Hub image: Slurm/Pyxis on H100, Docker on B300.
 Triggered on every push to `main` and on PRs.
 
 ## Files
@@ -30,16 +29,16 @@ The Dockerfile no longer builds a CUDA 12 image, and `_test.yml` no longer runs
 
 ## Test matrix
 
-`_test.yml` runs 2 jobs per push, both on the H100 runner:
+`_test.yml` has the following GPU test legs:
 
 | GPU | Arch override | cu132 |
 |-----|----------------|-------|
 | h100 | (none, sm90) | ✓ |
 | h100 | sm120 | ✓ |
+| b300 | (none, sm103) | ✓ |
 
 The h100/sm120 job selects QuACK's SM120 implementations with `QUACK_ARCH=120`
-but compiles and executes on H100 hardware. The B300 leg is disabled for now
-(see the comment in `_test.yml`).
+but compiles and executes on H100 hardware.
 
 ## Runners
 
@@ -68,13 +67,34 @@ Four GPUs is deliberate: wall time scales almost linearly with xdist workers
 and several workers cannot share one GPU because the largest tests need most
 of its memory.
 
+### B300 listener
+
+`quack-b300` runs inside the pinned image as a non-root user. Docker exposes
+only GPUs 0–3 and a CI-only named volume (registration, workspace and caches);
+neither the host user's home nor the Docker socket is mounted. Both the runner
+name and its container hostname must stay generic: Actions publishes both.
+The listener shares its user with the checkout, so the same PR review rule
+applies here. `unless-stopped` restarts it after daemon or machine restarts.
+
+From `tools/ci/runner` on the Docker host, set `IMAGE` to `IMAGE_CU132` from
+`_test.yml`, then `bash listener.sh build "$IMAGE"`. For first registration,
+pipe a short-lived repository registration token from a trusted admin client
+to `bash listener.sh register "$IMAGE"` over SSH; do not put a PAT on the
+runner. Then `bash listener.sh start "$IMAGE"` and verify the `b300` label is
+online in repository Settings → Actions → Runners.
+
+**On an image bump**, build the new listener image first. When the runner is
+idle, `docker stop quack-b300 && docker rm quack-b300`, then `bash listener.sh
+start "$IMAGE"`. Keep its named volume; no re-registration is needed. CI fails
+explicitly if the deployed image tag doesn't match the workflow pin.
+
 ## Test strategy
 
 Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
 - `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24 --async-compile-strict`
-  On Slurm runners the GPUs are the ones Slurm allocates. On Apptainer runners
-  the action picks GPUs with at least 50 GB free, waiting up to 5 minutes and
+  On Slurm runners the GPUs are the ones Slurm allocates. On Docker and Apptainer
+  runners the action picks visible GPUs with at least 50 GB free, waiting up to 5 minutes and
   polling every 15 seconds when runner assignment races with transient GPU
   contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
   workers (forkserver sidecar, GPU-blind) while the affected tests defer and
@@ -108,7 +128,7 @@ fails CI until a new image is cut. Three steps:
 # 1. Build & push from a box that has docker (one-time Hub login: `docker login -u tridao`)
 ./tools/ci/docker/build.sh --image --push
 # On a runner, add --sif to also pre-build the SIF the gpu-test action caches.
-# On a docker-less runner (b300), pre-warm from the pushed image with:
+# On an Apptainer runner, pre-warm from the pushed image with:
 #   DATE=YY.MM.DD ./tools/ci/docker/build.sh --sif
 # unattended variant: DOCKERHUB_TOKEN=hub_xxx ./tools/ci/docker/build.sh --image --push
 ```
@@ -125,7 +145,8 @@ git commit -am "Bump CI image to cu13.2-NEW_DATE"
 git push
 ```
 
-Runners auto-fetch the new image on the next CI run. No manual runner steps.
+Slurm and Apptainer runners fetch the new image on the next run. For Docker,
+redeploy the [B300 listener](#b300-listener) when changing the pin.
 
 ## Manual / local SIF testing (off-CI)
 

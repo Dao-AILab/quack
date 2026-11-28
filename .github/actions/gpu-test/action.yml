@@ -1,7 +1,7 @@
 name: GPU Test
 description: >-
   Fetch the image from Docker Hub (cached by tag), compile and run tests — through
-  Slurm/Pyxis on runners that have it, in an Apptainer SIF elsewhere
+  Slurm/Pyxis, directly in a containerized runner, or in an Apptainer SIF
 inputs:
   cuda:
     description: >-
@@ -49,6 +49,16 @@ runs:
       env:
         IMAGE: ${{ inputs.image }}
       run: |
+        # Containerized listeners are provisioned from the CI image itself.
+        # Never silently test against an old toolchain after a workflow bump.
+        if [[ -n "${QUACK_RUNNER_IMAGE:-}" ]]; then
+          if [[ "$QUACK_RUNNER_IMAGE" != "$IMAGE" ]]; then
+            echo "::error::Runner uses $QUACK_RUNNER_IMAGE; redeploy it with $IMAGE"
+            exit 1
+          fi
+          echo 'QUACK_CI_MODE=container' >> "$GITHUB_ENV"
+          exit 0
+        fi
         WORK_DIR="${CI_WORK_DIR:-$HOME}"
         mkdir -p "$WORK_DIR"
 
@@ -220,7 +230,7 @@ runs:
           # kernels, the tests and the cause.
           # Pin the Triton 3.9 FP fusion behavior for torch.compile reference paths.
           export TRITON_DEFAULT_FP_FUSION=1 &&
-          CUDA_VISIBLE_DEVICES=\$FREE_GPUS pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24 --async-compile-strict
+          CUDA_VISIBLE_DEVICES=\$FREE_GPUS python3 -m pytest tests/ -n \$NUM_GPUS --dist worksteal --max-worker-restart \$NUM_GPUS --async-compile=24 --async-compile-strict
         "
 
         if [ "$QUACK_CI_MODE" = slurm ]; then
@@ -248,6 +258,14 @@ runs:
             export HOME='$QUACK_CI_HOME' PYTHONNOUSERSITE=1 FREE_GPUS=\$CUDA_VISIBLE_DEVICES
             export NUM_GPUS=\$(tr ',' '\n' <<< \"\$FREE_GPUS\" | wc -l)
             $INNER"
+        elif [ "$QUACK_CI_MODE" = container ]; then
+          # The listener has no access to host Python or other host GPUs. Keep
+          # editable installs local to this job despite the persistent HOME.
+          VENV=$(mktemp -d "$RUNNER_TEMP/venv.XXXXXXXX")
+          trap 'rm -rf "$VENV"' EXIT
+          python3 -m venv --system-site-packages "$VENV"
+          PATH="$VENV/bin:$PATH" PYTHONNOUSERSITE=1 FREE_GPUS="$FREE_GPUS" NUM_GPUS="$NUM_GPUS" \
+            bash -e -c "$INNER"
         else
           # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
           # this Python inside the SIF picks up packages from the runner user's
