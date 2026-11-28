@@ -1,8 +1,7 @@
 # QuACK CI
 
-CI runs on a self-hosted H100 runner (sm90 and an sm120-override leg) inside a
-container built from a Docker image on Docker Hub: through Slurm/Pyxis from an
-Enroot SquashFS on the cluster, or in an Apptainer SIF on runners without Slurm.
+CI runs on self-hosted H100 (sm90 and an sm120-override leg) and B300 runners
+using the same pinned Docker Hub image: Slurm/Pyxis on H100, Docker on B300.
 Triggered on every push to `main` and on PRs.
 
 ## Files
@@ -30,16 +29,16 @@ The Dockerfile no longer builds a CUDA 12 image, and `_test.yml` no longer runs
 
 ## Test matrix
 
-`_test.yml` runs 2 jobs per push, both on the H100 runner:
+`_test.yml` has the following GPU test legs:
 
 | GPU | Arch override | cu132 |
 |-----|----------------|-------|
 | h100 | (none, sm90) | ✓ |
 | h100 | sm120 | ✓ |
+| b300 | (none, sm103) | ✓ |
 
 The h100/sm120 job selects QuACK's SM120 implementations with `QUACK_ARCH=120`
-but compiles and executes on H100 hardware. The B300 leg is disabled for now
-(see the comment in `_test.yml`).
+but compiles and executes on H100 hardware.
 
 ## Runners
 
@@ -49,8 +48,8 @@ job as `srun --gres=gpu:4 --container-image=<sqsh>` on a compute node, so the
 login node only hosts the listener. The image is imported once per tag into
 `$CI_WORK_DIR` (`~/quack-ci`, shared storage) as an Enroot SquashFS. The login
 pod restarting kills the listener; restart it on the login node with
-`bash ~/actions-runner-quack/start.sh`. Runners without Slurm
-keep using an Apptainer SIF.
+`bash ~/actions-runner-quack/start.sh`. The action also supports an Apptainer
+SIF on runners without Slurm or a configured Docker backend.
 
 The listener runs as a cluster user on the login node, and a job's checkout
 (including this action) executes there before any container starts. The test
@@ -68,13 +67,32 @@ Four GPUs is deliberate: wall time scales almost linearly with xdist workers
 and several workers cannot share one GPU because the largest tests need most
 of its memory.
 
+### B300 listener
+
+Like H100, the listener handles checkout and launches the pinned CI image for
+each job. Here the launcher is a dedicated account's rootless Docker daemon,
+not Slurm. The listener uses GitHub's stock `actions-runner` image, needs no
+GPU, and mounts the workspace at its host path so it can pass the checkout to
+Docker. `QUACK_CI_DOCKER_GPUS=0,1,2,3` selects the Docker backend and devices.
+Each test container gets only those GPUs, the checkout, and a cache volume;
+it gets neither the Docker socket nor the listener credentials. The checkout
+on the listener can access the CI account's daemon: keep the PR approval gate.
+
+GitHub logs both runner name and machine name. Keep the registration, listener
+hostname and rootless daemon name `quack-b300`; test containers use `quack-job`.
+As the CI account, `docker --context rootless logs --tail 20 quack-b300` checks
+the listener. Its restart policy is `unless-stopped`, and the rootless daemon
+is a lingering systemd user service. No listener rebuild on a CI image bump.
+The job container enforces its own 30-minute timeout (including GPU wait),
+then force-kills after a 60-second grace period, even if the listener exits.
+
 ## Test strategy
 
 Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
 - `CUDA_VISIBLE_DEVICES=$FREE_GPUS pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24 --async-compile-strict`
-  On Slurm runners the GPUs are the ones Slurm allocates. On Apptainer runners
-  the action picks GPUs with at least 50 GB free, waiting up to 5 minutes and
+  On Slurm runners the GPUs are the ones Slurm allocates. On Docker and Apptainer
+  runners the action picks visible GPUs with at least 50 GB free, waiting up to 5 minutes and
   polling every 15 seconds when runner assignment races with transient GPU
   contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
   workers (forkserver sidecar, GPU-blind) while the affected tests defer and
@@ -88,11 +106,16 @@ Per `gpu-test/action.yml`: a single pass with async kernel compilation —
 
 ## Image caching on runners
 
-The action pulls `docker://$IMAGE` into `${CI_WORK_DIR:-$HOME}/<tagslug>.sif`
+On Apptainer the action pulls `docker://$IMAGE` into `${CI_WORK_DIR:-$HOME}/<tagslug>.sif`
 (`.sqsh` on Slurm runners) on first use, then reuses the cached file on
 subsequent jobs with the same tag. Each cache hit refreshes the file's mtime.
 During image setup, CI prunes other tags of the same repository and format
 that have gone unused for at least seven days.
+
+On Docker, the listener records last use per CI image tag under
+`$HOME/.cache/quack-ci/docker-images`. It removes only previously used tags of
+the same repository after seven idle days, never the current tag, listener
+image, or cache volume.
 
 `tools/docker/sqsh.env` sets zstd level 3 and 1 MiB blocks for CI cache misses
 and manual `--sqsh` / `--sif` builds. Existing cached images are not repacked.
@@ -108,7 +131,7 @@ fails CI until a new image is cut. Three steps:
 # 1. Build & push from a box that has docker (one-time Hub login: `docker login -u tridao`)
 ./tools/ci/docker/build.sh --image --push
 # On a runner, add --sif to also pre-build the SIF the gpu-test action caches.
-# On a docker-less runner (b300), pre-warm from the pushed image with:
+# On an Apptainer runner, pre-warm from the pushed image with:
 #   DATE=YY.MM.DD ./tools/ci/docker/build.sh --sif
 # unattended variant: DOCKERHUB_TOKEN=hub_xxx ./tools/ci/docker/build.sh --image --push
 ```
@@ -125,7 +148,7 @@ git commit -am "Bump CI image to cu13.2-NEW_DATE"
 git push
 ```
 
-Runners auto-fetch the new image on the next CI run. No manual runner steps.
+All three backends fetch the new image on the next run.
 
 ## Manual / local SIF testing (off-CI)
 

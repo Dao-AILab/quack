@@ -1,7 +1,7 @@
 name: GPU Test
 description: >-
   Fetch the image from Docker Hub (cached by tag), compile and run tests — through
-  Slurm/Pyxis on runners that have it, in an Apptainer SIF elsewhere
+  Slurm/Pyxis, rootless Docker, or Apptainer
 inputs:
   cuda:
     description: >-
@@ -49,12 +49,31 @@ runs:
       env:
         IMAGE: ${{ inputs.image }}
       run: |
+        if [[ ${QUACK_CI_DOCKER_GPUS+x} ]]; then
+          if ! [[ "$QUACK_CI_DOCKER_GPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            echo '::error::QUACK_CI_DOCKER_GPUS must be a comma-separated list of GPU indices (e.g. 0,1,2,3)'
+            exit 2
+          fi
+          # Docker caches pulls, but image creation time isn't last CI use.
+          # Track just the tags this listener uses; never prune the whole daemon.
+          repo=${IMAGE%:*}
+          tag=${IMAGE##*:}
+          stamps="$HOME/.cache/quack-ci/docker-images/$repo"
+          mkdir -p "$stamps"
+          docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE"
+          touch "$stamps/$tag"
+          while IFS= read -r stale; do
+            if docker image rm "$repo:$stale"; then rm -- "$stamps/$stale"; fi
+          done < <(find "$stamps" -maxdepth 1 -type f ! -name "$tag" -mtime +6 -printf '%f\n')
+          echo 'QUACK_CI_MODE=docker' >> "$GITHUB_ENV"
+          exit 0
+        fi
         WORK_DIR="${CI_WORK_DIR:-$HOME}"
         mkdir -p "$WORK_DIR"
 
         # Slurm clusters with Pyxis run the image through
         # `srun --container-image` from an Enroot SquashFS, which must sit on
-        # storage every node sees. Every other runner uses an Apptainer SIF.
+        # storage every node sees. Otherwise fall back to an Apptainer SIF.
         # (grep without -q: it must read all of srun's output, or srun dies of
         # SIGPIPE and pipefail turns a match into "no Pyxis".)
         if command -v srun >/dev/null 2>&1 && srun --help 2>&1 | grep -- '--container-image' >/dev/null; then
@@ -116,49 +135,12 @@ runs:
       env:
         ARCH: ${{ inputs.arch }}
         CUDA: ${{ inputs.cuda }}
+        IMAGE: ${{ inputs.image }}
         GPU_WAIT_SECONDS: ${{ inputs.gpu_wait_seconds }}
         GPU_POLL_SECONDS: ${{ inputs.gpu_poll_seconds }}
         SLURM_GPUS: ${{ inputs.slurm_gpus }}
       run: |
-        if [ "$QUACK_CI_MODE" != slurm ]; then
-          if ! [[ "$GPU_WAIT_SECONDS" =~ ^[0-9]+$ && "$GPU_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::gpu_wait_seconds must be non-negative and gpu_poll_seconds must be positive"
-            exit 2
-          fi
-
-          # Runner placement checks the host before the listener starts, but a
-          # tenant can allocate memory between that check and job assignment.
-          # Absorb short races here instead of immediately failing the CI leg.
-          # 50000 MiB covers the measured ~45 GiB peak of the largest fp32
-          # forward/backward RMSNorm case with a small safety margin.
-          GPU_DEADLINE=$(( $(date +%s) + GPU_WAIT_SECONDS ))
-          while :; do
-            FREE_GPUS=$(
-              nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null |
-                awk -F', ' '$2 >= 50000 {print $1}' |
-                paste -sd,
-            ) || true
-            if [ -n "$FREE_GPUS" ]; then
-              break
-            fi
-
-            NOW=$(date +%s)
-            if (( NOW >= GPU_DEADLINE )); then
-              echo "::error::No GPUs with >= 50GB free memory after waiting ${GPU_WAIT_SECONDS}s"
-              nvidia-smi --query-gpu=index,memory.used,memory.free \
-                --format=csv,noheader,nounits || true
-              exit 1
-            fi
-            REMAINING=$(( GPU_DEADLINE - NOW ))
-            echo "No GPU has >= 50GB free; retrying in ${GPU_POLL_SECONDS}s (${REMAINING}s remaining)"
-            sleep "$GPU_POLL_SECONDS"
-          done
-
-          NUM_GPUS=$(tr ',' '\n' <<< "$FREE_GPUS" | wc -l)
-          echo "Running tests on GPUs: $FREE_GPUS"
-        fi
-
-        # The script that runs inside the container, shared by both launchers.
+        # The script that runs inside the container, shared by all launchers.
         INNER="
           # Editable-install over the container's baked-in quack so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
@@ -248,7 +230,22 @@ runs:
             export HOME='$QUACK_CI_HOME' PYTHONNOUSERSITE=1 FREE_GPUS=\$CUDA_VISIBLE_DEVICES
             export NUM_GPUS=\$(tr ',' '\n' <<< \"\$FREE_GPUS\" | wc -l)
             $INNER"
+        elif [ "$QUACK_CI_MODE" = docker ]; then
+          IFS=, read -ra gpus <<< "$QUACK_CI_DOCKER_GPUS"
+          devices=()
+          for gpu in "${gpus[@]}"; do devices+=(--device "nvidia.com/gpu=$gpu"); done
+          # Only the checkout and a cache volume cross into the test container.
+          # The listener has the CI user's rootless socket; the tests do not.
+          job="quack-job-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$job" >/dev/null 2>&1 || true' EXIT
+          docker run --rm --init --name "$job" --hostname quack-job --cap-drop ALL \
+            --security-opt no-new-privileges --shm-size 16g --memory 200g "${devices[@]}" \
+            -v "$PWD:$PWD" -w "$PWD" -v quack-ci-cache:/ci-home -e HOME=/ci-home \
+            -e PYTHONNOUSERSITE=1 -e GPU_WAIT_SECONDS -e GPU_POLL_SECONDS \
+            "$IMAGE" timeout --verbose --kill-after=60s 30m \
+            bash -ec 'source .github/actions/gpu-test/free-gpus.sh; exec bash -ec "$1"' _ "$INNER"
         else
+          source .github/actions/gpu-test/free-gpus.sh
           # PYTHONNOUSERSITE=1 — apptainer bind-mounts $HOME by default, so without
           # this Python inside the SIF picks up packages from the runner user's
           # ~/.local/lib/python3.12/site-packages, shadowing the SIF's copies.
